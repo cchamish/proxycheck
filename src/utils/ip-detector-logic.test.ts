@@ -260,8 +260,8 @@ test('resolveRepoBaseUrl normalizes empty values, repository slugs, and full URL
 
 test('formatDiagnosticSummary renders full unit labels and handles absent or invalid values', () => {
   assert.equal(
-    formatDiagnosticSummary({ duration: 5.331, memory: 71, isCached: false }),
-    'Executed in 5.331 seconds \u00b7 Taken 71 megabytes'
+    formatDiagnosticSummary({ duration: 5.331, memory: 71.4, isCached: false }),
+    'Executed in 5.331 seconds \u00b7 Taken 71.40 megabytes'
   );
   assert.equal(
     formatDiagnosticSummary({ duration: 0.012, memory: null, isCached: false }),
@@ -274,10 +274,10 @@ test('formatDiagnosticSummary renders full unit labels and handles absent or inv
   assert.equal(formatDiagnosticSummary(null), 'Executed in 0.000 seconds');
 });
 
-test('buildDiagnosticMetrics preserves zero durations, rounds memory, and falls back on missing fields', () => {
+test('buildDiagnosticMetrics preserves zero durations, rounds memory to two decimals, and falls back on missing fields', () => {
   assert.deepEqual(
-    buildDiagnosticMetrics({ durationSeconds: 0, memoryMb: 71.4, isCached: true }, 0.45),
-    { duration: 0, memory: 71, isCached: true }
+    buildDiagnosticMetrics({ durationSeconds: 0, memoryMb: 71.456, isCached: true }, 0.45),
+    { duration: 0, memory: 71.46, isCached: true }
   );
   assert.deepEqual(
     buildDiagnosticMetrics({ durationSeconds: undefined, memoryMb: null, isCached: false }, 0.25),

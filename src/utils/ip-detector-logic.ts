@@ -305,7 +305,7 @@ export interface DiagnosticPayload {
 }
 
 /**
- * Normalizes backend diagnostic fields into non-negative duration and rounded megabyte values.
+ * Normalizes backend diagnostic fields into non-negative duration and two-decimal megabyte values.
  */
 export function buildDiagnosticMetrics(
   payload?: DiagnosticPayload | null,
@@ -324,7 +324,7 @@ export function buildDiagnosticMetrics(
   const rawMemory = payload?.memoryMb;
   const memory =
     typeof rawMemory === 'number' && Number.isFinite(rawMemory) && rawMemory >= 0
-      ? Math.round(rawMemory)
+      ? Math.round(rawMemory * 100) / 100
       : null;
 
   return {
@@ -347,7 +347,7 @@ export function formatDiagnosticSummary(diagnostic?: DiagnosticMetrics | null): 
 
   const rawMemory = diagnostic?.memory;
   if (typeof rawMemory === 'number' && Number.isFinite(rawMemory) && rawMemory >= 0) {
-    parts.push(`Taken ${Math.round(rawMemory)} megabytes`);
+    parts.push(`Taken ${rawMemory.toFixed(2)} megabytes`);
   }
 
   return parts.join(' \u00b7 ');

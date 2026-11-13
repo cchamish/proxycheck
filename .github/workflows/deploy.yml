@@ -45,6 +45,12 @@ jobs:
             exit 1
           fi
 
+      - name: Check out verified commit
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 1
+
       - name: Configure SSH credentials
         env:
           TOOLFORGE_HOST: ${{ secrets.TOOLFORGE_HOST }}
@@ -65,9 +71,13 @@ jobs:
           VITE_GITHUB_REPO: ${{ github.repository }}
           REPO_GIT_URL: ${{ github.server_url }}/${{ github.repository }}.git
         run: |
+          VITE_COMMIT_HASH="$(git rev-parse --short HEAD)"
+          VITE_COMMIT_TIMESTAMP="$(LC_ALL=C git log -1 --format=%cd --date='format:%H:%M %d %b %Y')"
           {
             printf 'target_branch=%q\n' "$TARGET_BRANCH"
             printf 'vite_github_repo=%q\n' "$VITE_GITHUB_REPO"
+            printf 'vite_commit_hash=%q\n' "$VITE_COMMIT_HASH"
+            printf 'vite_commit_timestamp=%q\n' "$VITE_COMMIT_TIMESTAMP"
             printf 'repo_git_url=%q\n' "$REPO_GIT_URL"
             cat << 'EOF'
               set -euo pipefail
@@ -76,6 +86,8 @@ jobs:
               toolforge build start \
                 --ref "$target_branch" \
                 --envvar "VITE_GITHUB_REPO=$vite_github_repo" \
+                --envvar "VITE_COMMIT_HASH=$vite_commit_hash" \
+                --envvar "VITE_COMMIT_TIMESTAMP=$vite_commit_timestamp" \
                 "$repo_git_url"
 
               echo "Restarting Build Service web service and verifying status"

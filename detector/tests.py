@@ -1947,6 +1947,49 @@ class SettingsAndHardeningTests(TestCase):
             mem = views.get_process_memory_mb()
             self.assertIsNone(mem)
 
+    def test_auth_user_and_logout_include_request_diagnostics(self):
+        with patch("detector.views.get_process_memory_mb", return_value=71.4):
+            unauth_resp = self.client.get("/api/v1/auth/user/")
+            self.assertEqual(unauth_resp.status_code, 200)
+            unauth_payload = unauth_resp.json()
+            self.assertFalse(unauth_payload["isLoggedIn"])
+            self.assertIsInstance(unauth_payload["durationSeconds"], (int, float))
+            self.assertGreaterEqual(unauth_payload["durationSeconds"], 0)
+            self.assertEqual(unauth_payload["memoryMb"], 71.4)
+
+            session = self.client.session
+            session["wikimedia_user"] = {
+                "isLoggedIn": True,
+                "username": "SysopTester",
+                "role": "Local Administrator (sysop)",
+                "hasAccess": True,
+                "localGroups": ["sysop"],
+                "globalGroups": [],
+            }
+            session.save()
+
+            auth_resp = self.client.get("/api/v1/auth/user/")
+            self.assertEqual(auth_resp.status_code, 200)
+            auth_payload = auth_resp.json()
+            self.assertTrue(auth_payload["isLoggedIn"])
+            self.assertEqual(auth_payload["username"], "SysopTester")
+            self.assertIsInstance(auth_payload["durationSeconds"], (int, float))
+            self.assertGreaterEqual(auth_payload["durationSeconds"], 0)
+            self.assertEqual(auth_payload["memoryMb"], 71.4)
+
+            stored_user = self.client.session.get("wikimedia_user", {})
+            self.assertNotIn("durationSeconds", stored_user)
+            self.assertNotIn("memoryMb", stored_user)
+
+        with patch("detector.views.get_process_memory_mb", return_value=None):
+            logout_resp = self.client.get("/api/v1/auth/logout/")
+            self.assertEqual(logout_resp.status_code, 200)
+            logout_payload = logout_resp.json()
+            self.assertEqual(logout_payload["status"], "logged_out")
+            self.assertIsInstance(logout_payload["durationSeconds"], (int, float))
+            self.assertGreaterEqual(logout_payload["durationSeconds"], 0)
+            self.assertIsNone(logout_payload["memoryMb"])
+
 
 class GadgetTokenAndCorsAuthTests(TestCase):
     """Tests for CentralAuth token exchange, Bearer verification, unified RBAC, and Wikimedia CORS."""

@@ -230,6 +230,48 @@ export function resolveRepoBaseUrl(configuredRepo?: string | null): string {
     : `https://github.com/${trimmed}`;
 }
 
+const ENGLISH_MONTH_ABBREVIATIONS = [
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
+];
+
+/**
+ * Formats a Date in UTC as "HH:MM DD Mon YYYY" with English month abbreviations.
+ */
+export function formatUtcCommitTimestamp(date: Date = new Date()): string {
+  const target = Number.isNaN(date.getTime()) ? new Date() : date;
+  const hours = String(target.getUTCHours()).padStart(2, '0');
+  const minutes = String(target.getUTCMinutes()).padStart(2, '0');
+  const day = String(target.getUTCDate()).padStart(2, '0');
+  const month = ENGLISH_MONTH_ABBREVIATIONS[target.getUTCMonth()];
+  const year = target.getUTCFullYear();
+  return `${hours}:${minutes} ${day} ${month} ${year}`;
+}
+
+/**
+ * Formats commit hash and optional commit timestamp into the parenthesized footer label.
+ */
+export function formatCommitVersionLabel(
+  commitHash?: string | null,
+  commitTimestamp?: string | null
+): string {
+  const normalizedHash = String(commitHash ?? '').trim() || 'dev';
+  const normalizedTimestamp = String(commitTimestamp ?? '').trim();
+  return normalizedTimestamp
+    ? `(r.${normalizedHash} @ ${normalizedTimestamp})`
+    : `(r.${normalizedHash})`;
+}
+
 export function filterComparisonResults(results: ProviderRawResult[] | undefined | null): ProviderRawResult[] {
   if (!Array.isArray(results)) return [];
   return results.filter((row) => row.provider !== 'GetIPIntel' && row.provider !== 'Tor Onionoo');
@@ -250,12 +292,118 @@ export function simplifySecurityFlags(
   return [{ label: 'No Flags', isHighRisk: false }];
 }
 
+export interface DiagnosticMetrics {
+  duration: number;
+  memory: number | null;
+  isCached: boolean;
+}
+
+export interface DiagnosticPayload {
+  durationSeconds?: number | null;
+  memoryMb?: number | null;
+  isCached?: boolean | null;
+}
+
+/**
+ * Normalizes backend diagnostic fields into non-negative duration and rounded megabyte values.
+ */
+export function buildDiagnosticMetrics(
+  payload?: DiagnosticPayload | null,
+  fallbackDuration = 0
+): DiagnosticMetrics {
+  const safeFallback =
+    typeof fallbackDuration === 'number' && Number.isFinite(fallbackDuration) && fallbackDuration >= 0
+      ? fallbackDuration
+      : 0;
+  const rawDuration = payload?.durationSeconds;
+  const duration =
+    typeof rawDuration === 'number' && Number.isFinite(rawDuration) && rawDuration >= 0
+      ? rawDuration
+      : safeFallback;
+
+  const rawMemory = payload?.memoryMb;
+  const memory =
+    typeof rawMemory === 'number' && Number.isFinite(rawMemory) && rawMemory >= 0
+      ? Math.round(rawMemory)
+      : null;
+
+  return {
+    duration,
+    memory,
+    isCached: Boolean(payload?.isCached),
+  };
+}
+
+/**
+ * Formats execution duration and optional worker memory usage into full-unit footer text.
+ */
+export function formatDiagnosticSummary(diagnostic?: DiagnosticMetrics | null): string {
+  const rawDuration = diagnostic?.duration;
+  const duration =
+    typeof rawDuration === 'number' && Number.isFinite(rawDuration) && rawDuration >= 0
+      ? rawDuration
+      : 0;
+  const parts = [`Executed in ${duration.toFixed(3)} seconds`];
+
+  const rawMemory = diagnostic?.memory;
+  if (typeof rawMemory === 'number' && Number.isFinite(rawMemory) && rawMemory >= 0) {
+    parts.push(`Taken ${Math.round(rawMemory)} megabytes`);
+  }
+
+  return parts.join(' \u00b7 ');
+}
+
+/**
+ * Measures initial document load time in seconds from browser navigation timing when available.
+ */
+export function measureInitialLoadDurationSeconds(): number {
+  if (typeof performance === 'undefined' || typeof performance.getEntriesByType !== 'function') {
+    return 0;
+  }
+  try {
+    const entries = performance.getEntriesByType('navigation');
+    const navEntry = entries[0] as PerformanceNavigationTiming | undefined;
+    if (
+      navEntry &&
+      typeof navEntry.responseEnd === 'number' &&
+      Number.isFinite(navEntry.responseEnd) &&
+      navEntry.responseEnd > 0
+    ) {
+      const start =
+        typeof navEntry.startTime === 'number' && Number.isFinite(navEntry.startTime)
+          ? navEntry.startTime
+          : 0;
+      const seconds = (navEntry.responseEnd - start) / 1000;
+      if (Number.isFinite(seconds) && seconds >= 0) {
+        return Number(seconds.toFixed(3));
+      }
+    }
+  } catch {
+    return 0;
+  }
+  return 0;
+}
+
+/**
+ * Computes elapsed seconds since a performance.now() timestamp, returning 0 when unavailable.
+ */
+export function measureElapsedSeconds(startTimeMs: number): number {
+  if (typeof performance === 'undefined' || typeof performance.now !== 'function' || !Number.isFinite(startTimeMs)) {
+    return 0;
+  }
+  const elapsedMs = performance.now() - startTimeMs;
+  if (!Number.isFinite(elapsedMs) || elapsedMs < 0) {
+    return 0;
+  }
+  return Number((elapsedMs / 1000).toFixed(3));
+}
+
 export interface DetectionCoordinatorState {
   isLoading: boolean;
   validationError: string;
   sessionExpiredMessage: string;
   detectionData: any | null;
-  diagnostic: { duration: number; memory: number | null; isCached: boolean } | null;
+  diagnostic: DiagnosticMetrics | null;
   user: {
     isLoggedIn: boolean;
     username: string;
@@ -358,11 +506,7 @@ export function createDetectionCoordinator(
 
       state.sessionExpiredMessage = '';
       state.detectionData = data;
-      state.diagnostic = {
-        duration: data.durationSeconds || 0.0,
-        memory: data.memoryMb != null ? Math.round(data.memoryMb) : null,
-        isCached: Boolean(data.isCached),
-      };
+      state.diagnostic = buildDiagnosticMetrics(data);
       state.ipHistory = updateIpHistory(state.ipHistory, data.ip || targetIp);
       options?.onHistoryUpdated?.(state.ipHistory);
     } catch (err: any) {

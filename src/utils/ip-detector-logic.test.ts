@@ -1,5 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { resolveCommitMetadata } from '../../vite.config';
 import {
   isValidIpAddress,
   canonicalizeIpAddress,
@@ -8,6 +12,12 @@ import {
   simplifySecurityFlags,
   createDetectionCoordinator,
   resolveRepoBaseUrl,
+  formatUtcCommitTimestamp,
+  formatCommitVersionLabel,
+  buildDiagnosticMetrics,
+  formatDiagnosticSummary,
+  measureInitialLoadDurationSeconds,
+  measureElapsedSeconds,
   type DetectionCoordinatorState,
   type ProviderRawResult,
 } from './ip-detector-logic';
@@ -246,4 +256,109 @@ test('resolveRepoBaseUrl normalizes empty values, repository slugs, and full URL
   assert.equal(resolveRepoBaseUrl('   '), '');
   assert.equal(resolveRepoBaseUrl('wikimedia/proxycheck'), 'https://github.com/wikimedia/proxycheck');
   assert.equal(resolveRepoBaseUrl('https://github.com/wikimedia/proxycheck/'), 'https://github.com/wikimedia/proxycheck');
+});
+
+test('formatDiagnosticSummary renders full unit labels and handles absent or invalid values', () => {
+  assert.equal(
+    formatDiagnosticSummary({ duration: 5.331, memory: 71, isCached: false }),
+    'Executed in 5.331 seconds \u00b7 Taken 71 megabytes'
+  );
+  assert.equal(
+    formatDiagnosticSummary({ duration: 0.012, memory: null, isCached: false }),
+    'Executed in 0.012 seconds'
+  );
+  assert.equal(
+    formatDiagnosticSummary({ duration: Number.NaN, memory: undefined as unknown as null, isCached: false }),
+    'Executed in 0.000 seconds'
+  );
+  assert.equal(formatDiagnosticSummary(null), 'Executed in 0.000 seconds');
+});
+
+test('buildDiagnosticMetrics preserves zero durations, rounds memory, and falls back on missing fields', () => {
+  assert.deepEqual(
+    buildDiagnosticMetrics({ durationSeconds: 0, memoryMb: 71.4, isCached: true }, 0.45),
+    { duration: 0, memory: 71, isCached: true }
+  );
+  assert.deepEqual(
+    buildDiagnosticMetrics({ durationSeconds: undefined, memoryMb: null, isCached: false }, 0.25),
+    { duration: 0.25, memory: null, isCached: false }
+  );
+  assert.deepEqual(
+    buildDiagnosticMetrics({ durationSeconds: -1, memoryMb: Number.NaN }, -0.5),
+    { duration: 0, memory: null, isCached: false }
+  );
+  assert.deepEqual(buildDiagnosticMetrics(null, 0.123), {
+    duration: 0.123,
+    memory: null,
+    isCached: false,
+  });
+});
+
+test('Initial load and elapsed timing helpers return non-negative finite seconds', () => {
+  const initialSeconds = measureInitialLoadDurationSeconds();
+  assert.equal(typeof initialSeconds, 'number');
+  assert.equal(Number.isFinite(initialSeconds) && initialSeconds >= 0, true);
+
+  assert.equal(measureElapsedSeconds(Number.NaN), 0);
+  const start = performance.now();
+  const elapsed = measureElapsedSeconds(start);
+  assert.equal(Number.isFinite(elapsed) && elapsed >= 0, true);
+});
+
+test('formatUtcCommitTimestamp formats dates in UTC with English month abbreviations', () => {
+  const sampleDate = new Date('2026-11-14T12:34:56Z');
+  assert.equal(formatUtcCommitTimestamp(sampleDate), '12:34 14 Nov 2026');
+
+  const paddedDate = new Date('2026-01-05T04:07:09Z');
+  assert.equal(formatUtcCommitTimestamp(paddedDate), '04:07 05 Jan 2026');
+
+  const invalidFallback = formatUtcCommitTimestamp(new Date(Number.NaN));
+  assert.match(invalidFallback, /^\d{2}:\d{2} \d{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4}$/);
+});
+
+test('formatCommitVersionLabel formats commit hash and timestamp inside parentheses', () => {
+  assert.equal(
+    formatCommitVersionLabel('3236900', '12:34 14 Nov 2026'),
+    '(r.3236900 @ 12:34 14 Nov 2026)'
+  );
+  assert.equal(formatCommitVersionLabel('3236900', ''), '(r.3236900)');
+  assert.equal(formatCommitVersionLabel('', '12:34 14 Nov 2026'), '(r.dev @ 12:34 14 Nov 2026)');
+  assert.equal(formatCommitVersionLabel(null, null), '(r.dev)');
+});
+
+test('resolveCommitMetadata reads Git metadata, honours env overrides, and falls back without .git', () => {
+  const timestampPattern = /^\d{2}:\d{2} \d{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4}$/;
+
+  const fromRepo = resolveCommitMetadata({}, process.cwd());
+  assert.notEqual(fromRepo.commitHash, '');
+  assert.notEqual(fromRepo.commitHash, 'dev');
+  assert.match(fromRepo.commitTimestamp, timestampPattern);
+
+  const fromEnv = resolveCommitMetadata(
+    {
+      VITE_COMMIT_HASH: 'a046aca',
+      VITE_COMMIT_TIMESTAMP: '12:34 14 Nov 2026',
+    },
+    process.cwd()
+  );
+  assert.deepEqual(fromEnv, {
+    commitHash: 'a046aca',
+    commitTimestamp: '12:34 14 Nov 2026',
+  });
+
+  const nonGitDir = fs.mkdtempSync(path.join(os.tmpdir(), 'proxycheck-no-git-'));
+  try {
+    const fallback = resolveCommitMetadata({}, nonGitDir);
+    assert.equal(fallback.commitHash, 'dev');
+    assert.match(fallback.commitTimestamp, timestampPattern);
+
+    const sourceVersionFallback = resolveCommitMetadata(
+      { SOURCE_VERSION: '3236900abcdef1234567890' },
+      nonGitDir
+    );
+    assert.equal(sourceVersionFallback.commitHash, '3236900');
+    assert.match(sourceVersionFallback.commitTimestamp, timestampPattern);
+  } finally {
+    fs.rmSync(nonGitDir, { recursive: true, force: true });
+  }
 });

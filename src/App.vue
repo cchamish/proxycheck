@@ -354,16 +354,11 @@
             rel="noopener noreferrer"
             class="commit-link"
           >
-            (r.{{ commitHash }})
+            {{ commitVersionLabel }}
           </a>
-          <span v-else class="commit-link">(r.{{ commitHash }})</span>
-          <template v-if="diagnostic">
-            &middot; Executed in {{ diagnostic.duration.toFixed(3) }}s
-            <template v-if="diagnostic.memory !== null && diagnostic.memory !== undefined">
-              &middot; {{ diagnostic.memory }} MB
-            </template>
-            <span v-if="diagnostic.isCached" class="cached-pill">Cached</span>
-          </template>
+          <span v-else class="commit-link">{{ commitVersionLabel }}</span>
+          &middot; {{ formatDiagnosticSummary(footerDiagnostic) }}
+          <span v-if="footerDiagnostic.isCached" class="cached-pill">Cached</span>
         </span>
       </div>
       <div class="footer-right">
@@ -406,6 +401,12 @@ import {
   simplifySecurityFlags,
   createDetectionCoordinator,
   resolveRepoBaseUrl,
+  formatCommitVersionLabel,
+  buildDiagnosticMetrics,
+  formatDiagnosticSummary,
+  measureInitialLoadDurationSeconds,
+  measureElapsedSeconds,
+  type DiagnosticMetrics,
   type DetectionCoordinatorState,
   type DetectionResponse,
   type ProviderRawResult,
@@ -466,7 +467,17 @@ const {
 
 const inputIp = ref('');
 const commitHash = typeof __COMMIT_HASH__ !== 'undefined' ? __COMMIT_HASH__ : 'dev';
+const commitTimestamp = typeof __COMMIT_TIMESTAMP__ !== 'undefined' ? __COMMIT_TIMESTAMP__ : '';
+const commitVersionLabel = formatCommitVersionLabel(commitHash, commitTimestamp);
 const repoBaseUrl = resolveRepoBaseUrl(import.meta.env.VITE_GITHUB_REPO);
+const initialDiagnostic = ref<DiagnosticMetrics>({
+  duration: measureInitialLoadDurationSeconds(),
+  memory: null,
+  isCached: false,
+});
+const footerDiagnostic = computed<DiagnosticMetrics>(
+  () => diagnostic.value ?? initialDiagnostic.value
+);
 
 const coordinator = createDetectionCoordinator(
   (url, init) => fetch(url, init),
@@ -617,13 +628,31 @@ function formatChance(score?: number | string | null): number {
 }
 
 async function fetchUserStatus() {
+  const requestStart = typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : 0;
   try {
     const res = await fetch('/api/v1/auth/user/');
+    const fallbackDuration = measureElapsedSeconds(requestStart);
     if (res.ok) {
       const data = await res.json();
-      user.value = data;
+      user.value = {
+        isLoggedIn: Boolean(data?.isLoggedIn),
+        username: String(data?.username || ''),
+        role: String(data?.role || ''),
+        hasAccess: Boolean(data?.hasAccess),
+      };
+      initialDiagnostic.value = buildDiagnosticMetrics(
+        {
+          durationSeconds: data?.durationSeconds,
+          memoryMb: data?.memoryMb,
+          isCached: false,
+        },
+        fallbackDuration
+      );
+    } else {
+      initialDiagnostic.value = buildDiagnosticMetrics(null, fallbackDuration);
     }
   } catch (err) {
+    initialDiagnostic.value = buildDiagnosticMetrics(null, measureElapsedSeconds(requestStart));
     console.warn('Authentication status query failed:', err);
   }
 }
@@ -633,12 +662,15 @@ function handleLogin() {
 }
 
 async function handleLogout() {
+  const requestStart = typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : 0;
   try {
     const res = await fetch('/api/v1/auth/logout/');
+    const fallbackDuration = measureElapsedSeconds(requestStart);
     if (!res.ok) {
       console.error('Logout failed with HTTP status:', res.status);
       return;
     }
+    const data = await res.json().catch(() => null);
     user.value = {
       isLoggedIn: false,
       username: '',
@@ -647,6 +679,16 @@ async function handleLogout() {
     };
     detectionData.value = null;
     diagnostic.value = null;
+    initialDiagnostic.value = buildDiagnosticMetrics(
+      data
+        ? {
+            durationSeconds: data?.durationSeconds,
+            memoryMb: data?.memoryMb,
+            isCached: false,
+          }
+        : null,
+      fallbackDuration
+    );
   } catch (err) {
     console.error('Logout error:', err);
   }

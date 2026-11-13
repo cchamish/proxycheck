@@ -156,6 +156,15 @@ def get_process_memory_mb() -> Optional[float]:
         return None
 
 
+def _attach_request_diagnostics(payload: Dict[str, Any], start_time: float) -> Dict[str, Any]:
+    """Returns a copy of payload annotated with execution duration in seconds and worker memory in megabytes."""
+    return {
+        **payload,
+        "durationSeconds": round(time.perf_counter() - start_time, 3),
+        "memoryMb": get_process_memory_mb(),
+    }
+
+
 def canonicalize_ip(raw_ip: str) -> Optional[str]:
     """Returns the canonical compressed IPv4 or IPv6 address string, or None when invalid."""
     if not isinstance(raw_ip, str):
@@ -221,9 +230,7 @@ def _build_non_public_response_payload(
     start_time: float,
 ) -> Dict[str, Any]:
     """Builds a standard HTTP 200 payload for non-public or reserved IP addresses without external lookups."""
-    duration = round(time.perf_counter() - start_time, 3)
-    mem_mb = get_process_memory_mb()
-    return {
+    payload = {
         "ip": ip,
         "isNonPublic": True,
         "nonPublicCategory": category,
@@ -266,9 +273,8 @@ def _build_non_public_response_payload(
             "totalSources": 0,
             "cachedAt": None,
         },
-        "durationSeconds": duration,
-        "memoryMb": mem_mb,
     }
+    return _attach_request_diagnostics(payload, start_time)
 
 
 REDACTED_PLACEHOLDER = "***REDACTED***"
@@ -2321,14 +2327,7 @@ async def _detect_ip_get(request):
                 _release_inflight_task(ip, inflight_task)
                 base_payload = await _execute_detection_with_cache(ip)
 
-    duration = round(time.perf_counter() - start_time, 3)
-    mem_mb = get_process_memory_mb()
-    result_payload = {
-        **base_payload,
-        "durationSeconds": duration,
-        "memoryMb": mem_mb,
-    }
-    return JsonResponse(result_payload)
+    return JsonResponse(_attach_request_diagnostics(base_payload, start_time))
 
 
 _SESSION_UNAVAILABLE_ERROR = "Authentication session storage is temporarily unavailable."
@@ -2461,21 +2460,22 @@ def _flush_session_async(request, *, context: str) -> bool:
 
 
 async def get_current_user(request):
+    start_time = time.perf_counter()
     session_user = await _get_session_user(request, context="get_current_user")
 
-    if not session_user:
-        return JsonResponse(
-            {
-                "isLoggedIn": False,
-                "username": "",
-                "role": "",
-                "hasAccess": False,
-                "localGroups": [],
-                "globalGroups": [],
-            }
-        )
+    if not isinstance(session_user, dict) or not session_user:
+        payload = {
+            "isLoggedIn": False,
+            "username": "",
+            "role": "",
+            "hasAccess": False,
+            "localGroups": [],
+            "globalGroups": [],
+        }
+    else:
+        payload = dict(session_user)
 
-    return JsonResponse(session_user)
+    return JsonResponse(_attach_request_diagnostics(payload, start_time))
 
 
 async def oauth_login(request):
@@ -2655,8 +2655,9 @@ async def oauth_callback(request):
 
 
 async def oauth_logout(request):
+    start_time = time.perf_counter()
     await _flush_session_async(request, context="oauth_logout")
-    return JsonResponse({"status": "logged_out"})
+    return JsonResponse(_attach_request_diagnostics({"status": "logged_out"}, start_time))
 
 
 @csrf_exempt

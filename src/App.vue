@@ -547,6 +547,23 @@ function getProviderMetaItems(row: ProviderDisplayRow | null | undefined): strin
       items.push(`Feeds: ${row.threatfeeds.join(', ')}`);
     }
   }
+  if (row.carrier) {
+    items.push(`Carrier: ${row.carrier}`);
+  }
+  if (row.mobileBrand) {
+    items.push(`Mobile brand: ${row.mobileBrand}`);
+  }
+  if (row.cloudProvider) {
+    items.push(`Cloud: ${row.cloudProvider}`);
+  }
+  if (row.provider === 'AbuseIPDB' || row.totalReports !== undefined || row.numDistinctUsers !== undefined) {
+    if (row.totalReports !== undefined && row.totalReports !== null) {
+      items.push(`Reports: ${row.totalReports}`);
+    }
+    if (row.numDistinctUsers !== undefined && row.numDistinctUsers !== null) {
+      items.push(`Distinct users: ${row.numDistinctUsers}`);
+    }
+  }
   const lastSeenValue = row.lastSeen || row.last_seen || row.maxDate;
   if (lastSeenValue) {
     items.push(`Last seen: ${lastSeenValue}`);

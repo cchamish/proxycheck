@@ -261,6 +261,8 @@ def _build_non_public_response_payload(
         "recommendedCidr": None,
         "defaultCidr": None,
         "mmdbCidr": None,
+        "cloudCidr": None,
+        "cloudProvider": None,
         "cidrNote": f"External lookups skipped for {reason.lower()}",
         "results": [],
         "isCached": False,
@@ -552,7 +554,7 @@ def _read_maxmind_sync(ip: str) -> Dict[str, Any]:
         if resolved_prefix_len is not None:
             combined_record["_mmdb_prefix_len"] = resolved_prefix_len
 
-        return adapt_maxmind(combined_record, has_db=True, status_code=200)
+        return adapt_maxmind(combined_record, has_db=True, status_code=200, ip=ip)
     except Exception as exc:
         _evict_maxmind_reader(country_db_path)
         _evict_maxmind_reader(asn_db_path)
@@ -1155,7 +1157,7 @@ def aggregate_intelligence_metrics(
 
     hosting_keywords = ("datacenter", "data center", "hosting", "cloud", "transit", "cdn")
     residential_keywords = ("isp", "residential", "fixed line", "mobile", "commercial", "education")
-    anonymizer_keywords = ("proxy", "vpn", "tor", "attacker", "threat", "block 1", "spam", "botnet")
+    anonymizer_keywords = ("proxy", "vpn", "tor", "relay", "abuser", "attacker", "threat", "block 1", "spam", "botnet")
 
     is_tor = False
     tor_is_exit = False
@@ -1393,6 +1395,8 @@ def aggregate_intelligence_metrics(
         arbitration_tier = "destructive"
 
     mmdb_prefix_len: Optional[int] = None
+    cloud_cidr: Optional[str] = None
+    cloud_provider: Optional[str] = None
     for row in comparison_results:
         if row.get("provider") == "MaxMind" and row.get("status") == "200 OK":
             candidate_len = row.get("prefixLength")
@@ -1400,9 +1404,18 @@ def aggregate_intelligence_metrics(
                 candidate_len = row["rawJson"].get("prefix_len")
             if not isinstance(candidate_len, bool) and isinstance(candidate_len, int):
                 mmdb_prefix_len = candidate_len
+            if isinstance(row.get("cloudCidr"), str) and row.get("cloudCidr"):
+                cloud_cidr = row["cloudCidr"]
+            if isinstance(row.get("cloudProvider"), str) and row.get("cloudProvider"):
+                cloud_provider = row["cloudProvider"]
 
     rdns_info = classify_rdns_hostname(ptr_hostname)
-    cidr_info = compute_cidr_attribution(ip, mmdb_prefix_len)
+    cidr_info = compute_cidr_attribution(
+        ip,
+        mmdb_prefix_len,
+        cloud_cidr=cloud_cidr,
+        cloud_provider=cloud_provider,
+    )
 
     return {
         "ip": ip,
@@ -1432,6 +1445,8 @@ def aggregate_intelligence_metrics(
         "recommendedCidr": cidr_info["recommendedCidr"],
         "defaultCidr": cidr_info["defaultCidr"],
         "mmdbCidr": cidr_info["mmdbCidr"],
+        "cloudCidr": cidr_info["cloudCidr"],
+        "cloudProvider": cidr_info["cloudProvider"],
         "cidrNote": cidr_info["cidrNote"],
         "results": comparison_results,
     }

@@ -51,7 +51,10 @@ from detector.adapters import (
     adapt_stopforumspam,
     adapt_tor_onionoo,
     classify_rdns_hostname,
+    clear_offline_intelligence_caches,
     compute_cidr_attribution,
+    match_cloud_cidr,
+    match_hosting_asn_or_org,
 )
 from detector.middleware import AsyncWhiteNoiseMiddleware
 from detector.oauth import (
@@ -4874,3 +4877,418 @@ class AsgiSmokeTests(SimpleTestCase):
                 self.assertEqual(static_bytes, b"console.log('ok');\n")
                 self.assertEqual(api_bytes, b"async-ok")
                 self.assertEqual(async_called, ["/api/v1/auth/user/"])
+
+
+class CommercialProviderMetadataAdapterTests(SimpleTestCase):
+    """Tests for extracted metadata and security signals across commercial adapters."""
+
+    def test_ipdata_extracts_icloud_relay_and_carrier(self):
+        relay_row = adapt_ipdata(
+            {
+                "ip": "172.224.224.1",
+                "threat": {"is_icloud_relay": True, "scores": {"threat_score": 12}},
+                "carrier": {"name": "T-Mobile USA"},
+                "country_name": "United States",
+                "country_code": "US",
+            },
+            has_api_key=True,
+        )
+        self.assertEqual(relay_row["carrier"], "T-Mobile USA")
+        self.assertEqual(relay_row["usageType"], "mobile")
+        self.assertEqual(relay_row["isp"], "T-Mobile USA")
+        self.assertGreaterEqual(relay_row["threatScore"], 80)
+        self.assertIn({"label": "iCloud Private Relay", "isHighRisk": True}, relay_row["securityFlags"])
+
+        # Explicit company type takes precedence over carrier fallback and ignores malformed nested objects
+        company_row = adapt_ipdata(
+            {
+                "ip": "198.51.100.2",
+                "threat": "invalid-threat-payload",
+                "company": {"type": "isp", "name": "Example Mobile ISP"},
+                "carrier": "  Orange France  ",
+            },
+            has_api_key=True,
+        )
+        self.assertEqual(company_row["carrier"], "Orange France")
+        self.assertEqual(company_row["usageType"], "isp")
+        self.assertEqual(company_row["isp"], "Example Mobile ISP")
+
+    def test_ipregistry_extracts_mobile_relay_and_abuser(self):
+        mobile_row = adapt_ipregistry(
+            {
+                "connection": {"type": "mobile", "asn": 7018, "organization": "AT&T Mobility"},
+                "security": {"is_relay": True, "is_abuser": True},
+                "location": {"country": {"name": "United States", "code": "US"}},
+            },
+            has_api_key=True,
+        )
+        self.assertTrue(mobile_row["isMobile"])
+        self.assertEqual(mobile_row["usageType"], "mobile")
+        self.assertEqual(mobile_row["threatScore"], 75)
+        self.assertIn({"label": "Relay", "isHighRisk": True}, mobile_row["securityFlags"])
+        self.assertIn({"label": "Known Abuser", "isHighRisk": True}, mobile_row["securityFlags"])
+
+        hosting_row = adapt_ipregistry(
+            {
+                "connection": {"type": "hosting", "asn": 14061, "organization": "DigitalOcean"},
+                "security": {"is_proxy": True, "is_tor": True, "is_relay": True, "is_abuser": True},
+            },
+            has_api_key=True,
+        )
+        self.assertFalse(hosting_row["isMobile"])
+        self.assertEqual(hosting_row["threatScore"], 100)
+
+    def test_ip2location_extracts_mobile_brand_and_ignores_dash(self):
+        mobile_row = adapt_ip2location(
+            {
+                "asn": "21928",
+                "mobile_brand": "  T-Mobile  ",
+                "usage_type": "-",
+                "country_name": "United States",
+                "country_code": "US",
+            },
+            has_api_key=True,
+        )
+        self.assertEqual(mobile_row["mobileBrand"], "T-Mobile")
+        self.assertEqual(mobile_row["usageType"], "mobile")
+        self.assertEqual(mobile_row["isp"], "T-Mobile")
+
+        dash_row = adapt_ip2location(
+            {
+                "asn": "1221",
+                "as": "Telstra Corporation Ltd",
+                "mobile_brand": "-",
+                "usage_type": "ISP",
+            },
+            has_api_key=True,
+        )
+        self.assertIsNone(dash_row["mobileBrand"])
+        self.assertEqual(dash_row["usageType"], "ISP")
+        self.assertEqual(dash_row["isp"], "Telstra Corporation Ltd")
+
+    def test_abuseipdb_extracts_report_counts_and_last_reported_at(self):
+        row = adapt_abuseipdb(
+            {
+                "data": {
+                    "abuseConfidenceScore": 85,
+                    "totalReports": 42,
+                    "numDistinctUsers": 17,
+                    "lastReportedAt": "2026-10-01T12:30:00+00:00",
+                    "isp": "Hetzner Online GmbH",
+                    "countryName": "Germany",
+                    "countryCode": "DE",
+                    "usageType": "Data Center/Web Hosting/Transit",
+                }
+            },
+            has_api_key=True,
+        )
+        self.assertEqual(row["totalReports"], 42)
+        self.assertEqual(row["numDistinctUsers"], 17)
+        self.assertEqual(row["lastSeen"], "2026-10-01T12:30:00+00:00")
+
+        clamped_row = adapt_abuseipdb(
+            {
+                "data": {
+                    "abuseConfidenceScore": 0,
+                    "totalReports": -5,
+                    "numDistinctUsers": "invalid",
+                    "lastReportedAt": "   ",
+                }
+            },
+            has_api_key=True,
+        )
+        self.assertEqual(clamped_row["totalReports"], 0)
+        self.assertIsNone(clamped_row["numDistinctUsers"])
+        self.assertIsNone(clamped_row["lastSeen"])
+
+        err_row = adapt_abuseipdb(None, has_api_key=True, status_code=429)
+        self.assertIsNone(err_row["totalReports"])
+        self.assertIsNone(err_row["numDistinctUsers"])
+        self.assertIsNone(err_row["lastSeen"])
+
+
+class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
+    """Tests for offline hosting ASN rules, cloud CIDR matching, and GeoLite2 enrichment."""
+
+    def setUp(self):
+        clear_offline_intelligence_caches()
+        self.addCleanup(clear_offline_intelligence_caches)
+
+    def test_builtin_hosting_asn_fallback_and_non_hosting_exclusions(self):
+        with override_settings(
+            HOSTING_ASN_RULES_PATH="",
+            HOSTING_ASNS=(),
+            HOSTING_ORG_KEYWORDS=(),
+        ):
+            for asn in (14061, "AS24940", 16276, 20473, 63949):
+                hit = match_hosting_asn_or_org(asn, "Some Organization")
+                self.assertIsNotNone(hit)
+                self.assertEqual(hit["matchedBy"], "asn")
+
+            kw_hit = match_hosting_asn_or_org(None, "Hetzner Online GmbH")
+            self.assertIsNotNone(kw_hit)
+            self.assertEqual(kw_hit["matchedBy"], "keyword")
+
+            # Non-hosting ISPs and CDN names without hosting keywords should remain unflagged
+            self.assertIsNone(match_hosting_asn_or_org(1221, "Telstra Corporation Ltd"))
+            self.assertIsNone(match_hosting_asn_or_org(13335, "Cloudflare, Inc."))
+
+    def test_custom_hosting_asn_rules_json_and_settings_override(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rules_file = Path(tmpdir) / "hosting_asn_rules.json"
+            rules_file.write_text(
+                json.dumps(
+                    {
+                        "hosts": [
+                            {"name": "Example Cloud Host", "asn": 64510, "keywords": ["ExampleHost"]},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with override_settings(
+                HOSTING_ASN_RULES_PATH=str(rules_file),
+                HOSTING_ASNS=("64512",),
+                HOSTING_ORG_KEYWORDS=("CustomRack",),
+            ):
+                json_hit = match_hosting_asn_or_org("AS64510", "Unlisted")
+                self.assertEqual(json_hit, {"provider": "Example Cloud Host", "matchedBy": "asn"})
+
+                env_asn_hit = match_hosting_asn_or_org(64512, "Unlisted")
+                self.assertEqual(env_asn_hit, {"provider": "AS64512", "matchedBy": "asn"})
+
+                env_kw_hit = match_hosting_asn_or_org(None, "CustomRack Infrastructure LLC")
+                self.assertEqual(env_kw_hit, {"provider": "CustomRack", "matchedBy": "keyword"})
+
+                # Word boundaries prevent partial substring false positives
+                self.assertIsNone(match_hosting_asn_or_org(None, "MyExampleHostCompany"))
+
+    def test_cloud_cidr_matching_formats_narrowest_prefix_and_ipv6(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            computehosts_file = Path(tmpdir) / "computehosts.json"
+            computehosts_file.write_text(
+                json.dumps(
+                    [
+                        {"range": "52.94.236.0/24", "provider": "aws"},
+                        {"range": "52.94.236.64/26", "provider": "Amazon AWS"},
+                        {"range": "2600:1f18:2000::/48", "provider": "aws"},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            with override_settings(CLOUD_CIDR_DB_PATH=str(computehosts_file)):
+                narrow_hit = match_cloud_cidr("52.94.236.70")
+                self.assertEqual(
+                    narrow_hit,
+                    {"cidr": "52.94.236.64/26", "prefixLength": 26, "provider": "Amazon AWS"},
+                )
+                v6_hit = match_cloud_cidr("2600:1f18:2000:1::1")
+                self.assertEqual(
+                    v6_hit,
+                    {"cidr": "2600:1f18:2000::/48", "prefixLength": 48, "provider": "Amazon AWS"},
+                )
+                mapped_v4_hit = match_cloud_cidr("::ffff:52.94.236.70")
+                self.assertEqual(
+                    mapped_v4_hit,
+                    {"cidr": "52.94.236.64/26", "prefixLength": 26, "provider": "Amazon AWS"},
+                )
+                self.assertIsNone(match_cloud_cidr("8.8.8.8"))
+
+            clear_offline_intelligence_caches()
+            aws_file = Path(tmpdir) / "ip-ranges.json"
+            aws_file.write_text(
+                json.dumps(
+                    {
+                        "prefixes": [{"ip_prefix": "3.5.140.0/22", "service": "AMAZON"}],
+                        "ipv6_prefixes": [{"ipv6_prefix": "2a05:d014::/40", "service": "EC2"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with override_settings(CLOUD_CIDR_DB_PATH=str(aws_file)):
+                self.assertEqual(match_cloud_cidr("3.5.140.5")["provider"], "Amazon AWS")
+                self.assertEqual(match_cloud_cidr("2a05:d014:1::5")["cidr"], "2a05:d014::/40")
+
+            clear_offline_intelligence_caches()
+            provider_dict_file = Path(tmpdir) / "provider_cidrs.json"
+            provider_dict_file.write_text(
+                json.dumps({"gcp": ["34.64.0.0/16"], "azure": ["20.48.0.0/16"]}),
+                encoding="utf-8",
+            )
+            with override_settings(CLOUD_CIDR_DB_PATH=str(provider_dict_file)):
+                self.assertEqual(match_cloud_cidr("34.64.1.2")["provider"], "Google Cloud")
+                self.assertEqual(match_cloud_cidr("20.48.1.2")["provider"], "Microsoft Azure")
+
+            clear_offline_intelligence_caches()
+            broken_file = Path(tmpdir) / "broken.json"
+            broken_file.write_text("{not-valid-json", encoding="utf-8")
+            with override_settings(CLOUD_CIDR_DB_PATH=str(broken_file)):
+                self.assertIsNone(match_cloud_cidr("34.64.1.2"))
+
+            with override_settings(CLOUD_CIDR_DB_PATH=str(Path(tmpdir) / "missing.json")):
+                self.assertIsNone(match_cloud_cidr("34.64.1.2"))
+
+    def test_cloud_cidr_cache_reloads_when_file_mtime_changes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cidr_file = Path(tmpdir) / "cloud_cidrs.json"
+            cidr_file.write_text(json.dumps({"gcp": ["34.64.0.0/16"]}), encoding="utf-8")
+            with override_settings(CLOUD_CIDR_DB_PATH=str(cidr_file)):
+                self.assertIsNone(match_cloud_cidr("20.48.1.2"))
+
+                cidr_file.write_text(json.dumps({"azure": ["20.48.0.0/16"]}), encoding="utf-8")
+                stat = cidr_file.stat()
+                os.utime(cidr_file, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+
+                reloaded = match_cloud_cidr("20.48.1.2")
+                self.assertIsNotNone(reloaded)
+                self.assertEqual(reloaded["provider"], "Microsoft Azure")
+
+    def test_maxmind_geolite2_enrichment_preserves_explicit_geoip2_user_type(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cidr_file = Path(tmpdir) / "cloud_cidrs.json"
+            cidr_file.write_text(
+                json.dumps([{"range": "54.239.28.64/26", "provider": "Amazon AWS"}]),
+                encoding="utf-8",
+            )
+            with override_settings(
+                CLOUD_CIDR_DB_PATH=str(cidr_file),
+                HOSTING_ASN_RULES_PATH="",
+                HOSTING_ASNS=(),
+                HOSTING_ORG_KEYWORDS=(),
+            ):
+                cloud_enriched = adapt_maxmind(
+                    {
+                        "autonomous_system_number": 16509,
+                        "autonomous_system_organization": "Amazon.com, Inc.",
+                        "country": {"names": {"en": "United States"}, "iso_code": "US"},
+                        "_mmdb_prefix_len": 24,
+                        "_ip": "54.239.28.85",
+                    },
+                    has_db=True,
+                    ip="54.239.28.85",
+                )
+                self.assertEqual(cloud_enriched["usageType"], "hosting")
+                self.assertGreaterEqual(cloud_enriched["threatScore"], 50)
+                self.assertEqual(cloud_enriched["cloudProvider"], "Amazon AWS")
+                self.assertEqual(cloud_enriched["cloudCidr"], "54.239.28.64/26")
+                self.assertEqual(cloud_enriched["cloudPrefixLength"], 26)
+                self.assertEqual(cloud_enriched["hostingProvider"], "Amazon AWS")
+                self.assertIn({"label": "Hosting", "isHighRisk": True}, cloud_enriched["securityFlags"])
+                self.assertNotIn("_ip", cloud_enriched["rawJson"])
+                self.assertNotIn("_mmdb_prefix_len", cloud_enriched["rawJson"])
+
+                # Paid GeoIP2 user_type takes priority over offline hosting fallback
+                explicit_geoip2 = adapt_maxmind(
+                    {
+                        "autonomous_system_number": 14061,
+                        "autonomous_system_organization": "DigitalOcean, LLC",
+                        "traits": {"user_type": "residential"},
+                    },
+                    has_db=True,
+                    ip="159.89.10.1",
+                )
+                self.assertEqual(explicit_geoip2["usageType"], "residential")
+                self.assertEqual(explicit_geoip2["threatScore"], 0)
+                self.assertEqual(explicit_geoip2["securityFlags"], [{"label": "No Flags", "isHighRisk": False}])
+
+    def test_compute_cidr_attribution_uses_cloud_prefix_rules(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cidr_file = Path(tmpdir) / "cloud_cidrs.json"
+            cidr_file.write_text(
+                json.dumps(
+                    {
+                        "Amazon AWS": ["54.239.28.64/26", "2600:1f18:2000::/80"],
+                        "Google Cloud": ["34.64.0.0/16"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with override_settings(CLOUD_CIDR_DB_PATH=str(cidr_file)):
+                narrow_v4 = compute_cidr_attribution("54.239.28.85")
+                self.assertEqual(narrow_v4["recommendedCidr"], "54.239.28.64/26")
+                self.assertEqual(narrow_v4["defaultCidr"], "54.239.28.0/24")
+                self.assertEqual(narrow_v4["cloudCidr"], "54.239.28.64/26")
+                self.assertEqual(narrow_v4["cloudProvider"], "Amazon AWS")
+
+                narrow_v6 = compute_cidr_attribution("2600:1f18:2000::5")
+                self.assertEqual(narrow_v6["recommendedCidr"], "2600:1f18:2000::/80")
+                self.assertEqual(narrow_v6["defaultCidr"], "2600:1f18:2000::/64")
+                self.assertEqual(narrow_v6["cloudCidr"], "2600:1f18:2000::/80")
+
+                wide_v4 = compute_cidr_attribution("34.64.12.34")
+                self.assertEqual(wide_v4["recommendedCidr"], "34.64.12.0/24")
+                self.assertEqual(wide_v4["cloudCidr"], "34.64.0.0/16")
+                self.assertEqual(wide_v4["cloudProvider"], "Google Cloud")
+
+                mmdb_wins = compute_cidr_attribution("54.239.28.85", mmdb_prefix_len=27)
+                self.assertEqual(mmdb_wins["recommendedCidr"], "54.239.28.64/27")
+                self.assertEqual(mmdb_wins["cloudCidr"], "54.239.28.64/26")
+
+    def test_views_read_maxmind_sync_and_aggregate_intelligence_integration(self):
+        views._maxmind_readers.clear()
+        self.addCleanup(views._maxmind_readers.clear)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cidr_file = Path(tmpdir) / "cloud_cidrs.json"
+            cidr_file.write_text(
+                json.dumps([{"range": "54.239.28.64/26", "provider": "Amazon AWS"}]),
+                encoding="utf-8",
+            )
+            country_db = Path(tmpdir) / "GeoLite2-Country.mmdb"
+            asn_db = Path(tmpdir) / "GeoLite2-ASN.mmdb"
+            country_db.write_bytes(b"stub")
+            asn_db.write_bytes(b"stub")
+
+            country_rec = {"country": {"names": {"en": "United States"}, "iso_code": "US"}}
+            asn_rec = {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "Amazon.com, Inc.",
+            }
+            fake_country_reader = MagicMock()
+            fake_country_reader.get.return_value = country_rec
+            fake_country_reader.get_with_prefix_len.return_value = (country_rec, 16)
+
+            fake_asn_reader = MagicMock()
+            fake_asn_reader.get.return_value = asn_rec
+            fake_asn_reader.get_with_prefix_len.return_value = (asn_rec, 24)
+
+            fake_maxmind_module = MagicMock()
+            fake_maxmind_module.open_database.side_effect = (
+                lambda db_path: fake_country_reader if "country" in str(db_path).lower() else fake_asn_reader
+            )
+
+            with (
+                override_settings(
+                    MAXMIND_COUNTRY_DB_PATH=str(country_db),
+                    MAXMIND_ASN_DB_PATH=str(asn_db),
+                    CLOUD_CIDR_DB_PATH=str(cidr_file),
+                    HOSTING_ASN_RULES_PATH="",
+                    HOSTING_ASNS=(),
+                    HOSTING_ORG_KEYWORDS=(),
+                ),
+                patch.dict("sys.modules", {"maxminddb": fake_maxmind_module}),
+            ):
+                maxmind_row = views._read_maxmind_sync("54.239.28.85")
+                self.assertEqual(maxmind_row["usageType"], "hosting")
+                self.assertEqual(maxmind_row["cloudCidr"], "54.239.28.64/26")
+                self.assertEqual(maxmind_row["cloudProvider"], "Amazon AWS")
+
+                relay_row = adapt_ipregistry(
+                    {
+                        "connection": {"type": "hosting", "asn": 16509, "organization": "Amazon.com, Inc."},
+                        "security": {"is_relay": True},
+                    },
+                    has_api_key=True,
+                )
+                aggregated = views.aggregate_intelligence_metrics("54.239.28.85", [maxmind_row, relay_row])
+                self.assertEqual(aggregated["recommendedCidr"], "54.239.28.64/26")
+                self.assertEqual(aggregated["cloudCidr"], "54.239.28.64/26")
+                self.assertEqual(aggregated["cloudProvider"], "Amazon AWS")
+                self.assertIn("Amazon AWS cloud prefix /26", aggregated["cidrNote"])
+                self.assertEqual(relay_row["threatScore"], 75)
+                self.assertEqual(aggregated["results"][1]["threatScore"], 80)
+                self.assertEqual(aggregated["arbitrationVerdict"], "Confirmed Proxy / VPN (1/1 Sources)")
+                self.assertEqual(aggregated["arbitrationTier"], "destructive")
+
+        non_public = views._build_non_public_response_payload("127.0.0.1", "loopback", "Loopback IP", time.monotonic())
+        self.assertIsNone(non_public["cloudCidr"])
+        self.assertIsNone(non_public["cloudProvider"])

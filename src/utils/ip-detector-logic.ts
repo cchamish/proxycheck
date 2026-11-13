@@ -36,6 +36,15 @@ export interface ProviderRawResult {
   prefixLength?: number;
   port?: number | null;
   lastSeen?: string | null;
+  carrier?: string | null;
+  mobileBrand?: string | null;
+  totalReports?: number | null;
+  numDistinctUsers?: number | null;
+  isMobile?: boolean;
+  cloudProvider?: string | null;
+  cloudCidr?: string | null;
+  cloudPrefixLength?: number | null;
+  hostingProvider?: string | null;
   isTor?: boolean;
   torIsExit?: boolean;
   torRunning?: boolean;
@@ -99,6 +108,8 @@ export interface DetectionResponse {
   recommendedCidr?: string | null;
   defaultCidr?: string | null;
   mmdbCidr?: string | null;
+  cloudCidr?: string | null;
+  cloudProvider?: string | null;
   cidrNote?: string | null;
   results: ProviderRawResult[];
 }

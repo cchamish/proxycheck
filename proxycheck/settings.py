@@ -254,14 +254,21 @@ IPHUB_API_KEY = os.environ.get("IPHUB_API_KEY", "")
 IPHUNTER_API_KEY = os.environ.get("IPHUNTER_API_KEY", "")
 
 
-def resolve_mmdb_file(
+def _parse_csv_env(name: str) -> tuple[str, ...]:
+    raw_value = os.environ.get(name, "").strip()
+    if not raw_value:
+        return ()
+    return tuple(item.strip() for item in raw_value.split(",") if item.strip())
+
+
+def resolve_data_file(
     configured_path: str,
     filename: str,
     base_dir: Path | str,
     *,
     default_missing: Optional[str] = None,
 ) -> str:
-    """Finds an MMDB file across configured, workspace, and Toolforge data paths."""
+    """Finds a local intelligence data file across configured, workspace, and Toolforge data paths."""
     if configured_path:
         configured = Path(configured_path)
         if configured.is_file():
@@ -288,6 +295,22 @@ def resolve_mmdb_file(
     return configured_path if default_missing is None else default_missing
 
 
+def resolve_mmdb_file(
+    configured_path: str,
+    filename: str,
+    base_dir: Path | str,
+    *,
+    default_missing: Optional[str] = None,
+) -> str:
+    """Finds an MMDB file across configured, workspace, and Toolforge data paths."""
+    return resolve_data_file(
+        configured_path,
+        filename,
+        base_dir,
+        default_missing=default_missing,
+    )
+
+
 def _resolve_mmdb_path(env_var_name: str, filename: str) -> str:
     custom_path = os.environ.get(env_var_name, "").strip()
     if custom_path:
@@ -300,5 +323,21 @@ def _resolve_mmdb_path(env_var_name: str, filename: str) -> str:
     )
 
 
+def _resolve_optional_data_path(env_var_name: str, filenames: str | tuple[str, ...]) -> str:
+    custom_path = os.environ.get(env_var_name, "").strip()
+    if custom_path:
+        return custom_path
+    candidate_names = (filenames,) if isinstance(filenames, str) else filenames
+    for filename in candidate_names:
+        resolved = resolve_data_file("", filename, BASE_DIR, default_missing="")
+        if resolved:
+            return resolved
+    return str(BASE_DIR.parent / "data" / candidate_names[0])
+
+
 MAXMIND_COUNTRY_DB_PATH = _resolve_mmdb_path("MAXMIND_COUNTRY_DB_PATH", "GeoLite2-Country.mmdb")
 MAXMIND_ASN_DB_PATH = _resolve_mmdb_path("MAXMIND_ASN_DB_PATH", "GeoLite2-ASN.mmdb")
+CLOUD_CIDR_DB_PATH = _resolve_optional_data_path("CLOUD_CIDR_DB_PATH", ("cloud_cidrs.json", "computehosts.json"))
+HOSTING_ASN_RULES_PATH = _resolve_optional_data_path("HOSTING_ASN_RULES_PATH", "hosting_asn_rules.json")
+HOSTING_ASNS = _parse_csv_env("HOSTING_ASNS")
+HOSTING_ORG_KEYWORDS = _parse_csv_env("HOSTING_ORG_KEYWORDS")

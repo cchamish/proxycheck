@@ -28,7 +28,10 @@ def _read_text_if_exists(file_path: Path) -> Optional[str]:
 
 
 def _read_favicon_svg(base_dir: Path) -> Optional[bytes]:
-    for candidate in (base_dir / "dist" / "Toolforge.svg", base_dir / "public" / "Toolforge.svg"):
+    for candidate in (
+        base_dir / "dist" / "Toolforge.svg",
+        base_dir / "src" / "assets" / "Toolforge.svg",
+    ):
         if candidate.is_file():
             return candidate.read_bytes()
     return None

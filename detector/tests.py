@@ -4172,6 +4172,14 @@ class LoopIsolationAndSessionSettingsTests(TestCase):
             with patch.dict(os.environ, {"TOOL_DATA_DIR": str(tool_root)}):
                 resolved_db = views._resolve_db_file("", "GeoLite2-Country.mmdb", Path(tmpdir) / "workspace")
             self.assertEqual(resolved_db, str(mmdb_file))
+            self.assertEqual(
+                views._resolve_db_file(str(data_dir), "GeoLite2-Country.mmdb", Path(tmpdir) / "workspace"),
+                str(mmdb_file),
+            )
+            self.assertEqual(
+                views._resolve_db_file(str(data_dir), "GeoLite2-ASN.mmdb", Path(tmpdir) / "workspace"),
+                str(data_dir / "GeoLite2-ASN.mmdb"),
+            )
 
     def test_procfile_starts_asgi_gunicorn_without_runtime_collectstatic(self):
         from django.conf import settings as django_settings

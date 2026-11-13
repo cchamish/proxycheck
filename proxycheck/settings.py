@@ -261,9 +261,13 @@ def resolve_mmdb_file(
     *,
     default_missing: Optional[str] = None,
 ) -> str:
-    """Finds an existing MMDB file across configured, workspace, and Toolforge data paths."""
-    if configured_path and os.path.exists(configured_path):
-        return configured_path
+    """Finds an MMDB file across configured, workspace, and Toolforge data paths."""
+    if configured_path:
+        configured = Path(configured_path)
+        if configured.is_file():
+            return str(configured)
+        if configured.is_dir():
+            return str(configured / filename)
 
     base_path = Path(str(base_dir))
     # Check local workspace directories and Toolforge mounted data paths in order.

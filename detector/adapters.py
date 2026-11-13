@@ -424,7 +424,9 @@ def _parse_cloud_cidr_payload(payload: Any, default_provider: str = "Cloud Provi
                     for item in prefix_list:
                         if not isinstance(item, dict):
                             continue
-                        raw_cidr = item.get("ip_prefix") or item.get("ipv6_prefix") or item.get("cidr") or item.get("range")
+                        raw_cidr = (
+                            item.get("ip_prefix") or item.get("ipv6_prefix") or item.get("cidr") or item.get("range")
+                        )
                         if isinstance(raw_cidr, str):
                             entries.append((raw_cidr, "Amazon AWS"))
             return entries
@@ -568,7 +570,9 @@ def _ingest_hosting_rule_entry(
     keywords: List[str],
 ) -> None:
     if isinstance(entry, dict):
-        provider_name = str(entry.get("name") or entry.get("provider") or "Hosting Provider").strip() or "Hosting Provider"
+        provider_name = (
+            str(entry.get("name") or entry.get("provider") or "Hosting Provider").strip() or "Hosting Provider"
+        )
         single_asn = _normalize_asn_number(entry.get("asn"))
         if single_asn is not None:
             asn_map[single_asn] = provider_name
@@ -631,7 +635,9 @@ def _parse_hosting_rules_payload(payload: Any) -> Tuple[Dict[int, str], List[str
 
 
 def _build_hosting_keyword_pattern(keywords: Iterable[str]) -> Optional[re.Pattern[str]]:
-    unique_keywords = sorted({kw.strip().lower() for kw in keywords if isinstance(kw, str) and kw.strip()}, key=len, reverse=True)
+    unique_keywords = sorted(
+        {kw.strip().lower() for kw in keywords if isinstance(kw, str) and kw.strip()}, key=len, reverse=True
+    )
     if not unique_keywords:
         return None
     escaped = "|".join(re.escape(kw) for kw in unique_keywords)
@@ -1122,9 +1128,7 @@ def adapt_ipdata(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_c
 
     carrier_name = _extract_carrier_name(raw_data.get("carrier"))
     company_type = company.get("type")
-    normalized_company_type = (
-        company_type.strip() if isinstance(company_type, str) and company_type.strip() else None
-    )
+    normalized_company_type = company_type.strip() if isinstance(company_type, str) and company_type.strip() else None
     usage_type = normalized_company_type or ("mobile" if carrier_name else "-")
     isp_name = raw_data.get("organisation") or org_fallback or company.get("name") or carrier_name or "-"
 

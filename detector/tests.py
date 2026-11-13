@@ -5252,8 +5252,8 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
             fake_asn_reader.get_with_prefix_len.return_value = (asn_rec, 24)
 
             fake_maxmind_module = MagicMock()
-            fake_maxmind_module.open_database.side_effect = (
-                lambda db_path: fake_country_reader if "country" in str(db_path).lower() else fake_asn_reader
+            fake_maxmind_module.open_database.side_effect = lambda db_path: (
+                fake_country_reader if "country" in str(db_path).lower() else fake_asn_reader
             )
 
             with (

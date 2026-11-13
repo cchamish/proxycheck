@@ -83,12 +83,47 @@ jobs:
               set -euo pipefail
 
               echo "Building ASGI container image via Toolforge Build Service"
-              toolforge build start \
-                --ref "$target_branch" \
-                --envvar "VITE_GITHUB_REPO=$vite_github_repo" \
-                --envvar "VITE_COMMIT_HASH=$vite_commit_hash" \
-                --envvar "VITE_COMMIT_TIMESTAMP=$vite_commit_timestamp" \
-                "$repo_git_url"
+              build_output="$(mktemp)"
+              if toolforge build start \
+                  --ref "$target_branch" \
+                  --envvar "VITE_GITHUB_REPO=$vite_github_repo" \
+                  --envvar "VITE_COMMIT_HASH=$vite_commit_hash" \
+                  --envvar "VITE_COMMIT_TIMESTAMP=$vite_commit_timestamp" \
+                  "$repo_git_url" 2>&1 | tee "$build_output"; then
+                rm -f "$build_output"
+              else
+                if ! grep -Eiq 'BuildClientError: Error getting the logs|container .* is not available' "$build_output"; then
+                  echo "Toolforge build failed before a recoverable log-read error:"
+                  cat "$build_output"
+                  rm -f "$build_output"
+                  exit 1
+                fi
+                echo "Build start returned an error; checking the existing build before failing."
+                build_recovered=false
+                for wait_seconds in 15 30; do
+                  sleep "$wait_seconds"
+                  if ! build_status="$(toolforge build show 2>&1)"; then
+                    echo "Unable to query the build status yet:"
+                    echo "$build_status"
+                    continue
+                  fi
+                  echo "$build_status"
+                  if grep -Eiq 'succeeded|success' <<< "$build_status"; then
+                    build_recovered=true
+                    break
+                  fi
+                  if grep -Eiq 'failed|error|cancelled' <<< "$build_status"; then
+                    break
+                  fi
+                done
+                if [[ "$build_recovered" != true ]]; then
+                  echo "Toolforge build did not reach a successful state."
+                  cat "$build_output"
+                  rm -f "$build_output"
+                  exit 1
+                fi
+                rm -f "$build_output"
+              fi
 
               echo "Restarting Build Service web service and verifying status"
               if ! toolforge webservice buildservice restart --mount=all; then

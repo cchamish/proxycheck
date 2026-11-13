@@ -2,6 +2,12 @@
   <div class="proxy-detector-layout">
     <header class="cdx-header">
       <div class="header-left">
+        <img
+          :src="proxycheckLogo"
+          alt=""
+          class="app-logo"
+          aria-hidden="true"
+        />
         <h1 class="app-title">Proxy Detector</h1>
       </div>
       <div class="header-right">
@@ -387,6 +393,7 @@
 
 <script setup lang="ts">
 import { reactive, toRefs, ref, computed, onMounted } from 'vue';
+import proxycheckLogo from './assets/Proxycheck.svg';
 import toolforgeLogo from './assets/Toolforge.svg';
 import wmcsLogo from './assets/WMCS.svg';
 import {

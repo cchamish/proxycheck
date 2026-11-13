@@ -1,0 +1,34 @@
+target-version = "py315"
+line-length = 120
+
+exclude = [
+  ".git",
+  "__pycache__",
+  "dist",
+  "node_modules",
+  "staticfiles",
+  "venv",
+  ".venv",
+]
+
+[lint]
+select = [
+  "E4",
+  "E7",
+  "E9",
+  "F",
+  "W",
+  "DJ",
+  "ASYNC",
+  "I",
+  "B",
+  "S",
+]
+ignore = [
+  # Helpers forward HTTP timeout values to httpx rather than wrapping asyncio.timeout directly.
+  "ASYNC109",
+]
+
+[lint.per-file-ignores]
+# Test fixtures use dummy credentials and non-routable IP literals such as 0.0.0.0.
+"detector/tests.py" = ["S101", "S104", "S105", "S106"]

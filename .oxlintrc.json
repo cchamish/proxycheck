@@ -1,0 +1,24 @@
+{
+  "plugins": [
+    "typescript",
+    "unicorn",
+    "oxc",
+    "vue"
+  ],
+  "categories": {
+    "correctness": "error"
+  },
+  "rules": {
+    "eslint/no-unused-vars": "error"
+  },
+  "env": {
+    "builtin": true,
+    "browser": true,
+    "node": true
+  },
+  "ignorePatterns": [
+    "dist/**",
+    "node_modules/**",
+    "staticfiles/**"
+  ]
+}

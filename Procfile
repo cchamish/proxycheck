@@ -1,0 +1,1 @@
+web: sh -c 'exec gunicorn proxycheck.asgi:application -k uvicorn_worker.UvicornWorker --workers "${WEB_CONCURRENCY:-2}" --bind "0.0.0.0:${PORT:-8000}" --forwarded-allow-ips="*" --access-logfile - --error-logfile -'

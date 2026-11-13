@@ -1,0 +1,144 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  lint-meta:
+    name: Metadata and Syntax Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+
+      - name: Install Python dependencies
+        run: uv sync --locked
+
+      - name: Lint Python code with Ruff
+        run: uv run ruff check --output-format=github .
+
+      - name: Check Python formatting with Ruff
+        run: uv run ruff format --check .
+
+      - name: Lint workflow and Dependabot YAML files
+        run: |
+          uvx --python 3.14 yamllint -d "{extends: relaxed, rules: {line-length: {max: 160}, new-line-at-end-of-file: disable}}" .github/
+
+  backend:
+    name: Backend Checks and Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DJANGO_SECRET_KEY: 71f381c61b34b373d956482ca0fb67080c0bb4a54987da84bb3e0436d809506db08c191a8fde4494f6a5e099fc908cd44b8d1709c294d24eb7c3d6afb09a2b11
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+
+      - name: Install Python dependencies
+        run: uv sync --locked
+
+      - name: Run Django deploy and migration checks
+        run: |
+          uv run python manage.py check --deploy --fail-level WARNING
+          uv run python manage.py makemigrations --check --dry-run
+
+      - name: Run Django test suite
+        run: uv run python manage.py test --verbosity 2
+
+  frontend:
+    name: Frontend Lint, Typecheck and Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: '.node-version'
+          cache: 'npm'
+          cache-dependency-path: 'package-lock.json'
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Lint frontend code with Oxlint
+        run: npx oxlint -c .oxlintrc.json src vite.config.ts
+
+      - name: Check TypeScript and Vue types
+        run: npm run typecheck
+
+      - name: Run frontend unit tests
+        run: npm test
+
+      - name: Build frontend bundle
+        env:
+          VITE_GITHUB_REPO: ${{ github.repository }}
+        run: |
+          npm run build
+          test -f dist/index.html && test -d dist/assets
+
+      - name: Upload built frontend dist artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-dist
+          path: dist/
+          retention-days: 1
+
+  static-assets:
+    name: Django Collectstatic Verification
+    needs: frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DJANGO_SECRET_KEY: 71f381c61b34b373d956482ca0fb67080c0bb4a54987da84bb3e0436d809506db08c191a8fde4494f6a5e099fc908cd44b8d1709c294d24eb7c3d6afb09a2b11
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+
+      - name: Download built frontend dist artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: dist/
+
+      - name: Install production Python dependencies
+        run: uv sync --locked --no-dev
+
+      - name: Verify collectstatic and WhiteNoise compression
+        run: |
+          test -f dist/index.html && test -d dist/assets
+          uv run python manage.py collectstatic --noinput --clear
+          test -d staticfiles && test -n "$(ls -A staticfiles)"

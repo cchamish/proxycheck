@@ -1,0 +1,93 @@
+name: Deploy
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    branches:
+      - main
+    types:
+      - completed
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: toolforge-deploy-main
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    environment:
+      name: Toolforge
+      url: https://proxycheck.toolforge.org/
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Verify main branch tip matches CI commit
+        env:
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          TARGET_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          # Toolforge build start currently rejects raw commit hashes (phab:T429227),
+          # so confirm the branch ref still points to the verified CI commit before building.
+          remote_sha="$(git ls-remote "$REPO_URL" "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          if [ "$remote_sha" != "$VERIFIED_SHA" ]; then
+            echo "Remote refs/heads/$TARGET_BRANCH ($remote_sha) does not match verified commit $VERIFIED_SHA."
+            exit 1
+          fi
+
+      - name: Configure SSH credentials
+        env:
+          TOOLFORGE_HOST: ${{ secrets.TOOLFORGE_HOST }}
+          TOOLFORGE_SSH_KEY: ${{ secrets.TOOLFORGE_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$TOOLFORGE_SSH_KEY" | tr -d '\r' > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$TOOLFORGE_HOST" >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Trigger remote Build Service deployment on Toolforge
+        env:
+          TOOLFORGE_USER: ${{ secrets.TOOLFORGE_USER }}
+          TOOLFORGE_HOST: ${{ secrets.TOOLFORGE_HOST }}
+          TARGET_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          VITE_GITHUB_REPO: ${{ github.repository }}
+          REPO_GIT_URL: ${{ github.server_url }}/${{ github.repository }}.git
+        run: |
+          {
+            printf 'target_branch=%q\n' "$TARGET_BRANCH"
+            printf 'vite_github_repo=%q\n' "$VITE_GITHUB_REPO"
+            printf 'repo_git_url=%q\n' "$REPO_GIT_URL"
+            cat << 'EOF'
+              set -euo pipefail
+
+              echo "Building ASGI container image via Toolforge Build Service"
+              toolforge build start \
+                --ref "$target_branch" \
+                --envvar "VITE_GITHUB_REPO=$vite_github_repo" \
+                "$repo_git_url"
+
+              echo "Restarting Build Service web service and verifying status"
+              if ! toolforge webservice buildservice restart --mount=all; then
+                toolforge webservice stop 2>/dev/null || true
+                toolforge webservice buildservice start --mount=all
+              fi
+              sleep 6
+              toolforge webservice status
+          EOF
+          } | ssh -i ~/.ssh/id_deploy -o BatchMode=yes -o StrictHostKeyChecking=yes "${TOOLFORGE_USER}@${TOOLFORGE_HOST}" "become proxycheck bash -s"
+
+      - name: Clean up SSH credentials
+        if: always()
+        run: rm -f ~/.ssh/id_deploy

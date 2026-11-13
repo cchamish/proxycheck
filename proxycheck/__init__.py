@@ -1,0 +1,1 @@
+# proxycheck project configuration package

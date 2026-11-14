@@ -291,6 +291,13 @@
               <tr v-for="row in filteredResults" :key="row.provider">
                 <td class="col-provider">
                   <div class="provider-cell">
+                    <span
+                      v-if="getProviderUpdatedLabel(row)"
+                      class="provider-updated-time"
+                      :title="row.cachedAt || detectionData?.cacheMeta?.cachedAt || undefined"
+                    >
+                      {{ getProviderUpdatedLabel(row) }}
+                    </span>
                     <span class="provider-name">{{ row.provider }}</span>
                     <span
                       class="cdx-badge"
@@ -397,7 +404,7 @@
 </template>
 
 <script setup lang="ts">
-import { reactive, toRefs, ref, computed, onMounted } from 'vue';
+import { reactive, toRefs, ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import proxycheckLogo from './assets/Proxycheck.svg';
 import toolforgeLogo from './assets/Toolforge.svg';
 import wmcsLogo from './assets/WMCS.svg';
@@ -417,6 +424,7 @@ import {
   createDetectionCoordinator,
   resolveRepoBaseUrl,
   formatCommitVersionLabel,
+  resolveProviderUpdatedLabel,
   buildDiagnosticMetrics,
   formatDiagnosticSummary,
   measureInitialLoadDurationSeconds,
@@ -541,6 +549,16 @@ type ProviderDisplayRow = Omit<Partial<ProviderRawResult>, 'port'> & {
   port?: number | string | null;
   last_seen?: string | null;
 };
+
+const nowTimestampMs = ref(Date.now());
+
+watch(detectionData, () => {
+  nowTimestampMs.value = Date.now();
+});
+
+function getProviderUpdatedLabel(row: ProviderDisplayRow | null | undefined): string | null {
+  return resolveProviderUpdatedLabel(row, detectionData.value, nowTimestampMs.value);
+}
 
 function getProviderMetaItems(row: ProviderDisplayRow | null | undefined): string[] {
   if (!row || typeof row !== 'object') return [];
@@ -749,7 +767,12 @@ function getInitialIpParam(): string {
   }
 }
 
+let relativeTimeTimer: ReturnType<typeof setInterval> | null = null;
+
 onMounted(async () => {
+  relativeTimeTimer = setInterval(() => {
+    nowTimestampMs.value = Date.now();
+  }, 30_000);
   const initialIp = getInitialIpParam();
   if (initialIp) {
     inputIp.value = initialIp;
@@ -757,6 +780,13 @@ onMounted(async () => {
   await fetchUserStatus();
   if (initialIp && user.value.isLoggedIn && user.value.hasAccess) {
     executeDetection(initialIp);
+  }
+});
+
+onUnmounted(() => {
+  if (relativeTimeTimer !== null) {
+    clearInterval(relativeTimeTimer);
+    relativeTimeTimer = null;
   }
 });
 </script>

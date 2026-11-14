@@ -1259,6 +1259,97 @@ class AggregationAndCacheIntegrityTests(TestCase):
             self.assertEqual(ttls_by_key.get(f"ipcheck:v2:prov:{dynamic_key}:8.8.8.8"), 7200)
         self.assertNotIn("ipcheck:v2:prov:maxmind:8.8.8.8", ttls_by_key)
 
+    @patch("dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock)
+    @patch("detector.views.query_dshield", new_callable=AsyncMock)
+    @patch("detector.views.query_stopforumspam", new_callable=AsyncMock)
+    @patch("detector.views.query_tor_onionoo", new_callable=AsyncMock)
+    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
+    @patch("detector.views.query_iphunter", new_callable=AsyncMock)
+    @patch("detector.views.query_iphub", new_callable=AsyncMock)
+    @patch("detector.views.query_proxycheck", new_callable=AsyncMock)
+    @patch("detector.views.query_getipintel", new_callable=AsyncMock)
+    @patch("detector.views.query_ip2location", new_callable=AsyncMock)
+    @patch("detector.views.query_ipregistry", new_callable=AsyncMock)
+    @patch("detector.views.query_ipdata", new_callable=AsyncMock)
+    @patch("detector.views.query_abuseipdb", new_callable=AsyncMock)
+    @patch("detector.views.query_cloudflare_radar", new_callable=AsyncMock)
+    def test_partial_cache_hit_annotates_only_cached_rows_with_timestamps(
+        self,
+        mock_cf,
+        mock_abuse,
+        mock_ipdata,
+        mock_ipreg,
+        mock_ip2loc,
+        mock_gii,
+        mock_pc,
+        mock_iphub,
+        mock_iphunter,
+        mock_mm,
+        mock_tor,
+        mock_sfs,
+        mock_dshield,
+        mock_dns_resolve,
+    ):
+        def _ok_row(name):
+            return {
+                "provider": name,
+                "status": "200 OK",
+                "statusCode": 200,
+                "asn": "AS15169",
+                "isp": "Google",
+                "organisation": "Google",
+                "location": "United States",
+                "usageType": "isp",
+                "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
+                "threatScore": 0,
+                "countryCode": "US",
+                "rawJson": {},
+            }
+
+        for m, name in (
+            (mock_cf, "Cloudflare Radar"),
+            (mock_abuse, "AbuseIPDB"),
+            (mock_ipdata, "IPData"),
+            (mock_ipreg, "IPRegistry"),
+            (mock_ip2loc, "IP2Location"),
+            (mock_gii, "GetIPIntel"),
+            (mock_pc, "Proxycheck"),
+            (mock_iphub, "IPHub"),
+            (mock_iphunter, "IPHunter"),
+            (mock_tor, "Tor Onionoo"),
+            (mock_sfs, "StopForumSpam"),
+            (mock_dshield, "DShield"),
+        ):
+            m.return_value = _ok_row(name)
+        mock_mm.return_value = dict(MAXMIND_STUB)
+        mock_dns_resolve.side_effect = dns.resolver.NXDOMAIN()
+
+        cached_iso = "2026-11-14T06:15:00+00:00"
+        cache_store = {
+            "ipcheck:v2:prov:cloudflare_radar:8.8.8.8": json.dumps(
+                {"row": _ok_row("Cloudflare Radar"), "cachedAt": cached_iso}
+            )
+        }
+        mock_redis = MagicMock()
+        mock_redis.get = AsyncMock(side_effect=lambda k: cache_store.get(k))
+        mock_redis.set = AsyncMock()
+        _login_authorised(self)
+
+        with patch("detector.views.redis_client", mock_redis):
+            response = self.client.get("/api/v1/detect?ip=8.8.8.8")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertFalse(payload["isCached"])
+        self.assertTrue(payload["cacheMeta"]["isPartial"])
+        rows_by_provider = {row["provider"]: row for row in payload["results"]}
+        self.assertTrue(rows_by_provider["Cloudflare Radar"].get("isCached"))
+        self.assertEqual(rows_by_provider["Cloudflare Radar"].get("cachedAt"), cached_iso)
+        self.assertNotIn("isCached", rows_by_provider["AbuseIPDB"])
+        self.assertNotIn("cachedAt", rows_by_provider["AbuseIPDB"])
+        mock_cf.assert_not_called()
+        mock_abuse.assert_called_once()
+
 
 class ConnectionAndReaderReuseTests(TestCase):
     """Tests event-loop-aware HTTP client reuse and lazy MaxMind reader caching."""
@@ -6065,3 +6156,197 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
             ):
                 missing_row = views._read_maxmind_sync("1.1.1.1")
             self.assertEqual(missing_row["status"], "Database Missing")
+
+    def test_adapt_maxmind_falls_back_to_non_english_localized_names(self):
+        localized_row = adapt_maxmind(
+            {
+                "country": {"names": {"zh-CN": "中国"}, "iso_code": "CN"},
+                "subdivisions": [{"names": {"zh-CN": "北京"}, "iso_code": "BJ"}],
+                "city": {"names": {"zh-CN": "北京"}},
+                "location": {"latitude": 39.9075, "longitude": 116.3971},
+            },
+            has_db=True,
+        )
+        self.assertEqual(localized_row["location"], "北京, 中国 (39.9075, 116.3971)")
+        self.assertEqual(localized_row["coordinates"], "39.9075, 116.3971")
+        self.assertEqual(localized_row["countryCode"], "CN")
+
+    def test_maxmind_resolver_expands_env_nested_subdirs_and_reloads_updated_file(self):
+        from proxycheck.settings import resolve_mmdb_file
+
+        views._maxmind_readers.clear()
+        views._maxmind_reader_stats.clear()
+        self.addCleanup(views._maxmind_readers.clear)
+        self.addCleanup(views._maxmind_reader_stats.clear)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tool_root = Path(tmpdir) / "tool"
+            flat_data_dir = tool_root / "data"
+            nested_city_dir = flat_data_dir / "GeoLite2-City_20261114"
+            nested_city_dir.mkdir(parents=True)
+            country_file = flat_data_dir / "GeoLite2-Country.mmdb"
+            city_file = nested_city_dir / "GeoLite2-City.mmdb"
+            country_file.write_bytes(b"country-v1")
+            city_file.write_bytes(b"city-v1")
+
+            with patch.dict(os.environ, {"TOOL_DATA_DIR": str(tool_root)}):
+                self.assertEqual(
+                    resolve_mmdb_file("$TOOL_DATA_DIR/data", "GeoLite2-City.mmdb", tmpdir),
+                    str(city_file),
+                )
+                self.assertEqual(
+                    resolve_mmdb_file("", "GeoLite2-Country.mmdb", tmpdir),
+                    str(country_file),
+                )
+                self.assertEqual(
+                    resolve_mmdb_file("", "GeoLite2-City.mmdb", tmpdir),
+                    str(city_file),
+                )
+
+            country_reader = MagicMock()
+            country_reader.get.return_value = {
+                "country": {"names": {"en": "China"}, "iso_code": "CN"},
+            }
+            city_v1_reader = MagicMock()
+            city_v1_reader.get.return_value = {
+                "country": {"names": {"en": "China"}, "iso_code": "CN"},
+            }
+            city_v2_reader = MagicMock()
+            city_v2_reader.get.return_value = {
+                "country": {"names": {"en": "China"}, "iso_code": "CN"},
+                "subdivisions": [{"names": {"en": "Beijing"}, "iso_code": "BJ"}],
+                "city": {"names": {"en": "Beijing"}},
+                "location": {"latitude": 39.9075, "longitude": 116.3971},
+            }
+            country_open_paths = []
+            city_open_paths = []
+
+            def _open_sequence(path):
+                path_str = str(path)
+                if "city" in Path(path_str).name.lower():
+                    reader = city_v1_reader if not city_open_paths else city_v2_reader
+                    city_open_paths.append(path_str)
+                    return reader
+                country_open_paths.append(path_str)
+                return country_reader
+
+            fake_maxmind_module = MagicMock()
+            fake_maxmind_module.open_database.side_effect = _open_sequence
+
+            with (
+                override_settings(
+                    MAXMIND_DB_DIR=str(flat_data_dir),
+                    CLOUD_CIDR_DB_PATH="",
+                    HOSTING_ASN_RULES_PATH="",
+                ),
+                patch.dict("sys.modules", {"maxminddb": fake_maxmind_module}),
+            ):
+                row_before_update = views._read_maxmind_sync("1.2.3.4")
+                self.assertEqual(row_before_update["location"], "China")
+
+                # Replace the file on disk with a different size so the cached reader reopens cleanly
+                city_file.write_bytes(b"city-v2-updated-bytes")
+                row_after_update = views._read_maxmind_sync("1.2.3.4")
+                self.assertEqual(row_after_update["location"], "Beijing, China (39.9075, 116.3971)")
+                self.assertEqual(row_after_update["coordinates"], "39.9075, 116.3971")
+                self.assertEqual(len(country_open_paths), 1)
+                self.assertEqual(len(city_open_paths), 2)
+                city_v1_reader.close.assert_called_once()
+
+    @patch("dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock)
+    @patch("detector.views.httpx.AsyncClient")
+    def test_stale_pre_city_maxmind_cache_refreshes_when_city_db_exists(self, mock_async_client_cls, mock_dns_resolve):
+        views._maxmind_readers.clear()
+        views._maxmind_reader_stats.clear()
+        self.addCleanup(views._maxmind_readers.clear)
+        self.addCleanup(views._maxmind_reader_stats.clear)
+
+        target_ip = "1.2.3.4"
+        cache_store = {}
+        for provider_key, provider_name, _uses_http, _cooldown, _fn in views._PROVIDER_SPECS:
+            row_payload = {
+                "provider": provider_name,
+                "status": "200 OK",
+                "statusCode": 200,
+                "asn": "AS137718",
+                "isp": "Beijing Volcano Engine",
+                "organisation": "Beijing Volcano Engine",
+                "location": "China",
+                "usageType": "isp",
+                "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
+                "threatScore": 0,
+                "countryCode": "CN",
+                "rawJson": {"country": {"iso_code": "CN"}},
+            }
+            cache_store[f"ipcheck:v2:prov:{provider_key}:{target_ip}"] = json.dumps(
+                {"row": row_payload, "cachedAt": "2026-11-14T08:00:00+00:00"}
+            )
+        cache_store[f"ipcheck:v2:prov:ptr:{target_ip}"] = json.dumps(
+            {"hostname": "example.net", "status": "ok", "cachedAt": "2026-11-14T08:00:00+00:00"}
+        )
+
+        async def _fake_redis_set(key, value, ex=None):
+            cache_store[key] = value
+
+        mock_redis = MagicMock()
+        mock_redis.get = AsyncMock(side_effect=lambda k: cache_store.get(k))
+        mock_redis.set = AsyncMock(side_effect=_fake_redis_set)
+        _login_authorised(self)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mmdb_dir = Path(tmpdir)
+            for fname in ("GeoLite2-Country.mmdb", "GeoLite2-City.mmdb", "GeoLite2-ASN.mmdb"):
+                (mmdb_dir / fname).write_bytes(b"stub")
+
+            readers_by_path = {}
+            country_reader = MagicMock()
+            country_reader.get.return_value = {"country": {"names": {"en": "China"}, "iso_code": "CN"}}
+            city_reader = MagicMock()
+            city_reader.get.return_value = {
+                "country": {"names": {"en": "China"}, "iso_code": "CN"},
+                "subdivisions": [{"names": {"en": "Beijing"}, "iso_code": "BJ"}],
+                "city": {"names": {"en": "Beijing"}},
+                "location": {"latitude": 39.9075, "longitude": 116.3971},
+            }
+            asn_reader = MagicMock()
+            asn_reader.get.return_value = {
+                "autonomous_system_number": 137718,
+                "autonomous_system_organization": "Beijing Volcano Engine",
+            }
+            readers_by_path[str(mmdb_dir / "GeoLite2-Country.mmdb")] = country_reader
+            readers_by_path[str(mmdb_dir / "GeoLite2-City.mmdb")] = city_reader
+            readers_by_path[str(mmdb_dir / "GeoLite2-ASN.mmdb")] = asn_reader
+
+            fake_maxmind_module = MagicMock()
+            fake_maxmind_module.open_database.side_effect = lambda p: readers_by_path[str(p)]
+
+            with (
+                override_settings(
+                    MAXMIND_DB_DIR=str(mmdb_dir),
+                    CLOUD_CIDR_DB_PATH="",
+                    HOSTING_ASN_RULES_PATH="",
+                ),
+                patch.dict("sys.modules", {"maxminddb": fake_maxmind_module}),
+                patch("detector.views.redis_client", mock_redis),
+            ):
+                first_resp = self.client.get(f"/api/v1/detect?ip={target_ip}")
+                second_resp = self.client.get(f"/api/v1/detect?ip={target_ip}")
+
+        self.assertEqual(first_resp.status_code, 200)
+        first_payload = first_resp.json()
+        first_mm = next(r for r in first_payload["results"] if r["provider"] == "MaxMind")
+        self.assertEqual(first_mm["location"], "Beijing, China (39.9075, 116.3971)")
+        self.assertEqual(first_mm["coordinates"], "39.9075, 116.3971")
+        self.assertEqual(first_payload["cacheMeta"]["hitCount"], 16)
+
+        cached_mm_wrapper = json.loads(cache_store[f"ipcheck:v2:prov:maxmind:{target_ip}"])
+        self.assertTrue(cached_mm_wrapper["cityDbLoaded"])
+
+        self.assertEqual(second_resp.status_code, 200)
+        second_payload = second_resp.json()
+        second_mm = next(r for r in second_payload["results"] if r["provider"] == "MaxMind")
+        self.assertEqual(second_mm["location"], "Beijing, China (39.9075, 116.3971)")
+        self.assertEqual(second_payload["cacheMeta"]["hitCount"], 17)
+        self.assertEqual(city_reader.get.call_count, 1)
+        mock_async_client_cls.assert_not_called()
+        mock_dns_resolve.assert_not_called()

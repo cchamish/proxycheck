@@ -261,6 +261,46 @@ def _parse_csv_env(name: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in raw_value.split(",") if item.strip())
 
 
+def _expand_configured_path(raw_path: str) -> str:
+    """Expands environment variables and user home shortcuts in configured paths."""
+    cleaned = str(raw_path or "").strip()
+    if not cleaned:
+        return ""
+    return os.path.expanduser(os.path.expandvars(cleaned))
+
+
+def _standard_data_directories(base_dir: Path | str) -> list[Path]:
+    """Returns local workspace and Toolforge data directories in lookup priority order."""
+    base_path = Path(str(base_dir))
+    directories = [
+        base_path.parent / "data",
+        base_path.parent,
+        base_path / "data",
+        base_path,
+    ]
+    tool_data_dir = _expand_configured_path(os.environ.get("TOOL_DATA_DIR", ""))
+    if tool_data_dir:
+        expanded_tool_dir = Path(tool_data_dir)
+        directories.append(expanded_tool_dir / "www" / "python" / "data")
+        directories.append(expanded_tool_dir / "data")
+    home_dir = Path.home()
+    directories.append(home_dir / "www" / "python" / "data")
+    directories.append(home_dir / "data")
+    return directories
+
+
+def _find_mmdb_in_directory(directory: Path, filename: str) -> Optional[Path]:
+    """Finds an MMDB file directly inside directory or one extracted archive subdirectory."""
+    direct = directory / filename
+    if direct.exists():
+        return direct
+    if directory.is_dir():
+        nested_matches = sorted(match for match in directory.glob(f"*/{filename}") if match.is_file())
+        if nested_matches:
+            return nested_matches[0]
+    return None
+
+
 def resolve_data_file(
     configured_path: str,
     filename: str,
@@ -269,30 +309,21 @@ def resolve_data_file(
     default_missing: Optional[str] = None,
 ) -> str:
     """Finds a local intelligence data file across configured, workspace, and Toolforge data paths."""
-    if configured_path:
-        configured = Path(configured_path)
+    expanded_configured = _expand_configured_path(configured_path)
+    if expanded_configured:
+        configured = Path(expanded_configured)
         if configured.is_file():
             return str(configured)
         if configured.is_dir():
             return str(configured / filename)
 
-    base_path = Path(str(base_dir))
     # Check local workspace directories and Toolforge mounted data paths in order.
-    candidates = [
-        base_path.parent / "data" / filename,
-        base_path.parent / filename,
-        base_path / "data" / filename,
-        base_path / filename,
-    ]
-    tool_data_dir = os.environ.get("TOOL_DATA_DIR", "").strip()
-    if tool_data_dir:
-        candidates.append(Path(tool_data_dir) / "www" / "python" / "data" / filename)
-    candidates.append(Path.home() / "www" / "python" / "data" / filename)
-    for candidate in candidates:
+    for directory in _standard_data_directories(base_dir):
+        candidate = directory / filename
         if candidate.exists():
             return str(candidate)
 
-    return configured_path if default_missing is None else default_missing
+    return expanded_configured if default_missing is None else default_missing
 
 
 def resolve_mmdb_file(
@@ -303,19 +334,32 @@ def resolve_mmdb_file(
     default_missing: Optional[str] = None,
 ) -> str:
     """Resolves an MMDB file from a configured directory or standard data locations."""
-    if configured_path:
-        configured = Path(configured_path)
+    expanded_configured = _expand_configured_path(configured_path)
+    if expanded_configured:
+        configured = Path(expanded_configured)
         if configured.is_file():
             return str(configured)
+        matched = _find_mmdb_in_directory(configured, filename)
+        if matched is not None:
+            return str(matched)
         return str(configured / filename)
 
     fallback = default_missing if default_missing is not None else str(Path(str(base_dir)).parent / "data" / filename)
-    return resolve_data_file(
+    resolved_direct = resolve_data_file(
         "",
         filename,
         base_dir,
-        default_missing=fallback,
+        default_missing="",
     )
+    if resolved_direct:
+        return resolved_direct
+
+    for directory in _standard_data_directories(base_dir):
+        matched = _find_mmdb_in_directory(directory, filename)
+        if matched is not None:
+            return str(matched)
+
+    return fallback
 
 
 def _resolve_optional_data_path(env_var_name: str, filenames: str | tuple[str, ...]) -> str:

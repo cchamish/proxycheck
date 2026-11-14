@@ -1385,13 +1385,16 @@ def adapt_ip2location(raw_data: Optional[Dict[str, Any]], has_api_key: bool, sta
 
 
 def _extract_maxmind_name(node: Any) -> str:
-    """Extracts an English display name from a GeoLite2 or GeoIP2 field value."""
+    """Extracts a display name from a GeoLite2 or GeoIP2 field value, preferring English."""
     if isinstance(node, dict):
         names = node.get("names")
         if isinstance(names, dict):
             en_name = names.get("en")
             if isinstance(en_name, str) and en_name.strip():
                 return en_name.strip()
+            for candidate in names.values():
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate.strip()
         direct_name = node.get("name")
         if isinstance(direct_name, str) and direct_name.strip():
             return direct_name.strip()

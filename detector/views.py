@@ -364,6 +364,8 @@ def _parse_upstream_json(resp: httpx.Response) -> Tuple[Any, int]:
 
 _maxmind_lock = threading.Lock()
 _maxmind_readers: Dict[str, Any] = {}
+_maxmind_reader_stats: Dict[str, Optional[Tuple[int, int]]] = {}
+_missing_city_db_logged_paths: set[str] = set()
 
 _http_client_instance: Optional[Any] = None
 _http_client_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -371,14 +373,38 @@ _http_client_lock = threading.Lock()
 _http_clients_by_loop: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Any]" = weakref.WeakKeyDictionary()
 
 
+def _get_file_stat_signature(db_path: str) -> Optional[Tuple[int, int]]:
+    """Returns an mtime and size signature for detecting updated MMDB files on disk."""
+    try:
+        stat_result = os.stat(db_path)
+    except OSError:
+        return None
+    return (stat_result.st_mtime_ns, stat_result.st_size)
+
+
 def _get_maxmind_reader(db_path: str, maxminddb_module: Any) -> Any:
-    """Returns a cached MaxMind reader for the database path, opening it lazily under a thread lock."""
+    """Returns a cached MaxMind reader, reopening it automatically when the file changes on disk."""
+    current_sig = _get_file_stat_signature(db_path)
+    stale_reader: Optional[Any] = None
+    with _maxmind_lock:
+        reader = _maxmind_readers.get(db_path)
+        if reader is not None:
+            if current_sig is None or _maxmind_reader_stats.get(db_path) == current_sig:
+                return reader
+            stale_reader = _maxmind_readers.pop(db_path, None)
+            _maxmind_reader_stats.pop(db_path, None)
+    if stale_reader is not None:
+        try:
+            stale_reader.close()
+        except Exception as exc:
+            logger.debug(f"Failed to close superseded MaxMind reader: {exc}")
     with _maxmind_lock:
         reader = _maxmind_readers.get(db_path)
         if reader is not None:
             return reader
         reader = maxminddb_module.open_database(db_path)
         _maxmind_readers[db_path] = reader
+        _maxmind_reader_stats[db_path] = current_sig
         return reader
 
 
@@ -386,6 +412,7 @@ def _evict_maxmind_reader(db_path: str) -> None:
     """Removes and closes a cached MaxMind reader when an error occurs or the database file is absent."""
     with _maxmind_lock:
         reader = _maxmind_readers.pop(db_path, None)
+        _maxmind_reader_stats.pop(db_path, None)
     if reader is not None:
         try:
             reader.close()
@@ -534,6 +561,26 @@ def _merge_maxmind_dict_field(combined: Dict[str, Any], key: str, value: Any) ->
         combined[key] = value
 
 
+_MAXMIND_DB_SPECS = (
+    ("country", MAXMIND_COUNTRY_DB_FILENAME),
+    ("city", MAXMIND_CITY_DB_FILENAME),
+    ("asn", MAXMIND_ASN_DB_FILENAME),
+)
+
+
+def _resolve_maxmind_db_paths() -> Dict[str, str]:
+    """Resolves Country, City, and ASN MMDB paths using configured MAXMIND_DB_DIR or fallbacks."""
+    base_dir = getattr(settings, "BASE_DIR", os.getcwd())
+    configured_dir = str(getattr(settings, "MAXMIND_DB_DIR", "") or os.environ.get("MAXMIND_DB_DIR", "")).strip()
+    return {key: _resolve_db_file(configured_dir, filename, base_dir) for key, filename in _MAXMIND_DB_SPECS}
+
+
+def _has_local_maxmind_city_db() -> bool:
+    """Returns True when GeoLite2-City.mmdb is present on disk at its resolved location."""
+    city_path = _resolve_maxmind_db_paths().get("city", "")
+    return bool(city_path and os.path.exists(city_path))
+
+
 def _merge_maxmind_records(
     country_rec: Optional[Dict[str, Any]],
     city_rec: Optional[Dict[str, Any]],
@@ -542,7 +589,9 @@ def _merge_maxmind_records(
     """Combines Country, City, and ASN MMDB lookups while preserving iso_code consistency."""
     combined: Dict[str, Any] = {}
     if isinstance(city_rec, dict):
-        combined.update(city_rec)
+        for key, value in city_rec.items():
+            if value is not None:
+                combined[key] = value
     if isinstance(country_rec, dict):
         for key, value in country_rec.items():
             if key in ("country", "registered_country", "represented_country", "continent", "traits"):
@@ -550,7 +599,9 @@ def _merge_maxmind_records(
             elif key not in combined and value is not None:
                 combined[key] = value
     if isinstance(asn_rec, dict):
-        combined.update(asn_rec)
+        for key, value in asn_rec.items():
+            if value is not None:
+                combined[key] = value
     return combined
 
 
@@ -559,22 +610,31 @@ def _read_maxmind_sync(ip: str) -> Dict[str, Any]:
     Reads local GeoLite2 and GeoIP2 Country, City, and ASN MMDB files synchronously.
     Offloaded via `asyncio.to_thread` to avoid blocking the ASGI event loop on disk I/O.
     """
-    base_dir = getattr(settings, "BASE_DIR", os.getcwd())
-    configured_dir = str(getattr(settings, "MAXMIND_DB_DIR", "") or os.environ.get("MAXMIND_DB_DIR", "")).strip()
-    db_specs = (
-        ("country", MAXMIND_COUNTRY_DB_FILENAME),
-        ("city", MAXMIND_CITY_DB_FILENAME),
-        ("asn", MAXMIND_ASN_DB_FILENAME),
-    )
-    db_paths = {key: _resolve_db_file(configured_dir, filename, base_dir) for key, filename in db_specs}
+    db_paths = _resolve_maxmind_db_paths()
     available_paths = {key: path for key, path in db_paths.items() if os.path.exists(path)}
 
-    for key, filename in db_specs:
+    for key, filename in _MAXMIND_DB_SPECS:
         if key not in available_paths:
             _evict_missing_maxmind_readers(filename, db_paths[key])
 
     if not available_paths:
         return adapt_maxmind(None, has_db=False)
+
+    city_path = db_paths["city"]
+    if "city" in available_paths:
+        with _maxmind_lock:
+            _missing_city_db_logged_paths.discard(city_path)
+    else:
+        should_log_missing_city = False
+        with _maxmind_lock:
+            if city_path not in _missing_city_db_logged_paths:
+                _missing_city_db_logged_paths.add(city_path)
+                should_log_missing_city = True
+        if should_log_missing_city:
+            logger.warning(
+                "GeoLite2-City.mmdb was not found at %s; MaxMind lookups will omit city and coordinates",
+                city_path,
+            )
 
     try:
         import maxminddb
@@ -1668,6 +1728,23 @@ def _build_unhandled_provider_error_row(provider_name: str, safe_message: str) -
     }
 
 
+def _should_refresh_cached_maxmind_entry(raw_value: Optional[str], row: Dict[str, Any]) -> bool:
+    """Invalidates pre-City cached MaxMind entries when GeoLite2-City.mmdb is present on disk."""
+    if not _has_local_maxmind_city_db():
+        return False
+    if row.get("coordinates") is not None:
+        return False
+    if raw_value:
+        try:
+            parsed = json.loads(raw_value)
+        except (ValueError, TypeError) as exc:
+            logger.debug("Invalid cached MaxMind payload during city DB check: %s", exc)
+            return True
+        if isinstance(parsed, dict) and parsed.get("cityDbLoaded") is True:
+            return False
+    return True
+
+
 async def _read_provider_caches(
     ip: str,
 ) -> Tuple[Dict[str, Tuple[Dict[str, Any], Optional[str]]], Optional[Tuple[Optional[str], Optional[str]]]]:
@@ -1680,6 +1757,8 @@ async def _read_provider_caches(
     for idx, (provider_key, _, _, _, _) in enumerate(_PROVIDER_SPECS):
         decoded = _decode_cached_provider_entry(raw_values[idx])
         if decoded is not None:
+            if provider_key == "maxmind" and _should_refresh_cached_maxmind_entry(raw_values[idx], decoded[0]):
+                continue
             cached_providers[provider_key] = decoded
     cached_ptr = _decode_cached_ptr_entry(raw_values[-1])
     return cached_providers, cached_ptr
@@ -1800,6 +1879,9 @@ async def _execute_detection_with_cache(
             row_copy = dict(row)
             if isinstance(row_copy.get("rawJson"), (dict, list)):
                 row_copy["rawJson"] = _sanitize_payload(row_copy["rawJson"])
+            row_copy["isCached"] = True
+            if cached_at:
+                row_copy["cachedAt"] = cached_at
             clean_results.append(row_copy)
             if not _is_unconfigured_provider_row(row_copy):
                 hit_count += 1
@@ -1836,7 +1918,10 @@ async def _execute_detection_with_cache(
             event = upstream_events.get(provider_key)
             status_code = row.get("statusCode")
             if _is_provider_result_cacheable(row):
-                cache_entry = json.dumps({"row": row, "cachedAt": now_iso})
+                entry_payload: Dict[str, Any] = {"row": row, "cachedAt": now_iso}
+                if provider_key == "maxmind":
+                    entry_payload["cityDbLoaded"] = _has_local_maxmind_city_db()
+                cache_entry = json.dumps(entry_payload)
                 redis_write_ops.append(
                     _safe_redis_set(
                         _provider_cache_key(provider_key, ip),

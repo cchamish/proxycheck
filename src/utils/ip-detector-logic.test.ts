@@ -17,8 +17,11 @@ import {
   simplifySecurityFlags,
   createDetectionCoordinator,
   resolveRepoBaseUrl,
+  normalizeUtcCommitTimestamp,
   formatUtcCommitTimestamp,
   formatCommitVersionLabel,
+  formatRelativeUpdatedLabel,
+  resolveProviderUpdatedLabel,
   buildDiagnosticMetrics,
   formatDiagnosticSummary,
   measureInitialLoadDurationSeconds,
@@ -310,45 +313,73 @@ test('Initial load and elapsed timing helpers return non-negative finite seconds
   assert.equal(Number.isFinite(elapsed) && elapsed >= 0, true);
 });
 
-test('formatUtcCommitTimestamp formats dates in UTC with English month abbreviations', () => {
-  const sampleDate = new Date('2026-11-14T12:34:56Z');
-  assert.equal(formatUtcCommitTimestamp(sampleDate), '12:34 14 Nov 2026');
-
-  const paddedDate = new Date('2026-01-05T04:07:09Z');
-  assert.equal(formatUtcCommitTimestamp(paddedDate), '04:07 05 Jan 2026');
-
-  const invalidFallback = formatUtcCommitTimestamp(new Date(Number.NaN));
-  assert.match(invalidFallback, /^\d{2}:\d{2} \d{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4}$/);
+test('normalizeUtcCommitTimestamp appends a single UTC suffix when missing', () => {
+  assert.equal(normalizeUtcCommitTimestamp('12:34 14 Nov 2026'), '12:34 14 Nov 2026 (UTC)');
+  assert.equal(normalizeUtcCommitTimestamp('12:34 14 Nov 2026 (UTC)'), '12:34 14 Nov 2026 (UTC)');
+  assert.equal(normalizeUtcCommitTimestamp('12:34 14 Nov 2026(utc)'), '12:34 14 Nov 2026 (UTC)');
+  assert.equal(normalizeUtcCommitTimestamp('12:34 14 Nov 2026 UTC'), '12:34 14 Nov 2026 (UTC)');
+  assert.equal(normalizeUtcCommitTimestamp(''), '');
+  assert.equal(normalizeUtcCommitTimestamp(null), '');
 });
 
-test('formatCommitVersionLabel formats commit hash and timestamp inside parentheses', () => {
+test('formatUtcCommitTimestamp formats dates in UTC with English month abbreviations', () => {
+  const sampleDate = new Date('2026-11-14T12:34:56Z');
+  assert.equal(formatUtcCommitTimestamp(sampleDate), '12:34 14 Nov 2026 (UTC)');
+
+  const offsetDate = new Date('2026-11-14T17:12:13+08:00');
+  assert.equal(formatUtcCommitTimestamp(offsetDate), '09:12 14 Nov 2026 (UTC)');
+
+  const paddedDate = new Date('2026-01-05T04:07:09Z');
+  assert.equal(formatUtcCommitTimestamp(paddedDate), '04:07 05 Jan 2026 (UTC)');
+
+  const invalidFallback = formatUtcCommitTimestamp(new Date(Number.NaN));
+  assert.match(invalidFallback, /^\d{2}:\d{2} \d{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \(UTC\)$/);
+});
+
+test('formatCommitVersionLabel formats commit hash and UTC timestamp inside parentheses', () => {
   assert.equal(
     formatCommitVersionLabel('3236900', '12:34 14 Nov 2026'),
-    '(r.3236900 @ 12:34 14 Nov 2026)'
+    '(r.3236900 @ 12:34 14 Nov 2026 (UTC))'
+  );
+  assert.equal(
+    formatCommitVersionLabel('3236900', '12:34 14 Nov 2026 (UTC)'),
+    '(r.3236900 @ 12:34 14 Nov 2026 (UTC))'
   );
   assert.equal(formatCommitVersionLabel('3236900', ''), '(r.3236900)');
-  assert.equal(formatCommitVersionLabel('', '12:34 14 Nov 2026'), '(r.dev @ 12:34 14 Nov 2026)');
+  assert.equal(formatCommitVersionLabel('', '12:34 14 Nov 2026'), '(r.dev @ 12:34 14 Nov 2026 (UTC))');
   assert.equal(formatCommitVersionLabel(null, null), '(r.dev)');
 });
 
-test('resolveCommitMetadata reads Git metadata, honours env overrides, and falls back without .git', () => {
-  const timestampPattern = /^\d{2}:\d{2} \d{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4}$/;
+test('resolveCommitMetadata reads Git metadata in UTC, honours env overrides, and falls back without .git', () => {
+  const timestampPattern = /^\d{2}:\d{2} \d{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \(UTC\)$/;
 
   const fromRepo = resolveCommitMetadata({}, process.cwd());
   assert.notEqual(fromRepo.commitHash, '');
   assert.notEqual(fromRepo.commitHash, 'dev');
   assert.match(fromRepo.commitTimestamp, timestampPattern);
 
-  const fromEnv = resolveCommitMetadata(
+  const fromEnvWithoutSuffix = resolveCommitMetadata(
     {
       VITE_COMMIT_HASH: 'a046aca',
       VITE_COMMIT_TIMESTAMP: '12:34 14 Nov 2026',
     },
     process.cwd()
   );
-  assert.deepEqual(fromEnv, {
+  assert.deepEqual(fromEnvWithoutSuffix, {
     commitHash: 'a046aca',
-    commitTimestamp: '12:34 14 Nov 2026',
+    commitTimestamp: '12:34 14 Nov 2026 (UTC)',
+  });
+
+  const fromEnvWithSuffix = resolveCommitMetadata(
+    {
+      VITE_COMMIT_HASH: 'a046aca',
+      VITE_COMMIT_TIMESTAMP: '12:34 14 Nov 2026 (UTC)',
+    },
+    process.cwd()
+  );
+  assert.deepEqual(fromEnvWithSuffix, {
+    commitHash: 'a046aca',
+    commitTimestamp: '12:34 14 Nov 2026 (UTC)',
   });
 
   const nonGitDir = fs.mkdtempSync(path.join(os.tmpdir(), 'proxycheck-no-git-'));
@@ -509,5 +540,66 @@ test('Comparison table renders simplified LOCATION header without coordinates su
   const appVue = fs.readFileSync(path.resolve(process.cwd(), 'src/App.vue'), 'utf8');
   assert.match(appVue, /<th scope="col">LOCATION<\/th>/);
   assert.doesNotMatch(appVue, /LOCATION\s*(?:&amp;|&)\s*COORDINATES/i);
+});
+
+test('formatRelativeUpdatedLabel formats d/h/m relative age, omits zero units, and handles sub-minute timestamps', () => {
+  const nowMs = Date.parse('2026-11-14T12:00:00Z');
+  const minuteMs = 60_000;
+  const hourMs = 60 * minuteMs;
+  const dayMs = 24 * hourMs;
+
+  assert.equal(formatRelativeUpdatedLabel(new Date(nowMs - 5_000), nowMs), 'Updated just now');
+  assert.equal(formatRelativeUpdatedLabel(new Date(nowMs - 59_000), nowMs), 'Updated just now');
+  assert.equal(formatRelativeUpdatedLabel(new Date(nowMs + 5_000), nowMs), 'Updated just now');
+
+  assert.equal(formatRelativeUpdatedLabel(new Date(nowMs - 1 * minuteMs), nowMs), 'Updated 1m ago');
+  assert.equal(formatRelativeUpdatedLabel(new Date(nowMs - 59 * minuteMs), nowMs), 'Updated 59m ago');
+  assert.equal(formatRelativeUpdatedLabel(new Date(nowMs - 1 * hourMs), nowMs), 'Updated 1h ago');
+  assert.equal(formatRelativeUpdatedLabel(new Date(nowMs - (1 * hourMs + 35 * minuteMs)), nowMs), 'Updated 1h 35m ago');
+  assert.equal(formatRelativeUpdatedLabel(new Date(nowMs - 1 * dayMs), nowMs), 'Updated 1d ago');
+  assert.equal(formatRelativeUpdatedLabel(new Date(nowMs - (1 * dayMs + 5 * minuteMs)), nowMs), 'Updated 1d 5m ago');
+  assert.equal(formatRelativeUpdatedLabel(new Date(nowMs - (2 * dayMs + 3 * hourMs)), nowMs), 'Updated 2d 3h ago');
+  assert.equal(
+    formatRelativeUpdatedLabel(new Date(nowMs - (2 * dayMs + 3 * hourMs + 45 * minuteMs)), nowMs),
+    'Updated 2d 3h 45m ago'
+  );
+
+  assert.equal(formatRelativeUpdatedLabel('2026-11-14T10:15:00+00:00', nowMs), 'Updated 1h 45m ago');
+  assert.equal(formatRelativeUpdatedLabel('', nowMs), null);
+  assert.equal(formatRelativeUpdatedLabel(null, nowMs), null);
+  assert.equal(formatRelativeUpdatedLabel('invalid-timestamp', nowMs), null);
+});
+
+test('resolveProviderUpdatedLabel handles per-row and top-level cache state and App.vue places it above provider label', () => {
+  const nowMs = Date.parse('2026-11-14T12:00:00Z');
+  const cachedRow = {
+    ...makeProviderResult('IPRegistry'),
+    isCached: true,
+    cachedAt: '2026-11-14T11:30:00Z',
+  };
+  const freshRow = makeProviderResult('AbuseIPDB');
+
+  assert.equal(
+    resolveProviderUpdatedLabel(cachedRow, { isCached: false, cacheMeta: { status: 'partial', isPartial: true, hitCount: 1, missCount: 1, cooldownCount: 0, totalSources: 2, cachedAt: '2026-11-14T08:00:00Z' } }, nowMs),
+    'Updated 30m ago'
+  );
+  assert.equal(
+    resolveProviderUpdatedLabel(freshRow, { isCached: false, cacheMeta: { status: 'partial', isPartial: true, hitCount: 1, missCount: 1, cooldownCount: 0, totalSources: 2, cachedAt: '2026-11-14T08:00:00Z' } }, nowMs),
+    null
+  );
+  assert.equal(
+    resolveProviderUpdatedLabel(freshRow, { isCached: true, cacheMeta: { status: 'hit', isPartial: false, hitCount: 1, missCount: 0, cooldownCount: 0, totalSources: 1, cachedAt: '2026-11-14T08:00:00Z' } }, nowMs),
+    'Updated 4h ago'
+  );
+  assert.equal(resolveProviderUpdatedLabel({ ...makeProviderResult('MaxMind'), isCached: false, cachedAt: '2026-11-14T10:00:00Z' }, { isCached: true }, nowMs), null);
+
+  const appVue = fs.readFileSync(path.resolve(process.cwd(), 'src/App.vue'), 'utf8');
+  assert.match(
+    appVue,
+    /<div class="provider-cell">\s*<span[\s\S]*?class="provider-updated-time"[\s\S]*?>\s*\{\{\s*getProviderUpdatedLabel\(row\)\s*\}\}\s*<\/span>\s*<span class="provider-name">/
+  );
+
+  const codexCss = fs.readFileSync(path.resolve(process.cwd(), 'src/codex.css'), 'utf8');
+  assert.match(codexCss, /\.provider-updated-time\s*\{[\s\S]*?font-size:\s*12px;[\s\S]*?color:\s*var\(--cdx-color-muted\);/);
 });
 

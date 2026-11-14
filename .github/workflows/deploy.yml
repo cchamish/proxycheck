@@ -72,7 +72,7 @@ jobs:
           REPO_GIT_URL: ${{ github.server_url }}/${{ github.repository }}.git
         run: |
           VITE_COMMIT_HASH="$(git rev-parse --short HEAD)"
-          VITE_COMMIT_TIMESTAMP="$(LC_ALL=C git log -1 --format=%cd --date='format:%H:%M, %d %b %Y')"
+          VITE_COMMIT_TIMESTAMP="$(TZ=UTC0 LC_ALL=C git log -1 --format=%cd --date='format-local:%H:%M %d %b %Y (UTC)')"
           {
             printf 'target_branch=%q\n' "$TARGET_BRANCH"
             printf 'vite_github_repo=%q\n' "$VITE_GITHUB_REPO"

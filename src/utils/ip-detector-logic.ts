@@ -66,6 +66,8 @@ export interface ProviderRawResult {
   count?: number;
   threatfeeds?: string[];
   maxDate?: string | null;
+  isCached?: boolean;
+  cachedAt?: string | null;
   rawJson: Record<string, unknown>;
 }
 
@@ -305,7 +307,19 @@ const ENGLISH_MONTH_ABBREVIATIONS = [
 ];
 
 /**
- * Formats a Date in UTC as "HH:MM DD Mon YYYY" with English month abbreviations.
+ * Normalizes a commit timestamp string so non-empty values end with " (UTC)".
+ */
+export function normalizeUtcCommitTimestamp(timestamp?: string | null): string {
+  const trimmed = String(timestamp ?? '').trim();
+  if (!trimmed) {
+    return '';
+  }
+  const withoutUtcSuffix = trimmed.replace(/\s*\(?\butc\)?$/i, '').trim();
+  return withoutUtcSuffix ? `${withoutUtcSuffix} (UTC)` : trimmed;
+}
+
+/**
+ * Formats a Date in UTC as "HH:MM DD Mon YYYY (UTC)" with English month abbreviations.
  */
 export function formatUtcCommitTimestamp(date: Date = new Date()): string {
   const target = Number.isNaN(date.getTime()) ? new Date() : date;
@@ -314,7 +328,7 @@ export function formatUtcCommitTimestamp(date: Date = new Date()): string {
   const day = String(target.getUTCDate()).padStart(2, '0');
   const month = ENGLISH_MONTH_ABBREVIATIONS[target.getUTCMonth()];
   const year = target.getUTCFullYear();
-  return `${hours}:${minutes} ${day} ${month} ${year}`;
+  return `${hours}:${minutes} ${day} ${month} ${year} (UTC)`;
 }
 
 /**
@@ -325,10 +339,86 @@ export function formatCommitVersionLabel(
   commitTimestamp?: string | null
 ): string {
   const normalizedHash = String(commitHash ?? '').trim() || 'dev';
-  const normalizedTimestamp = String(commitTimestamp ?? '').trim();
+  const normalizedTimestamp = normalizeUtcCommitTimestamp(commitTimestamp);
   return normalizedTimestamp
     ? `(r.${normalizedHash} @ ${normalizedTimestamp})`
     : `(r.${normalizedHash})`;
+}
+
+const MINUTES_PER_HOUR = 60;
+const MINUTES_PER_DAY = 24 * MINUTES_PER_HOUR;
+const MILLISECONDS_PER_MINUTE = 60_000;
+
+/**
+ * Formats an ISO timestamp or Date as a compact relative update label ("Updated 1d 2h 5m ago"
+ * or "Updated just now" under one minute), omitting zero-valued units.
+ */
+export function formatRelativeUpdatedLabel(
+  cachedAt?: string | Date | null,
+  now: Date | number = Date.now()
+): string | null {
+  if (cachedAt === null || cachedAt === undefined) {
+    return null;
+  }
+
+  let cachedMs: number;
+  if (cachedAt instanceof Date) {
+    cachedMs = cachedAt.getTime();
+  } else {
+    const trimmed = String(cachedAt).trim();
+    if (!trimmed) {
+      return null;
+    }
+    cachedMs = Date.parse(trimmed);
+  }
+
+  if (!Number.isFinite(cachedMs)) {
+    return null;
+  }
+
+  const resolvedNowMs = now instanceof Date ? now.getTime() : now;
+  const nowMs = Number.isFinite(resolvedNowMs) ? resolvedNowMs : Date.now();
+  const diffMs = nowMs - cachedMs;
+
+  if (diffMs < MILLISECONDS_PER_MINUTE) {
+    return 'Updated just now';
+  }
+
+  const totalMinutes = Math.floor(diffMs / MILLISECONDS_PER_MINUTE);
+  const days = Math.floor(totalMinutes / MINUTES_PER_DAY);
+  const hours = Math.floor((totalMinutes % MINUTES_PER_DAY) / MINUTES_PER_HOUR);
+  const minutes = totalMinutes % MINUTES_PER_HOUR;
+
+  const parts = [
+    [days, 'd'],
+    [hours, 'h'],
+    [minutes, 'm'],
+  ] as const;
+  const formattedParts = parts
+    .filter(([value]) => value > 0)
+    .map(([value, suffix]) => `${value}${suffix}`);
+
+  return `Updated ${formattedParts.join(' ')} ago`;
+}
+
+/**
+ * Resolves the relative "Updated ... ago" label for a cached provider row, or returns null when uncached.
+ */
+export function resolveProviderUpdatedLabel(
+  row?: Pick<Partial<ProviderRawResult>, 'isCached' | 'cachedAt'> | null,
+  detectionData?: Partial<DetectionResponse> | null,
+  now: Date | number = Date.now()
+): string | null {
+  if (!row || typeof row !== 'object') {
+    return null;
+  }
+  const rowIsCached =
+    row.isCached !== undefined ? Boolean(row.isCached) : Boolean(detectionData?.isCached);
+  if (!rowIsCached) {
+    return null;
+  }
+  const cachedAt = row.cachedAt || detectionData?.cacheMeta?.cachedAt || null;
+  return formatRelativeUpdatedLabel(cachedAt, now);
 }
 
 export function filterComparisonResults(results: ProviderRawResult[] | undefined | null): ProviderRawResult[] {

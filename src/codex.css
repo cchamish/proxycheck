@@ -553,7 +553,15 @@ body {
 .provider-cell {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3px;
+}
+
+.provider-updated-time {
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.25;
+  color: var(--cdx-color-muted);
+  white-space: nowrap;
 }
 
 .provider-name {

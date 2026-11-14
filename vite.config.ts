@@ -1,7 +1,7 @@
 import { defineConfig, loadEnv } from 'vite';
 import vue from '@vitejs/plugin-vue';
 import { execFileSync } from 'child_process';
-import { formatUtcCommitTimestamp } from './src/utils/ip-detector-logic.ts';
+import { formatUtcCommitTimestamp, normalizeUtcCommitTimestamp } from './src/utils/ip-detector-logic.ts';
 
 function readGitMetadata(args: string[], cwd: string): string {
   return execFileSync('git', args, {
@@ -38,13 +38,18 @@ export function resolveCommitMetadata(
     commitHash = 'dev';
   }
 
-  let commitTimestamp = (env.VITE_COMMIT_TIMESTAMP || env.COMMIT_TIMESTAMP || '').trim();
+  let commitTimestamp = normalizeUtcCommitTimestamp(
+    env.VITE_COMMIT_TIMESTAMP || env.COMMIT_TIMESTAMP || ''
+  );
   if (!commitTimestamp) {
     try {
-      commitTimestamp = readGitMetadata(
-        ['log', '-1', '--format=%cd', '--date=format:%H:%M %d %b %Y'],
-        cwd
-      );
+      const rawUnixSeconds = readGitMetadata(['log', '-1', '--format=%ct'], cwd);
+      if (/^-?\d+$/.test(rawUnixSeconds)) {
+        const unixSeconds = Number.parseInt(rawUnixSeconds, 10);
+        if (Number.isFinite(unixSeconds)) {
+          commitTimestamp = formatUtcCommitTimestamp(new Date(unixSeconds * 1000));
+        }
+      }
     } catch {
       // Fall back to the UTC build timestamp when Git metadata is absent.
     }

@@ -256,31 +256,18 @@ body {
   align-items: center;
 }
 
-.overview-gauges {
-  display: flex;
-  gap: 14px;
-  align-items: stretch;
-}
-
 @media (max-width: 900px) {
   .overview-body {
     grid-template-columns: 1fr;
     gap: 20px;
   }
 
-  .overview-gauges {
-    justify-content: center;
+  .prediction-gauge-container {
+    justify-self: center;
   }
 }
 
-@media (max-width: 520px) {
-  .overview-gauges {
-    flex-direction: column;
-    align-items: center;
-  }
-}
-
-/* Threat and prediction score gauges */
+/* Prediction score gauge */
 .score-gauge-container {
   display: flex;
   flex-direction: column;
@@ -356,16 +343,6 @@ body {
   color: var(--cdx-color-muted);
   font-weight: 500;
   margin-top: 2px;
-}
-
-.gauge-tier-pill {
-  font-size: 11px;
-  font-weight: 700;
-  padding: 3px 10px;
-  border-radius: 9999px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  white-space: nowrap;
 }
 
 /* Basic IP information summary table */
@@ -643,35 +620,6 @@ body {
   background-color: var(--cdx-color-success-bg);
   color: var(--cdx-color-success);
   border: 1px solid rgba(20, 134, 109, 0.3);
-}
-
-.score-display {
-  display: flex;
-  align-items: baseline;
-  gap: 2px;
-  white-space: nowrap;
-}
-
-.score-number {
-  font-size: 16px;
-  font-weight: 700;
-}
-
-.score-scale {
-  font-size: 11px;
-  color: var(--cdx-color-muted);
-}
-
-.score-high {
-  color: #b32424;
-}
-
-.score-medium {
-  color: #ac6600;
-}
-
-.score-low {
-  color: #14866d;
 }
 
 .text-muted {

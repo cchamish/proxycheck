@@ -118,68 +118,44 @@
           </template>
           <template #description>
             <div class="overview-body">
-              <div class="overview-gauges">
-                <div class="score-gauge-container">
-                  <span class="gauge-title">Threat Score</span>
-                  <div
-                    class="gauge-circle"
-                    :class="getScoreTierClass(detectionData.comprehensiveScore ?? 0)"
-                  >
-                    <span
-                      class="gauge-score-value"
-                      :class="{ 'gauge-score-value--sm': String(detectionData.comprehensiveScore ?? 0).length > 3 }"
-                    >
-                      {{ detectionData.comprehensiveScore ?? 0 }}
-                    </span>
-                    <span class="gauge-score-max">/ 100</span>
-                  </div>
+              <div class="score-gauge-container prediction-gauge-container">
+                <span class="gauge-title">Prediction</span>
+                <div
+                  class="gauge-circle"
+                  :class="getPredictionScoreTierClass(detectionData)"
+                >
                   <span
-                    class="gauge-tier-pill cdx-badge"
-                    :class="getScoreTierBadge(detectionData.comprehensiveScore ?? 0)"
+                    class="gauge-score-value"
+                    :class="{ 'gauge-score-value--sm': String(formatChance(detectionData.prediction_score)).length > 3 }"
                   >
-                    {{ getScoreTierLabel(detectionData.comprehensiveScore ?? 0) }}
+                    {{ formatChance(detectionData.prediction_score) }}
                   </span>
+                  <span class="gauge-score-max">%</span>
                 </div>
-
-                <div class="score-gauge-container prediction-gauge-container">
-                  <span class="gauge-title">Prediction</span>
-                  <div
-                    class="gauge-circle"
-                    :class="getPredictionScoreTierClass(detectionData)"
+                <div class="prediction-badge-wrapper">
+                  <span
+                    v-if="detectionData.predictionTier === 'destructive'"
+                    class="prediction-badge prediction-badge--destructive"
                   >
-                    <span
-                      class="gauge-score-value"
-                      :class="{ 'gauge-score-value--sm': String(formatChance(detectionData.prediction_score)).length > 3 }"
-                    >
-                      {{ formatChance(detectionData.prediction_score) }}
-                    </span>
-                    <span class="gauge-score-max">%</span>
-                  </div>
-                  <div class="prediction-badge-wrapper">
-                    <span
-                      v-if="detectionData.predictionTier === 'destructive'"
-                      class="prediction-badge prediction-badge--destructive"
-                    >
-                      <span aria-hidden="true">✘</span>
-                      {{ detectionData.predictionLabel || 'Proxy / VPN' }}
-                    </span>
-                    <span
-                      v-else-if="detectionData.predictionTier === 'success'"
-                      class="prediction-badge prediction-badge--success"
-                    >
-                      <span aria-hidden="true">✔</span>
-                      {{ detectionData.predictionLabel || 'Safe Residential' }}
-                    </span>
-                    <span
-                      v-else
-                      class="prediction-badge prediction-badge--neutral"
-                    >
-                      {{ detectionData.predictionLabel || 'Needs Human Review' }}
-                      <template v-if="detectionData.getipintel_chance !== null && detectionData.getipintel_chance !== undefined">
-                        ({{ formatChance(detectionData.prediction_score) }}%)
-                      </template>
-                    </span>
-                  </div>
+                    <span aria-hidden="true">✘</span>
+                    {{ detectionData.predictionLabel || 'Proxy / VPN' }}
+                  </span>
+                  <span
+                    v-else-if="detectionData.predictionTier === 'success'"
+                    class="prediction-badge prediction-badge--success"
+                  >
+                    <span aria-hidden="true">✔</span>
+                    {{ detectionData.predictionLabel || 'Safe Residential' }}
+                  </span>
+                  <span
+                    v-else
+                    class="prediction-badge prediction-badge--neutral"
+                  >
+                    {{ detectionData.predictionLabel || 'Needs Human Review' }}
+                    <template v-if="detectionData.getipintel_chance !== null && detectionData.getipintel_chance !== undefined">
+                      ({{ formatChance(detectionData.prediction_score) }}%)
+                    </template>
+                  </span>
                 </div>
               </div>
 
@@ -284,7 +260,6 @@
                 <th scope="col">LOCATION</th>
                 <th scope="col">USAGE TYPE</th>
                 <th scope="col">SECURITY FLAGS</th>
-                <th scope="col">THREAT SCORE</th>
               </tr>
             </thead>
             <tbody>
@@ -340,19 +315,6 @@
                       {{ flag.label }}
                     </span>
                   </div>
-                </td>
-
-                <td class="col-score">
-                  <div v-if="row.threatScore !== null" class="score-display">
-                    <span
-                      class="score-number"
-                      :class="getScoreColorClass(row.threatScore)"
-                    >
-                      {{ row.threatScore }}
-                    </span>
-                    <span class="score-scale">/100</span>
-                  </div>
-                  <span v-else class="text-muted">-</span>
                 </td>
               </tr>
             </tbody>
@@ -617,30 +579,6 @@ function getStatusBadgeClass(status?: string | null): string {
   }
   if (status.includes('429') || status.includes('Cooldown')) return 'badge-warning';
   return 'badge-destructive';
-}
-
-function getScoreColorClass(score: number): string {
-  if (score >= 70) return 'score-high';
-  if (score >= 30) return 'score-medium';
-  return 'score-low';
-}
-
-function getScoreTierClass(score: number): string {
-  if (score >= 70) return 'score-tier-high';
-  if (score >= 30) return 'score-tier-moderate';
-  return 'score-tier-low';
-}
-
-function getScoreTierBadge(score: number): string {
-  if (score >= 70) return 'badge-destructive';
-  if (score >= 30) return 'badge-warning';
-  return 'badge-success';
-}
-
-function getScoreTierLabel(score: number): string {
-  if (score >= 70) return 'High Risk';
-  if (score >= 30) return 'Moderate Risk';
-  return 'Low Risk';
 }
 
 function getPredictionScoreTierClass(data: DetectionResponse | null | undefined): string {

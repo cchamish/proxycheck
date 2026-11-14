@@ -148,7 +148,6 @@ class DetectorAuthTests(TestCase):
                 "location": "-",
                 "usageType": "-",
                 "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                "threatScore": None,
                 "rawJson": {"status": "error", "message": "API key not configured"},
             }
 
@@ -183,7 +182,6 @@ class DetectorAuthTests(TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["ip"], "8.8.8.8")
-        self.assertIn("comprehensiveScore", payload)
         self.assertEqual(len(payload["results"]), 15)
         result_providers = {row["provider"] for row in payload["results"]}
         self.assertNotIn("Tor Onionoo", result_providers)
@@ -611,7 +609,6 @@ MAXMIND_STUB = {
     "location": "-",
     "usageType": "-",
     "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-    "threatScore": None,
     "rawJson": {"status": "error", "message": "Local MMDB files not found"},
 }
 
@@ -859,13 +856,12 @@ class UpstreamPayloadDefenceTests(TestCase):
                 result = adapt_iphub({"ip": "8.8.8.8", "block": block}, True, 200)
                 self.assertEqual(result["status"], "502 Error")
                 self.assertIsNone(result["block"])
-                self.assertIsNone(result["threatScore"])
 
     def test_iphub_numeric_string_block_is_classified(self):
         result = adapt_iphub({"ip": "8.8.8.8", "block": "1", "countryCode": "US"}, True, 200)
         self.assertEqual(result["status"], "200 OK")
         self.assertEqual(result["block"], 1)
-        self.assertEqual(result["threatScore"], 85)
+        self.assertTrue(any(flag["isHighRisk"] for flag in result["securityFlags"]))
 
     def test_iphunter_null_and_invalid_block_degrade_to_format_error(self):
         for payload in ({"block": None}, {"block": "invalid"}, {"data": {"block": "NaN"}}):
@@ -883,7 +879,6 @@ class UpstreamPayloadDefenceTests(TestCase):
     def test_getipintel_nan_result_is_rejected(self):
         result = adapt_getipintel({"status": "success", "result": "NaN"}, True, 200)
         self.assertEqual(result["status"], "400 Error")
-        self.assertIsNone(result["threatScore"])
 
     def test_cloudflare_null_result_does_not_crash(self):
         unconfigured = adapt_cloudflare_radar(None, False)
@@ -967,7 +962,6 @@ class MaxMindUsageTypeTests(TestCase):
         result = adapt_maxmind(dict(self.GEOLITE2_RECORD), True, 200)
         self.assertEqual(result["status"], "200 OK")
         self.assertEqual(result["usageType"], "unknown")
-        self.assertEqual(result["threatScore"], 0)
         self.assertEqual(result["securityFlags"], [{"label": "No Flags", "isHighRisk": False}])
 
     def test_geoip2_hosting_user_type_is_still_flagged(self):
@@ -975,13 +969,11 @@ class MaxMindUsageTypeTests(TestCase):
         result = adapt_maxmind(record, True, 200)
         self.assertEqual(result["usageType"], "hosting")
         self.assertIn({"label": "Hosting", "isHighRisk": True}, result["securityFlags"])
-        self.assertEqual(result["threatScore"], 50)
 
     def test_geoip2_residential_user_type_is_preserved(self):
         record = dict(self.GEOLITE2_RECORD, traits={"user_type": "residential"})
         result = adapt_maxmind(record, True, 200)
         self.assertEqual(result["usageType"], "residential")
-        self.assertEqual(result["threatScore"], 0)
 
     def test_non_dict_traits_do_not_crash(self):
         record = dict(self.GEOLITE2_RECORD, traits="corrupted")
@@ -991,7 +983,8 @@ class MaxMindUsageTypeTests(TestCase):
     def test_geolite2_row_does_not_raise_aggregate_score(self):
         maxmind_row = adapt_maxmind(dict(self.GEOLITE2_RECORD), True, 200)
         aggregated = views.aggregate_intelligence_metrics("1.2.3.4", [maxmind_row])
-        self.assertEqual(aggregated["comprehensiveScore"], 0)
+        self.assertFalse(aggregated["isMajorityProxyVpn"])
+        self.assertEqual(aggregated["arbitrationTier"], "neutral")
         self.assertNotIn("Hosting", aggregated["arbitrationVerdict"])
 
 
@@ -1019,7 +1012,6 @@ class AggregationAndCacheIntegrityTests(TestCase):
                 "location": "United States",
                 "usageType": "hosting",
                 "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                "threatScore": 10,
                 "countryCode": "US",
                 "rawJson": {"ip": "1.1.1.1"},
             },
@@ -1033,7 +1025,6 @@ class AggregationAndCacheIntegrityTests(TestCase):
                 "location": "United States",
                 "usageType": "isp",
                 "securityFlags": [{"label": "Proxy", "isHighRisk": True}],
-                "threatScore": 30,
                 "countryCode": "US",
                 "rawJson": {"ip": "1.1.1.1"},
             },
@@ -1045,14 +1036,11 @@ class AggregationAndCacheIntegrityTests(TestCase):
         # Verify caller input structures were not modified in place
         self.assertEqual(input_rows, snapshot)
         self.assertEqual(input_rows[0]["securityFlags"], [{"label": "No Flags", "isHighRisk": False}])
-        self.assertEqual(input_rows[0]["threatScore"], 10)
-        self.assertEqual(input_rows[1]["threatScore"], 30)
 
-        # Verify returned copy carries the normalized scores and flags
+        # Verify returned copy normalizes hosting flags without mutating inputs
         out_rows = {row["provider"]: row for row in aggregated["results"]}
         self.assertEqual(out_rows["IPData"]["securityFlags"], [{"label": "Hosting", "isHighRisk": True}])
-        self.assertEqual(out_rows["IPData"]["threatScore"], 50)
-        self.assertEqual(out_rows["IPRegistry"]["threatScore"], 80)
+        self.assertEqual(out_rows["IPRegistry"]["securityFlags"], [{"label": "Proxy", "isHighRisk": True}])
 
     @patch("dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock)
     @patch("detector.views.query_maxmind", new_callable=AsyncMock)
@@ -1092,7 +1080,6 @@ class AggregationAndCacheIntegrityTests(TestCase):
                         "location": "United States",
                         "usageType": "isp",
                         "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                        "threatScore": 0,
                         "countryCode": "US",
                         "rawJson": {},
                     },
@@ -1123,7 +1110,7 @@ class AggregationAndCacheIntegrityTests(TestCase):
         self.assertEqual(payload["cacheMeta"]["hitCount"], 17)
         self.assertEqual(payload["cacheMeta"]["cachedAt"], "2026-11-13T08:00:00+00:00")
         self.assertEqual(payload["ptrHostname"], "dns.google")
-        self.assertEqual(payload["comprehensiveScore"], 0)
+        self.assertEqual(payload["arbitrationTier"], "success")
         mock_async_client_cls.assert_not_called()
         mock_dns_resolve.assert_not_called()
         mock_mm.assert_not_called()
@@ -1207,7 +1194,6 @@ class AggregationAndCacheIntegrityTests(TestCase):
                 "location": "United States",
                 "usageType": "isp",
                 "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                "threatScore": 0,
                 "countryCode": "US",
                 "rawJson": {},
             }
@@ -1301,7 +1287,6 @@ class AggregationAndCacheIntegrityTests(TestCase):
                 "location": "United States",
                 "usageType": "isp",
                 "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                "threatScore": 0,
                 "countryCode": "US",
                 "rawJson": {},
             }
@@ -1680,7 +1665,6 @@ class IpCanonicalizationAndSecurityBaselineTests(TestCase):
                 "location": "United States",
                 "usageType": "isp",
                 "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                "threatScore": 0,
                 "countryCode": "US",
                 "rawJson": {},
             }
@@ -1947,7 +1931,6 @@ class ReverseDnsAndCidrAttributionTests(TestCase):
                 "location": "United States",
                 "usageType": "isp",
                 "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                "threatScore": 0,
                 "countryCode": "US",
                 "rawJson": {},
             }
@@ -2079,7 +2062,6 @@ class DetectEndpointRoutingAndValidationTests(TestCase):
                 "location": "-",
                 "usageType": "-",
                 "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                "threatScore": None,
                 "rawJson": {"status": "error", "message": "API key not configured"},
             }
 
@@ -2110,7 +2092,7 @@ class DetectEndpointRoutingAndValidationTests(TestCase):
         data_legacy = response_legacy.json()
 
         self.assertEqual(data_canonical["ip"], data_legacy["ip"])
-        self.assertEqual(data_canonical["comprehensiveScore"], data_legacy["comprehensiveScore"])
+        self.assertEqual(data_canonical["arbitrationVerdict"], data_legacy["arbitrationVerdict"])
         self.assertEqual(data_canonical["recommendedCidr"], data_legacy["recommendedCidr"])
         self.assertEqual(len(data_canonical["results"]), len(data_legacy["results"]))
 
@@ -2155,7 +2137,6 @@ class DetectEndpointRoutingAndValidationTests(TestCase):
                 "location": "-",
                 "usageType": "-",
                 "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                "threatScore": None,
                 "rawJson": {"status": "error", "message": "API key not configured"},
             }
 
@@ -2343,7 +2324,6 @@ class GadgetTokenAndCorsAuthTests(TestCase):
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "rawJson": {"status": "error", "message": "API key not configured"},
         }
 
@@ -3496,7 +3476,6 @@ class SingleflightCoalescingTests(TestCase):
                     "location": "United States",
                     "usageType": "isp",
                     "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                    "threatScore": 0,
                     "countryCode": "US",
                     "rawJson": {},
                 }
@@ -3569,7 +3548,6 @@ class SingleflightCoalescingTests(TestCase):
                     "location": "United States",
                     "usageType": "isp",
                     "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                    "threatScore": 0,
                     "countryCode": "US",
                     "rawJson": {},
                 }
@@ -3750,7 +3728,6 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
                     "location": "United States",
                     "usageType": "cdn",
                     "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                    "threatScore": 0,
                     "countryCode": "US",
                     "rawJson": {},
                 },
@@ -4002,7 +3979,6 @@ class AsyncDnsAndDnsblTests(TestCase):
         self.assertEqual(sbl_row["status"], "200 OK")
         self.assertTrue(sbl_row["isListed"])
         self.assertIn("SBL", sbl_row["usageType"])
-        self.assertGreaterEqual(sbl_row["threatScore"], 75)
         self.assertTrue(any(flag["isHighRisk"] and "SBL" in flag["label"] for flag in sbl_row["securityFlags"]))
 
         with patch(
@@ -4015,7 +3991,8 @@ class AsyncDnsAndDnsblTests(TestCase):
         self.assertTrue(combo_row["isListed"])
         self.assertIn("CSS", combo_row["usageType"])
         self.assertIn("XBL/CBL", combo_row["usageType"])
-        self.assertEqual(combo_row["threatScore"], 85)
+        self.assertTrue(any(flag["isHighRisk"] and "CSS" in flag["label"] for flag in combo_row["securityFlags"]))
+        self.assertTrue(any(flag["isHighRisk"] and "XBL" in flag["label"] for flag in combo_row["securityFlags"]))
 
         for pbl_code in ("127.0.0.10", "127.0.0.11"):
             with self.subTest(pbl_code=pbl_code):
@@ -4028,7 +4005,6 @@ class AsyncDnsAndDnsblTests(TestCase):
                 self.assertEqual(pbl_row["status"], "200 OK")
                 self.assertTrue(pbl_row["isPolicyRange"])
                 self.assertIn("Policy/Dynamic ISP Range", pbl_row["usageType"])
-                self.assertEqual(pbl_row["threatScore"], 0)
                 self.assertFalse(any(flag["isHighRisk"] for flag in pbl_row["securityFlags"]))
 
         for restricted_code in ("127.255.255.254", "127.255.255.255"):
@@ -4043,7 +4019,6 @@ class AsyncDnsAndDnsblTests(TestCase):
                 self.assertTrue(blocked_row.get("isQueryRestricted"))
                 self.assertEqual(blocked_row["statusCode"], 429)
                 self.assertEqual(blocked_row["status"], "429 Query Blocked")
-                self.assertIsNone(blocked_row["threatScore"])
                 self.assertIn(restricted_code, blocked_row["usageType"])
                 self.assertFalse(any(flag["isHighRisk"] for flag in blocked_row["securityFlags"]))
 
@@ -4056,7 +4031,6 @@ class AsyncDnsAndDnsblTests(TestCase):
         self.assertEqual(clean_row["status"], "200 OK")
         self.assertFalse(clean_row["isListed"])
         self.assertEqual(clean_row["usageType"], "Clean (Not Listed)")
-        self.assertEqual(clean_row["threatScore"], 0)
 
     async def test_spamcop_listed_and_nxdomain_clean(self):
         with patch(
@@ -4189,7 +4163,6 @@ class AsyncDnsAndDnsblTests(TestCase):
                 "location": "United States",
                 "usageType": "isp",
                 "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                "threatScore": 0,
                 "countryCode": "US",
                 "rawJson": {},
             }
@@ -4248,7 +4221,7 @@ class AsyncDnsAndDnsblTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         payload = resp.json()
         self.assertEqual(payload["arbitrationVerdict"], "Clean Residential / Direct (0/8 Sources)")
-        self.assertEqual(payload["comprehensiveScore"], 0)
+        self.assertEqual(payload["arbitrationTier"], "success")
 
         rows = {row["provider"]: row for row in payload["results"]}
         self.assertTrue(rows["Spamhaus ZEN"]["isListed"])
@@ -4336,7 +4309,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         self.assertEqual(result["status"], "200 OK")
         self.assertEqual(result["port"], 1080)
         self.assertEqual(result["lastSeen"], "2 hours ago")
-        self.assertEqual(result["threatScore"], 82)
+        self.assertEqual(result["riskScore"], 82)
 
         unix_adapted = adapt_proxycheck(
             {
@@ -4374,7 +4347,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         self.assertTrue(exit_res["torIsExit"])
         self.assertTrue(exit_res["torRunning"])
         self.assertEqual(exit_res["torLabel"], "Tor Exit")
-        self.assertEqual(exit_res["threatScore"], 90)
+        self.assertTrue(any(flag["isHighRisk"] for flag in exit_res["securityFlags"]))
         self.assertIn("Exit", exit_res["torFlags"])
 
         guard_v6 = adapt_tor_onionoo(
@@ -4405,7 +4378,6 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
             ip="185.220.101.4",
         )
         self.assertFalse(prefix_miss["isTor"])
-        self.assertEqual(prefix_miss["threatScore"], 0)
 
         offline_relay = adapt_tor_onionoo(
             {
@@ -4485,7 +4457,6 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         )
         self.assertFalse(clean["appears"])
         self.assertEqual(clean["frequency"], 0)
-        self.assertEqual(clean["threatScore"], 0)
 
         api_err = adapt_stopforumspam({"success": 0, "error": "rate limit"}, status_code=200)
         self.assertEqual(api_err["status"], "400 Error")
@@ -4529,7 +4500,6 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         self.assertIsNone(listed.get("countryCode"))
 
         clean = adapt_dshield({"ip": {"attacks": 0, "count": 0, "threatfeeds": []}}, status_code=200)
-        self.assertEqual(clean["threatScore"], 0)
         self.assertEqual(clean["usageType"], "Clean (No Activity)")
 
         captured = {}
@@ -4716,7 +4686,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         self.assertFalse(payload["is_broadcast_ip"])
         self.assertFalse(payload["isMajorityProxyVpn"])
         self.assertEqual(payload["arbitrationVerdict"], "Clean Residential / Direct (0/8 Sources)")
-        self.assertEqual(payload["comprehensiveScore"], 0)
+        self.assertEqual(payload["arbitrationTier"], "success")
 
         rows = {row["provider"]: row for row in payload["results"]}
         self.assertNotIn("Tor Onionoo", rows)
@@ -4745,7 +4715,6 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         self.assertTrue(tor_payload["torRunning"])
         self.assertEqual(tor_payload["torLabel"], "Tor Exit")
         self.assertIn("Exit", tor_payload["torFlags"])
-        self.assertGreaterEqual(tor_payload["comprehensiveScore"], 90)
         self.assertEqual(tor_payload["arbitrationTier"], "destructive")
         self.assertIn("Tor Exit", tor_payload["arbitrationVerdict"])
         self.assertNotIn("Tor Onionoo", {row["provider"] for row in tor_payload["results"]})
@@ -5010,7 +4979,6 @@ class RedisDegradationAndOAuthFallbackTests(TestCase):
                 "location": "United States",
                 "usageType": "isp",
                 "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                "threatScore": 0,
                 "countryCode": "US",
                 "rawJson": {},
             }
@@ -5620,7 +5588,7 @@ class CommercialProviderMetadataAdapterTests(SimpleTestCase):
         relay_row = adapt_ipdata(
             {
                 "ip": "172.224.224.1",
-                "threat": {"is_icloud_relay": True, "scores": {"threat_score": 12}},
+                "threat": {"is_icloud_relay": True},
                 "carrier": {"name": "T-Mobile USA"},
                 "country_name": "United States",
                 "country_code": "US",
@@ -5630,7 +5598,6 @@ class CommercialProviderMetadataAdapterTests(SimpleTestCase):
         self.assertEqual(relay_row["carrier"], "T-Mobile USA")
         self.assertEqual(relay_row["usageType"], "mobile")
         self.assertEqual(relay_row["isp"], "T-Mobile USA")
-        self.assertGreaterEqual(relay_row["threatScore"], 80)
         self.assertIn({"label": "iCloud Private Relay", "isHighRisk": True}, relay_row["securityFlags"])
 
         # Explicit company type takes precedence over carrier fallback and ignores malformed nested objects
@@ -5658,7 +5625,6 @@ class CommercialProviderMetadataAdapterTests(SimpleTestCase):
         )
         self.assertTrue(mobile_row["isMobile"])
         self.assertEqual(mobile_row["usageType"], "mobile")
-        self.assertEqual(mobile_row["threatScore"], 75)
         self.assertIn({"label": "Relay", "isHighRisk": True}, mobile_row["securityFlags"])
         self.assertIn({"label": "Known Abuser", "isHighRisk": True}, mobile_row["securityFlags"])
 
@@ -5670,7 +5636,8 @@ class CommercialProviderMetadataAdapterTests(SimpleTestCase):
             has_api_key=True,
         )
         self.assertFalse(hosting_row["isMobile"])
-        self.assertEqual(hosting_row["threatScore"], 100)
+        self.assertIn({"label": "Relay", "isHighRisk": True}, hosting_row["securityFlags"])
+        self.assertIn({"label": "Known Abuser", "isHighRisk": True}, hosting_row["securityFlags"])
 
     def test_ip2location_extracts_mobile_brand_and_ignores_dash(self):
         mobile_row = adapt_ip2location(
@@ -5902,7 +5869,6 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
                     ip="54.239.28.85",
                 )
                 self.assertEqual(cloud_enriched["usageType"], "hosting")
-                self.assertGreaterEqual(cloud_enriched["threatScore"], 50)
                 self.assertEqual(cloud_enriched["cloudProvider"], "Amazon AWS")
                 self.assertEqual(cloud_enriched["cloudCidr"], "54.239.28.64/26")
                 self.assertEqual(cloud_enriched["cloudPrefixLength"], 26)
@@ -5922,7 +5888,6 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
                     ip="159.89.10.1",
                 )
                 self.assertEqual(explicit_geoip2["usageType"], "residential")
-                self.assertEqual(explicit_geoip2["threatScore"], 0)
                 self.assertEqual(explicit_geoip2["securityFlags"], [{"label": "No Flags", "isHighRisk": False}])
 
     def test_compute_cidr_attribution_uses_cloud_prefix_rules(self):
@@ -6017,8 +5982,6 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
                 self.assertEqual(aggregated["cloudCidr"], "54.239.28.64/26")
                 self.assertEqual(aggregated["cloudProvider"], "Amazon AWS")
                 self.assertIn("Amazon AWS cloud prefix /26", aggregated["cidrNote"])
-                self.assertEqual(relay_row["threatScore"], 75)
-                self.assertEqual(aggregated["results"][1]["threatScore"], 80)
                 self.assertEqual(aggregated["arbitrationVerdict"], "Confirmed Proxy / VPN (1/1 Sources)")
                 self.assertEqual(aggregated["arbitrationTier"], "destructive")
 
@@ -6312,7 +6275,6 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
                 "location": "China",
                 "usageType": "isp",
                 "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                "threatScore": 0,
                 "countryCode": "CN",
                 "rawJson": {"country": {"iso_code": "CN"}},
             }
@@ -6388,3 +6350,64 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         self.assertEqual(city_reader.get.call_count, 1)
         mock_async_client_cls.assert_not_called()
         mock_dns_resolve.assert_not_called()
+
+
+class FlagBasedArbitrationTests(SimpleTestCase):
+    """Tests for flag and Proxycheck risk arbitrage."""
+
+    @staticmethod
+    def _clean_row(provider: str) -> dict:
+        return {
+            "provider": provider,
+            "status": "200 OK",
+            "statusCode": 200,
+            "asn": "AS7922",
+            "isp": "Comcast",
+            "organisation": "Comcast",
+            "location": "United States",
+            "usageType": "isp",
+            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
+            "countryCode": "US",
+            "rawJson": {},
+        }
+
+    def test_arbitration_uses_flags_and_proxycheck_risk_score(self):
+        clean_sources = [
+            self._clean_row("IPHunter"),
+            self._clean_row("AbuseIPDB"),
+            self._clean_row("IPData"),
+            self._clean_row("IPRegistry"),
+            self._clean_row("IP2Location"),
+        ]
+
+        # A single hosting tag with no behavioral signal is dismissed as a minor attribute dispute
+        isolated_hosting = self._clean_row("IPHub")
+        isolated_hosting["usageType"] = "hosting"
+        isolated_hosting["securityFlags"] = [{"label": "Hosting", "isHighRisk": True}]
+        outlier_result = views.aggregate_intelligence_metrics("8.8.8.8", [*clean_sources, isolated_hosting])
+        self.assertEqual(outlier_result["arbitrationTier"], "success")
+        self.assertEqual(outlier_result["arbitrationVerdict"], "Clean Residential (1 Minor Attribute Dispute)")
+        self.assertFalse(outlier_result["isMajorityProxyVpn"])
+
+        # Proxycheck riskScore counts as a behavioral signal and prevents outlier dismissal
+        risky_hosting = self._clean_row("Proxycheck")
+        risky_hosting["usageType"] = "hosting"
+        risky_hosting["securityFlags"] = [{"label": "Hosting", "isHighRisk": True}]
+        risky_hosting["riskScore"] = 82
+        disputed_result = views.aggregate_intelligence_metrics("8.8.8.8", [*clean_sources, risky_hosting])
+        self.assertEqual(disputed_result["arbitrationTier"], "warning")
+        self.assertIn("(1/6 Sources)", disputed_result["arbitrationVerdict"])
+        self.assertNotIn("Clean Residential", disputed_result["arbitrationVerdict"])
+
+        # Majority high-risk anonymizer flags trigger the destructive confirmed verdict
+        proxy_rows = [
+            {
+                **self._clean_row(name),
+                "securityFlags": [{"label": "Proxy", "isHighRisk": True}],
+            }
+            for name in ("IPData", "IPRegistry", "Proxycheck")
+        ]
+        confirmed_result = views.aggregate_intelligence_metrics("8.8.8.8", [self._clean_row("IPHub"), *proxy_rows])
+        self.assertTrue(confirmed_result["isMajorityProxyVpn"])
+        self.assertEqual(confirmed_result["arbitrationTier"], "destructive")
+        self.assertIn("Confirmed Proxy", confirmed_result["arbitrationVerdict"])

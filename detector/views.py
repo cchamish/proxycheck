@@ -257,8 +257,6 @@ def _build_non_public_response_payload(
         "arbitrationVerdict": f"Non-Public / Reserved IP ({reason})",
         "arbitrationTier": "neutral",
         "isMajorityProxyVpn": False,
-        "comprehensiveScore": 0,
-        "baseScore": 0,
         "primaryCountry": reason,
         "primaryCoordinates": "N/A",
         "primaryAsn": "-",
@@ -1232,8 +1230,8 @@ def aggregate_intelligence_metrics(
     ptr_hostname: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Computes an independent GetIPIntel prediction, a consensus-verified comprehensive
-    security score with isolated hosting outlier downgrading, and a multi-source arbitration verdict.
+    Computes an independent GetIPIntel prediction, network metadata summary, and a multi-source
+    arbitration verdict with isolated hosting outlier handling.
     """
     valid_country_codes = set()
     valid_asns: List[str] = []
@@ -1254,8 +1252,6 @@ def aggregate_intelligence_metrics(
     }
     positive_proxy_vpn_votes = 0
     total_commercial_responses = 0
-    provider_threat_scores: List[int] = []
-    behavioral_scores: List[int] = []
 
     hosting_source_count = 0
     behavioral_threat_votes = 0
@@ -1354,25 +1350,15 @@ def aggregate_intelligence_metrics(
             if row_is_anonymizer:
                 has_anonymizer_flag = True
 
-            raw_t_score = r.get("threatScore")
-            t_score = int(round(raw_t_score)) if isinstance(raw_t_score, (int, float)) else 0
             explicit_risk = r.get("riskScore")
-            has_explicit_risk = isinstance(explicit_risk, (int, float)) and explicit_risk > 0
+            has_explicit_risk = (
+                isinstance(explicit_risk, (int, float)) and not isinstance(explicit_risk, bool) and explicit_risk > 0
+            )
+            has_row_high_risk_flag = any(f.get("isHighRisk") for f in flags)
 
-            if row_is_anonymizer and t_score < 80:
-                t_score = 80
-            elif row_is_hosting and t_score < 50 and not (p_name == "Proxycheck" and has_explicit_risk):
-                t_score = 50
-            r["threatScore"] = t_score
-
-            effective_provider_score = max(t_score, 50) if row_is_hosting else t_score
-            provider_threat_scores.append(effective_provider_score)
-
-            if row_is_anonymizer or has_explicit_risk or (not row_is_hosting and t_score > 0):
-                behavioral_val = int(round(explicit_risk)) if has_explicit_risk and not row_is_anonymizer else t_score
-                behavioral_scores.append(behavioral_val)
+            if row_is_anonymizer or has_explicit_risk or (not row_is_hosting and has_row_high_risk_flag):
                 behavioral_threat_votes += 1
-            elif not row_is_hosting and t_score == 0:
+            elif not row_is_hosting and not has_row_high_risk_flag:
                 clean_source_count += 1
 
         if p_name in commercial_providers:
@@ -1403,59 +1389,13 @@ def aggregate_intelligence_metrics(
         prediction_label = "Needs Human Review"
         prediction_tier = "neutral"
 
-    max_score = max(provider_threat_scores) if provider_threat_scores else 0
-    max_behavioral_score = max(behavioral_scores) if behavioral_scores else 0
-    risk_source_count = hosting_source_count + behavioral_threat_votes
-
     # Treat a single hosting tag as an outlier when at least five sources report clean residential usage and no behavioral threats exist.
     is_isolated_hosting_outlier = (
         not has_anonymizer_flag
-        and max_behavioral_score == 0
+        and behavioral_threat_votes == 0
         and hosting_source_count == 1
         and (clean_source_count >= 5 or residential_source_count >= 5)
     )
-
-    if risk_source_count == 0 or max_score == 0:
-        base_score = 0
-    elif is_isolated_hosting_outlier:
-        # Downgrade isolated hosting outlier to a minor 8-point attribute dispute (< 20 Low Risk)
-        base_score = 8
-    elif max_behavioral_score >= 75 or risk_source_count >= 2:
-        # Allowed into Moderate/High Risk (>= 40) only when:
-        # a) Confirmed behavioral threat >= 75, OR
-        # b) >= 2 sources cross-verify hosting / datacenter / proxy risk.
-        if len(provider_threat_scores) > 1:
-            others_avg = (sum(provider_threat_scores) - max_score) / float(len(provider_threat_scores) - 1)
-        else:
-            others_avg = float(max_score)
-        weighted_score = 0.6 * float(max_score) + 0.4 * others_avg
-        base_score = int(round(weighted_score))
-
-        if max_score >= 80:
-            peak_floor = max(70, int(round(0.85 * max_score)))
-            base_score = max(base_score, peak_floor)
-        elif max_behavioral_score >= 75:
-            base_score = max(base_score, 60)
-        elif has_datacenter_or_hosting and max_behavioral_score > 0:
-            attr_base = 40 if hosting_source_count == 1 else (45 if hosting_source_count == 2 else 50)
-            combined_attr_behavior = int(round(0.6 * attr_base + 0.4 * max_behavioral_score))
-            base_score = max(base_score, combined_attr_behavior)
-        elif hosting_source_count >= 2:
-            base_score = max(base_score, 45 if hosting_source_count == 2 else 50)
-
-        if has_anonymizer_flag and hosting_source_count >= 1 and base_score < 100:
-            base_score = min(100, base_score + 5)
-    else:
-        # Single uncorroborated source with a score below 75
-        if hosting_source_count == 1 and max_behavioral_score == 0:
-            base_score = 10
-        else:
-            base_score = min(35, int(round(0.5 * max_score)))
-
-    if is_tor and tor_running:
-        base_score = max(base_score, 90 if tor_is_exit else 80)
-
-    final_score = min(base_score + 15, 100) if is_broadcast_ip else min(base_score, 100)
 
     if total_commercial_responses == 0:
         arbitration_verdict = "Direct Connection (No Commercial Threats)"
@@ -1479,7 +1419,7 @@ def aggregate_intelligence_metrics(
         is_majority_proxy_vpn = False
         arbitration_tier = "success"
     elif positive_proxy_vpn_votes > 0:
-        if has_anonymizer_flag and max_behavioral_score >= 75:
+        if has_anonymizer_flag:
             arbitration_verdict = (
                 f"Disputed Proxy / VPN ({positive_proxy_vpn_votes}/{total_commercial_responses} Sources)"
             )
@@ -1542,8 +1482,6 @@ def aggregate_intelligence_metrics(
         "arbitrationVerdict": arbitration_verdict,
         "arbitrationTier": arbitration_tier,
         "isMajorityProxyVpn": is_majority_proxy_vpn,
-        "comprehensiveScore": final_score,
-        "baseScore": base_score,
         "primaryCountry": primary_country,
         "primaryCoordinates": primary_coordinates,
         "primaryAsn": primary_asn,
@@ -1699,7 +1637,6 @@ def _build_cooldown_provider_row(provider_name: str, cooldown_info: Dict[str, An
         "location": "-",
         "usageType": "-",
         "securityFlags": [{"label": "Provider Cooldown", "isHighRisk": False}],
-        "threatScore": None,
         "isCooldown": True,
         "rawJson": _sanitize_payload(
             {
@@ -1723,7 +1660,6 @@ def _build_unhandled_provider_error_row(provider_name: str, safe_message: str) -
         "location": "-",
         "usageType": "-",
         "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-        "threatScore": None,
         "rawJson": {"status": "error", "message": safe_message},
     }
 

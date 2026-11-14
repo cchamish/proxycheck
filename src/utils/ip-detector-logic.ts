@@ -36,7 +36,6 @@ export interface ProviderRawResult {
   location: string;
   usageType: string;
   securityFlags: { label: string; isHighRisk: boolean }[];
-  threatScore: number | null;
   chance?: number | null;
   block?: number | null;
   countryCode?: string;
@@ -106,8 +105,6 @@ export interface DetectionResponse {
   arbitrationVerdict: string;
   arbitrationTier?: string;
   isMajorityProxyVpn: boolean;
-  comprehensiveScore: number;
-  baseScore: number;
   primaryCountry: string;
   primaryCoordinates: string;
   primaryAsn: string;

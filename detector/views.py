@@ -76,6 +76,7 @@ from .oauth import (
     verify_centralauth_userinfo,
 )
 from .quota_telemetry import (
+    REDIS_KEY_NAMESPACE,
     build_dashboard_snapshot,
     check_and_consume_quota,
     extract_upstream_rate_limit,
@@ -1548,11 +1549,11 @@ _PROVIDER_SPECS: Tuple[Tuple[str, str, bool, bool, Callable[[Any, str], Any]], .
 
 
 def _provider_cache_key(provider_key: str, canonical_ip: str) -> str:
-    return f"ipcheck:v2:prov:{provider_key}:{canonical_ip}"
+    return f"{REDIS_KEY_NAMESPACE}:prov:{provider_key}:{canonical_ip}"
 
 
 def _provider_cooldown_key(provider_key: str) -> str:
-    return f"ipcheck:v2:cooldown:{provider_key}"
+    return f"{REDIS_KEY_NAMESPACE}:cooldown:{provider_key}"
 
 
 async def _safe_redis_get(key: str) -> Optional[str]:

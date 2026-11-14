@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 MINUTE_QUOTA_TTL_SECONDS = 120
 DAILY_QUOTA_TTL_SECONDS = 172800
 TELEMETRY_TTL_SECONDS = 7 * 86400
+REDIS_KEY_NAMESPACE = "proxycheck:v1"
 
 VALID_PROVIDER_OUTCOMES = frozenset(
     {
@@ -251,19 +252,19 @@ def is_admin_user(session_user: Any) -> bool:
 
 
 def _quota_minute_key(provider_key: str, now_dt: datetime) -> str:
-    return f"pc:quota:{provider_key}:min:{now_dt.strftime('%Y%m%d%H%M')}"
+    return f"{REDIS_KEY_NAMESPACE}:quota:{provider_key}:min:{now_dt.strftime('%Y%m%d%H%M')}"
 
 
 def _quota_daily_key(provider_key: str, now_dt: datetime) -> str:
-    return f"pc:quota:{provider_key}:day:{now_dt.strftime('%Y%m%d')}"
+    return f"{REDIS_KEY_NAMESPACE}:quota:{provider_key}:day:{now_dt.strftime('%Y%m%d')}"
 
 
 def _provider_telemetry_key(provider_key: str, now_dt: datetime) -> str:
-    return f"pc:telemetry:{provider_key}:day:{now_dt.strftime('%Y%m%d')}"
+    return f"{REDIS_KEY_NAMESPACE}:telemetry:{provider_key}:day:{now_dt.strftime('%Y%m%d')}"
 
 
 def _global_telemetry_key(now_dt: datetime) -> str:
-    return f"pc:telemetry:global:day:{now_dt.strftime('%Y%m%d')}"
+    return f"{REDIS_KEY_NAMESPACE}:telemetry:global:day:{now_dt.strftime('%Y%m%d')}"
 
 
 def _build_blocked_result(

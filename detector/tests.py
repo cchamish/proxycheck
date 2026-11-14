@@ -1067,7 +1067,7 @@ class AggregationAndCacheIntegrityTests(TestCase):
         }
         cache_store = {}
         for provider_key, provider_name in provider_map.items():
-            cache_store[f"ipcheck:v2:prov:{provider_key}:8.8.8.8"] = json.dumps(
+            cache_store[f"proxycheck:v1:prov:{provider_key}:8.8.8.8"] = json.dumps(
                 {
                     "row": {
                         "provider": provider_name,
@@ -1085,7 +1085,7 @@ class AggregationAndCacheIntegrityTests(TestCase):
                     "cachedAt": "2026-11-13T08:00:00+00:00",
                 }
             )
-        cache_store["ipcheck:v2:prov:ptr:8.8.8.8"] = json.dumps(
+        cache_store["proxycheck:v1:prov:ptr:8.8.8.8"] = json.dumps(
             {
                 "hostname": "dns.google",
                 "status": "ok",
@@ -1145,9 +1145,9 @@ class AggregationAndCacheIntegrityTests(TestCase):
 
                 self.assertEqual(response.status_code, 200)
                 written_keys = [c.args[0] for c in mock_redis.set.call_args_list]
-                self.assertFalse(any(k.startswith("ipcheck:v2:prov:") for k in written_keys))
+                self.assertFalse(any(k.startswith("proxycheck:v1:prov:") for k in written_keys))
                 cooldown_calls = [
-                    c for c in mock_redis.set.call_args_list if c.args[0].startswith("ipcheck:v2:cooldown:")
+                    c for c in mock_redis.set.call_args_list if c.args[0].startswith("proxycheck:v1:cooldown:")
                 ]
                 self.assertEqual(len(cooldown_calls), 14)
                 for call_obj in cooldown_calls:
@@ -1239,10 +1239,10 @@ class AggregationAndCacheIntegrityTests(TestCase):
             "iphub",
             "iphunter",
         ):
-            self.assertEqual(ttls_by_key.get(f"ipcheck:v2:prov:{provider_key}:8.8.8.8"), 86400)
+            self.assertEqual(ttls_by_key.get(f"proxycheck:v1:prov:{provider_key}:8.8.8.8"), 86400)
         for dynamic_key in ("ptr", "spamhaus_zen", "spamcop", "tor_onionoo", "stopforumspam", "dshield"):
-            self.assertEqual(ttls_by_key.get(f"ipcheck:v2:prov:{dynamic_key}:8.8.8.8"), 7200)
-        self.assertNotIn("ipcheck:v2:prov:maxmind:8.8.8.8", ttls_by_key)
+            self.assertEqual(ttls_by_key.get(f"proxycheck:v1:prov:{dynamic_key}:8.8.8.8"), 7200)
+        self.assertNotIn("proxycheck:v1:prov:maxmind:8.8.8.8", ttls_by_key)
 
     @patch("dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock)
     @patch("detector.views.query_dshield", new_callable=AsyncMock)
@@ -1310,7 +1310,7 @@ class AggregationAndCacheIntegrityTests(TestCase):
 
         cached_iso = "2026-11-14T06:15:00+00:00"
         cache_store = {
-            "ipcheck:v2:prov:cloudflare_radar:8.8.8.8": json.dumps(
+            "proxycheck:v1:prov:cloudflare_radar:8.8.8.8": json.dumps(
                 {"row": _ok_row("Cloudflare Radar"), "cachedAt": cached_iso}
             )
         }
@@ -1718,11 +1718,11 @@ class IpCanonicalizationAndSecurityBaselineTests(TestCase):
         self.assertEqual(third_payload["ip"], "2001:486:4860::8888")
         self.assertTrue(third_payload["isCached"])
         self.assertEqual(mock_redis.set.call_count, 13)
-        self.assertIn("ipcheck:v2:prov:proxycheck:2001:486:4860::8888", cache_store)
-        self.assertIn("ipcheck:v2:prov:tor_onionoo:2001:486:4860::8888", cache_store)
-        self.assertIn("ipcheck:v2:prov:stopforumspam:2001:486:4860::8888", cache_store)
-        self.assertIn("ipcheck:v2:prov:dshield:2001:486:4860::8888", cache_store)
-        self.assertIn("ipcheck:v2:prov:ptr:2001:486:4860::8888", cache_store)
+        self.assertIn("proxycheck:v1:prov:proxycheck:2001:486:4860::8888", cache_store)
+        self.assertIn("proxycheck:v1:prov:tor_onionoo:2001:486:4860::8888", cache_store)
+        self.assertIn("proxycheck:v1:prov:stopforumspam:2001:486:4860::8888", cache_store)
+        self.assertIn("proxycheck:v1:prov:dshield:2001:486:4860::8888", cache_store)
+        self.assertIn("proxycheck:v1:prov:ptr:2001:486:4860::8888", cache_store)
 
     def test_session_and_security_baseline_settings(self):
         from django.conf import settings as django_settings
@@ -1980,9 +1980,9 @@ class ReverseDnsAndCidrAttributionTests(TestCase):
         timeout_data = timeout_resp.json()
         self.assertIsNone(timeout_data["ptrHostname"])
         self.assertEqual(timeout_data["recommendedCidr"], "8.8.8.0/24")
-        self.assertNotIn("ipcheck:v2:prov:ptr:8.8.8.8", cache_store)
-        self.assertNotIn("ipcheck:v2:cooldown:ptr", cache_store)
-        self.assertEqual(written_ttls.get("ipcheck:v2:prov:cloudflare_radar:8.8.8.8"), 86400)
+        self.assertNotIn("proxycheck:v1:prov:ptr:8.8.8.8", cache_store)
+        self.assertNotIn("proxycheck:v1:cooldown:ptr", cache_store)
+        self.assertEqual(written_ttls.get("proxycheck:v1:prov:cloudflare_radar:8.8.8.8"), 86400)
         self.assertEqual(mock_cf.call_count, 1)
 
         # Subsequent lookup recovers PTR using cached providers without re-querying HTTP APIs
@@ -2003,7 +2003,7 @@ class ReverseDnsAndCidrAttributionTests(TestCase):
         self.assertFalse(ok_data["isCached"])
         self.assertTrue(ok_data["cacheMeta"]["isPartial"])
         self.assertEqual(ok_data["cacheMeta"]["status"], "partial")
-        self.assertEqual(written_ttls.get("ipcheck:v2:prov:ptr:8.8.8.8"), 7200)
+        self.assertEqual(written_ttls.get("proxycheck:v1:prov:ptr:8.8.8.8"), 7200)
         self.assertEqual(mock_cf.call_count, 1)
 
 
@@ -3734,7 +3734,7 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
             }
         )
         cache_store = {
-            "ipcheck:v2:prov:proxycheck:1.1.1.1": historical_proxycheck_1111,
+            "proxycheck:v1:prov:proxycheck:1.1.1.1": historical_proxycheck_1111,
         }
         written_ttls = {}
         requested_urls = []
@@ -3771,10 +3771,10 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
         first_payload = first_resp.json()
         first_rows = {row["provider"]: row for row in first_payload["results"]}
         self.assertEqual(first_rows["Proxycheck"]["statusCode"], 429)
-        self.assertIn("ipcheck:v2:cooldown:proxycheck", cache_store)
-        self.assertEqual(written_ttls["ipcheck:v2:cooldown:proxycheck"], 180)
-        self.assertNotIn("ipcheck:v2:prov:proxycheck:8.8.8.8", cache_store)
-        self.assertEqual(cache_store["ipcheck:v2:prov:proxycheck:1.1.1.1"], historical_proxycheck_1111)
+        self.assertIn("proxycheck:v1:cooldown:proxycheck", cache_store)
+        self.assertEqual(written_ttls["proxycheck:v1:cooldown:proxycheck"], 180)
+        self.assertNotIn("proxycheck:v1:prov:proxycheck:8.8.8.8", cache_store)
+        self.assertEqual(cache_store["proxycheck:v1:prov:proxycheck:1.1.1.1"], historical_proxycheck_1111)
 
         for healthy_key in (
             "cloudflare_radar",
@@ -3786,9 +3786,9 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
             "iphub",
             "iphunter",
         ):
-            self.assertIn(f"ipcheck:v2:prov:{healthy_key}:8.8.8.8", cache_store)
-            self.assertEqual(written_ttls[f"ipcheck:v2:prov:{healthy_key}:8.8.8.8"], 86400)
-        self.assertEqual(written_ttls["ipcheck:v2:prov:ptr:8.8.8.8"], 7200)
+            self.assertIn(f"proxycheck:v1:prov:{healthy_key}:8.8.8.8", cache_store)
+            self.assertEqual(written_ttls[f"proxycheck:v1:prov:{healthy_key}:8.8.8.8"], 86400)
+        self.assertEqual(written_ttls["proxycheck:v1:prov:ptr:8.8.8.8"], 7200)
 
         requested_urls.clear()
         with (
@@ -3803,7 +3803,7 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
         second_rows = {row["provider"]: row for row in second_resp.json()["results"]}
         self.assertTrue(second_rows["Proxycheck"].get("isCooldown"))
         self.assertIn("429 Cooldown", second_rows["Proxycheck"]["status"])
-        self.assertIn("ipcheck:v2:prov:cloudflare_radar:9.9.9.9", cache_store)
+        self.assertIn("proxycheck:v1:prov:cloudflare_radar:9.9.9.9", cache_store)
 
         requested_urls.clear()
         with (
@@ -3864,10 +3864,10 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
             self.assertEqual(views._get_provider_cache_ttl("dnsbl"), 1800)
 
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(written_ttls.get("ipcheck:v2:cooldown:proxycheck"), 120)
-        self.assertNotIn("ipcheck:v2:prov:proxycheck:8.8.8.8", cache_store)
-        self.assertEqual(written_ttls.get("ipcheck:v2:prov:ptr:8.8.8.8"), 1800)
-        self.assertEqual(written_ttls.get("ipcheck:v2:prov:cloudflare_radar:8.8.8.8"), 43200)
+        self.assertEqual(written_ttls.get("proxycheck:v1:cooldown:proxycheck"), 120)
+        self.assertNotIn("proxycheck:v1:prov:proxycheck:8.8.8.8", cache_store)
+        self.assertEqual(written_ttls.get("proxycheck:v1:prov:ptr:8.8.8.8"), 1800)
+        self.assertEqual(written_ttls.get("proxycheck:v1:prov:cloudflare_radar:8.8.8.8"), 43200)
 
 
 class HttpClientLifecycleTests(TestCase):
@@ -4190,8 +4190,8 @@ class AsyncDnsAndDnsblTests(TestCase):
         self.assertIn("SBL (127.0.0.2)", rows["Spamhaus ZEN"]["usageType"])
         self.assertTrue(rows["SpamCop"]["isListed"])
 
-        self.assertEqual(written_ttls.get("ipcheck:v2:prov:spamhaus_zen:1.2.3.4"), 7200)
-        self.assertEqual(written_ttls.get("ipcheck:v2:prov:spamcop:1.2.3.4"), 7200)
+        self.assertEqual(written_ttls.get("proxycheck:v1:prov:spamhaus_zen:1.2.3.4"), 7200)
+        self.assertEqual(written_ttls.get("proxycheck:v1:prov:spamcop:1.2.3.4"), 7200)
 
         cache_store.clear()
         written_ttls.clear()
@@ -4216,9 +4216,9 @@ class AsyncDnsAndDnsblTests(TestCase):
         blocked_rows = {row["provider"]: row for row in blocked_resp.json()["results"]}
         self.assertEqual(blocked_rows["Spamhaus ZEN"]["status"], "429 Query Blocked")
         self.assertFalse(blocked_rows["Spamhaus ZEN"]["isListed"])
-        self.assertNotIn("ipcheck:v2:prov:spamhaus_zen:8.7.6.5", cache_store)
-        self.assertEqual(written_ttls.get("ipcheck:v2:cooldown:spamhaus_zen"), 120)
-        self.assertEqual(written_ttls.get("ipcheck:v2:prov:spamcop:8.7.6.5"), 7200)
+        self.assertNotIn("proxycheck:v1:prov:spamhaus_zen:8.7.6.5", cache_store)
+        self.assertEqual(written_ttls.get("proxycheck:v1:cooldown:spamhaus_zen"), 120)
+        self.assertEqual(written_ttls.get("proxycheck:v1:prov:spamcop:8.7.6.5"), 7200)
 
 
 class OsintFeedsAndProxycheckExtensionsTests(TestCase):
@@ -4654,9 +4654,9 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         self.assertEqual(rows["StopForumSpam"]["lastSeen"], "2026-11-12 09:00:00")
         self.assertEqual(rows["DShield"]["attacks"], 80)
         self.assertEqual(rows["DShield"]["threatfeeds"], ["scanner"])
-        self.assertEqual(written_ttls.get("ipcheck:v2:prov:tor_onionoo:185.220.101.4"), 7200)
-        self.assertEqual(written_ttls.get("ipcheck:v2:prov:stopforumspam:185.220.101.4"), 7200)
-        self.assertEqual(written_ttls.get("ipcheck:v2:prov:dshield:185.220.101.4"), 7200)
+        self.assertEqual(written_ttls.get("proxycheck:v1:prov:tor_onionoo:185.220.101.4"), 7200)
+        self.assertEqual(written_ttls.get("proxycheck:v1:prov:stopforumspam:185.220.101.4"), 7200)
+        self.assertEqual(written_ttls.get("proxycheck:v1:prov:dshield:185.220.101.4"), 7200)
 
         tor_active_mode["enabled"] = True
         with (
@@ -4870,8 +4870,8 @@ class RedisDegradationAndOAuthFallbackTests(TestCase):
                     patch("detector.views.redis_client", mock_redis),
                     self.assertLogs("detector.views", level="WARNING") as captured_logs,
                 ):
-                    cached_value = await views._safe_redis_get("ipcheck:v2:prov:proxycheck:8.8.8.8")
-                    await views._safe_redis_set("ipcheck:v2:prov:proxycheck:8.8.8.8", "{}", ex=60)
+                    cached_value = await views._safe_redis_get("proxycheck:v1:prov:proxycheck:8.8.8.8")
+                    await views._safe_redis_set("proxycheck:v1:prov:proxycheck:8.8.8.8", "{}", ex=60)
 
                 self.assertIsNone(cached_value)
                 log_output = "\n".join(captured_logs.output)
@@ -6236,10 +6236,10 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
                 "countryCode": "CN",
                 "rawJson": {"country": {"iso_code": "CN"}},
             }
-            cache_store[f"ipcheck:v2:prov:{provider_key}:{target_ip}"] = json.dumps(
+            cache_store[f"proxycheck:v1:prov:{provider_key}:{target_ip}"] = json.dumps(
                 {"row": row_payload, "cachedAt": "2026-11-14T08:00:00+00:00"}
             )
-        cache_store[f"ipcheck:v2:prov:ptr:{target_ip}"] = json.dumps(
+        cache_store[f"proxycheck:v1:prov:ptr:{target_ip}"] = json.dumps(
             {"hostname": "example.net", "status": "ok", "cachedAt": "2026-11-14T08:00:00+00:00"}
         )
 
@@ -6297,7 +6297,7 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         self.assertEqual(first_mm["coordinates"], "39.9075, 116.3971")
         self.assertEqual(first_payload["cacheMeta"]["hitCount"], 15)
 
-        cached_mm_wrapper = json.loads(cache_store[f"ipcheck:v2:prov:maxmind:{target_ip}"])
+        cached_mm_wrapper = json.loads(cache_store[f"proxycheck:v1:prov:maxmind:{target_ip}"])
         self.assertTrue(cached_mm_wrapper["cityDbLoaded"])
 
         self.assertEqual(second_resp.status_code, 200)
@@ -6666,11 +6666,11 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         self.assertEqual(guarded_row["rawJson"]["window"], "rpm")
         self.assertEqual(third_rows["Proxycheck"]["status"], "200 OK")
 
-        min_keys = [key for key in fake_redis.strings if key.startswith("pc:quota:getipintel:min:")]
+        min_keys = [key for key in fake_redis.strings if key.startswith("proxycheck:v1:quota:getipintel:min:")]
         self.assertEqual(len(min_keys), 1)
         self.assertEqual(fake_redis.strings[min_keys[0]], "2")
 
-        telemetry_keys = [key for key in fake_redis.hashes if key.startswith("pc:telemetry:getipintel:day:")]
+        telemetry_keys = [key for key in fake_redis.hashes if key.startswith("proxycheck:v1:telemetry:getipintel:day:")]
         self.assertEqual(len(telemetry_keys), 1)
         self.assertEqual(fake_redis.hashes[telemetry_keys[0]].get("ok"), "2")
         self.assertEqual(fake_redis.hashes[telemetry_keys[0]].get("quota_blocked"), "1")
@@ -6711,8 +6711,8 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         self.assertEqual(rows["Proxycheck"]["status"], "Local Quota Guard (1/1 req/day)")
         self.assertEqual(rows["Proxycheck"]["rawJson"]["window"], "rpd")
 
-        min_keys = [key for key in fake_redis.strings if key.startswith("pc:quota:proxycheck:min:")]
-        day_keys = [key for key in fake_redis.strings if key.startswith("pc:quota:proxycheck:day:")]
+        min_keys = [key for key in fake_redis.strings if key.startswith("proxycheck:v1:quota:proxycheck:min:")]
+        day_keys = [key for key in fake_redis.strings if key.startswith("proxycheck:v1:quota:proxycheck:day:")]
         self.assertEqual(fake_redis.strings[min_keys[0]], "1")
         self.assertEqual(fake_redis.strings[day_keys[0]], "1")
 
@@ -6799,8 +6799,8 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         rows = {row["provider"]: row for row in response.json()["results"]}
         self.assertEqual(rows["GetIPIntel"]["status"], "No API Key")
         self.assertEqual(rows["SpamCop"]["status"], "Skipped (IPv6)")
-        self.assertFalse(any(key.startswith("pc:quota:getipintel:") for key in fake_redis.strings))
-        self.assertFalse(any(key.startswith("pc:quota:spamcop:") for key in fake_redis.strings))
+        self.assertFalse(any(key.startswith("proxycheck:v1:quota:getipintel:") for key in fake_redis.strings))
+        self.assertFalse(any(key.startswith("proxycheck:v1:quota:spamcop:") for key in fake_redis.strings))
 
     @override_settings(**TEST_UPSTREAM_SECRETS)
     def test_anonymised_telemetry_records_headers_and_never_stores_ip_or_username(self):
@@ -6853,8 +6853,16 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
 
         serialised_quota_and_telemetry = json.dumps(
             {
-                "strings": {k: v for k, v in fake_redis.strings.items() if k.startswith("pc:")},
-                "hashes": {k: v for k, v in fake_redis.hashes.items() if k.startswith("pc:")},
+                "strings": {
+                    k: v
+                    for k, v in fake_redis.strings.items()
+                    if k.startswith(("proxycheck:v1:quota:", "proxycheck:v1:telemetry:"))
+                },
+                "hashes": {
+                    k: v
+                    for k, v in fake_redis.hashes.items()
+                    if k.startswith(("proxycheck:v1:quota:", "proxycheck:v1:telemetry:"))
+                },
             }
         )
         for sensitive in (
@@ -6868,23 +6876,25 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         ):
             self.assertNotIn(sensitive, serialised_quota_and_telemetry)
 
-        global_key = next(key for key in fake_redis.hashes if key.startswith("pc:telemetry:global:day:"))
+        global_key = next(key for key in fake_redis.hashes if key.startswith("proxycheck:v1:telemetry:global:day:"))
         global_hash = fake_redis.hashes[global_key]
         self.assertEqual(global_hash.get("auth_session"), "2")
         self.assertEqual(global_hash.get("auth_gadget"), "1")
         self.assertEqual(global_hash.get("cache_hit"), "1")
         self.assertEqual(global_hash.get("cache_miss"), "2")
 
-        abuse_key = next(key for key in fake_redis.hashes if key.startswith("pc:telemetry:abuseipdb:day:"))
+        abuse_key = next(key for key in fake_redis.hashes if key.startswith("proxycheck:v1:telemetry:abuseipdb:day:"))
         self.assertEqual(fake_redis.hashes[abuse_key].get("upstream_remaining"), "982")
         self.assertEqual(fake_redis.hashes[abuse_key].get("upstream_limit"), "1000")
         self.assertEqual(fake_redis.hashes[abuse_key].get("ok"), "2")
         self.assertEqual(fake_redis.hashes[abuse_key].get("cache_hit"), "1")
 
-        ipdata_key = next(key for key in fake_redis.hashes if key.startswith("pc:telemetry:ipdata:day:"))
+        ipdata_key = next(key for key in fake_redis.hashes if key.startswith("proxycheck:v1:telemetry:ipdata:day:"))
         self.assertEqual(fake_redis.hashes[ipdata_key].get("upstream_used"), "142")
 
-        ipregistry_key = next(key for key in fake_redis.hashes if key.startswith("pc:telemetry:ipregistry:day:"))
+        ipregistry_key = next(
+            key for key in fake_redis.hashes if key.startswith("proxycheck:v1:telemetry:ipregistry:day:")
+        )
         self.assertEqual(fake_redis.hashes[ipregistry_key].get("upstream_remaining"), "4950")
 
     @override_settings(**TEST_UPSTREAM_SECRETS)
@@ -6920,17 +6930,21 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         self.assertEqual(second_resp.status_code, 200)
         self.assertEqual(second_resp.json()["cacheMeta"]["status"], "partial")
 
-        global_key = next(key for key in fake_redis.hashes if key.startswith("pc:telemetry:global:day:"))
+        global_key = next(key for key in fake_redis.hashes if key.startswith("proxycheck:v1:telemetry:global:day:"))
         self.assertEqual(fake_redis.hashes[global_key].get("cache_miss"), "1")
         self.assertEqual(fake_redis.hashes[global_key].get("cache_partial"), "1")
 
-        abuse_key = next(key for key in fake_redis.hashes if key.startswith("pc:telemetry:abuseipdb:day:"))
+        abuse_key = next(key for key in fake_redis.hashes if key.startswith("proxycheck:v1:telemetry:abuseipdb:day:"))
         self.assertEqual(fake_redis.hashes[abuse_key].get("429"), "1")
 
-        ipregistry_key = next(key for key in fake_redis.hashes if key.startswith("pc:telemetry:ipregistry:day:"))
+        ipregistry_key = next(
+            key for key in fake_redis.hashes if key.startswith("proxycheck:v1:telemetry:ipregistry:day:")
+        )
         self.assertEqual(fake_redis.hashes[ipregistry_key].get("5xx"), "1")
 
-        proxycheck_key = next(key for key in fake_redis.hashes if key.startswith("pc:telemetry:proxycheck:day:"))
+        proxycheck_key = next(
+            key for key in fake_redis.hashes if key.startswith("proxycheck:v1:telemetry:proxycheck:day:")
+        )
         self.assertEqual(fake_redis.hashes[proxycheck_key].get("timeout"), "1")
 
     def test_admin_provider_dashboard_only_honours_allowlisted_wiki_users(self):
@@ -7087,19 +7101,19 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         min_bucket = now_dt.strftime("%Y%m%d%H%M")
         day_bucket = now_dt.strftime("%Y%m%d")
 
-        fake_redis.strings[f"pc:quota:getipintel:min:{min_bucket}"] = "15"
-        fake_redis.strings[f"pc:quota:getipintel:day:{day_bucket}"] = "320"
-        fake_redis.strings["ipcheck:v2:cooldown:ipregistry"] = json.dumps({"reason": "HTTP 429"})
-        fake_redis.ttls["ipcheck:v2:cooldown:ipregistry"] = 95
+        fake_redis.strings[f"proxycheck:v1:quota:getipintel:min:{min_bucket}"] = "15"
+        fake_redis.strings[f"proxycheck:v1:quota:getipintel:day:{day_bucket}"] = "320"
+        fake_redis.strings["proxycheck:v1:cooldown:ipregistry"] = json.dumps({"reason": "HTTP 429"})
+        fake_redis.ttls["proxycheck:v1:cooldown:ipregistry"] = 95
 
-        fake_redis.hashes[f"pc:telemetry:global:day:{day_bucket}"] = {
+        fake_redis.hashes[f"proxycheck:v1:telemetry:global:day:{day_bucket}"] = {
             "auth_session": "7",
             "auth_gadget": "3",
             "cache_hit": "4",
             "cache_partial": "2",
             "cache_miss": "4",
         }
-        fake_redis.hashes[f"pc:telemetry:getipintel:day:{day_bucket}"] = {
+        fake_redis.hashes[f"proxycheck:v1:telemetry:getipintel:day:{day_bucket}"] = {
             "ok": "11",
             "cache_hit": "4",
             "quota_blocked": "2",
@@ -7107,7 +7121,7 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
             "5xx": "0",
             "timeout": "0",
         }
-        fake_redis.hashes[f"pc:telemetry:proxycheck:day:{day_bucket}"] = {
+        fake_redis.hashes[f"proxycheck:v1:telemetry:proxycheck:day:{day_bucket}"] = {
             "ok": "9",
             "cache_hit": "6",
             "upstream_remaining": "991",
@@ -7161,3 +7175,28 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         self.assertEqual(providers["proxycheck"]["upstreamRemaining"], 991)
         self.assertEqual(providers["proxycheck"]["upstreamLimit"], 1000)
         self.assertEqual(providers["proxycheck"]["telemetry"]["cacheHit"], 6)
+
+    def test_redis_key_builders_use_proxycheck_v1_namespace(self):
+        from datetime import datetime, timezone
+
+        from detector import quota_telemetry
+
+        sample_dt = datetime(2026, 11, 15, 10, 30, tzinfo=timezone.utc)
+        self.assertEqual(views._provider_cache_key("proxycheck", "8.8.8.8"), "proxycheck:v1:prov:proxycheck:8.8.8.8")
+        self.assertEqual(views._provider_cooldown_key("proxycheck"), "proxycheck:v1:cooldown:proxycheck")
+        self.assertEqual(
+            quota_telemetry._quota_minute_key("getipintel", sample_dt),
+            "proxycheck:v1:quota:getipintel:min:202611151030",
+        )
+        self.assertEqual(
+            quota_telemetry._quota_daily_key("getipintel", sample_dt),
+            "proxycheck:v1:quota:getipintel:day:20261115",
+        )
+        self.assertEqual(
+            quota_telemetry._provider_telemetry_key("getipintel", sample_dt),
+            "proxycheck:v1:telemetry:getipintel:day:20261115",
+        )
+        self.assertEqual(
+            quota_telemetry._global_telemetry_key(sample_dt),
+            "proxycheck:v1:telemetry:global:day:20261115",
+        )

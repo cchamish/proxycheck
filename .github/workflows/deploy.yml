@@ -6,6 +6,7 @@ on:
       - CI
     branches:
       - main
+      - dev
     types:
       - completed
 
@@ -14,7 +15,7 @@ permissions:
   deployments: write
 
 concurrency:
-  group: toolforge-deploy-main
+  group: toolforge-deploy-${{ github.event.workflow_run.head_branch }}
   cancel-in-progress: false
 
 jobs:
@@ -22,16 +23,16 @@ jobs:
     if: >-
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_branch == 'main' &&
+      (github.event.workflow_run.head_branch == 'main' || github.event.workflow_run.head_branch == 'dev') &&
       github.event.workflow_run.head_repository.full_name == github.repository
     environment:
       name: Toolforge
-      url: https://proxycheck.toolforge.org/
+      url: ${{ github.event.workflow_run.head_branch == 'dev' && 'https://proxycheck-dev.toolforge.org/' || 'https://proxycheck.toolforge.org/' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
-      - name: Verify main branch tip matches CI commit
+      - name: Verify target branch tip matches CI commit
         env:
           REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
           TARGET_BRANCH: ${{ github.event.workflow_run.head_branch }}
@@ -68,6 +69,7 @@ jobs:
           TOOLFORGE_USER: ${{ secrets.TOOLFORGE_USER }}
           TOOLFORGE_HOST: ${{ secrets.TOOLFORGE_HOST }}
           TARGET_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          TOOLFORGE_TOOL: ${{ github.event.workflow_run.head_branch == 'dev' && 'proxycheck-dev' || 'proxycheck' }}
           VITE_GITHUB_REPO: ${{ github.repository }}
           REPO_GIT_URL: ${{ github.server_url }}/${{ github.repository }}.git
         run: |
@@ -75,6 +77,7 @@ jobs:
           VITE_COMMIT_TIMESTAMP="$(TZ=UTC0 LC_ALL=C git log -1 --format=%cd --date='format-local:%H:%M %d %b %Y (UTC)')"
           {
             printf 'target_branch=%q\n' "$TARGET_BRANCH"
+            printf 'toolforge_tool=%q\n' "$TOOLFORGE_TOOL"
             printf 'vite_github_repo=%q\n' "$VITE_GITHUB_REPO"
             printf 'vite_commit_hash=%q\n' "$VITE_COMMIT_HASH"
             printf 'vite_commit_timestamp=%q\n' "$VITE_COMMIT_TIMESTAMP"
@@ -133,7 +136,7 @@ jobs:
               sleep 6
               toolforge webservice status
           EOF
-          } | ssh -i ~/.ssh/id_deploy -o BatchMode=yes -o StrictHostKeyChecking=yes "${TOOLFORGE_USER}@${TOOLFORGE_HOST}" "become proxycheck bash -s"
+          } | ssh -i ~/.ssh/id_deploy -o BatchMode=yes -o StrictHostKeyChecking=yes "${TOOLFORGE_USER}@${TOOLFORGE_HOST}" "become $TOOLFORGE_TOOL bash -s"
 
       - name: Clean up SSH credentials
         if: always()

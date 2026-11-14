@@ -84,6 +84,16 @@ jobs:
             cat << 'EOF'
               set -euo pipefail
 
+              for _ in {1..30}; do
+                current_status="$(toolforge build show 2>/dev/null | awk -F': ' '/^[[:space:]]*Status:/ {print tolower($2)}' || true)"
+                if [[ "$current_status" == "running" || "$current_status" == "pending" ]]; then
+                  echo "Previous build is still $current_status, waiting 10s..."
+                  sleep 10
+                else
+                  break
+                fi
+              done
+
               echo "Building ASGI container image via Toolforge Build Service"
               build_output="$(mktemp)"
               if toolforge build start \
@@ -95,36 +105,46 @@ jobs:
                 rm -f "$build_output"
               else
                 if ! grep -Eiq 'BuildClientError: Error getting the logs|container .* is not available' "$build_output"; then
-                  echo "Toolforge build failed before a recoverable log-read error:"
-                  cat "$build_output"
-                  rm -f "$build_output"
-                  exit 1
-                fi
-                echo "Build start returned an error; checking the existing build before failing."
-                build_recovered=false
-                for wait_seconds in 15 30; do
-                  sleep "$wait_seconds"
-                  if ! build_status="$(toolforge build show 2>&1)"; then
-                    echo "Unable to query the build status yet:"
-                    echo "$build_status"
-                    continue
-                  fi
-                  echo "$build_status"
-                  if grep -Eiq 'succeeded|success' <<< "$build_status"; then
-                    build_recovered=true
-                    break
-                  fi
-                  if grep -Eiq 'failed|error|cancelled' <<< "$build_status"; then
-                    break
-                  fi
-                done
-                if [[ "$build_recovered" != true ]]; then
-                  echo "Toolforge build did not reach a successful state."
-                  cat "$build_output"
+                  echo "Toolforge build failed before a recoverable log-read error."
                   rm -f "$build_output"
                   exit 1
                 fi
                 rm -f "$build_output"
+
+                echo "Build log stream disconnected early; polling 'toolforge build show' until completion..."
+                build_recovered=false
+                for attempt in {1..30}; do
+                  sleep 10
+                  if ! build_status="$(toolforge build show 2>&1)"; then
+                    echo "[$attempt/30] Unable to query build status yet, retrying..."
+                    continue
+                  fi
+
+                  if ! grep -Fq "VITE_COMMIT_HASH=$vite_commit_hash" <<< "$build_status"; then
+                    echo "[$attempt/30] Waiting for build of commit $vite_commit_hash to register..."
+                    continue
+                  fi
+
+                  status_val="$(awk -F': ' '/^[[:space:]]*Status:/ {print tolower($2); exit}' <<< "$build_status")"
+                  echo "[$attempt/30] Current build status: ${status_val:-unknown}"
+
+                  case "$status_val" in
+                    ok|succeeded|success)
+                      echo "$build_status"
+                      build_recovered=true
+                      break
+                      ;;
+                    failed|error|cancelled|aborted)
+                      echo "$build_status"
+                      break
+                      ;;
+                  esac
+                done
+
+                if [[ "$build_recovered" != true ]]; then
+                  echo "Toolforge build did not reach a successful state."
+                  exit 1
+                fi
               fi
 
               echo "Restarting Build Service web service and verifying status"

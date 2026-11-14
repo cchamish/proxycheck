@@ -504,3 +504,10 @@ test('Detection coordinator skips onDetectionSuccess when HTTP 401 expires sessi
   await coordinator.executeDetection('8.8.8.8');
   assert.equal(called, false);
 });
+
+test('Comparison table renders simplified LOCATION header without coordinates suffix', () => {
+  const appVue = fs.readFileSync(path.resolve(process.cwd(), 'src/App.vue'), 'utf8');
+  assert.match(appVue, /<th scope="col">LOCATION<\/th>/);
+  assert.doesNotMatch(appVue, /LOCATION\s*(?:&amp;|&)\s*COORDINATES/i);
+});
+

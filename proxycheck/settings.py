@@ -302,24 +302,19 @@ def resolve_mmdb_file(
     *,
     default_missing: Optional[str] = None,
 ) -> str:
-    """Finds an MMDB file across configured, workspace, and Toolforge data paths."""
+    """Resolves an MMDB file from a configured directory or standard data locations."""
+    if configured_path:
+        configured = Path(configured_path)
+        if configured.is_file():
+            return str(configured)
+        return str(configured / filename)
+
+    fallback = default_missing if default_missing is not None else str(Path(str(base_dir)).parent / "data" / filename)
     return resolve_data_file(
-        configured_path,
-        filename,
-        base_dir,
-        default_missing=default_missing,
-    )
-
-
-def _resolve_mmdb_path(env_var_name: str, filename: str) -> str:
-    custom_path = os.environ.get(env_var_name, "").strip()
-    if custom_path:
-        return custom_path
-    return resolve_mmdb_file(
         "",
         filename,
-        BASE_DIR,
-        default_missing=str(BASE_DIR.parent / "data" / filename),
+        base_dir,
+        default_missing=fallback,
     )
 
 
@@ -335,8 +330,10 @@ def _resolve_optional_data_path(env_var_name: str, filenames: str | tuple[str, .
     return str(BASE_DIR.parent / "data" / candidate_names[0])
 
 
-MAXMIND_COUNTRY_DB_PATH = _resolve_mmdb_path("MAXMIND_COUNTRY_DB_PATH", "GeoLite2-Country.mmdb")
-MAXMIND_ASN_DB_PATH = _resolve_mmdb_path("MAXMIND_ASN_DB_PATH", "GeoLite2-ASN.mmdb")
+MAXMIND_COUNTRY_DB_FILENAME = "GeoLite2-Country.mmdb"
+MAXMIND_CITY_DB_FILENAME = "GeoLite2-City.mmdb"
+MAXMIND_ASN_DB_FILENAME = "GeoLite2-ASN.mmdb"
+MAXMIND_DB_DIR = os.environ.get("MAXMIND_DB_DIR", "").strip()
 CLOUD_CIDR_DB_PATH = _resolve_optional_data_path("CLOUD_CIDR_DB_PATH", ("cloud_cidrs.json", "computehosts.json"))
 HOSTING_ASN_RULES_PATH = _resolve_optional_data_path("HOSTING_ASN_RULES_PATH", "hosting_asn_rules.json")
 HOSTING_ASNS = _parse_csv_env("HOSTING_ASNS")

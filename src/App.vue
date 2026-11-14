@@ -281,7 +281,7 @@
                 <th scope="col">PROVIDER</th>
                 <th scope="col" style="width: 120px;">ASN</th>
                 <th scope="col">ISP / ORGANISATION</th>
-                <th scope="col">LOCATION &amp; COORDINATES</th>
+                <th scope="col">LOCATION</th>
                 <th scope="col">USAGE TYPE</th>
                 <th scope="col">SECURITY FLAGS</th>
                 <th scope="col">THREAT SCORE</th>

@@ -1384,6 +1384,39 @@ def adapt_ip2location(raw_data: Optional[Dict[str, Any]], has_api_key: bool, sta
     }
 
 
+def _extract_maxmind_name(node: Any) -> str:
+    """Extracts an English display name from a GeoLite2 or GeoIP2 field value."""
+    if isinstance(node, dict):
+        names = node.get("names")
+        if isinstance(names, dict):
+            en_name = names.get("en")
+            if isinstance(en_name, str) and en_name.strip():
+                return en_name.strip()
+        direct_name = node.get("name")
+        if isinstance(direct_name, str) and direct_name.strip():
+            return direct_name.strip()
+    elif isinstance(node, str) and node.strip():
+        return node.strip()
+    return ""
+
+
+def _extract_maxmind_subdivision(raw_subdivisions: Any) -> str:
+    """Extracts the primary administrative subdivision name or code from MaxMind records."""
+    if isinstance(raw_subdivisions, (list, tuple)):
+        for entry in raw_subdivisions:
+            name = _extract_maxmind_name(entry)
+            if name:
+                return name
+            if isinstance(entry, dict):
+                iso_code = entry.get("iso_code")
+                if isinstance(iso_code, str) and iso_code.strip():
+                    return iso_code.strip()
+        return ""
+    if isinstance(raw_subdivisions, dict):
+        return _extract_maxmind_name(raw_subdivisions)
+    return ""
+
+
 def adapt_maxmind(
     raw_data: Optional[Dict[str, Any]],
     has_db: bool = True,
@@ -1391,7 +1424,7 @@ def adapt_maxmind(
     *,
     ip: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Normalizes combined GeoLite2 and GeoIP2 Country and ASN MMDB records."""
+    """Normalizes combined GeoLite2 and GeoIP2 Country, City, and ASN MMDB records."""
     if not has_db:
         return {
             "provider": "MaxMind",
@@ -1428,25 +1461,42 @@ def adapt_maxmind(
     org_name = raw_data.get("autonomous_system_organization") or raw_data.get("as") or raw_data.get("isp") or "-"
 
     country_obj = raw_data.get("country") or {}
-    country_name = ""
+    country_name = _extract_maxmind_name(country_obj)
     country_code = ""
     if isinstance(country_obj, dict):
-        country_name = (country_obj.get("names") or {}).get("en") or country_obj.get("name") or ""
-        country_code = (country_obj.get("iso_code") or "").upper()
-    elif isinstance(country_obj, str):
-        country_name = country_obj
+        raw_iso = country_obj.get("iso_code")
+        if isinstance(raw_iso, str) and raw_iso.strip():
+            country_code = raw_iso.strip().upper()
 
     if not country_code and raw_data.get("country_code"):
-        country_code = str(raw_data.get("country_code")).upper()
+        country_code = str(raw_data.get("country_code")).strip().upper()
+
+    subdivision_name = _extract_maxmind_subdivision(raw_data.get("subdivisions") or raw_data.get("subdivision"))
+    city_name = _extract_maxmind_name(raw_data.get("city"))
 
     loc_obj = raw_data.get("location") or {}
     lat = loc_obj.get("latitude") if isinstance(loc_obj, dict) else None
     lon = loc_obj.get("longitude") if isinstance(loc_obj, dict) else None
-    coords = f"{lat}, {lon}" if lat is not None and lon is not None else None
+    has_coords = (
+        lat is not None
+        and lon is not None
+        and not isinstance(lat, bool)
+        and not isinstance(lon, bool)
+        and str(lat).strip() != ""
+        and str(lon).strip() != ""
+    )
+    coords = f"{lat}, {lon}" if has_coords else None
 
-    loc_str = country_name or "-"
+    loc_parts: List[str] = []
+    seen_parts = set()
+    for part in (city_name, subdivision_name, country_name):
+        if part and part.lower() not in seen_parts:
+            loc_parts.append(part)
+            seen_parts.add(part.lower())
+
+    loc_str = ", ".join(loc_parts) if loc_parts else "-"
     if coords:
-        loc_str += f" ({coords})"
+        loc_str = f"{loc_str} ({coords})" if loc_parts else f"Unknown ({coords})"
 
     traits = raw_data.get("traits")
     if not isinstance(traits, dict):

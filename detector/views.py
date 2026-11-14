@@ -33,7 +33,12 @@ from django.core import signing
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
-from proxycheck.settings import resolve_mmdb_file
+from proxycheck.settings import (
+    MAXMIND_ASN_DB_FILENAME,
+    MAXMIND_CITY_DB_FILENAME,
+    MAXMIND_COUNTRY_DB_FILENAME,
+    resolve_mmdb_file,
+)
 
 from .adapters import (
     adapt_abuseipdb,
@@ -388,6 +393,14 @@ def _evict_maxmind_reader(db_path: str) -> None:
             logger.debug(f"Failed to close MaxMind reader: {exc}")
 
 
+def _evict_missing_maxmind_readers(filename: str, resolved_path: str) -> None:
+    """Evicts cached readers matching a missing MMDB path or filename so deleted files never leak handles."""
+    with _maxmind_lock:
+        stale_keys = [key for key in _maxmind_readers if key == resolved_path or os.path.basename(key) == filename]
+    for key in stale_keys:
+        _evict_maxmind_reader(key)
+
+
 async def _strip_request_cookie_header(request: httpx.Request) -> None:
     request.headers.pop("cookie", None)
 
@@ -502,31 +515,65 @@ def _extract_mmdb_prefix_len(reader: Any, ip: str) -> Optional[int]:
 
 
 def _resolve_db_file(configured_path: str, filename: str, base_dir: Any) -> str:
-    """Finds an existing MMDB database file across configured and conventional locations."""
+    """Finds an MMDB database file across a configured directory or standard data locations."""
     return resolve_mmdb_file(configured_path, filename, base_dir)
+
+
+def _merge_maxmind_dict_field(combined: Dict[str, Any], key: str, value: Any) -> None:
+    """Deep-merges nested MaxMind dictionaries while keeping Country iso_code authoritative."""
+    existing = combined.get(key)
+    if isinstance(existing, dict) and isinstance(value, dict):
+        merged = dict(existing)
+        for sub_key, sub_val in value.items():
+            if sub_key == "names" and isinstance(merged.get("names"), dict) and isinstance(sub_val, dict):
+                merged["names"] = {**merged["names"], **sub_val}
+            elif sub_val is not None:
+                merged[sub_key] = sub_val
+        combined[key] = merged
+    elif value is not None:
+        combined[key] = value
+
+
+def _merge_maxmind_records(
+    country_rec: Optional[Dict[str, Any]],
+    city_rec: Optional[Dict[str, Any]],
+    asn_rec: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Combines Country, City, and ASN MMDB lookups while preserving iso_code consistency."""
+    combined: Dict[str, Any] = {}
+    if isinstance(city_rec, dict):
+        combined.update(city_rec)
+    if isinstance(country_rec, dict):
+        for key, value in country_rec.items():
+            if key in ("country", "registered_country", "represented_country", "continent", "traits"):
+                _merge_maxmind_dict_field(combined, key, value)
+            elif key not in combined and value is not None:
+                combined[key] = value
+    if isinstance(asn_rec, dict):
+        combined.update(asn_rec)
+    return combined
 
 
 def _read_maxmind_sync(ip: str) -> Dict[str, Any]:
     """
-    Reads local GeoLite2 and GeoIP2 Country and ASN MMDB files synchronously.
+    Reads local GeoLite2 and GeoIP2 Country, City, and ASN MMDB files synchronously.
     Offloaded via `asyncio.to_thread` to avoid blocking the ASGI event loop on disk I/O.
     """
     base_dir = getattr(settings, "BASE_DIR", os.getcwd())
-    country_db_path = str(getattr(settings, "MAXMIND_COUNTRY_DB_PATH", os.path.join(base_dir, "GeoLite2-Country.mmdb")))
-    asn_db_path = str(getattr(settings, "MAXMIND_ASN_DB_PATH", os.path.join(base_dir, "GeoLite2-ASN.mmdb")))
+    configured_dir = str(getattr(settings, "MAXMIND_DB_DIR", "") or os.environ.get("MAXMIND_DB_DIR", "")).strip()
+    db_specs = (
+        ("country", MAXMIND_COUNTRY_DB_FILENAME),
+        ("city", MAXMIND_CITY_DB_FILENAME),
+        ("asn", MAXMIND_ASN_DB_FILENAME),
+    )
+    db_paths = {key: _resolve_db_file(configured_dir, filename, base_dir) for key, filename in db_specs}
+    available_paths = {key: path for key, path in db_paths.items() if os.path.exists(path)}
 
-    country_db_path = _resolve_db_file(country_db_path, "GeoLite2-Country.mmdb", base_dir)
-    asn_db_path = _resolve_db_file(asn_db_path, "GeoLite2-ASN.mmdb", base_dir)
+    for key, filename in db_specs:
+        if key not in available_paths:
+            _evict_missing_maxmind_readers(filename, db_paths[key])
 
-    has_country = os.path.exists(country_db_path)
-    has_asn = os.path.exists(asn_db_path)
-
-    if not has_country:
-        _evict_maxmind_reader(country_db_path)
-    if not has_asn:
-        _evict_maxmind_reader(asn_db_path)
-
-    if not has_country and not has_asn:
+    if not available_paths:
         return adapt_maxmind(None, has_db=False)
 
     try:
@@ -535,32 +582,31 @@ def _read_maxmind_sync(ip: str) -> Dict[str, Any]:
         logger.warning("maxminddb package not installed; returning Database Missing fallback")
         return adapt_maxmind(None, has_db=False)
 
-    combined_record: Dict[str, Any] = {}
-    country_prefix_len: Optional[int] = None
-    asn_prefix_len: Optional[int] = None
     try:
-        if has_country:
-            country_reader = _get_maxmind_reader(country_db_path, maxminddb)
-            country_rec = country_reader.get(ip)
-            if isinstance(country_rec, dict):
-                combined_record.update(country_rec)
-            country_prefix_len = _extract_mmdb_prefix_len(country_reader, ip)
+        records: Dict[str, Optional[Dict[str, Any]]] = {}
+        prefix_lens: Dict[str, Optional[int]] = {}
+        for key, path in available_paths.items():
+            reader = _get_maxmind_reader(path, maxminddb)
+            rec = reader.get(ip)
+            records[key] = rec if isinstance(rec, dict) else None
+            prefix_lens[key] = _extract_mmdb_prefix_len(reader, ip)
 
-        if has_asn:
-            asn_reader = _get_maxmind_reader(asn_db_path, maxminddb)
-            asn_rec = asn_reader.get(ip)
-            if isinstance(asn_rec, dict):
-                combined_record.update(asn_rec)
-            asn_prefix_len = _extract_mmdb_prefix_len(asn_reader, ip)
-
-        resolved_prefix_len = asn_prefix_len if asn_prefix_len is not None else country_prefix_len
+        combined_record = _merge_maxmind_records(
+            records.get("country"),
+            records.get("city"),
+            records.get("asn"),
+        )
+        resolved_prefix_len = next(
+            (prefix_lens.get(key) for key in ("asn", "country", "city") if prefix_lens.get(key) is not None),
+            None,
+        )
         if resolved_prefix_len is not None:
             combined_record["_mmdb_prefix_len"] = resolved_prefix_len
 
         return adapt_maxmind(combined_record, has_db=True, status_code=200, ip=ip)
     except Exception as exc:
-        _evict_maxmind_reader(country_db_path)
-        _evict_maxmind_reader(asn_db_path)
+        for path in db_paths.values():
+            _evict_maxmind_reader(path)
         safe_message = _sanitize_error_message(str(exc))
         logger.error(f"Error querying MaxMind local database: {safe_message}")
         return adapt_maxmind({"error": safe_message}, has_db=True, status_code=500)

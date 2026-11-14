@@ -1315,6 +1315,13 @@ class ConnectionAndReaderReuseTests(TestCase):
 
         mock_country_reader = MagicMock()
         mock_country_reader.get.return_value = {"country": {"iso_code": "US", "names": {"en": "United States"}}}
+        mock_city_reader = MagicMock()
+        mock_city_reader.get.return_value = {
+            "country": {"iso_code": "US", "names": {"en": "United States"}},
+            "subdivisions": [{"iso_code": "CA", "names": {"en": "California"}}],
+            "city": {"names": {"en": "Mountain View"}},
+            "location": {"latitude": 37.386, "longitude": -122.0838},
+        }
         mock_asn_reader = MagicMock()
         mock_asn_reader.get.return_value = {
             "autonomous_system_number": 13335,
@@ -1322,8 +1329,11 @@ class ConnectionAndReaderReuseTests(TestCase):
         }
 
         def _fake_open(path):
-            if "country" in str(path).lower():
+            lowered = str(path).lower()
+            if "country" in lowered:
                 return mock_country_reader
+            if "city" in lowered:
+                return mock_city_reader
             return mock_asn_reader
 
         mock_maxmind_module = MagicMock()
@@ -1337,9 +1347,12 @@ class ConnectionAndReaderReuseTests(TestCase):
             res_two = views._read_maxmind_sync("8.8.8.8")
 
         self.assertEqual(res_one["status"], "200 OK")
+        self.assertEqual(res_one["location"], "Mountain View, California, United States (37.386, -122.0838)")
+        self.assertEqual(res_one["countryCode"], "US")
         self.assertEqual(res_two["status"], "200 OK")
-        self.assertEqual(mock_maxmind_module.open_database.call_count, 2)
+        self.assertEqual(mock_maxmind_module.open_database.call_count, 3)
         self.assertEqual(mock_country_reader.get.call_count, 2)
+        self.assertEqual(mock_city_reader.get.call_count, 2)
         self.assertEqual(mock_asn_reader.get.call_count, 2)
 
         # Verify graceful fallback when local MMDB files are absent
@@ -4736,21 +4749,37 @@ class LoopIsolationAndSessionSettingsTests(TestCase):
             env_file.write_text("DJANGO_DEBUG=False\n", encoding="utf-8")
             mmdb_file = data_dir / "GeoLite2-Country.mmdb"
             mmdb_file.write_bytes(b"")
+            city_mmdb_file = data_dir / "GeoLite2-City.mmdb"
+            city_mmdb_file.write_bytes(b"")
 
             resolved_env = _resolve_dotenv_path(Path(tmpdir) / "workspace", str(tool_root))
             self.assertEqual(resolved_env, env_file)
 
             with patch.dict(os.environ, {"TOOL_DATA_DIR": str(tool_root)}):
                 resolved_db = views._resolve_db_file("", "GeoLite2-Country.mmdb", Path(tmpdir) / "workspace")
+                resolved_city_db = views._resolve_db_file("", "GeoLite2-City.mmdb", Path(tmpdir) / "workspace")
             self.assertEqual(resolved_db, str(mmdb_file))
+            self.assertEqual(resolved_city_db, str(city_mmdb_file))
             self.assertEqual(
                 views._resolve_db_file(str(data_dir), "GeoLite2-Country.mmdb", Path(tmpdir) / "workspace"),
                 str(mmdb_file),
             )
             self.assertEqual(
+                views._resolve_db_file(str(data_dir), "GeoLite2-City.mmdb", Path(tmpdir) / "workspace"),
+                str(city_mmdb_file),
+            )
+            self.assertEqual(
                 views._resolve_db_file(str(data_dir), "GeoLite2-ASN.mmdb", Path(tmpdir) / "workspace"),
                 str(data_dir / "GeoLite2-ASN.mmdb"),
             )
+            missing_custom_dir = Path(tmpdir) / "absent_mmdb_dir"
+            with patch.dict(os.environ, {"TOOL_DATA_DIR": str(tool_root)}):
+                self.assertEqual(
+                    views._resolve_db_file(
+                        str(missing_custom_dir), "GeoLite2-Country.mmdb", Path(tmpdir) / "workspace"
+                    ),
+                    str(missing_custom_dir / "GeoLite2-Country.mmdb"),
+                )
 
     def test_procfile_starts_asgi_gunicorn_without_runtime_collectstatic(self):
         from django.conf import settings as django_settings
@@ -5834,8 +5863,7 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
 
             with (
                 override_settings(
-                    MAXMIND_COUNTRY_DB_PATH=str(country_db),
-                    MAXMIND_ASN_DB_PATH=str(asn_db),
+                    MAXMIND_DB_DIR=str(tmpdir),
                     CLOUD_CIDR_DB_PATH=str(cidr_file),
                     HOSTING_ASN_RULES_PATH="",
                     HOSTING_ASNS=(),
@@ -5868,3 +5896,172 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         non_public = views._build_non_public_response_payload("127.0.0.1", "loopback", "Loopback IP", time.monotonic())
         self.assertIsNone(non_public["cloudCidr"])
         self.assertIsNone(non_public["cloudProvider"])
+
+    def _query_mmdb_dir(
+        self,
+        ip: str,
+        db_records: dict[str, tuple[dict, int | None]],
+        *,
+        cidr_path: str = "",
+    ) -> dict:
+        """Creates stub MMDB files in one directory and runs _read_maxmind_sync against fake readers."""
+        views._maxmind_readers.clear()
+        self.addCleanup(views._maxmind_readers.clear)
+        filename_map = {
+            "country": "GeoLite2-Country.mmdb",
+            "city": "GeoLite2-City.mmdb",
+            "asn": "GeoLite2-ASN.mmdb",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            readers_by_path: dict[str, MagicMock] = {}
+            for role, (rec, prefix_len) in db_records.items():
+                db_path = Path(tmpdir) / filename_map[role]
+                db_path.write_bytes(b"stub")
+                reader = MagicMock()
+                reader.get.return_value = rec
+                if prefix_len is not None:
+                    reader.get_with_prefix_len.return_value = (rec, prefix_len)
+                readers_by_path[str(db_path)] = reader
+
+            fake_maxmind_module = MagicMock()
+            fake_maxmind_module.open_database.side_effect = lambda path: readers_by_path[str(path)]
+
+            with (
+                override_settings(
+                    MAXMIND_DB_DIR=str(tmpdir),
+                    CLOUD_CIDR_DB_PATH=cidr_path,
+                    HOSTING_ASN_RULES_PATH="",
+                    HOSTING_ASNS=(),
+                    HOSTING_ORG_KEYWORDS=(),
+                ),
+                patch.dict("sys.modules", {"maxminddb": fake_maxmind_module}),
+            ):
+                return views._read_maxmind_sync(ip)
+
+    def test_adapt_maxmind_city_subdivision_coordinates_and_deduplication(self):
+        us_row = adapt_maxmind(
+            {
+                "country": {"names": {"en": "United States"}, "iso_code": "US"},
+                "subdivisions": [{"names": {"en": "California"}, "iso_code": "CA"}],
+                "city": {"names": {"en": "Mountain View"}},
+                "location": {"latitude": 37.386, "longitude": -122.0838},
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "Google LLC",
+            },
+            has_db=True,
+        )
+        self.assertEqual(us_row["location"], "Mountain View, California, United States (37.386, -122.0838)")
+        self.assertEqual(us_row["coordinates"], "37.386, -122.0838")
+        self.assertEqual(us_row["countryCode"], "US")
+
+        # Duplicate city and subdivision names should collapse cleanly
+        tokyo_row = adapt_maxmind(
+            {
+                "country": {"names": {"en": "Japan"}, "iso_code": "JP"},
+                "subdivisions": [{"names": {"en": "Tokyo"}, "iso_code": "13"}],
+                "city": {"names": {"en": "Tokyo"}},
+                "location": {"latitude": 35.6895, "longitude": 139.6917},
+            },
+            has_db=True,
+        )
+        self.assertEqual(tokyo_row["location"], "Tokyo, Japan (35.6895, 139.6917)")
+
+        # Corrupted subdivisions or missing names still preserve valid country output
+        fallback_row = adapt_maxmind(
+            {
+                "country": {"names": {"en": "Singapore"}, "iso_code": "SG"},
+                "subdivisions": "corrupted",
+                "city": {"names": {"en": "Singapore"}},
+            },
+            has_db=True,
+        )
+        self.assertEqual(fallback_row["location"], "Singapore")
+
+    def test_three_mmdb_collaboration_preserves_country_iso_and_city_fallback_coords(self):
+        # Country DB remains authoritative on iso_code even when City DB omits or differs on country
+        maxmind_row = self._query_mmdb_dir(
+            "8.8.8.8",
+            {
+                "country": ({"country": {"names": {"en": "United States"}, "iso_code": "US"}}, 16),
+                "city": (
+                    {
+                        "country": {"names": {"en": "United States"}, "iso_code": "CA"},
+                        "subdivisions": [{"names": {"en": "Virginia"}, "iso_code": "VA"}],
+                        "city": {"names": {"en": "Ashburn"}},
+                        "location": {"latitude": 39.0438, "longitude": -77.4874},
+                    },
+                    27,
+                ),
+                "asn": (
+                    {
+                        "autonomous_system_number": 15169,
+                        "autonomous_system_organization": "Google LLC",
+                    },
+                    24,
+                ),
+            },
+        )
+        self.assertEqual(maxmind_row["countryCode"], "US")
+        self.assertEqual(maxmind_row["location"], "Ashburn, Virginia, United States (39.0438, -77.4874)")
+        self.assertEqual(maxmind_row["coordinates"], "39.0438, -77.4874")
+        # ASN routing prefix takes precedence over City and Country prefixes
+        self.assertEqual(maxmind_row["prefixLength"], 24)
+
+        consistent_ipdata = adapt_ipdata(
+            {"country_code": "US", "country_name": "United States", "city": "Ashburn", "region": "Virginia"},
+            has_api_key=True,
+        )
+        consistent_agg = views.aggregate_intelligence_metrics("8.8.8.8", [consistent_ipdata, maxmind_row])
+        self.assertFalse(consistent_agg["is_broadcast_ip"])
+        self.assertEqual(consistent_agg["primaryCoordinates"], "39.0438, -77.4874")
+
+        conflicting_abuseipdb = adapt_abuseipdb(
+            {"data": {"countryName": "Germany", "countryCode": "DE", "abuseConfidenceScore": 0}},
+            has_api_key=True,
+        )
+        broadcast_agg = views.aggregate_intelligence_metrics("8.8.8.8", [conflicting_abuseipdb, maxmind_row])
+        self.assertTrue(broadcast_agg["is_broadcast_ip"])
+        self.assertEqual(broadcast_agg["primaryCoordinates"], "39.0438, -77.4874")
+
+    def test_maxmind_db_dir_partial_databases_and_explicit_missing_dir(self):
+        # City and ASN without Country DB still supply country, city, subdivision, and coordinates
+        city_only_country_row = self._query_mmdb_dir(
+            "1.1.1.1",
+            {
+                "city": (
+                    {
+                        "country": {"names": {"en": "Australia"}, "iso_code": "AU"},
+                        "subdivisions": [{"names": {"en": "New South Wales"}, "iso_code": "NSW"}],
+                        "city": {"names": {"en": "Sydney"}},
+                        "location": {"latitude": -33.8688, "longitude": 151.2093},
+                    },
+                    25,
+                ),
+                "asn": (
+                    {
+                        "autonomous_system_number": 13335,
+                        "autonomous_system_organization": "Cloudflare, Inc.",
+                    },
+                    None,
+                ),
+            },
+        )
+        self.assertEqual(city_only_country_row["countryCode"], "AU")
+        self.assertEqual(city_only_country_row["location"], "Sydney, New South Wales, Australia (-33.8688, 151.2093)")
+        self.assertEqual(city_only_country_row["prefixLength"], 25)
+
+        # Explicit empty MAXMIND_DB_DIR does not fall back to unrelated data directories
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tool_root = Path(tmpdir) / "tool"
+            fallback_data = tool_root / "www" / "python" / "data"
+            fallback_data.mkdir(parents=True)
+            (fallback_data / "GeoLite2-Country.mmdb").write_bytes(b"stub")
+            empty_dir = Path(tmpdir) / "empty_mmdb"
+            empty_dir.mkdir()
+
+            with (
+                override_settings(MAXMIND_DB_DIR=str(empty_dir)),
+                patch.dict(os.environ, {"TOOL_DATA_DIR": str(tool_root)}),
+            ):
+                missing_row = views._read_maxmind_sync("1.1.1.1")
+            self.assertEqual(missing_row["status"], "Database Missing")

@@ -3104,6 +3104,28 @@ class GadgetTokenAndCorsAuthTests(TestCase):
             self.assertTrue(allowed)
             self.assertEqual(role_label, "Allowlisted Wikimedia User")
 
+        with override_settings(
+            ALLOWED_WIKI_USERS="Allowlisted_Operator",
+            RESTRICT_TO_ALLOWED_WIKI_USERS=True,
+        ):
+            allowed, role_label, _, _ = evaluate_wikimedia_rights(
+                {
+                    "username": "Allowlisted_Operator",
+                    "global_rights": ["checkuser-temporary-account"],
+                }
+            )
+            self.assertTrue(allowed)
+            self.assertEqual(role_label, "Allowlisted Wikimedia User")
+
+            denied, role_label, _, _ = evaluate_wikimedia_rights(
+                {
+                    "username": "Other_Operator",
+                    "global_rights": ["checkuser-temporary-account"],
+                }
+            )
+            self.assertFalse(denied)
+            self.assertEqual(role_label, "Access Denied (restricted user allowlist)")
+
         session = self.client.session
         session["oauth_state"] = "state-allowlist"
         session.save()

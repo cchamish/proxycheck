@@ -47,9 +47,9 @@
           Log in with Wikimedia
         </cdx-button>
         <p class="login-groups-note">
-          This tool is designed for users with the
-          <code>{{ REQUIRED_USER_RIGHTS[0] }}(-no-preference)</code>
-          right on any Wikimedia project.
+          This tool is designed for users with either the
+          <code>{{ REQUIRED_USER_RIGHTS[0] }}</code> or
+          <code>{{ REQUIRED_USER_RIGHTS[1] }}</code> right on any Wikimedia project.
         </p>
       </div>
 
@@ -59,7 +59,7 @@
           :inline="false"
           class="unauthorised-message"
         >
-          Access Denied: You must hold either the <code>{{ REQUIRED_USER_RIGHTS[0] }}</code> or <code>{{ REQUIRED_USER_RIGHTS[1] }}</code> user right on any Wikimedia project to use this tool.
+          Access Denied: your Wikimedia account is not authorised to use this tool.
         </cdx-message>
       </div>
 

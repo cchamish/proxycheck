@@ -23,4 +23,6 @@ urlpatterns = [
     re_path(r"^auth/gadget-token$", views.exchange_gadget_token),
     path("auth/switch-role/", views.switch_test_role, name="switch_test_role"),
     re_path(r"^auth/switch-role$", views.switch_test_role),
+    path("admin/provider-dashboard/", views.admin_provider_dashboard, name="admin_provider_dashboard"),
+    re_path(r"^admin/provider-dashboard$", views.admin_provider_dashboard),
 ]

@@ -26,6 +26,10 @@ import {
   formatDiagnosticSummary,
   measureInitialLoadDurationSeconds,
   measureElapsedSeconds,
+  isAuthorisedAdminUser,
+  computeQuotaUsagePercent,
+  getQuotaProgressTone,
+  formatUpstreamQuotaLabel,
   type DetectionCoordinatorState,
   type ProviderRawResult,
 } from './ip-detector-logic';
@@ -620,4 +624,118 @@ test('Executive overview aligns Prediction gauge with IP details and renders six
   assert.match(codexCss, /\.overview-body\s*\{[\s\S]*?grid-template-columns:\s*auto\s+1fr;[\s\S]*?width:\s*100%;/);
   assert.match(codexCss, /\.prediction-gauge-container\s*\{[\s\S]*?justify-self:\s*center;/);
 });
+
+test('isAuthorisedAdminUser honours only backend allowlist verification flag', () => {
+  assert.equal(isAuthorisedAdminUser(null), false);
+  assert.equal(isAuthorisedAdminUser({ isLoggedIn: false, hasAccess: true, isAdmin: true }), false);
+  assert.equal(
+    isAuthorisedAdminUser({
+      isLoggedIn: true,
+      hasAccess: false,
+      isAdmin: true,
+      role: 'Allowlisted Wikimedia User',
+      localGroups: ['sysop'],
+    }),
+    false
+  );
+  assert.equal(
+    isAuthorisedAdminUser({
+      isLoggedIn: true,
+      hasAccess: true,
+      isAdmin: false,
+      role: 'Local Administrator (sysop)',
+      localGroups: ['sysop'],
+      globalGroups: ['steward'],
+    }),
+    false
+  );
+  assert.equal(
+    isAuthorisedAdminUser({
+      isLoggedIn: true,
+      hasAccess: true,
+      role: 'Local Administrator (sysop)',
+      localGroups: ['sysop'],
+      globalGroups: [],
+    }),
+    false
+  );
+  assert.equal(
+    isAuthorisedAdminUser({
+      isLoggedIn: true,
+      hasAccess: true,
+      role: 'Steward',
+      localGroups: [],
+      globalGroups: ['steward'],
+    }),
+    false
+  );
+  assert.equal(
+    isAuthorisedAdminUser({
+      isLoggedIn: true,
+      hasAccess: true,
+      role: 'Temporary Account Access (local: checkuser-temporary-account)',
+      localGroups: ['checkuser-temporary-account'],
+      globalGroups: [],
+    }),
+    false
+  );
+  assert.equal(
+    isAuthorisedAdminUser({
+      isLoggedIn: true,
+      hasAccess: true,
+      isAdmin: true,
+      role: 'Allowlisted Wikimedia User',
+    }),
+    true
+  );
+});
+
+test('Quota percentage, tone thresholds, and upstream quota label formatters handle edge cases', () => {
+  assert.equal(computeQuotaUsagePercent(5, 0), 0);
+  assert.equal(computeQuotaUsagePercent(0, 100), 0);
+  assert.equal(computeQuotaUsagePercent(45, 100), 45);
+  assert.equal(computeQuotaUsagePercent(250, 100), 100);
+  assert.equal(computeQuotaUsagePercent(-3, 100), 0);
+
+  assert.equal(getQuotaProgressTone(5, 0), 'normal');
+  assert.equal(getQuotaProgressTone(79, 100), 'normal');
+  assert.equal(getQuotaProgressTone(80, 100), 'warning');
+  assert.equal(getQuotaProgressTone(99, 100), 'warning');
+  assert.equal(getQuotaProgressTone(100, 100), 'danger');
+
+  assert.equal(
+    formatUpstreamQuotaLabel({ upstreamRemaining: 982, upstreamLimit: 1000, upstreamUsed: null }),
+    '982 / 1,000 left'
+  );
+  assert.equal(
+    formatUpstreamQuotaLabel({ upstreamRemaining: 4950, upstreamLimit: null, upstreamUsed: null }),
+    '4,950 left'
+  );
+  assert.equal(
+    formatUpstreamQuotaLabel({ upstreamRemaining: null, upstreamLimit: null, upstreamUsed: 142 }),
+    '142 used'
+  );
+  assert.equal(
+    formatUpstreamQuotaLabel({ upstreamRemaining: null, upstreamLimit: null, upstreamUsed: null }),
+    '-'
+  );
+});
+
+test('App.vue gates the API Quota & Health dashboard modal to authorised administrators', () => {
+  const appVue = fs.readFileSync(path.resolve(process.cwd(), 'src/App.vue'), 'utf8');
+  const dashboardModalVue = fs.readFileSync(
+    path.resolve(process.cwd(), 'src/components/ProviderDashboardModal.vue'),
+    'utf8'
+  );
+
+  assert.match(appVue, /v-if="isAdminUser"[\s\S]*?API Quota &(?:amp;)? Health/);
+  assert.match(appVue, /<provider-dashboard-modal/);
+  assert.match(dashboardModalVue, /\/api\/v1\/admin\/provider-dashboard|Refresh/);
+  assert.match(dashboardModalVue, /Total Requests Today/);
+  assert.match(dashboardModalVue, /Full Cache Hit Rate/);
+  assert.match(dashboardModalVue, /Proactive Quota Blocks Today/);
+  assert.match(dashboardModalVue, /Active Reactive Cooldowns/);
+  assert.match(dashboardModalVue, /OK \/ CACHE HIT \/ 429 \/ QUOTA BLOCKED/);
+});
+
 

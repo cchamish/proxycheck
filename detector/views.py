@@ -52,7 +52,6 @@ from .adapters import (
     adapt_ipregistry,
     adapt_maxmind,
     adapt_proxycheck,
-    adapt_sorbs,
     adapt_spamcop,
     adapt_spamhaus_zen,
     adapt_stopforumspam,
@@ -75,6 +74,15 @@ from .oauth import (
     is_session_rights_expired,
     normalize_and_validate_wikimedia_domain,
     verify_centralauth_userinfo,
+)
+from .quota_telemetry import (
+    build_dashboard_snapshot,
+    check_and_consume_quota,
+    extract_upstream_rate_limit,
+    is_admin_user,
+    is_provider_configured,
+    record_global_request_telemetry,
+    record_provider_outcomes_batch,
 )
 
 logger = logging.getLogger(__name__)
@@ -869,6 +877,7 @@ async def _query_dnsbl_zone(
             status_code=504,
             reason="DNS Timeout",
             cooldown_seconds=default_cooldown,
+            is_timeout=True,
         )
         return {
             "status": "timeout",
@@ -916,11 +925,6 @@ async def query_spamcop(ip: str) -> Dict[str, Any]:
     return adapt_spamcop(raw_data, status_code)
 
 
-async def query_sorbs(ip: str) -> Dict[str, Any]:
-    raw_data, status_code = await _query_dnsbl_zone(ip, "dnsbl.sorbs.net", "sorbs", "SORBS")
-    return adapt_sorbs(raw_data, status_code)
-
-
 USER_AGENT_HEADER = "ProxyCheck/1.0 (https://proxycheck.toolforge.org; tools.proxycheck@toolforge.org)"
 
 DYNAMIC_CACHE_PROVIDERS = frozenset(
@@ -929,7 +933,6 @@ DYNAMIC_CACHE_PROVIDERS = frozenset(
         "dnsbl",
         "spamhaus_zen",
         "spamcop",
-        "sorbs",
         "tor_onionoo",
         "stopforumspam",
         "dshield",
@@ -1008,6 +1011,10 @@ def _record_upstream_event(
     status_code: int,
     reason: str = "",
     cooldown_seconds: Optional[int] = None,
+    is_timeout: bool = False,
+    upstream_remaining: Optional[int] = None,
+    upstream_limit: Optional[int] = None,
+    upstream_used: Optional[int] = None,
 ) -> None:
     events = _provider_upstream_events.get()
     if isinstance(events, dict):
@@ -1016,6 +1023,10 @@ def _record_upstream_event(
             "statusCode": status_code,
             "reason": reason,
             "cooldownSeconds": cooldown_seconds,
+            "isTimeout": is_timeout,
+            "upstreamRemaining": upstream_remaining,
+            "upstreamLimit": upstream_limit,
+            "upstreamUsed": upstream_used,
         }
 
 
@@ -1055,11 +1066,17 @@ async def _fetch_upstream_json(
             status_code=502,
             reason=reason,
             cooldown_seconds=default_cooldown,
+            is_timeout=is_timeout,
         )
         return {"status": "error", "message": safe_message}, 502
 
     raw_status = getattr(resp, "status_code", 502)
     payload, parsed_status = _parse_upstream_json(resp)
+    upstream_remaining, upstream_limit, upstream_used = extract_upstream_rate_limit(
+        resp,
+        payload if raw_status == 200 and parsed_status == 200 else None,
+        provider_key,
+    )
     if raw_status == 429:
         retry_after_raw = _extract_retry_after_header(resp)
         cooldown_secs = _parse_retry_after_seconds(retry_after_raw)
@@ -1069,6 +1086,8 @@ async def _fetch_upstream_json(
             status_code=429,
             reason="429 Rate Limited",
             cooldown_seconds=cooldown_secs,
+            upstream_remaining=upstream_remaining,
+            upstream_limit=upstream_limit,
         )
     elif isinstance(raw_status, int) and raw_status >= 500:
         _record_upstream_event(
@@ -1077,6 +1096,8 @@ async def _fetch_upstream_json(
             status_code=raw_status,
             reason=f"HTTP {raw_status}",
             cooldown_seconds=default_cooldown,
+            upstream_remaining=upstream_remaining,
+            upstream_limit=upstream_limit,
         )
     elif parsed_status >= 500 and raw_status == 200:
         _record_upstream_event(
@@ -1091,6 +1112,9 @@ async def _fetch_upstream_json(
             provider_key,
             trigger_cooldown=False,
             status_code=parsed_status,
+            upstream_remaining=upstream_remaining,
+            upstream_limit=upstream_limit,
+            upstream_used=upstream_used,
         )
     return payload, parsed_status
 
@@ -1502,7 +1526,7 @@ def aggregate_intelligence_metrics(
 _ip_detect_inflight: Dict[str, asyncio.Task] = {}
 _ip_detect_inflight_lock = threading.Lock()
 
-_DNSBL_PROVIDER_KEYS = frozenset({"spamhaus_zen", "spamcop", "sorbs"})
+_DNSBL_PROVIDER_KEYS = frozenset({"spamhaus_zen", "spamcop"})
 
 _PROVIDER_SPECS: Tuple[Tuple[str, str, bool, bool, Callable[[Any, str], Any]], ...] = (
     ("cloudflare_radar", "Cloudflare Radar", True, True, lambda client, ip: query_cloudflare_radar(client, ip)),
@@ -1517,7 +1541,6 @@ _PROVIDER_SPECS: Tuple[Tuple[str, str, bool, bool, Callable[[Any, str], Any]], .
     ("maxmind", "MaxMind", False, False, lambda _client, ip: query_maxmind(ip)),
     ("spamhaus_zen", "Spamhaus ZEN", False, True, lambda _client, ip: query_spamhaus_zen(ip)),
     ("spamcop", "SpamCop", False, True, lambda _client, ip: query_spamcop(ip)),
-    ("sorbs", "SORBS", False, True, lambda _client, ip: query_sorbs(ip)),
     ("tor_onionoo", "Tor Onionoo", True, True, lambda client, ip: query_tor_onionoo(client, ip)),
     ("stopforumspam", "StopForumSpam", True, True, lambda client, ip: query_stopforumspam(client, ip)),
     ("dshield", "DShield", True, True, lambda client, ip: query_dshield(client, ip)),
@@ -1626,8 +1649,26 @@ def _build_cooldown_provider_row(provider_name: str, cooldown_info: Dict[str, An
     raw_status = cooldown_info.get("statusCode")
     status_code = raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool) else 503
     reason = str(cooldown_info.get("reason") or "Upstream rate limited or degraded")
-    status_label = "429 Cooldown (Rate Limited)" if status_code == 429 else f"{status_code} Cooldown (Circuit Open)"
-    return {
+    custom_label = cooldown_info.get("statusLabel")
+    is_quota_guard = bool(cooldown_info.get("isQuotaGuard"))
+    if isinstance(custom_label, str) and custom_label.strip():
+        status_label = custom_label.strip()
+    else:
+        status_label = "429 Cooldown (Rate Limited)" if status_code == 429 else f"{status_code} Cooldown (Circuit Open)"
+
+    flag_label = "Local Quota Guard" if is_quota_guard else "Provider Cooldown"
+    raw_payload: Dict[str, Any] = {
+        "status": "quota_guarded" if is_quota_guard else "cooldown",
+        "message": reason,
+        "retryAfterSeconds": cooldown_info.get("cooldownSeconds"),
+        "cooldownUntil": cooldown_info.get("until"),
+    }
+    if is_quota_guard:
+        raw_payload["window"] = cooldown_info.get("window")
+        raw_payload["used"] = cooldown_info.get("used")
+        raw_payload["limit"] = cooldown_info.get("limit")
+
+    row: Dict[str, Any] = {
         "provider": provider_name,
         "status": status_label,
         "statusCode": status_code,
@@ -1636,17 +1677,13 @@ def _build_cooldown_provider_row(provider_name: str, cooldown_info: Dict[str, An
         "organisation": "-",
         "location": "-",
         "usageType": "-",
-        "securityFlags": [{"label": "Provider Cooldown", "isHighRisk": False}],
+        "securityFlags": [{"label": flag_label, "isHighRisk": False}],
         "isCooldown": True,
-        "rawJson": _sanitize_payload(
-            {
-                "status": "cooldown",
-                "message": reason,
-                "retryAfterSeconds": cooldown_info.get("cooldownSeconds"),
-                "cooldownUntil": cooldown_info.get("until"),
-            }
-        ),
+        "rawJson": _sanitize_payload(raw_payload),
     }
+    if is_quota_guard:
+        row["isQuotaGuarded"] = True
+    return row
 
 
 def _build_unhandled_provider_error_row(provider_name: str, safe_message: str) -> Dict[str, Any]:
@@ -1768,11 +1805,38 @@ async def _execute_detection_with_cache(
             if decoded_cd is not None:
                 cooldown_entries[provider_key] = decoded_cd
 
-    specs_to_execute = [
+    candidate_specs = [
         (idx, spec)
         for idx, spec in enumerate(_PROVIDER_SPECS)
         if spec[0] not in cached_providers and spec[0] not in cooldown_entries
     ]
+    quota_dt = datetime.now(timezone.utc)
+    quota_candidates = [
+        spec[0]
+        for _, spec in candidate_specs
+        if spec[0] != "maxmind" and (is_ipv4 or spec[0] not in _DNSBL_PROVIDER_KEYS) and is_provider_configured(spec[0])
+    ]
+    quota_blocked_entries: Dict[str, Dict[str, Any]] = {}
+    if active_redis is not None and quota_candidates:
+        quota_results = await asyncio.gather(
+            *(check_and_consume_quota(provider_key, now_dt=quota_dt) for provider_key in quota_candidates)
+        )
+        for provider_key, quota_res in zip(quota_candidates, quota_results, strict=True):
+            if not quota_res.allowed:
+                window_unit = "min" if quota_res.window == "rpm" else "day"
+                cooldown_secs = 60 if quota_res.window == "rpm" else None
+                quota_blocked_entries[provider_key] = {
+                    "statusCode": 429,
+                    "isQuotaGuard": True,
+                    "statusLabel": f"Local Quota Guard ({quota_res.used}/{quota_res.limit} req/{window_unit})",
+                    "reason": f"Local quota limit reached ({quota_res.used}/{quota_res.limit} req/{window_unit})",
+                    "window": quota_res.window,
+                    "used": quota_res.used,
+                    "limit": quota_res.limit,
+                    "cooldownSeconds": cooldown_secs,
+                }
+
+    specs_to_execute = [(idx, spec) for idx, spec in candidate_specs if spec[0] not in quota_blocked_entries]
     needs_http_client = any(spec[2] for _, spec in specs_to_execute)
     needs_ptr = cached_ptr is None
 
@@ -1800,6 +1864,7 @@ async def _execute_detection_with_cache(
 
     clean_results: List[Dict[str, Any]] = []
     redis_write_ops = []
+    telemetry_entries: List[Dict[str, Any]] = []
     now_dt = datetime.now(timezone.utc)
     now_iso = now_dt.isoformat()
     default_cooldown, _, _ = _get_cooldown_bounds()
@@ -1823,10 +1888,17 @@ async def _execute_detection_with_cache(
                 hit_count += 1
                 if cached_at:
                     cached_at_timestamps.append(cached_at)
+                if active_redis is not None:
+                    telemetry_entries.append({"provider_key": provider_key, "outcome": "cache_hit"})
             continue
 
         if provider_key in cooldown_entries:
             clean_results.append(_build_cooldown_provider_row(provider_name, cooldown_entries[provider_key]))
+            cooldown_count += 1
+            continue
+
+        if provider_key in quota_blocked_entries:
+            clean_results.append(_build_cooldown_provider_row(provider_name, quota_blocked_entries[provider_key]))
             cooldown_count += 1
             continue
 
@@ -1853,6 +1925,51 @@ async def _execute_detection_with_cache(
         if active_redis is not None:
             event = upstream_events.get(provider_key)
             status_code = row.get("statusCode")
+            upstream_remaining = event.get("upstreamRemaining") if event else None
+            upstream_limit = event.get("upstreamLimit") if event else None
+            upstream_used = event.get("upstreamUsed") if event else None
+            if provider_key == "ipdata" and upstream_used is None and _is_provider_result_cacheable(row):
+                raw_json = row.get("rawJson")
+                if isinstance(raw_json, dict) and raw_json.get("count") is not None:
+                    _, fallback_limit, fallback_used = extract_upstream_rate_limit(None, raw_json, "ipdata")
+                    if fallback_used is not None:
+                        upstream_used = fallback_used
+                        if upstream_limit is None and fallback_limit is not None:
+                            upstream_limit = fallback_limit
+                        if upstream_remaining is None and upstream_limit is not None and upstream_limit > 0:
+                            upstream_remaining = max(0, upstream_limit - upstream_used)
+
+            if not _is_unconfigured_provider_row(row):
+                is_timeout_outcome = bool(
+                    (event and event.get("isTimeout"))
+                    or status_code == 504
+                    or (
+                        miss_triggered_exception
+                        and isinstance(res, (httpx.TimeoutException, asyncio.TimeoutError, TimeoutError))
+                    )
+                )
+                if _is_provider_result_cacheable(row):
+                    outcome_name: Optional[str] = "ok"
+                elif is_timeout_outcome:
+                    outcome_name = "timeout"
+                elif status_code == 429 or (event and event.get("statusCode") == 429):
+                    outcome_name = "429"
+                elif miss_triggered_exception or (isinstance(status_code, int) and status_code >= 500):
+                    outcome_name = "5xx"
+                else:
+                    outcome_name = None
+
+                if outcome_name is not None:
+                    telemetry_entries.append(
+                        {
+                            "provider_key": provider_key,
+                            "outcome": outcome_name,
+                            "upstream_remaining": upstream_remaining,
+                            "upstream_limit": upstream_limit,
+                            "upstream_used": upstream_used,
+                        }
+                    )
+
             if _is_provider_result_cacheable(row):
                 entry_payload: Dict[str, Any] = {"row": row, "cachedAt": now_iso}
                 if provider_key == "maxmind":
@@ -1937,6 +2054,9 @@ async def _execute_detection_with_cache(
                     ex=_get_provider_cache_ttl("ptr"),
                 )
             )
+
+    if active_redis is not None and telemetry_entries:
+        redis_write_ops.append(record_provider_outcomes_batch(telemetry_entries, now_dt=now_dt))
 
     if redis_write_ops:
         await asyncio.gather(*redis_write_ops)
@@ -2432,6 +2552,7 @@ async def _detect_ip_get(request):
                 {"error": token_error or "Invalid authentication token."},
                 status=401,
             )
+        auth_mode = "gadget"
     else:
         session_user = await _get_session_user(request)
         if not isinstance(session_user, dict) or not session_user.get("isLoggedIn"):
@@ -2444,6 +2565,7 @@ async def _detect_ip_get(request):
                 {"error": "Access denied. Insufficient Wikimedia user rights."},
                 status=403,
             )
+        auth_mode = "session"
 
     raw_ip = request.GET.get("ip")
     if raw_ip is None or not str(raw_ip).strip():
@@ -2542,6 +2664,10 @@ async def _detect_ip_get(request):
             except _StaleInflightLoopError:
                 _release_inflight_task(ip, inflight_task)
                 base_payload = await _execute_detection_with_cache(ip)
+
+    cache_status = (base_payload.get("cacheMeta") or {}).get("status")
+    if isinstance(cache_status, str) and cache_status in ("hit", "partial", "miss"):
+        await record_global_request_telemetry(cache_status, auth_mode)
 
     return JsonResponse(_attach_request_diagnostics(base_payload, start_time))
 
@@ -2697,13 +2823,49 @@ async def get_current_user(request):
             "username": "",
             "role": "",
             "hasAccess": False,
+            "isAdmin": False,
             "localGroups": [],
             "globalGroups": [],
         }
     else:
         payload = dict(session_user)
+        payload["isAdmin"] = is_admin_user(session_user)
 
     return JsonResponse(_attach_request_diagnostics(payload, start_time))
+
+
+async def admin_provider_dashboard(request):
+    """
+    Returns anonymised API quota usage, reactive cooldown states, and daily telemetry
+    for allowlisted administrators.
+    """
+    start_time = time.perf_counter()
+    if request.method != "GET":
+        return JsonResponse({"error": "Method not allowed"}, status=405)
+
+    auth_header = request.headers.get("Authorization")
+    if auth_header is not None and str(auth_header).strip():
+        return JsonResponse(
+            {"error": "Access denied. Administrator session privileges required."},
+            status=403,
+        )
+
+    session_user = await _get_session_user(request, context="admin_provider_dashboard")
+    if not isinstance(session_user, dict) or not session_user.get("isLoggedIn"):
+        return JsonResponse(
+            {"error": "Authentication required. Please log in with Wikimedia."},
+            status=401,
+        )
+    if not is_admin_user(session_user):
+        return JsonResponse(
+            {"error": "Access denied. Allowlisted administrator privileges required."},
+            status=403,
+        )
+
+    snapshot = await build_dashboard_snapshot()
+    response = JsonResponse(_attach_request_diagnostics(snapshot, start_time))
+    response["Cache-Control"] = "no-store"
+    return response
 
 
 async def oauth_login(request):
@@ -2927,6 +3089,7 @@ async def switch_test_role(request):
                 "username": "",
                 "role": "",
                 "hasAccess": False,
+                "isAdmin": False,
                 "localGroups": [],
                 "globalGroups": [],
             }
@@ -2972,4 +3135,4 @@ async def switch_test_role(request):
     user_data["rights_updated_at"] = time.time()
     if not await _persist_authenticated_session(request, user_data, context="switch_test_role"):
         return JsonResponse({"error": _SESSION_UNAVAILABLE_ERROR}, status=503)
-    return JsonResponse(user_data)
+    return JsonResponse({**user_data, "isAdmin": is_admin_user(user_data)})

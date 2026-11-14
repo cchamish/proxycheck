@@ -1961,22 +1961,6 @@ _SPAMHAUS_CODE_MAP: Dict[str, Tuple[str, str, bool]] = {
     "127.0.0.11": ("Policy/Dynamic ISP Range (PBL)", "Policy/Dynamic ISP Range (PBL)", False),
 }
 
-_SORBS_CODE_MAP: Dict[str, Tuple[str, bool]] = {
-    "127.0.0.2": ("HTTP Proxy", True),
-    "127.0.0.3": ("SOCKS Proxy", True),
-    "127.0.0.4": ("MISC Proxy", True),
-    "127.0.0.5": ("Open Relay", True),
-    "127.0.0.6": ("Spam Source", True),
-    "127.0.0.7": ("Web Form Spam", True),
-    "127.0.0.8": ("Spam / Blocked Host", True),
-    "127.0.0.9": ("Zombie / Hijacked", True),
-    "127.0.0.10": ("Dynamic IP (DUHL)", False),
-    "127.0.0.11": ("Bad Configuration", False),
-    "127.0.0.12": ("No Mail Server", False),
-    "127.0.0.13": ("Misc Listing", True),
-    "127.0.0.14": ("Non-Mail Server", False),
-}
-
 
 def _extract_dnsbl_codes(raw_data: Dict[str, Any]) -> List[str]:
     raw_codes = raw_data.get("codes")
@@ -2174,44 +2158,6 @@ def adapt_spamcop(raw_data: Optional[Dict[str, Any]], status_code: int = 200) ->
         "isListed": True,
         "listedCodes": codes,
         "listedCategories": ["Spam Source"],
-        "rawJson": payload,
-    }
-
-
-def adapt_sorbs(raw_data: Optional[Dict[str, Any]], status_code: int = 200) -> Dict[str, Any]:
-    """Normalizes SORBS DNSBL A-record responses and return code categories."""
-    early_row, payload = _adapt_dnsbl_precheck("SORBS", raw_data, status_code)
-    if early_row is not None:
-        return early_row
-
-    codes = _extract_dnsbl_codes(payload)
-    if not codes:
-        return _build_clean_dnsbl_row("SORBS", payload)
-
-    flags: List[Dict[str, Any]] = []
-    usage_parts: List[str] = []
-    categories: List[str] = []
-
-    for code in codes:
-        category, is_high_risk = _SORBS_CODE_MAP.get(code, (f"SORBS Listing ({code})", True))
-        if category not in categories:
-            categories.append(category)
-        usage_parts.append(f"{category} ({code})")
-        flags.append({"label": f"{category} ({code})", "isHighRisk": is_high_risk})
-
-    return {
-        "provider": "SORBS",
-        "status": "200 OK",
-        "statusCode": 200,
-        "asn": "-",
-        "isp": "-",
-        "organisation": "-",
-        "location": "-",
-        "usageType": f"Listed: {', '.join(usage_parts)}",
-        "securityFlags": flags,
-        "isListed": True,
-        "listedCodes": codes,
-        "listedCategories": categories,
         "rawJson": payload,
     }
 

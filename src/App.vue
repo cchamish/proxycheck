@@ -12,6 +12,16 @@
       </div>
       <div class="header-right">
         <template v-if="user.isLoggedIn">
+          <cdx-button
+            v-if="isAdminUser"
+            action="default"
+            weight="normal"
+            size="medium"
+            class="admin-dashboard-btn"
+            @click="isDashboardOpen = true"
+          >
+            API Quota &amp; Health
+          </cdx-button>
           <span class="user-pill">
             {{ user.username }}
           </span>
@@ -26,6 +36,12 @@
         </template>
       </div>
     </header>
+
+    <provider-dashboard-modal
+      v-if="isAdminUser"
+      v-model:open="isDashboardOpen"
+      @unauthorised="handleDashboardUnauthorised"
+    />
 
     <main class="cdx-main-container">
       <div v-if="!user.isLoggedIn" class="barrier-wrapper">
@@ -376,10 +392,12 @@ import {
   CdxCard,
   CdxMessage,
 } from '@wikimedia/codex';
+import ProviderDashboardModal from './components/ProviderDashboardModal.vue';
 import {
   REQUIRED_USER_RIGHTS,
   buildOAuthLoginUrl,
   buildPageUrlWithIp,
+  isAuthorisedAdminUser,
   isValidIpAddress,
   filterComparisonResults,
   simplifySecurityFlags,
@@ -436,9 +454,15 @@ const uiState = reactive<DetectionCoordinatorState>({
     username: '',
     role: '',
     hasAccess: false,
+    isAdmin: false,
+    localGroups: [],
+    globalGroups: [],
   },
   ipHistory: loadStoredHistory(),
 });
+
+const isDashboardOpen = ref(false);
+const isAdminUser = computed(() => isAuthorisedAdminUser(user.value));
 
 const {
   user,
@@ -577,7 +601,9 @@ function getStatusBadgeClass(status?: string | null): string {
   if (status === 'No API Key' || status === 'Database Missing' || status === 'Skipped (IPv6)') {
     return 'badge-neutral';
   }
-  if (status.includes('429') || status.includes('Cooldown')) return 'badge-warning';
+  if (status.includes('429') || status.includes('Cooldown') || status.includes('Quota Guard')) {
+    return 'badge-warning';
+  }
   return 'badge-destructive';
 }
 
@@ -639,6 +665,9 @@ async function fetchUserStatus() {
         username: String(data?.username || ''),
         role: String(data?.role || ''),
         hasAccess: Boolean(data?.hasAccess),
+        isAdmin: typeof data?.isAdmin === 'boolean' ? data.isAdmin : undefined,
+        localGroups: Array.isArray(data?.localGroups) ? data.localGroups : [],
+        globalGroups: Array.isArray(data?.globalGroups) ? data.globalGroups : [],
       };
       initialDiagnostic.value = buildDiagnosticMetrics(
         {
@@ -676,7 +705,11 @@ async function handleLogout() {
       username: '',
       role: '',
       hasAccess: false,
+      isAdmin: false,
+      localGroups: [],
+      globalGroups: [],
     };
+    isDashboardOpen.value = false;
     inputIp.value = '';
     detectionData.value = null;
     diagnostic.value = null;
@@ -694,6 +727,11 @@ async function handleLogout() {
   } catch (err) {
     console.error('Logout error:', err);
   }
+}
+
+function handleDashboardUnauthorised(): void {
+  isDashboardOpen.value = false;
+  fetchUserStatus();
 }
 
 function getInitialIpParam(): string {

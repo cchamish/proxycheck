@@ -731,3 +731,236 @@ body {
   width: auto;
   display: block;
 }
+
+/* Admin quota and health diagnostic modal */
+.admin-dashboard-btn {
+  font-size: 13px;
+}
+
+.cdx-dialog.provider-dashboard-dialog {
+  max-width: 1120px;
+  width: calc(100vw - 2rem);
+}
+
+.dashboard-modal-content {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.dashboard-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.dashboard-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.dashboard-updated-text {
+  font-size: 12px;
+  color: var(--cdx-color-muted);
+}
+
+.dashboard-alert {
+  margin: 0;
+}
+
+.dashboard-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+@media (max-width: 900px) {
+  .dashboard-kpi-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 560px) {
+  .dashboard-kpi-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.dashboard-kpi-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 14px;
+  background-color: var(--cdx-color-background-secondary);
+  border: 1px solid var(--cdx-color-border-subtle);
+  border-radius: 4px;
+}
+
+.kpi-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--cdx-color-subtle);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.kpi-value {
+  font-size: 22px;
+  font-weight: 800;
+  line-height: 1.2;
+  color: var(--cdx-color-base);
+}
+
+.kpi-value--warning {
+  color: var(--cdx-color-warning);
+}
+
+.kpi-subtext {
+  font-size: 12px;
+  color: var(--cdx-color-muted);
+}
+
+.dashboard-table-wrapper {
+  border: 1px solid var(--cdx-color-border-subtle);
+  border-radius: 4px;
+  overflow-x: auto;
+}
+
+.dashboard-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  text-align: left;
+}
+
+.dashboard-table th {
+  background-color: var(--cdx-color-background-secondary);
+  color: var(--cdx-color-subtle);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--cdx-color-border);
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.dashboard-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--cdx-color-border-subtle);
+  vertical-align: middle;
+  color: var(--cdx-color-base);
+}
+
+.dashboard-table tr:last-child td {
+  border-bottom: none;
+}
+
+.dashboard-table tr:hover td {
+  background-color: #fafbfc;
+}
+
+.dashboard-col-provider {
+  white-space: nowrap;
+}
+
+.dashboard-col-quota {
+  min-width: 150px;
+}
+
+.quota-metric-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 4px;
+}
+
+.quota-metric-value {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--cdx-color-base);
+  white-space: nowrap;
+}
+
+.quota-progress-track {
+  width: 100%;
+  height: 6px;
+  background-color: #eaecf0;
+  border-radius: 9999px;
+  overflow: hidden;
+}
+
+.quota-progress-fill {
+  height: 100%;
+  border-radius: 9999px;
+  transition: width 0.2s ease;
+}
+
+.quota-progress-fill--normal {
+  background-color: var(--cdx-color-primary);
+}
+
+.quota-progress-fill--warning {
+  background-color: var(--cdx-color-warning);
+}
+
+.quota-progress-fill--danger {
+  background-color: var(--cdx-color-destructive);
+}
+
+.dashboard-col-upstream {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.dashboard-col-telemetry {
+  min-width: 240px;
+}
+
+.telemetry-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.telemetry-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 9999px;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.telemetry-chip--ok {
+  background-color: var(--cdx-color-success-bg);
+  color: var(--cdx-color-success);
+}
+
+.telemetry-chip--cache {
+  background-color: #eaf3ff;
+  color: var(--cdx-color-primary);
+}
+
+.telemetry-chip--warn {
+  background-color: var(--cdx-color-warning-bg);
+  color: var(--cdx-color-warning);
+}
+
+.telemetry-chip--muted {
+  background-color: #f1f2f3;
+  color: var(--cdx-color-muted);
+}
+
+.telemetry-extra-line {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--cdx-color-muted);
+}

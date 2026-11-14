@@ -6748,6 +6748,7 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
     @override_settings(GETIPINTEL_RPM_LIMIT=15, GETIPINTEL_DAILY_LIMIT=5000)
     def test_lua_script_evaluation_and_redis_outage_fail_open(self):
         from asgiref.sync import async_to_sync
+
         from detector import quota_telemetry
 
         lua_client = MagicMock()
@@ -7080,7 +7081,6 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
     )
     def test_admin_provider_dashboard_returns_aggregated_schema(self):
         from datetime import datetime, timezone
-        from detector import quota_telemetry
 
         fake_redis = FakeAsyncRedis()
         now_dt = datetime(2026, 11, 15, 10, 30, tzinfo=timezone.utc)

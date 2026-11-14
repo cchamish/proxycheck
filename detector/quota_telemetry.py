@@ -723,7 +723,9 @@ async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict
                                 raw_day.decode("utf-8", errors="replace") if isinstance(raw_day, bytes) else raw_day
                             )
                             ttl_val = (
-                                raw_ttl if isinstance(raw_ttl, int) and not isinstance(raw_ttl, bool) and raw_ttl > 0 else 0
+                                raw_ttl
+                                if isinstance(raw_ttl, int) and not isinstance(raw_ttl, bool) and raw_ttl > 0
+                                else 0
                             )
                             cd_str = (
                                 raw_cd_payload.decode("utf-8", errors="replace")

@@ -6502,12 +6502,22 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         if "cloudflare.com" in url:
             return _mock_response(
                 status_code=200,
-                json_value={"success": True, "result": {"ip": {"asn": "15169", "asnName": "Google LLC", "asnLocation": "US"}}},
+                json_value={
+                    "success": True,
+                    "result": {"ip": {"asn": "15169", "asnName": "Google LLC", "asnLocation": "US"}},
+                },
             )
         if "abuseipdb.com" in url:
             resp = _mock_response(
                 status_code=200,
-                json_value={"data": {"isp": "Google LLC", "countryCode": "US", "usageType": "Data Center", "abuseConfidenceScore": 0}},
+                json_value={
+                    "data": {
+                        "isp": "Google LLC",
+                        "countryCode": "US",
+                        "usageType": "Data Center",
+                        "abuseConfidenceScore": 0,
+                    }
+                },
             )
             resp.headers = {"X-RateLimit-Remaining": "982", "X-RateLimit-Limit": "1000"}
             return resp
@@ -6537,25 +6547,61 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         if "ip2location.io" in url:
             return _mock_response(
                 status_code=200,
-                json_value={"asn": "15169", "as": "Google LLC", "country_name": "United States", "country_code": "US", "usage_type": "DCH", "is_proxy": False},
+                json_value={
+                    "asn": "15169",
+                    "as": "Google LLC",
+                    "country_name": "United States",
+                    "country_code": "US",
+                    "usage_type": "DCH",
+                    "is_proxy": False,
+                },
             )
         if "getipintel.net" in url:
             return _mock_response(status_code=200, json_value={"status": "success", "result": "0.02"})
         if "proxycheck.io" in url:
             return _mock_response(
                 status_code=200,
-                json_value={"status": "ok", ip: {"asn": "AS15169", "provider": "Google LLC", "country": "United States", "isocode": "US", "proxy": "no"}},
+                json_value={
+                    "status": "ok",
+                    ip: {
+                        "asn": "AS15169",
+                        "provider": "Google LLC",
+                        "country": "United States",
+                        "isocode": "US",
+                        "proxy": "no",
+                    },
+                },
             )
         if "iphub.info" in url:
-            return _mock_response(status_code=200, json_value={"asn": 15169, "isp": "Google LLC", "countryName": "United States", "countryCode": "US", "block": 0})
+            return _mock_response(
+                status_code=200,
+                json_value={
+                    "asn": 15169,
+                    "isp": "Google LLC",
+                    "countryName": "United States",
+                    "countryCode": "US",
+                    "block": 0,
+                },
+            )
         if "iphunter.info" in url:
-            return _mock_response(status_code=200, json_value={"status": "success", "data": {"isp": "Google LLC", "country_name": "United States", "country_code": "US", "block": 0}})
+            return _mock_response(
+                status_code=200,
+                json_value={
+                    "status": "success",
+                    "data": {"isp": "Google LLC", "country_name": "United States", "country_code": "US", "block": 0},
+                },
+            )
         if "onionoo.torproject.org" in url:
             return _mock_response(status_code=200, json_value={"relays": []})
         if "stopforumspam.org" in url:
-            return _mock_response(status_code=200, json_value={"success": 1, "ip": {"appears": 0, "frequency": 0, "confidence": 0.0}})
+            return _mock_response(
+                status_code=200, json_value={"success": 1, "ip": {"appears": 0, "frequency": 0, "confidence": 0.0}}
+            )
         if "sans.edu" in url or "dshield" in url:
-            return _mock_response(status_code=200, json_value={"ip": {"count": 0, "attacks": 0, "as": "15169", "asname": "Google LLC", "ascountry": "US"}})
+            return _mock_response(
+                status_code=200,
+                json_value={"ip": {"count": 0, "attacks": 0, "as": "15169", "asname": "Google LLC", "ascountry": "US"}},
+            )
         return _mock_response(status_code=404, json_value={})
 
     @staticmethod
@@ -6591,7 +6637,12 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         fake_resolver = MagicMock()
         fake_resolver.resolve = AsyncMock(side_effect=self._clean_dns_side_effect)
 
-        with patch("detector.views.redis_client", fake_redis), patch("detector.views.httpx.AsyncClient") as mock_client_cls, patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver), patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)):
+        with (
+            patch("detector.views.redis_client", fake_redis),
+            patch("detector.views.httpx.AsyncClient") as mock_client_cls,
+            patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver),
+            patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
+        ):
             _patch_async_client(mock_client_cls, fake_get)
             first_response = self.client.get("/api/v1/detect?ip=8.8.8.8")
             second_response = self.client.get("/api/v1/detect?ip=1.1.1.1")
@@ -6642,7 +6693,12 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         fake_resolver = MagicMock()
         fake_resolver.resolve = AsyncMock(side_effect=self._clean_dns_side_effect)
 
-        with patch("detector.views.redis_client", fake_redis), patch("detector.views.httpx.AsyncClient") as mock_client_cls, patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver), patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)):
+        with (
+            patch("detector.views.redis_client", fake_redis),
+            patch("detector.views.httpx.AsyncClient") as mock_client_cls,
+            patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver),
+            patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
+        ):
             _patch_async_client(mock_client_cls, fake_get)
             self.client.get("/api/v1/detect?ip=8.8.8.8")
             blocked_response = self.client.get("/api/v1/detect?ip=1.1.1.1")
@@ -6673,7 +6729,12 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         fake_resolver = MagicMock()
         fake_resolver.resolve = AsyncMock(side_effect=self._clean_dns_side_effect)
 
-        with patch("detector.views.redis_client", fake_redis), patch("detector.views.httpx.AsyncClient") as mock_client_cls, patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver), patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)):
+        with (
+            patch("detector.views.redis_client", fake_redis),
+            patch("detector.views.httpx.AsyncClient") as mock_client_cls,
+            patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver),
+            patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
+        ):
             _patch_async_client(mock_client_cls, fake_get)
             self.client.get("/api/v1/detect?ip=8.8.8.8")
             second_response = self.client.get("/api/v1/detect?ip=1.1.1.1")
@@ -6726,7 +6787,11 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         fake_resolver = MagicMock()
         fake_resolver.resolve = AsyncMock(side_effect=views.dns.resolver.NXDOMAIN())
 
-        with patch("detector.views.redis_client", fake_redis), patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver), patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)):
+        with (
+            patch("detector.views.redis_client", fake_redis),
+            patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver),
+            patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
+        ):
             response = self.client.get("/api/v1/detect?ip=2001:4860:4860::8888")
 
         self.assertEqual(response.status_code, 200)
@@ -6760,7 +6825,12 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         gadget_client = self.client.__class__()
         gadget_token = views.issue_gadget_token("SensitiveGadgetUser")
 
-        with patch("detector.views.redis_client", fake_redis), patch("detector.views.httpx.AsyncClient") as mock_client_cls, patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver), patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)):
+        with (
+            patch("detector.views.redis_client", fake_redis),
+            patch("detector.views.httpx.AsyncClient") as mock_client_cls,
+            patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver),
+            patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
+        ):
             _patch_async_client(mock_client_cls, fake_get)
             first_session = self.client.get(
                 "/api/v1/detect?ip=8.8.8.8",
@@ -6835,7 +6905,12 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         fake_resolver = MagicMock()
         fake_resolver.resolve = AsyncMock(side_effect=self._clean_dns_side_effect)
 
-        with patch("detector.views.redis_client", fake_redis), patch("detector.views.httpx.AsyncClient") as mock_client_cls, patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver), patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)):
+        with (
+            patch("detector.views.redis_client", fake_redis),
+            patch("detector.views.httpx.AsyncClient") as mock_client_cls,
+            patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver),
+            patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
+        ):
             _patch_async_client(mock_client_cls, fake_get)
             first_resp = self.client.get("/api/v1/detect?ip=8.8.8.8")
             second_resp = self.client.get("/api/v1/detect?ip=8.8.8.8")
@@ -6863,9 +6938,12 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         gadget_token = views.issue_gadget_token("AllowlistedDashboardAdmin")
 
         with patch("detector.views.redis_client", fake_redis):
-            with override_settings(ALLOWED_WIKI_USERS="AllowlistedDashboardAdmin, second_admin, ~2026-12345"), patch.dict(
-                os.environ,
-                {"ALLOWED_WIKI_USERS": "AllowlistedDashboardAdmin, second_admin, ~2026-12345"},
+            with (
+                override_settings(ALLOWED_WIKI_USERS="AllowlistedDashboardAdmin, second_admin, ~2026-12345"),
+                patch.dict(
+                    os.environ,
+                    {"ALLOWED_WIKI_USERS": "AllowlistedDashboardAdmin, second_admin, ~2026-12345"},
+                ),
             ):
                 unauthenticated = self.client.get("/api/v1/admin/provider-dashboard")
                 self.assertEqual(unauthenticated.status_code, 401)
@@ -7083,5 +7161,3 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         self.assertEqual(providers["proxycheck"]["upstreamRemaining"], 991)
         self.assertEqual(providers["proxycheck"]["upstreamLimit"], 1000)
         self.assertEqual(providers["proxycheck"]["telemetry"]["cacheHit"], 6)
-
-

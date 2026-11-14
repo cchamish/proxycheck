@@ -1814,9 +1814,7 @@ async def _execute_detection_with_cache(
     quota_candidates = [
         spec[0]
         for _, spec in candidate_specs
-        if spec[0] != "maxmind"
-        and (is_ipv4 or spec[0] not in _DNSBL_PROVIDER_KEYS)
-        and is_provider_configured(spec[0])
+        if spec[0] != "maxmind" and (is_ipv4 or spec[0] not in _DNSBL_PROVIDER_KEYS) and is_provider_configured(spec[0])
     ]
     quota_blocked_entries: Dict[str, Dict[str, Any]] = {}
     if active_redis is not None and quota_candidates:
@@ -1838,11 +1836,7 @@ async def _execute_detection_with_cache(
                     "cooldownSeconds": cooldown_secs,
                 }
 
-    specs_to_execute = [
-        (idx, spec)
-        for idx, spec in candidate_specs
-        if spec[0] not in quota_blocked_entries
-    ]
+    specs_to_execute = [(idx, spec) for idx, spec in candidate_specs if spec[0] not in quota_blocked_entries]
     needs_http_client = any(spec[2] for _, spec in specs_to_execute)
     needs_ptr = cached_ptr is None
 

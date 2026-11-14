@@ -269,10 +269,10 @@ test('resolveRepoBaseUrl normalizes empty values, repository slugs, and full URL
   assert.equal(resolveRepoBaseUrl('https://github.com/wikimedia/proxycheck/'), 'https://github.com/wikimedia/proxycheck');
 });
 
-test('formatDiagnosticSummary renders full unit labels and handles absent or invalid values', () => {
+test('formatDiagnosticSummary renders execution duration and worker RSS labels', () => {
   assert.equal(
     formatDiagnosticSummary({ duration: 5.331, memory: 71.4, isCached: false }),
-    'Executed in 5.331 seconds \u00b7 Taken 71.40 megabytes'
+    'Executed in 5.331 seconds \u00b7 Worker RSS 71.40 MB'
   );
   assert.equal(
     formatDiagnosticSummary({ duration: 0.012, memory: null, isCached: false }),

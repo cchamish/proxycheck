@@ -2243,7 +2243,10 @@ class SettingsAndHardeningTests(TestCase):
         self.assertTrue(prefix.startswith("proxycheck_") or prefix.startswith("proxy_detector"))
 
     def test_process_memory_mb_degrades_to_none_on_error(self):
-        with patch.dict(sys.modules, {"resource": None}):
+        with (
+            patch.object(views, "_read_proc_rss_mb", return_value=None),
+            patch.dict(sys.modules, {"resource": None}),
+        ):
             mem = views.get_process_memory_mb()
             self.assertIsNone(mem)
 

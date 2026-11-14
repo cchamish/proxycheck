@@ -480,7 +480,7 @@ export function buildDiagnosticMetrics(
 }
 
 /**
- * Formats execution duration and optional worker memory usage into full-unit footer text.
+ * Formats execution duration and optional worker RSS memory usage into footer text.
  */
 export function formatDiagnosticSummary(diagnostic?: DiagnosticMetrics | null): string {
   const rawDuration = diagnostic?.duration;
@@ -492,7 +492,7 @@ export function formatDiagnosticSummary(diagnostic?: DiagnosticMetrics | null): 
 
   const rawMemory = diagnostic?.memory;
   if (typeof rawMemory === 'number' && Number.isFinite(rawMemory) && rawMemory >= 0) {
-    parts.push(`Taken ${rawMemory.toFixed(2)} megabytes`);
+    parts.push(`Worker RSS ${rawMemory.toFixed(2)} MB`);
   }
 
   return parts.join(' \u00b7 ');

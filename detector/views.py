@@ -161,8 +161,29 @@ def _get_redis_client() -> Optional[Any]:
         return loop_client
 
 
+def _read_proc_rss_mb() -> Optional[float]:
+    """Reads live resident set size (RSS) from Linux procfs in megabytes when available."""
+    try:
+        with open("/proc/self/statm", encoding="ascii") as statm_file:
+            fields = statm_file.read().split()
+        if len(fields) < 2:
+            return None
+        rss_pages = int(fields[1])
+        page_size = os.sysconf("SC_PAGESIZE")
+    except OSError, AttributeError, ValueError, TypeError:
+        return None
+
+    if rss_pages < 0 or page_size <= 0:
+        return None
+    return round((rss_pages * page_size) / (1024.0 * 1024.0), 2)
+
+
 def get_process_memory_mb() -> Optional[float]:
-    """Returns peak resident set size (RSS) of the current worker in megabytes, or None on unsupported platforms."""
+    """Returns current worker RSS in megabytes, falling back to peak RSS when procfs is unavailable."""
+    proc_rss = _read_proc_rss_mb()
+    if proc_rss is not None:
+        return proc_rss
+
     try:
         import resource
 

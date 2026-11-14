@@ -1,4 +1,4 @@
-name: Deploy
+name: Deploy to Toolforge
 
 on:
   workflow_run:
@@ -6,7 +6,6 @@ on:
       - CI
     branches:
       - main
-      - dev
     types:
       - completed
 
@@ -15,7 +14,7 @@ permissions:
   deployments: write
 
 concurrency:
-  group: toolforge-deploy-${{ github.event.workflow_run.head_branch }}
+  group: toolforge-deploy-main
   cancel-in-progress: false
 
 jobs:
@@ -23,19 +22,19 @@ jobs:
     if: >-
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.conclusion == 'success' &&
-      (github.event.workflow_run.head_branch == 'main' || github.event.workflow_run.head_branch == 'dev') &&
+      github.event.workflow_run.head_branch == 'main' &&
       github.event.workflow_run.head_repository.full_name == github.repository
     environment:
       name: Toolforge
-      url: ${{ github.event.workflow_run.head_branch == 'dev' && 'https://proxycheck-dev.toolforge.org/' || 'https://proxycheck.toolforge.org/' }}
+      url: https://proxycheck.toolforge.org/
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
-      - name: Verify target branch tip matches CI commit
+      - name: Verify main branch tip matches CI commit
         env:
           REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
-          TARGET_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          TARGET_BRANCH: main
           VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           # Toolforge build start currently rejects raw commit hashes (phab:T429227),
@@ -68,8 +67,8 @@ jobs:
         env:
           TOOLFORGE_USER: ${{ secrets.TOOLFORGE_USER }}
           TOOLFORGE_HOST: ${{ secrets.TOOLFORGE_HOST }}
-          TARGET_BRANCH: ${{ github.event.workflow_run.head_branch }}
-          TOOLFORGE_TOOL: ${{ github.event.workflow_run.head_branch == 'dev' && 'proxycheck-dev' || 'proxycheck' }}
+          TARGET_BRANCH: main
+          TOOLFORGE_TOOL: proxycheck
           VITE_GITHUB_REPO: ${{ github.repository }}
           REPO_GIT_URL: ${{ github.server_url }}/${{ github.repository }}.git
         run: |

@@ -2205,6 +2205,17 @@ _MAX_MERGED_PROJECT_RIGHTS_LOOKUPS = 15
 _MERGED_PROJECT_RIGHTS_BATCH_SIZE = 5
 
 
+def _merged_project_edit_count(project: Dict[str, Any]) -> int:
+    raw_edit_count = project.get("editcount", 0)
+    if isinstance(raw_edit_count, bool):
+        return 0
+    try:
+        edit_count = int(raw_edit_count)
+    except TypeError, ValueError:
+        return 0
+    return max(edit_count, 0)
+
+
 async def _populate_merged_project_rights(
     client: httpx.AsyncClient,
     username: str,
@@ -2220,7 +2231,7 @@ async def _populate_merged_project_rights(
         return []
 
     enriched = [dict(project) if isinstance(project, dict) else project for project in merged_projects]
-    candidates: List[Tuple[int, str]] = []
+    candidates: List[Tuple[int, int, int, str]] = []
     seen_domains: Set[str] = set(checked_domains)
 
     for idx, project in enumerate(enriched):
@@ -2236,21 +2247,30 @@ async def _populate_merged_project_rights(
         if not domain or domain in seen_domains:
             continue
         seen_domains.add(domain)
-        candidates.append((idx, domain))
-        if len(candidates) >= _MAX_MERGED_PROJECT_RIGHTS_LOOKUPS:
-            break
+        normalized_groups = {str(group).strip().lower() for group in project_groups if group}
+        candidates.append(
+            (
+                0 if "sysop" in normalized_groups else 1,
+                -_merged_project_edit_count(project),
+                idx,
+                domain,
+            )
+        )
 
     if not candidates:
         return enriched
 
+    candidates.sort()
+    candidates = candidates[:_MAX_MERGED_PROJECT_RIGHTS_LOOKUPS]
+
     for start in range(0, len(candidates), _MERGED_PROJECT_RIGHTS_BATCH_SIZE):
         batch = candidates[start : start + _MERGED_PROJECT_RIGHTS_BATCH_SIZE]
         results = await asyncio.gather(
-            *(fetch_project_user_rights(client, username, domain) for _, domain in batch),
+            *(fetch_project_user_rights(client, username, domain) for _, _, _, domain in batch),
             return_exceptions=True,
         )
         found_required = False
-        for (idx, _domain), result in zip(batch, results, strict=True):
+        for (_, _, idx, _domain), result in zip(batch, results, strict=True):
             rights = result if isinstance(result, list) else []
             enriched[idx]["rights"] = rights
             normalized = {str(right).strip().lower() for right in rights if right}

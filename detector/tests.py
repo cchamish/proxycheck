@@ -2951,6 +2951,44 @@ class GadgetTokenAndCorsAuthTests(TestCase):
         mock_fetch.assert_not_called()
         self.assertEqual(allow_resp.json()["username"], "allowlisted Tester")
 
+    def test_merged_project_rights_lookup_prioritises_sysop_and_edit_count(self):
+        merged_projects = [
+            {"wiki": "enwiki", "url": "https://en.wikipedia.org", "editcount": 9000, "groups": []},
+            {"wiki": "frwiki", "url": "https://fr.wikipedia.org", "editcount": 500, "groups": ["user"]},
+            {"wiki": "dewiki", "url": "https://de.wikipedia.org", "editcount": 10, "groups": ["sysop"]},
+            {"wiki": "eswiki", "url": "https://es.wikipedia.org", "editcount": 100, "groups": ["sysop"]},
+            {"wiki": "itwiki", "url": "https://it.wikipedia.org", "editcount": 1000, "groups": ["user"]},
+            {"wiki": "jawiki", "url": "https://ja.wikipedia.org", "editcount": 9999},
+        ]
+        queried_domains = []
+
+        async def record_lookup(_client, _username, domain):
+            queried_domains.append(domain)
+            return []
+
+        with patch("detector.views.fetch_project_user_rights", side_effect=record_lookup):
+            enriched = asyncio.run(
+                views._populate_merged_project_rights(
+                    MagicMock(),
+                    "ExampleUser",
+                    merged_projects,
+                    checked_domains=set(),
+                )
+            )
+
+        self.assertEqual(
+            queried_domains,
+            [
+                "es.wikipedia.org",
+                "de.wikipedia.org",
+                "it.wikipedia.org",
+                "fr.wikipedia.org",
+            ],
+        )
+        self.assertNotIn("en.wikipedia.org", queried_domains)
+        self.assertNotIn("ja.wikipedia.org", queried_domains)
+        self.assertEqual(len(enriched), len(merged_projects))
+
     def test_detect_ip_bearer_token_authentication_and_tamper_resistance(self):
         self._patch_all_providers()
         with patch("detector.views.redis_client", None):

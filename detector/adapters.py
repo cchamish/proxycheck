@@ -888,7 +888,6 @@ def adapt_cloudflare_radar(
             "location": "-",
             "usageType": "-",
             "securityFlags": [],
-            "threatScore": None,
             "rawJson": {"status": "error", "message": "API key not configured"},
         }
 
@@ -909,7 +908,6 @@ def adapt_cloudflare_radar(
             "location": "-",
             "usageType": "-",
             "securityFlags": [],
-            "threatScore": None,
             "rawJson": raw_data or {"status": "error", "message": f"HTTP {status_code}"},
         }
 
@@ -932,7 +930,6 @@ def adapt_cloudflare_radar(
         "location": country,
         "usageType": asn_obj.get("type") or "infrastructure",
         "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-        "threatScore": None,
         "countryCode": asn_obj.get("country"),
         "rawJson": raw_data,
     }
@@ -950,7 +947,6 @@ def adapt_abuseipdb(raw_data: Optional[Dict[str, Any]], has_api_key: bool, statu
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "totalReports": None,
             "numDistinctUsers": None,
             "lastSeen": None,
@@ -974,7 +970,6 @@ def adapt_abuseipdb(raw_data: Optional[Dict[str, Any]], has_api_key: bool, statu
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "totalReports": None,
             "numDistinctUsers": None,
             "lastSeen": None,
@@ -996,13 +991,6 @@ def adapt_abuseipdb(raw_data: Optional[Dict[str, Any]], has_api_key: bool, statu
     loc_parts = [p for p in [data.get("countryName"), data.get("countryCode")] if p]
     location = ", ".join(loc_parts) if loc_parts else "-"
 
-    raw_score = data.get("abuseConfidenceScore")
-    score = int(round(raw_score)) if isinstance(raw_score, (int, float)) else 0
-    if data.get("isTor"):
-        score = max(score, 90)
-    if is_datacenter_usage:
-        score = max(score, 50)
-
     raw_total_reports = _safe_int(data.get("totalReports"), default=None)
     total_reports = max(0, raw_total_reports) if raw_total_reports is not None else None
     raw_distinct_users = _safe_int(data.get("numDistinctUsers"), default=None)
@@ -1020,7 +1008,6 @@ def adapt_abuseipdb(raw_data: Optional[Dict[str, Any]], has_api_key: bool, statu
         "location": location,
         "usageType": usage_type,
         "securityFlags": flags if flags else [{"label": "No Flags", "isHighRisk": False}],
-        "threatScore": score,
         "totalReports": total_reports,
         "numDistinctUsers": num_distinct_users,
         "lastSeen": last_seen,
@@ -1041,7 +1028,6 @@ def adapt_ipdata(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_c
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "carrier": None,
             "rawJson": {"status": "error", "message": "API key not configured"},
         }
@@ -1063,7 +1049,6 @@ def adapt_ipdata(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_c
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "carrier": None,
             "rawJson": raw_data or {"status": "error", "message": f"HTTP {status_code}"},
         }
@@ -1110,21 +1095,6 @@ def adapt_ipdata(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_c
         loc_str += f" ({coords})"
     location = loc_str if loc_str else "-"
 
-    scores_obj = threat.get("scores")
-    if not isinstance(scores_obj, dict):
-        scores_obj = {}
-    raw_threat_score = scores_obj.get("threat_score")
-    threat_score = int(round(raw_threat_score)) if isinstance(raw_threat_score, (int, float)) else 0
-
-    if threat.get("is_tor") or threat.get("is_known_attacker"):
-        threat_score = max(threat_score, 90)
-    if threat.get("is_proxy") or threat.get("is_vpn"):
-        threat_score = max(threat_score, 85)
-    if threat.get("is_icloud_relay"):
-        threat_score = max(threat_score, 80)
-    if threat.get("is_datacenter"):
-        threat_score = max(threat_score, 50)
-
     carrier_name = _extract_carrier_name(raw_data.get("carrier"))
     company_type = company.get("type")
     normalized_company_type = company_type.strip() if isinstance(company_type, str) and company_type.strip() else None
@@ -1141,7 +1111,6 @@ def adapt_ipdata(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_c
         "location": location,
         "usageType": usage_type,
         "securityFlags": flags if flags else [{"label": "No Flags", "isHighRisk": False}],
-        "threatScore": threat_score,
         "carrier": carrier_name,
         "countryCode": raw_data.get("country_code"),
         "coordinates": coords,
@@ -1161,7 +1130,6 @@ def adapt_ipregistry(raw_data: Optional[Dict[str, Any]], has_api_key: bool, stat
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "isMobile": False,
             "rawJson": {"status": "error", "message": "API key not configured"},
         }
@@ -1183,7 +1151,6 @@ def adapt_ipregistry(raw_data: Optional[Dict[str, Any]], has_api_key: bool, stat
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "isMobile": False,
             "rawJson": raw_data or {"status": "error", "message": f"HTTP {status_code}"},
         }
@@ -1236,19 +1203,6 @@ def adapt_ipregistry(raw_data: Optional[Dict[str, Any]], has_api_key: bool, stat
         loc_str += f" ({coords})"
     location = loc_str if loc_str else "-"
 
-    threat_score = 0
-    if security.get("is_proxy") or security.get("is_vpn") or is_relay:
-        threat_score += 50
-    if security.get("is_tor"):
-        threat_score += 30
-    if security.get("is_threat") or is_abuser:
-        threat_score += 20
-    if is_relay or is_abuser:
-        threat_score = max(threat_score, 75)
-    if security.get("is_cloud_provider") or is_hosting_conn:
-        threat_score = max(threat_score, 50)
-    threat_score = min(100, threat_score)
-
     org_val = connection.get("organization") or "-"
     country_code = country_obj.get("code")
 
@@ -1262,7 +1216,6 @@ def adapt_ipregistry(raw_data: Optional[Dict[str, Any]], has_api_key: bool, stat
         "location": location,
         "usageType": conn_type,
         "securityFlags": flags if flags else [{"label": "No Flags", "isHighRisk": False}],
-        "threatScore": threat_score,
         "isMobile": is_mobile_conn,
         "countryCode": country_code,
         "coordinates": coords,
@@ -1282,7 +1235,6 @@ def adapt_ip2location(raw_data: Optional[Dict[str, Any]], has_api_key: bool, sta
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "mobileBrand": None,
             "rawJson": {"status": "error", "message": "API key not configured"},
         }
@@ -1306,7 +1258,6 @@ def adapt_ip2location(raw_data: Optional[Dict[str, Any]], has_api_key: bool, sta
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "mobileBrand": None,
             "rawJson": raw_data or {"status": "error", "message": err_msg or f"HTTP {status_code}"},
         }
@@ -1345,16 +1296,6 @@ def adapt_ip2location(raw_data: Optional[Dict[str, Any]], has_api_key: bool, sta
         loc_str += f" ({coords})"
     location = loc_str if loc_str else "-"
 
-    threat_score = 0
-    if is_proxy or is_vpn:
-        threat_score = max(threat_score, 75)
-    if is_tor:
-        threat_score = max(threat_score, 90)
-    if is_data_center:
-        threat_score = max(threat_score, 50)
-    if is_spam:
-        threat_score = max(threat_score, 85)
-
     raw_mobile_brand = raw_data.get("mobile_brand")
     mobile_brand = (
         raw_mobile_brand.strip()
@@ -1376,7 +1317,6 @@ def adapt_ip2location(raw_data: Optional[Dict[str, Any]], has_api_key: bool, sta
         "location": location,
         "usageType": usage_type,
         "securityFlags": flags if flags else [{"label": "No Flags", "isHighRisk": False}],
-        "threatScore": threat_score if threat_score > 0 else 0,
         "mobileBrand": mobile_brand,
         "countryCode": raw_data.get("country_code"),
         "coordinates": coords,
@@ -1439,7 +1379,6 @@ def adapt_maxmind(
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "rawJson": {"status": "error", "message": "Local MMDB files not found"},
         }
 
@@ -1455,7 +1394,6 @@ def adapt_maxmind(
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "rawJson": raw_data or {"status": "error", "message": f"HTTP {status_code}"},
         }
 
@@ -1531,14 +1469,6 @@ def adapt_maxmind(
     if is_hosting:
         flags.append({"label": "Hosting", "isHighRisk": True})
 
-    threat_score = 0
-    if is_tor:
-        threat_score = max(threat_score, 90)
-    if is_proxy or is_vpn:
-        threat_score = max(threat_score, 80)
-    if is_hosting:
-        threat_score = max(threat_score, 50)
-
     raw_prefix_val = raw_data.get("_mmdb_prefix_len")
     if raw_prefix_val is None:
         raw_prefix_val = raw_data.get("prefix_len")
@@ -1563,7 +1493,6 @@ def adapt_maxmind(
         "location": loc_str,
         "usageType": usage_type,
         "securityFlags": flags if flags else [{"label": "No Flags", "isHighRisk": False}],
-        "threatScore": threat_score,
         "countryCode": country_code or None,
         "coordinates": coords,
         "rawJson": clean_raw_json,
@@ -1594,7 +1523,6 @@ def adapt_getipintel(
             "location": "-",
             "usageType": "ML Prediction",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "chance": None,
             "rawJson": {"status": "error", "message": "GETIPINTEL_CONTACT_EMAIL not configured"},
         }
@@ -1616,7 +1544,6 @@ def adapt_getipintel(
             "location": "-",
             "usageType": "ML Prediction",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "chance": None,
             "rawJson": raw_data or {"status": "error", "message": f"HTTP {status_code}"},
         }
@@ -1640,7 +1567,6 @@ def adapt_getipintel(
             "location": "-",
             "usageType": "ML Prediction",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "chance": None,
             "rawJson": raw_data,
         }
@@ -1662,7 +1588,6 @@ def adapt_getipintel(
         "location": "-",
         "usageType": "ML Prediction",
         "securityFlags": flags if flags else [{"label": "No Flags", "isHighRisk": False}],
-        "threatScore": int(round(chance)),
         "chance": chance,
         "rawJson": raw_data,
     }
@@ -1710,7 +1635,6 @@ def adapt_proxycheck(
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "port": None,
             "lastSeen": None,
             "rawJson": {"status": "error", "message": "PROXYCHECK_API_KEY not configured"},
@@ -1733,7 +1657,6 @@ def adapt_proxycheck(
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "port": None,
             "lastSeen": None,
             "rawJson": raw_data or {"status": "error", "message": f"HTTP {status_code}"},
@@ -1819,15 +1742,6 @@ def adapt_proxycheck(
         except ValueError, TypeError:
             parsed_risk = None
 
-    if parsed_risk is not None:
-        threat_score = parsed_risk
-        if is_tor:
-            threat_score = max(threat_score, 90)
-        elif is_proxy or is_vpn:
-            threat_score = max(threat_score, 80)
-    else:
-        threat_score = 90 if is_tor else (80 if (is_proxy or is_vpn) else (50 if is_hosting else 0))
-
     usage_type = "hosting" if is_hosting else (str(raw_type).strip().lower() if raw_type else "-")
 
     normalized_port: Optional[int] = None
@@ -1865,7 +1779,6 @@ def adapt_proxycheck(
         "location": loc_str,
         "usageType": usage_type,
         "securityFlags": flags if flags else [{"label": "No Flags", "isHighRisk": False}],
-        "threatScore": threat_score,
         "riskScore": parsed_risk,
         "port": normalized_port,
         "lastSeen": normalized_last_seen,
@@ -1888,7 +1801,6 @@ def adapt_iphub(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_co
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "block": None,
             "rawJson": {"status": "error", "message": "IPHUB_API_KEY not configured"},
         }
@@ -1916,7 +1828,6 @@ def adapt_iphub(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_co
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "block": None,
             "rawJson": raw_data or {"status": "error", "message": f"HTTP {status_code}"},
         }
@@ -1935,7 +1846,6 @@ def adapt_iphub(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_co
     loc_parts = [p for p in [country_name, country_code] if p and p != "ZZ"]
     location = ", ".join(loc_parts) if loc_parts else "-"
 
-    threat_score = 85 if block_val == 1 else (55 if block_val == 2 else 0)
     usage_type = "hosting / proxy" if block_val == 1 else ("mixed" if block_val == 2 else "residential")
 
     return {
@@ -1948,7 +1858,6 @@ def adapt_iphub(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_co
         "location": location,
         "usageType": usage_type,
         "securityFlags": flags if flags else [{"label": "No Flags", "isHighRisk": False}],
-        "threatScore": threat_score,
         "block": block_val,
         "countryCode": str(country_code).upper() if country_code and country_code != "ZZ" else None,
         "rawJson": raw_data,
@@ -1968,7 +1877,6 @@ def adapt_iphunter(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "block": None,
             "rawJson": {"status": "error", "message": "IPHUNTER_API_KEY not configured"},
         }
@@ -2004,7 +1912,6 @@ def adapt_iphunter(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "block": None,
             "rawJson": raw_data or {"status": "error", "message": f"HTTP {status_code}"},
         }
@@ -2024,7 +1931,6 @@ def adapt_iphunter(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status
     loc_parts = [p for p in [city_name, country_name, country_code] if p]
     location = ", ".join(loc_parts) if loc_parts else "-"
 
-    threat_score = 85 if block_val == 1 else (50 if block_val == 2 else 0)
     usage_type = "proxy / hosting" if block_val == 1 else "residential"
 
     return {
@@ -2037,39 +1943,38 @@ def adapt_iphunter(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status
         "location": location,
         "usageType": usage_type,
         "securityFlags": flags if flags else [{"label": "No Flags", "isHighRisk": False}],
-        "threatScore": threat_score,
         "block": block_val,
         "countryCode": str(country_code).upper() if country_code else None,
         "rawJson": raw_data,
     }
 
 
-_SPAMHAUS_CODE_MAP: Dict[str, Tuple[str, str, bool, int]] = {
-    "127.0.0.2": ("SBL", "Spamhaus SBL", True, 80),
-    "127.0.0.3": ("CSS", "Spamhaus CSS", True, 75),
-    "127.0.0.4": ("XBL/CBL", "Spamhaus XBL/CBL", True, 85),
-    "127.0.0.5": ("XBL/CBL", "Spamhaus XBL/CBL", True, 85),
-    "127.0.0.6": ("XBL/CBL", "Spamhaus XBL/CBL", True, 85),
-    "127.0.0.7": ("XBL/CBL", "Spamhaus XBL/CBL", True, 85),
-    "127.0.0.9": ("SBL DROP/EDROP", "Spamhaus DROP/EDROP", True, 85),
-    "127.0.0.10": ("Policy/Dynamic ISP Range (PBL)", "Policy/Dynamic ISP Range (PBL)", False, 0),
-    "127.0.0.11": ("Policy/Dynamic ISP Range (PBL)", "Policy/Dynamic ISP Range (PBL)", False, 0),
+_SPAMHAUS_CODE_MAP: Dict[str, Tuple[str, str, bool]] = {
+    "127.0.0.2": ("SBL", "Spamhaus SBL", True),
+    "127.0.0.3": ("CSS", "Spamhaus CSS", True),
+    "127.0.0.4": ("XBL/CBL", "Spamhaus XBL/CBL", True),
+    "127.0.0.5": ("XBL/CBL", "Spamhaus XBL/CBL", True),
+    "127.0.0.6": ("XBL/CBL", "Spamhaus XBL/CBL", True),
+    "127.0.0.7": ("XBL/CBL", "Spamhaus XBL/CBL", True),
+    "127.0.0.9": ("SBL DROP/EDROP", "Spamhaus DROP/EDROP", True),
+    "127.0.0.10": ("Policy/Dynamic ISP Range (PBL)", "Policy/Dynamic ISP Range (PBL)", False),
+    "127.0.0.11": ("Policy/Dynamic ISP Range (PBL)", "Policy/Dynamic ISP Range (PBL)", False),
 }
 
-_SORBS_CODE_MAP: Dict[str, Tuple[str, bool, int]] = {
-    "127.0.0.2": ("HTTP Proxy", True, 85),
-    "127.0.0.3": ("SOCKS Proxy", True, 85),
-    "127.0.0.4": ("MISC Proxy", True, 80),
-    "127.0.0.5": ("Open Relay", True, 75),
-    "127.0.0.6": ("Spam Source", True, 75),
-    "127.0.0.7": ("Web Form Spam", True, 70),
-    "127.0.0.8": ("Spam / Blocked Host", True, 70),
-    "127.0.0.9": ("Zombie / Hijacked", True, 85),
-    "127.0.0.10": ("Dynamic IP (DUHL)", False, 10),
-    "127.0.0.11": ("Bad Configuration", False, 15),
-    "127.0.0.12": ("No Mail Server", False, 10),
-    "127.0.0.13": ("Misc Listing", True, 60),
-    "127.0.0.14": ("Non-Mail Server", False, 10),
+_SORBS_CODE_MAP: Dict[str, Tuple[str, bool]] = {
+    "127.0.0.2": ("HTTP Proxy", True),
+    "127.0.0.3": ("SOCKS Proxy", True),
+    "127.0.0.4": ("MISC Proxy", True),
+    "127.0.0.5": ("Open Relay", True),
+    "127.0.0.6": ("Spam Source", True),
+    "127.0.0.7": ("Web Form Spam", True),
+    "127.0.0.8": ("Spam / Blocked Host", True),
+    "127.0.0.9": ("Zombie / Hijacked", True),
+    "127.0.0.10": ("Dynamic IP (DUHL)", False),
+    "127.0.0.11": ("Bad Configuration", False),
+    "127.0.0.12": ("No Mail Server", False),
+    "127.0.0.13": ("Misc Listing", True),
+    "127.0.0.14": ("Non-Mail Server", False),
 }
 
 
@@ -2108,7 +2013,6 @@ def _adapt_dnsbl_precheck(
             "location": "-",
             "usageType": "IPv4 Only (Skipped for IPv6)",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "isListed": False,
             "isSkippedIpv6": True,
             "listedCodes": [],
@@ -2136,7 +2040,6 @@ def _adapt_dnsbl_precheck(
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "isListed": False,
             "listedCodes": [],
             "listedCategories": [],
@@ -2157,7 +2060,6 @@ def _build_clean_dnsbl_row(provider_name: str, raw_data: Dict[str, Any]) -> Dict
         "location": "-",
         "usageType": "Clean (Not Listed)",
         "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-        "threatScore": 0,
         "isListed": False,
         "listedCodes": [],
         "listedCategories": [],
@@ -2189,7 +2091,6 @@ def adapt_spamhaus_zen(raw_data: Optional[Dict[str, Any]], status_code: int = 20
             "location": "-",
             "usageType": f"Query Restricted ({', '.join(blocked_codes)}: {reason_detail})",
             "securityFlags": [{"label": "Query Restricted (Unapplied)", "isHighRisk": False}],
-            "threatScore": None,
             "isListed": False,
             "isQueryRestricted": True,
             "listedCodes": [],
@@ -2203,18 +2104,16 @@ def adapt_spamhaus_zen(raw_data: Optional[Dict[str, Any]], status_code: int = 20
     flags: List[Dict[str, Any]] = []
     usage_parts: List[str] = []
     categories: List[str] = []
-    max_score = 0
     seen_labels = set()
 
     for code in codes:
         if code in _SPAMHAUS_CODE_MAP:
-            category, flag_label, is_high_risk, score = _SPAMHAUS_CODE_MAP[code]
+            category, flag_label, is_high_risk = _SPAMHAUS_CODE_MAP[code]
         else:
-            category, flag_label, is_high_risk, score = (
+            category, flag_label, is_high_risk = (
                 f"Spamhaus Code {code}",
                 f"Spamhaus Listed ({code})",
                 True,
-                60,
             )
 
         if category not in categories:
@@ -2229,7 +2128,6 @@ def adapt_spamhaus_zen(raw_data: Optional[Dict[str, Any]], status_code: int = 20
         if full_label not in seen_labels:
             seen_labels.add(full_label)
             flags.append({"label": full_label, "isHighRisk": is_high_risk})
-        max_score = max(max_score, score)
 
     is_only_pbl = all(code in ("127.0.0.10", "127.0.0.11") for code in codes)
     usage_text = ", ".join(usage_parts) if is_only_pbl else f"Listed: {', '.join(usage_parts)}"
@@ -2244,7 +2142,6 @@ def adapt_spamhaus_zen(raw_data: Optional[Dict[str, Any]], status_code: int = 20
         "location": "-",
         "usageType": usage_text,
         "securityFlags": flags,
-        "threatScore": max_score,
         "isListed": True,
         "isPolicyRange": is_only_pbl,
         "listedCodes": codes,
@@ -2274,7 +2171,6 @@ def adapt_spamcop(raw_data: Optional[Dict[str, Any]], status_code: int = 200) ->
         "location": "-",
         "usageType": f"Listed: Spam Source ({', '.join(codes)})",
         "securityFlags": flags,
-        "threatScore": 75,
         "isListed": True,
         "listedCodes": codes,
         "listedCategories": ["Spam Source"],
@@ -2295,15 +2191,13 @@ def adapt_sorbs(raw_data: Optional[Dict[str, Any]], status_code: int = 200) -> D
     flags: List[Dict[str, Any]] = []
     usage_parts: List[str] = []
     categories: List[str] = []
-    max_score = 0
 
     for code in codes:
-        category, is_high_risk, score = _SORBS_CODE_MAP.get(code, (f"SORBS Listing ({code})", True, 60))
+        category, is_high_risk = _SORBS_CODE_MAP.get(code, (f"SORBS Listing ({code})", True))
         if category not in categories:
             categories.append(category)
         usage_parts.append(f"{category} ({code})")
         flags.append({"label": f"{category} ({code})", "isHighRisk": is_high_risk})
-        max_score = max(max_score, score)
 
     return {
         "provider": "SORBS",
@@ -2315,7 +2209,6 @@ def adapt_sorbs(raw_data: Optional[Dict[str, Any]], status_code: int = 200) -> D
         "location": "-",
         "usageType": f"Listed: {', '.join(usage_parts)}",
         "securityFlags": flags,
-        "threatScore": max_score,
         "isListed": True,
         "listedCodes": codes,
         "listedCategories": categories,
@@ -2402,7 +2295,6 @@ def adapt_tor_onionoo(
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "isTor": False,
             "torIsExit": False,
             "torRunning": False,
@@ -2493,7 +2385,6 @@ def adapt_tor_onionoo(
             "location": "-",
             "usageType": tor_summary,
             "securityFlags": [{"label": tor_label, "isHighRisk": True}],
-            "threatScore": 90 if active_is_exit else 80,
             "isTor": True,
             "torIsExit": active_is_exit,
             "torRunning": True,
@@ -2519,7 +2410,6 @@ def adapt_tor_onionoo(
             "location": "-",
             "usageType": offline_summary,
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": 0,
             "isTor": False,
             "torIsExit": False,
             "torRunning": False,
@@ -2539,7 +2429,6 @@ def adapt_tor_onionoo(
         "location": "-",
         "usageType": "Not a Tor Node",
         "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-        "threatScore": 0,
         "isTor": False,
         "torIsExit": False,
         "torRunning": False,
@@ -2575,7 +2464,6 @@ def adapt_stopforumspam(raw_data: Optional[Dict[str, Any]], status_code: int = 2
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "appears": False,
             "frequency": None,
             "confidence": None,
@@ -2616,11 +2504,9 @@ def adapt_stopforumspam(raw_data: Optional[Dict[str, Any]], status_code: int = 2
 
     if appears:
         flags = [{"label": f"Forum Spam ({frequency}x)", "isHighRisk": True}]
-        threat_score = int(round(confidence)) if confidence is not None else min(100, max(35, frequency * 15))
         usage_type = "Forum Spam Reported"
     else:
         flags = [{"label": "No Flags", "isHighRisk": False}]
-        threat_score = 0
         usage_type = "Clean (Not Listed)"
 
     return {
@@ -2633,7 +2519,6 @@ def adapt_stopforumspam(raw_data: Optional[Dict[str, Any]], status_code: int = 2
         "location": "-",
         "usageType": usage_type,
         "securityFlags": flags,
-        "threatScore": threat_score,
         "appears": appears,
         "frequency": frequency,
         "confidence": confidence,
@@ -2710,7 +2595,6 @@ def adapt_dshield(raw_data: Optional[Dict[str, Any]], status_code: int = 200) ->
             "location": "-",
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "threatScore": None,
             "attacks": None,
             "count": None,
             "threatfeeds": [],
@@ -2750,11 +2634,9 @@ def adapt_dshield(raw_data: Optional[Dict[str, Any]], status_code: int = 200) ->
             flags.append({"label": f"Attack Activity ({attacks} attacks)", "isHighRisk": True})
         if threatfeeds:
             flags.append({"label": f"Feeds: {', '.join(threatfeeds[:3])}", "isHighRisk": True})
-        threat_score = min(100, max(35, min(60, attacks) + min(25, count * 2) + (15 if threatfeeds else 0)))
         usage_type = "Malicious Activity" if (attacks > 0 or count > 0) else "Threat Feed Listed"
     else:
         flags = [{"label": "No Flags", "isHighRisk": False}]
-        threat_score = 0
         usage_type = "Clean (No Activity)"
 
     return {
@@ -2767,7 +2649,6 @@ def adapt_dshield(raw_data: Optional[Dict[str, Any]], status_code: int = 200) ->
         "location": loc_val,
         "usageType": usage_type,
         "securityFlags": flags,
-        "threatScore": threat_score,
         "attacks": attacks,
         "count": count,
         "threatfeeds": threatfeeds,

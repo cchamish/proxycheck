@@ -41,7 +41,6 @@ function makeProviderResult(provider: ProviderRawResult['provider']): ProviderRa
     location: '-',
     usageType: '-',
     securityFlags: [],
-    threatScore: null,
     rawJson: {},
   };
 }
@@ -144,7 +143,7 @@ test('Rapid consecutive history queries discard stale earlier responses and pres
     status: 200,
     json: async () => ({
       ip: '8.8.8.8',
-      comprehensiveScore: 10,
+      prediction_score: 10,
       durationSeconds: 0.12,
       memoryMb: 44,
       isCached: true,
@@ -161,7 +160,7 @@ test('Rapid consecutive history queries discard stale earlier responses and pres
     status: 200,
     json: async () => ({
       ip: '1.1.1.1',
-      comprehensiveScore: 85,
+      prediction_score: 85,
       durationSeconds: 0.95,
       memoryMb: 48,
       isCached: false,
@@ -171,7 +170,7 @@ test('Rapid consecutive history queries discard stale earlier responses and pres
   await taskOne;
 
   assert.equal(coordinator.state.detectionData?.ip, '8.8.8.8');
-  assert.equal(coordinator.state.detectionData?.comprehensiveScore, 10);
+  assert.equal(coordinator.state.detectionData?.prediction_score, 10);
   assert.equal(coordinator.state.isLoading, false);
   assert.deepEqual(coordinator.state.ipHistory, ['8.8.8.8']);
 });
@@ -189,7 +188,7 @@ test('HTTP 401 response during detection resets user session state and surfaces 
     role: 'Temporary Account Access (local: checkuser-temporary-account)',
     hasAccess: true,
   });
-  coordinator.state.detectionData = { ip: '1.1.1.1', comprehensiveScore: 20, results: [] };
+  coordinator.state.detectionData = { ip: '1.1.1.1', prediction_score: 20, results: [] };
 
   await coordinator.executeDetection('8.8.8.8');
 
@@ -236,7 +235,7 @@ test('Detection coordinator preserves null memory diagnostics and invokes histor
       status: 200,
       json: async () => ({
         ip: '8.8.8.8',
-        comprehensiveScore: 0,
+        prediction_score: 0,
         durationSeconds: 0.25,
         memoryMb: null,
         isCached: false,
@@ -473,7 +472,7 @@ test('Detection coordinator fires onDetectionSuccess only for non-stale HTTP 200
     undefined,
     {
       onDetectionSuccess: (canonicalIp, data) => {
-        succeeded.push({ ip: canonicalIp, score: data.comprehensiveScore });
+        succeeded.push({ ip: canonicalIp, score: data.prediction_score });
       },
     },
   );
@@ -491,7 +490,7 @@ test('Detection coordinator fires onDetectionSuccess only for non-stale HTTP 200
     status: 200,
     json: async () => ({
       ip: '2001:0db8:0000:0000:0000:0000:0000:0001',
-      comprehensiveScore: 25,
+      prediction_score: 25,
       results: [],
     }),
   });
@@ -502,7 +501,7 @@ test('Detection coordinator fires onDetectionSuccess only for non-stale HTTP 200
     status: 200,
     json: async () => ({
       ip: '1.1.1.1',
-      comprehensiveScore: 80,
+      prediction_score: 80,
       results: [],
     }),
   });
@@ -601,5 +600,24 @@ test('resolveProviderUpdatedLabel handles per-row and top-level cache state and 
 
   const codexCss = fs.readFileSync(path.resolve(process.cwd(), 'src/codex.css'), 'utf8');
   assert.match(codexCss, /\.provider-updated-time\s*\{[\s\S]*?font-size:\s*12px;[\s\S]*?color:\s*var\(--cdx-color-muted\);/);
+});
+
+test('Executive overview aligns Prediction gauge with IP details and renders six comparison columns', () => {
+  const appVue = fs.readFileSync(path.resolve(process.cwd(), 'src/App.vue'), 'utf8');
+  const codexCss = fs.readFileSync(path.resolve(process.cwd(), 'src/codex.css'), 'utf8');
+
+  assert.match(
+    appVue,
+    /<div class="overview-body">\s*<div class="score-gauge-container prediction-gauge-container">[\s\S]*?<span class="gauge-title">Prediction<\/span>[\s\S]*?<\/div>\s*<div class="basic-info-container">/
+  );
+  assert.match(
+    appVue,
+    /<thead>\s*<tr>\s*<th scope="col">PROVIDER<\/th>\s*<th scope="col"[^>]*>ASN<\/th>\s*<th scope="col">ISP \/ ORGANISATION<\/th>\s*<th scope="col">LOCATION<\/th>\s*<th scope="col">USAGE TYPE<\/th>\s*<th scope="col">SECURITY FLAGS<\/th>\s*<\/tr>\s*<\/thead>/
+  );
+
+  assert.match(codexCss, /\.executive-overview-card\s*\{[\s\S]*?align-items:\s*stretch;/);
+  assert.match(codexCss, /\.executive-overview-card\s+\.cdx-card__text\s*\{[\s\S]*?width:\s*100%;/);
+  assert.match(codexCss, /\.overview-body\s*\{[\s\S]*?grid-template-columns:\s*auto\s+1fr;[\s\S]*?width:\s*100%;/);
+  assert.match(codexCss, /\.prediction-gauge-container\s*\{[\s\S]*?justify-self:\s*center;/);
 });
 

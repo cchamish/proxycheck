@@ -239,7 +239,12 @@ body {
   padding: 20px 24px;
   display: flex;
   flex-direction: column;
+  align-items: stretch;
   gap: 16px;
+}
+
+.executive-overview-card .cdx-card__text {
+  width: 100%;
 }
 
 .overview-card-title {
@@ -254,6 +259,7 @@ body {
   grid-template-columns: auto 1fr;
   gap: 24px;
   align-items: center;
+  width: 100%;
 }
 
 @media (max-width: 900px) {
@@ -350,6 +356,8 @@ body {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  min-width: 0;
+  width: 100%;
 }
 
 .basic-info-table {

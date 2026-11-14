@@ -615,7 +615,9 @@ test('Executive overview aligns Prediction gauge with IP details and renders six
     /<thead>\s*<tr>\s*<th scope="col">PROVIDER<\/th>\s*<th scope="col"[^>]*>ASN<\/th>\s*<th scope="col">ISP \/ ORGANISATION<\/th>\s*<th scope="col">LOCATION<\/th>\s*<th scope="col">USAGE TYPE<\/th>\s*<th scope="col">SECURITY FLAGS<\/th>\s*<\/tr>\s*<\/thead>/
   );
 
-  assert.match(codexCss, /\.overview-body\s*\{[\s\S]*?grid-template-columns:\s*auto\s+1fr;/);
+  assert.match(codexCss, /\.executive-overview-card\s*\{[\s\S]*?align-items:\s*stretch;/);
+  assert.match(codexCss, /\.executive-overview-card\s+\.cdx-card__text\s*\{[\s\S]*?width:\s*100%;/);
+  assert.match(codexCss, /\.overview-body\s*\{[\s\S]*?grid-template-columns:\s*auto\s+1fr;[\s\S]*?width:\s*100%;/);
   assert.match(codexCss, /\.prediction-gauge-container\s*\{[\s\S]*?justify-self:\s*center;/);
 });
 

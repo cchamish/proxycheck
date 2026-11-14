@@ -45,6 +45,16 @@ else:
 DEBUG = os.environ.get("DJANGO_DEBUG", "False").lower() in ("true", "1", "yes")
 ENABLE_TEST_AUTH = os.environ.get("ENABLE_TEST_AUTH") == "1"
 
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    if not value:
+        return default
+    return value in ("1", "true", "yes", "on")
+
+
+RESTRICT_TO_ALLOWED_WIKI_USERS = _parse_bool_env("RESTRICT_TO_ALLOWED_WIKI_USERS")
+
 _IS_TEST_RUN = "test" in sys.argv or "pytest" in sys.modules
 
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY")

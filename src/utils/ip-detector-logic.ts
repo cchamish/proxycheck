@@ -24,7 +24,6 @@ export interface ProviderRawResult {
     | 'MaxMind'
     | 'Spamhaus ZEN'
     | 'SpamCop'
-    | 'SORBS'
     | 'Tor Onionoo'
     | 'StopForumSpam'
     | 'DShield';
@@ -544,18 +543,128 @@ export function measureElapsedSeconds(startTimeMs: number): number {
   return Number((elapsedMs / 1000).toFixed(3));
 }
 
+export interface UserSessionState {
+  isLoggedIn: boolean;
+  username: string;
+  role: string;
+  hasAccess: boolean;
+  isAdmin?: boolean;
+  localGroups?: string[];
+  globalGroups?: string[];
+}
+
+export interface ProviderDashboardTelemetry {
+  ok: number;
+  cacheHit: number;
+  rateLimited429: number;
+  error5xx: number;
+  timeout: number;
+  quotaBlocked: number;
+}
+
+export interface ProviderDashboardRow {
+  key: string;
+  name: string;
+  usesHttp: boolean;
+  configured: boolean;
+  status: string;
+  statusKey: 'healthy' | 'quota_guarded' | 'cooldown' | 'no_api_key';
+  cooldownTtlSeconds: number;
+  cooldownReason?: string | null;
+  minuteUsed: number;
+  minuteLimit: number;
+  dailyUsed: number;
+  dailyLimit: number;
+  upstreamRemaining: number | null;
+  upstreamLimit: number | null;
+  upstreamUsed: number | null;
+  lastStatusAt: string | null;
+  telemetry: ProviderDashboardTelemetry;
+}
+
+export interface ProviderDashboardGlobalMetrics {
+  totalRequestsToday: number;
+  authSession: number;
+  authGadget: number;
+  cacheHit: number;
+  cachePartial: number;
+  cacheMiss: number;
+  fullCacheHitRatePercent: number;
+  totalQuotaBlocksToday: number;
+  activeCooldownCount: number;
+  activeQuotaGuardCount: number;
+}
+
+export interface ProviderDashboardResponse {
+  generatedAt: string;
+  dateBucket: string;
+  redisAvailable: boolean;
+  global: ProviderDashboardGlobalMetrics;
+  providers: ProviderDashboardRow[];
+  durationSeconds?: number;
+  memoryMb?: number | null;
+}
+
+/**
+ * Returns true only when the backend verified the active session against ALLOWED_WIKI_USERS.
+ */
+export function isAuthorisedAdminUser(user?: Partial<UserSessionState> | null): boolean {
+  if (!user || !user.isLoggedIn || !user.hasAccess) {
+    return false;
+  }
+  return user.isAdmin === true;
+}
+
+/**
+ * Computes clamped quota utilisation percentage for visual progress bars.
+ */
+export function computeQuotaUsagePercent(used: number, limit: number): number {
+  if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0 || used <= 0) {
+    return 0;
+  }
+  return Math.min(100, Math.round((used / limit) * 100));
+}
+
+/**
+ * Determines the visual severity tone for a quota progress bar.
+ */
+export function getQuotaProgressTone(used: number, limit: number): 'normal' | 'warning' | 'danger' {
+  if (!Number.isFinite(limit) || limit <= 0) {
+    return 'normal';
+  }
+  const ratio = used / limit;
+  if (ratio >= 1) {
+    return 'danger';
+  }
+  if (ratio >= 0.8) {
+    return 'warning';
+  }
+  return 'normal';
+}
+
+/**
+ * Formats upstream-reported remaining quota or IPData usage counts for table display.
+ */
+export function formatUpstreamQuotaLabel(row: Pick<ProviderDashboardRow, 'upstreamRemaining' | 'upstreamLimit' | 'upstreamUsed'>): string {
+  if (row.upstreamRemaining !== null && row.upstreamRemaining !== undefined) {
+    if (row.upstreamLimit !== null && row.upstreamLimit !== undefined && row.upstreamLimit > 0) {
+      return `${row.upstreamRemaining.toLocaleString('en-GB')} / ${row.upstreamLimit.toLocaleString('en-GB')} left`;
+    }
+    return `${row.upstreamRemaining.toLocaleString('en-GB')} left`;
+  }
+  if (row.upstreamUsed !== null && row.upstreamUsed !== undefined) {
+    return `${row.upstreamUsed.toLocaleString('en-GB')} used`;
+  }
+  return '-';
+}
+
 export interface DetectionCoordinatorState {
   isLoading: boolean;
   validationError: string;
   sessionExpiredMessage: string;
   detectionData: any | null;
   diagnostic: DiagnosticMetrics | null;
-  user: {
-    isLoggedIn: boolean;
-    username: string;
-    role: string;
-    hasAccess: boolean;
-  };
+  user: UserSessionState;
   ipHistory: string[];
 }
 
@@ -575,7 +684,7 @@ export function createDetectionCoordinator(
     status: number;
     json: () => Promise<any>;
   }>,
-  initialUser: { isLoggedIn: boolean; username: string; role: string; hasAccess: boolean } = {
+  initialUser: UserSessionState = {
     isLoggedIn: true,
     username: 'AdminUser',
     role: 'Temporary Account Access (local: checkuser-temporary-account)',
@@ -632,6 +741,9 @@ export function createDetectionCoordinator(
           username: '',
           role: '',
           hasAccess: false,
+          isAdmin: false,
+          localGroups: [],
+          globalGroups: [],
         };
         state.detectionData = null;
         state.diagnostic = null;

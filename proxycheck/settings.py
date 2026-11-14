@@ -215,6 +215,18 @@ def _parse_positive_int_env(name: str, default: int) -> int:
         return default
 
 
+def _parse_non_negative_int_env(name: str, default: int) -> int:
+    """Parses a non-negative integer environment variable where zero disables local interception."""
+    raw_value = os.environ.get(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        parsed = int(raw_value)
+        return parsed if parsed >= 0 else default
+    except ValueError:
+        return default
+
+
 def _parse_positive_float_env(name: str, default: float) -> float:
     raw_value = os.environ.get(name, "").strip()
     if not raw_value:
@@ -252,6 +264,54 @@ GETIPINTEL_CONTACT_EMAIL = os.environ.get("GETIPINTEL_CONTACT_EMAIL", "")
 PROXYCHECK_API_KEY = os.environ.get("PROXYCHECK_API_KEY", "")
 IPHUB_API_KEY = os.environ.get("IPHUB_API_KEY", "")
 IPHUNTER_API_KEY = os.environ.get("IPHUNTER_API_KEY", "")
+
+# Optional per-provider soft quota limits (zero disables local interception)
+CLOUDFLARE_RADAR_RPM_LIMIT = _parse_non_negative_int_env("CLOUDFLARE_RADAR_RPM_LIMIT", 240)
+CLOUDFLARE_RADAR_DAILY_LIMIT = _parse_non_negative_int_env("CLOUDFLARE_RADAR_DAILY_LIMIT", 0)
+ABUSEIPDB_RPM_LIMIT = _parse_non_negative_int_env("ABUSEIPDB_RPM_LIMIT", 0)
+ABUSEIPDB_DAILY_LIMIT = _parse_non_negative_int_env("ABUSEIPDB_DAILY_LIMIT", 1000)
+IPDATA_RPM_LIMIT = _parse_non_negative_int_env("IPDATA_RPM_LIMIT", 0)
+IPDATA_DAILY_LIMIT = _parse_non_negative_int_env("IPDATA_DAILY_LIMIT", 1000)
+IPREGISTRY_RPM_LIMIT = _parse_non_negative_int_env("IPREGISTRY_RPM_LIMIT", 50)
+IPREGISTRY_DAILY_LIMIT = _parse_non_negative_int_env("IPREGISTRY_DAILY_LIMIT", 0)
+IP2LOCATION_RPM_LIMIT = _parse_non_negative_int_env("IP2LOCATION_RPM_LIMIT", 0)
+IP2LOCATION_DAILY_LIMIT = _parse_non_negative_int_env("IP2LOCATION_DAILY_LIMIT", 1000)
+GETIPINTEL_RPM_LIMIT = _parse_non_negative_int_env("GETIPINTEL_RPM_LIMIT", 15)
+GETIPINTEL_DAILY_LIMIT = _parse_non_negative_int_env("GETIPINTEL_DAILY_LIMIT", 500)
+PROXYCHECK_RPM_LIMIT = _parse_non_negative_int_env("PROXYCHECK_RPM_LIMIT", 0)
+PROXYCHECK_DAILY_LIMIT = _parse_non_negative_int_env("PROXYCHECK_DAILY_LIMIT", 1000)
+IPHUB_RPM_LIMIT = _parse_non_negative_int_env("IPHUB_RPM_LIMIT", 0)
+IPHUB_DAILY_LIMIT = _parse_non_negative_int_env("IPHUB_DAILY_LIMIT", 1000)
+IPHUNTER_RPM_LIMIT = _parse_non_negative_int_env("IPHUNTER_RPM_LIMIT", 0)
+IPHUNTER_DAILY_LIMIT = _parse_non_negative_int_env("IPHUNTER_DAILY_LIMIT", 1000)
+SPAMHAUS_ZEN_RPM_LIMIT = _parse_non_negative_int_env("SPAMHAUS_ZEN_RPM_LIMIT", 1000)
+SPAMHAUS_ZEN_DAILY_LIMIT = _parse_non_negative_int_env("SPAMHAUS_ZEN_DAILY_LIMIT", 0)
+SPAMCOP_RPM_LIMIT = _parse_non_negative_int_env("SPAMCOP_RPM_LIMIT", 0)
+SPAMCOP_DAILY_LIMIT = _parse_non_negative_int_env("SPAMCOP_DAILY_LIMIT", 0)
+TOR_ONIONOO_RPM_LIMIT = _parse_non_negative_int_env("TOR_ONIONOO_RPM_LIMIT", 0)
+TOR_ONIONOO_DAILY_LIMIT = _parse_non_negative_int_env("TOR_ONIONOO_DAILY_LIMIT", 0)
+STOPFORUMSPAM_RPM_LIMIT = _parse_non_negative_int_env("STOPFORUMSPAM_RPM_LIMIT", 15)
+STOPFORUMSPAM_DAILY_LIMIT = _parse_non_negative_int_env("STOPFORUMSPAM_DAILY_LIMIT", 20000)
+DSHIELD_RPM_LIMIT = _parse_non_negative_int_env("DSHIELD_RPM_LIMIT", 1000)
+DSHIELD_DAILY_LIMIT = _parse_non_negative_int_env("DSHIELD_DAILY_LIMIT", 0)
+
+PROVIDER_QUOTA_LIMITS = {
+    "cloudflare_radar": {"rpm": CLOUDFLARE_RADAR_RPM_LIMIT, "daily": CLOUDFLARE_RADAR_DAILY_LIMIT},
+    "abuseipdb": {"rpm": ABUSEIPDB_RPM_LIMIT, "daily": ABUSEIPDB_DAILY_LIMIT},
+    "ipdata": {"rpm": IPDATA_RPM_LIMIT, "daily": IPDATA_DAILY_LIMIT},
+    "ipregistry": {"rpm": IPREGISTRY_RPM_LIMIT, "daily": IPREGISTRY_DAILY_LIMIT},
+    "ip2location": {"rpm": IP2LOCATION_RPM_LIMIT, "daily": IP2LOCATION_DAILY_LIMIT},
+    "getipintel": {"rpm": GETIPINTEL_RPM_LIMIT, "daily": GETIPINTEL_DAILY_LIMIT},
+    "proxycheck": {"rpm": PROXYCHECK_RPM_LIMIT, "daily": PROXYCHECK_DAILY_LIMIT},
+    "iphub": {"rpm": IPHUB_RPM_LIMIT, "daily": IPHUB_DAILY_LIMIT},
+    "iphunter": {"rpm": IPHUNTER_RPM_LIMIT, "daily": IPHUNTER_DAILY_LIMIT},
+    "maxmind": {"rpm": 0, "daily": 0},
+    "spamhaus_zen": {"rpm": SPAMHAUS_ZEN_RPM_LIMIT, "daily": SPAMHAUS_ZEN_DAILY_LIMIT},
+    "spamcop": {"rpm": SPAMCOP_RPM_LIMIT, "daily": SPAMCOP_DAILY_LIMIT},
+    "tor_onionoo": {"rpm": TOR_ONIONOO_RPM_LIMIT, "daily": TOR_ONIONOO_DAILY_LIMIT},
+    "stopforumspam": {"rpm": STOPFORUMSPAM_RPM_LIMIT, "daily": STOPFORUMSPAM_DAILY_LIMIT},
+    "dshield": {"rpm": DSHIELD_RPM_LIMIT, "daily": DSHIELD_DAILY_LIMIT},
+}
 
 
 def _parse_csv_env(name: str) -> tuple[str, ...]:

@@ -19,7 +19,7 @@ import threading
 import time
 import weakref
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote, urlencode
 
 import dns.asyncresolver
@@ -58,10 +58,13 @@ from .adapters import (
 from .middleware import is_session_backend_error
 from .oauth import (
     DEFAULT_RIGHTS_TTL_SECONDS,
+    REQUIRED_WIKIMEDIA_RIGHTS_SET,
     CentralAuthVerificationError,
     InvalidCentralAuthTokenError,
     MetaWikiRightsFetchError,
     evaluate_wikimedia_rights,
+    extract_wikimedia_domain_from_project,
+    fetch_project_user_rights,
     fetch_user_rights_from_meta,
     is_allowlisted_wiki_user,
     is_session_rights_expired,
@@ -2067,6 +2070,139 @@ async def exchange_gadget_token(request):
     return _apply_detect_cors_headers(request, response, methods="POST, OPTIONS")
 
 
+_MAX_MERGED_PROJECT_RIGHTS_LOOKUPS = 15
+_MERGED_PROJECT_RIGHTS_BATCH_SIZE = 5
+
+
+async def _populate_merged_project_rights(
+    client: httpx.AsyncClient,
+    username: str,
+    merged_projects: Any,
+    *,
+    checked_domains: Set[str],
+) -> List[Any]:
+    """
+    Fetches per-wiki user rights for merged SUL accounts with local group memberships,
+    stopping once any project confirms a required temporary-account IP reveal right.
+    """
+    if not isinstance(merged_projects, list) or not merged_projects:
+        return []
+
+    enriched = [dict(project) if isinstance(project, dict) else project for project in merged_projects]
+    candidates: List[Tuple[int, str]] = []
+    seen_domains: Set[str] = set(checked_domains)
+
+    for idx, project in enumerate(enriched):
+        if not isinstance(project, dict):
+            continue
+        if isinstance(project.get("rights"), (list, tuple, set, frozenset)):
+            continue
+        # Only merged accounts carrying local groups can hold restricted temporary-account rights.
+        project_groups = project.get("groups")
+        if not isinstance(project_groups, list) or not any(g for g in project_groups if g):
+            continue
+        domain = extract_wikimedia_domain_from_project(project)
+        if not domain or domain in seen_domains:
+            continue
+        seen_domains.add(domain)
+        candidates.append((idx, domain))
+        if len(candidates) >= _MAX_MERGED_PROJECT_RIGHTS_LOOKUPS:
+            break
+
+    if not candidates:
+        return enriched
+
+    for start in range(0, len(candidates), _MERGED_PROJECT_RIGHTS_BATCH_SIZE):
+        batch = candidates[start : start + _MERGED_PROJECT_RIGHTS_BATCH_SIZE]
+        results = await asyncio.gather(
+            *(fetch_project_user_rights(client, username, domain) for _, domain in batch),
+            return_exceptions=True,
+        )
+        found_required = False
+        for (idx, _domain), result in zip(batch, results, strict=True):
+            rights = result if isinstance(result, list) else []
+            enriched[idx]["rights"] = rights
+            normalized = {str(right).strip().lower() for right in rights if right}
+            if normalized & REQUIRED_WIKIMEDIA_RIGHTS_SET:
+                found_required = True
+        if found_required:
+            break
+
+    return enriched
+
+
+async def _resolve_wikimedia_access(
+    client: httpx.AsyncClient,
+    username: str,
+    local_groups: List[str],
+    local_rights: Optional[List[str]] = None,
+    *,
+    wiki_domain: str = "meta.wikimedia.org",
+    local_rights_verified: bool = True,
+) -> Tuple[bool, str, List[str], List[str]]:
+    """
+    Resolves Wikimedia temporary-account IP reveal access from local rights,
+    global rights, cross-wiki merged project rights, and the explicit username allowlist
+    so web OAuth and gadget flows share one rule set.
+    """
+    base_info: Dict[str, Any] = {
+        "username": username,
+        "local_groups": local_groups,
+        "local_rights": local_rights or [],
+        "global_groups": [],
+        "global_rights": [],
+        "merged_projects": [],
+    }
+    if username.strip().startswith("~") or is_allowlisted_wiki_user(username):
+        return evaluate_wikimedia_rights(base_info)
+
+    local_eval = evaluate_wikimedia_rights(base_info)
+    try:
+        meta_rights = await fetch_user_rights_from_meta(
+            client,
+            username,
+            wiki_domain=wiki_domain,
+        )
+    except MetaWikiRightsFetchError as exc:
+        if local_eval[0]:
+            logger.warning(
+                f"Global userinfo lookup failed for {username} on {wiki_domain}, "
+                f"authorising via verified local wiki rights: {exc}"
+            )
+            return local_eval
+        raise
+
+    combined_info = {
+        "username": username,
+        "local_groups": local_groups,
+        "local_rights": local_rights or [],
+        "global_groups": meta_rights.get("global_groups", []),
+        "global_rights": meta_rights.get("global_rights", []),
+        "merged_projects": meta_rights.get("merged_projects", []),
+    }
+    eval_result = evaluate_wikimedia_rights(combined_info)
+    if eval_result[0]:
+        return eval_result
+
+    checked_domains: Set[str] = set()
+    validated_current = normalize_and_validate_wikimedia_domain(wiki_domain)
+    if local_rights_verified and validated_current:
+        checked_domains.add(validated_current)
+
+    enriched_projects = await _populate_merged_project_rights(
+        client,
+        username,
+        meta_rights.get("merged_projects", []),
+        checked_domains=checked_domains,
+    )
+    return evaluate_wikimedia_rights(
+        {
+            **combined_info,
+            "merged_projects": enriched_projects,
+        }
+    )
+
+
 async def _exchange_gadget_token_post(request):
     try:
         raw_body = request.body.decode("utf-8-sig") if request.body else ""
@@ -2140,50 +2276,28 @@ async def _exchange_gadget_token_post(request):
 
     username = wiki_userinfo["username"]
     local_groups = wiki_userinfo.get("local_groups") or []
+    local_rights = wiki_userinfo.get("rights")
+    local_rights_verified = isinstance(local_rights, list)
 
-    if is_allowlisted_wiki_user(username):
-        has_access = True
-    else:
-        local_has_access, _, _, _ = evaluate_wikimedia_rights(
-            {
-                "username": username,
-                "local_groups": local_groups,
-                "global_groups": [],
-                "merged_projects": [],
-            }
+    try:
+        has_access, _, _, _ = await _resolve_wikimedia_access(
+            client,
+            username,
+            local_groups,
+            local_rights if isinstance(local_rights, list) else [],
+            wiki_domain=wiki_domain,
+            local_rights_verified=local_rights_verified,
         )
-        try:
-            meta_rights = await fetch_user_rights_from_meta(
-                client,
-                username,
-                wiki_domain=wiki_domain,
+    except MetaWikiRightsFetchError as exc:
+        if "missing" in str(exc).lower():
+            return JsonResponse(
+                {"error": "Access denied. Unrecognised Wikimedia user."},
+                status=403,
             )
-        except MetaWikiRightsFetchError as exc:
-            if local_has_access:
-                logger.warning(
-                    f"Global userinfo lookup failed for {username} on {wiki_domain}, "
-                    f"authorising via verified local wiki groups: {exc}"
-                )
-                has_access = True
-            elif "missing" in str(exc).lower():
-                return JsonResponse(
-                    {"error": "Access denied. Unrecognised Wikimedia user."},
-                    status=403,
-                )
-            else:
-                return JsonResponse(
-                    {"error": "Unable to verify Wikimedia user rights at this time."},
-                    status=503,
-                )
-        else:
-            has_access, _, _, _ = evaluate_wikimedia_rights(
-                {
-                    "username": username,
-                    "local_groups": local_groups,
-                    "global_groups": meta_rights.get("global_groups", []),
-                    "merged_projects": meta_rights.get("merged_projects", []),
-                }
-            )
+        return JsonResponse(
+            {"error": "Unable to verify Wikimedia user rights at this time."},
+            status=503,
+        )
 
     if not has_access:
         return JsonResponse(
@@ -2415,31 +2529,43 @@ def _get_session_user(request, *, context: str = "session_rights_check") -> Any:
 
 
 @sync_to_async(thread_sensitive=True)
-def _pop_oauth_state(request) -> Tuple[Any, bool]:
-    """Thread-safe synchronous helper to pop and persist removal of oauth_state from the session."""
+def _pop_oauth_login_context(request) -> Tuple[Any, Optional[str], bool]:
+    """Pops the OAuth state token and optional post-login IP target from the session in one write."""
     try:
         state = request.session.pop("oauth_state", None)
+        post_login_ip = request.session.pop("oauth_post_login_ip", None)
     except Exception as exc:
         if not is_session_backend_error(exc):
             raise
         request.session.modified = False
         logger.warning(
-            "OAuth state load failed due to cache backend unavailability (%s)",
+            "OAuth login context load failed due to cache backend unavailability (%s)",
             type(exc).__name__,
         )
-        return None, False
+        return None, None, False
     request.session.modified = True
     saved = _safe_save_session(request, context="oauth_callback_state_pop")
-    return state, saved
+    cleaned_ip = canonicalize_ip(str(post_login_ip)) if isinstance(post_login_ip, str) else None
+    return state, cleaned_ip, saved
 
 
 @sync_to_async(thread_sensitive=True)
-def _persist_session_key(request, key: str, value: Any, *, context: str) -> bool:
-    """Thread-safe synchronous helper for persisting a single session key and rolling back on failure."""
-    request.session[key] = value
+def _persist_oauth_login_context(request, state: str, post_login_ip: Optional[str]) -> bool:
+    """Persists OAuth state and an optional validated IP deep-link target with rollback on failure."""
+    had_prev_ip = "oauth_post_login_ip" in request.session
+    prev_ip = request.session.get("oauth_post_login_ip")
+    request.session["oauth_state"] = state
+    if post_login_ip:
+        request.session["oauth_post_login_ip"] = post_login_ip
+    else:
+        request.session.pop("oauth_post_login_ip", None)
     request.session.modified = True
-    if not _safe_save_session(request, context=context):
-        request.session.pop(key, None)
+    if not _safe_save_session(request, context="oauth_login"):
+        request.session.pop("oauth_state", None)
+        if had_prev_ip:
+            request.session["oauth_post_login_ip"] = prev_ip
+        else:
+            request.session.pop("oauth_post_login_ip", None)
         request.session.modified = False
         return False
     return True
@@ -2501,10 +2627,12 @@ async def oauth_login(request):
     client_id = getattr(settings, "WIKIMEDIA_CLIENT_ID", "")
     redirect_uri = getattr(settings, "WIKIMEDIA_REDIRECT_URI", "")
     auth_base = getattr(settings, "WIKIMEDIA_OAUTH_URL", "https://meta.wikimedia.org/w/rest.php/oauth2")
+    raw_next_ip = request.GET.get("ip")
+    post_login_ip = canonicalize_ip(str(raw_next_ip)) if raw_next_ip is not None else None
 
     if client_id and redirect_uri:
         state = secrets.token_urlsafe(32)
-        if not await _persist_session_key(request, "oauth_state", state, context="oauth_login"):
+        if not await _persist_oauth_login_context(request, state, post_login_ip):
             return JsonResponse({"error": _SESSION_UNAVAILABLE_ERROR}, status=503)
         query_params = urlencode(
             {
@@ -2535,7 +2663,8 @@ async def oauth_login(request):
     }
     if not await _persist_authenticated_session(request, user_data, context="oauth_login_test_auth"):
         return JsonResponse({"error": _SESSION_UNAVAILABLE_ERROR}, status=503)
-    return HttpResponseRedirect("/")
+    fallback_redirect = f"/?{urlencode({'ip': post_login_ip})}" if post_login_ip else "/"
+    return HttpResponseRedirect(fallback_redirect)
 
 
 _OAUTH_CALLBACK_ERROR_CODES = {
@@ -2554,10 +2683,10 @@ _OAUTH_CALLBACK_ERROR_CODES = {
 
 async def oauth_callback(request):
     """
-    Exchanges the OAuth 2.0 authorization code for an access token, inspects SUL global and local
-    groups via Meta-Wiki, and persists the evaluated role in the user's session.
+    Exchanges the OAuth 2.0 authorization code for an access token, inspects Wikimedia
+    temporary-account IP reveal rights, and persists the evaluated role in the session.
     """
-    expected_state, state_saved = await _pop_oauth_state(request)
+    expected_state, post_login_ip, state_saved = await _pop_oauth_login_context(request)
     if not state_saved:
         return JsonResponse({"error": _SESSION_UNAVAILABLE_ERROR}, status=503)
 
@@ -2595,6 +2724,7 @@ async def oauth_callback(request):
     headers = {
         "User-Agent": USER_AGENT_HEADER,
     }
+    redirect_target = "/"
 
     try:
         async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
@@ -2627,28 +2757,34 @@ async def oauth_callback(request):
                 return HttpResponseRedirect("/")
 
             profile = profile_resp.json()
-            username = profile.get("username") or profile.get("sub") or ""
-            local_groups = profile.get("groups") or []
+            if not isinstance(profile, dict):
+                logger.warning("Wikimedia OAuth profile payload was not a JSON object")
+                return HttpResponseRedirect("/")
 
-            if username and is_allowlisted_wiki_user(username):
-                has_access, role_label, norm_local, norm_global = evaluate_wikimedia_rights(
-                    {
-                        "username": username,
-                        "local_groups": local_groups,
-                        "global_groups": [],
-                        "merged_projects": [],
-                    }
-                )
-            else:
-                meta_rights = await fetch_user_rights_from_meta(client, username) if username else {}
-                has_access, role_label, norm_local, norm_global = evaluate_wikimedia_rights(
-                    {
-                        "username": username,
-                        "local_groups": local_groups,
-                        "global_groups": meta_rights.get("global_groups", []),
-                        "merged_projects": meta_rights.get("merged_projects", []),
-                    }
-                )
+            raw_username = profile.get("username")
+            if not isinstance(raw_username, str) or not raw_username.strip():
+                logger.warning("Authenticated Wikimedia username missing from OAuth profile")
+                return HttpResponseRedirect("/")
+
+            username = raw_username.strip()
+            if username.startswith("~"):
+                logger.warning("Temporary Wikimedia accounts cannot authenticate via OAuth")
+                return HttpResponseRedirect("/")
+
+            raw_groups = profile.get("groups")
+            local_groups = raw_groups if isinstance(raw_groups, list) else []
+            raw_rights = profile.get("rights")
+            local_rights_verified = isinstance(raw_rights, list)
+            local_rights = raw_rights if local_rights_verified else []
+
+            has_access, role_label, norm_local, norm_global = await _resolve_wikimedia_access(
+                client,
+                username,
+                local_groups,
+                local_rights,
+                wiki_domain="meta.wikimedia.org",
+                local_rights_verified=local_rights_verified,
+            )
 
             user_session_payload = {
                 "isLoggedIn": True,
@@ -2662,11 +2798,13 @@ async def oauth_callback(request):
             persisted = await _persist_authenticated_session(request, user_session_payload)
             if not persisted:
                 return JsonResponse({"error": _SESSION_UNAVAILABLE_ERROR}, status=503)
+            if has_access and post_login_ip:
+                redirect_target = f"/?{urlencode({'ip': post_login_ip})}"
             logger.info(f"User {username} successfully authenticated with role: {role_label}")
     except Exception as exc:
         logger.error(f"OAuth callback processing error ({type(exc).__name__})")
 
-    return HttpResponseRedirect("/")
+    return HttpResponseRedirect(redirect_target)
 
 
 async def oauth_logout(request):

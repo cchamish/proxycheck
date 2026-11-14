@@ -46,6 +46,11 @@
         >
           Log in with Wikimedia
         </cdx-button>
+        <p class="login-groups-note">
+          This tool is designed for users with either the
+          <code>{{ REQUIRED_USER_RIGHTS[0] }}</code> or
+          <code>{{ REQUIRED_USER_RIGHTS[1] }}</code> right on any Wikimedia project.
+        </p>
       </div>
 
       <div v-else-if="!user.hasAccess" class="barrier-wrapper">
@@ -54,7 +59,7 @@
           :inline="false"
           class="unauthorised-message"
         >
-          Access Denied: You must be a local Administrator (sysop) on a Wikimedia project, or hold Global Rollbacker / Global Sysop rights to use this tool.
+          Access Denied: You must hold either the <code>{{ REQUIRED_USER_RIGHTS[0] }}</code> or <code>{{ REQUIRED_USER_RIGHTS[1] }}</code> user right on any Wikimedia project to use this tool.
         </cdx-message>
       </div>
 
@@ -403,6 +408,9 @@ import {
   CdxMessage,
 } from '@wikimedia/codex';
 import {
+  REQUIRED_USER_RIGHTS,
+  buildOAuthLoginUrl,
+  buildPageUrlWithIp,
   isValidIpAddress,
   filterComparisonResults,
   simplifySecurityFlags,
@@ -486,12 +494,24 @@ const footerDiagnostic = computed<DiagnosticMetrics>(
   () => diagnostic.value ?? initialDiagnostic.value
 );
 
+function syncBrowserUrlIp(ip: string | null): void {
+  if (typeof window === 'undefined' || !window.history || typeof window.history.replaceState !== 'function') {
+    return;
+  }
+  const nextUrl = buildPageUrlWithIp(window.location.pathname, window.location.search, ip);
+  const currentRelativeUrl = `${window.location.pathname}${window.location.search}`;
+  if (nextUrl !== currentRelativeUrl) {
+    window.history.replaceState(window.history.state, '', nextUrl);
+  }
+}
+
 const coordinator = createDetectionCoordinator(
   (url, init) => fetch(url, init),
   undefined,
   {
     state: uiState,
     onHistoryUpdated: saveStoredHistory,
+    onDetectionSuccess: (resolvedIp) => syncBrowserUrlIp(resolvedIp),
   }
 );
 
@@ -682,7 +702,7 @@ async function fetchUserStatus() {
 }
 
 function handleLogin() {
-  window.location.href = '/api/v1/auth/login/';
+  window.location.href = buildOAuthLoginUrl(window.location.search, inputIp.value);
 }
 
 async function handleLogout() {
@@ -701,8 +721,10 @@ async function handleLogout() {
       role: '',
       hasAccess: false,
     };
+    inputIp.value = '';
     detectionData.value = null;
     diagnostic.value = null;
+    syncBrowserUrlIp(null);
     initialDiagnostic.value = buildDiagnosticMetrics(
       data
         ? {

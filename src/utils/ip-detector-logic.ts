@@ -2,6 +2,14 @@
  * Shared IP validation, canonicalization, result helpers, and detection request coordinator.
  */
 
+export const REQUIRED_USER_RIGHTS = [
+  'checkuser-temporary-account',
+  'checkuser-temporary-account-no-preference',
+] as const;
+
+export const REQUIRED_USER_RIGHTS_SUMMARY =
+  'users who hold either the checkuser-temporary-account or checkuser-temporary-account-no-preference permission on any Wikimedia project.';
+
 export interface ProviderRawResult {
   provider:
     | 'Cloudflare Radar'
@@ -229,6 +237,46 @@ export function updateIpHistory(history: string[], newIp: string): string[] {
 }
 
 /**
+ * Extracts and canonicalizes the `ip` query parameter from a URL search string.
+ */
+export function extractCanonicalIpFromSearch(search?: string | null): string | null {
+  try {
+    const params = new URLSearchParams(search || '');
+    const rawIp = (params.get('ip') || '').trim();
+    return canonicalizeIpAddress(rawIp);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Builds the backend OAuth login URL while preserving a validated IP target for post-login lookup.
+ */
+export function buildOAuthLoginUrl(search?: string | null, fallbackIp?: string | null): string {
+  const targetIp = extractCanonicalIpFromSearch(search) ?? canonicalizeIpAddress(fallbackIp || '');
+  if (!targetIp) {
+    return '/api/v1/auth/login/';
+  }
+  return `/api/v1/auth/login/?ip=${encodeURIComponent(targetIp)}`;
+}
+
+/**
+ * Updates the relative page URL with a canonical `ip` query parameter while keeping unrelated parameters intact.
+ */
+export function buildPageUrlWithIp(pathname: string, search: string, ip: string | null): string {
+  const basePath = pathname && pathname.startsWith('/') ? pathname : '/';
+  const params = new URLSearchParams(search || '');
+  const canonical = ip ? canonicalizeIpAddress(ip) : null;
+  if (canonical) {
+    params.set('ip', canonical);
+  } else {
+    params.delete('ip');
+  }
+  const queryString = params.toString();
+  return queryString ? `${basePath}?${queryString}` : basePath;
+}
+
+/**
  * Resolves a configured GitHub repository slug or URL into a normalized HTTPS base URL.
  */
 export function resolveRepoBaseUrl(configuredRepo?: string | null): string {
@@ -427,6 +475,7 @@ export interface DetectionCoordinatorState {
 export interface DetectionCoordinatorOptions {
   state?: DetectionCoordinatorState;
   onHistoryUpdated?: (history: string[]) => void;
+  onDetectionSuccess?: (canonicalIp: string, data: any) => void;
 }
 
 /**
@@ -442,7 +491,7 @@ export function createDetectionCoordinator(
   initialUser: { isLoggedIn: boolean; username: string; role: string; hasAccess: boolean } = {
     isLoggedIn: true,
     username: 'AdminUser',
-    role: 'Local Administrator (sysop)',
+    role: 'Temporary Account Access (local: checkuser-temporary-account)',
     hasAccess: true,
   },
   options?: DetectionCoordinatorOptions
@@ -518,8 +567,10 @@ export function createDetectionCoordinator(
       state.sessionExpiredMessage = '';
       state.detectionData = data;
       state.diagnostic = buildDiagnosticMetrics(data);
-      state.ipHistory = updateIpHistory(state.ipHistory, data.ip || targetIp);
+      const resolvedIp = canonicalizeIpAddress(data?.ip || targetIp) ?? (data?.ip || targetIp);
+      state.ipHistory = updateIpHistory(state.ipHistory, resolvedIp);
       options?.onHistoryUpdated?.(state.ipHistory);
+      options?.onDetectionSuccess?.(resolvedIp, data);
     } catch (err: any) {
       if (requestId !== latestRequestId || (err && err.name === 'AbortError')) {
         return;

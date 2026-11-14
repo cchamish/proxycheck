@@ -30,24 +30,11 @@ WIKIMEDIA_HOST_RE = re.compile(
     rf"|^(?:[a-z0-9-]+\.)*(?:{WIKIMEDIA_BETA_SUFFIXES})\.beta\.wm(?:cloud|flabs)\.org$"
 )
 
-PRIVILEGED_GLOBAL_GROUP_LABELS: Dict[str, str] = {
-    "steward": "Steward",
-    "global-sysop": "Global Sysop",
-    "global-rollbacker": "Global Rollbacker",
-    "global-temporary-account-viewer": "Global Temporary Account Viewer",
-    "ombuds": "Ombuds",
-    "staff": "Wikimedia Foundation Staff",
-}
-
-PRIVILEGED_LOCAL_GROUP_LABELS: Dict[str, str] = {
-    "sysop": "Local Administrator (sysop)",
-    "administrator": "Local Administrator (sysop)",
-    "checkuser": "CheckUser",
-    "oversight": "Oversight",
-    "suppress": "Suppress",
-    "arbcom": "Arbitration Committee",
-    "temporary-account-viewer": "Temporary Account Viewer",
-}
+REQUIRED_WIKIMEDIA_RIGHTS: Tuple[str, ...] = (
+    "checkuser-temporary-account-no-preference",
+    "checkuser-temporary-account",
+)
+REQUIRED_WIKIMEDIA_RIGHTS_SET = frozenset(REQUIRED_WIKIMEDIA_RIGHTS)
 
 _TRANSIENT_MEDIAWIKI_ERROR_CODES = frozenset({"maxlag", "readonly", "ratelimited"})
 
@@ -133,7 +120,7 @@ def is_session_rights_expired(
     now: Optional[float] = None,
 ) -> bool:
     """
-    Returns True when the cached Wikimedia group evaluation in the user session
+    Returns True when the cached Wikimedia rights evaluation in the user session
     has exceeded its refresh window.
     """
     if not isinstance(user_data, dict):
@@ -147,42 +134,84 @@ def is_session_rights_expired(
     return (current_time - float(updated_at)) > float(ttl_seconds)
 
 
-def _format_local_project_role(group: str, label: str, wiki_name: str) -> str:
-    if group in ("sysop", "administrator"):
-        return f"Local Administrator (sysop: {wiki_name})"
-    return f"{label} ({wiki_name})"
+def _normalize_str_list(values: Any, *, lowercase: bool = False) -> List[str]:
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        return []
+    normalized: List[str] = []
+    for item in values:
+        if not item:
+            continue
+        cleaned = str(item).strip()
+        if not cleaned:
+            continue
+        normalized.append(cleaned.lower() if lowercase else cleaned)
+    return normalized
+
+
+def _find_required_right(rights: Any) -> Optional[str]:
+    """Returns the matching temporary-account IP reveal right when present."""
+    normalized = set(_normalize_str_list(rights, lowercase=True))
+    for right in REQUIRED_WIKIMEDIA_RIGHTS:
+        if right in normalized:
+            return right
+    return None
+
+
+def extract_wikimedia_domain_from_project(project: Any) -> Optional[str]:
+    """Extracts and validates a Wikimedia project hostname from a merged SUL entry."""
+    if not isinstance(project, dict):
+        return None
+    raw_url = project.get("url")
+    if not isinstance(raw_url, str):
+        return None
+    cleaned = raw_url.strip()
+    if cleaned.startswith("https://"):
+        host = cleaned[8:].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    elif cleaned.startswith("http://"):
+        host = cleaned[7:].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    else:
+        return None
+    return normalize_and_validate_wikimedia_domain(host)
 
 
 def evaluate_wikimedia_rights(user_info: Dict[str, Any]) -> Tuple[bool, str, List[str], List[str]]:
     """
-    Evaluates Wikimedia RBAC permissions across global groups, local groups,
-    SUL-merged project groups, and the configured username allowlist.
+    Evaluates Wikimedia permissions directly from user rights (`checkuser-temporary-account`
+    or `checkuser-temporary-account-no-preference`) rather than user group names,
+    alongside the configured operator username allowlist.
     """
-    global_groups = [str(g).strip().lower() for g in (user_info.get("global_groups") or []) if g]
-    local_groups = [str(g).strip().lower() for g in (user_info.get("local_groups") or []) if g]
+    global_groups = _normalize_str_list(user_info.get("global_groups") or [], lowercase=True)
+    local_groups = _normalize_str_list(user_info.get("local_groups") or [], lowercase=True)
+    raw_local_rights = user_info.get("local_rights") if "local_rights" in user_info else user_info.get("rights")
+    local_rights = _normalize_str_list(raw_local_rights or [], lowercase=True)
+    global_rights = _normalize_str_list(user_info.get("global_rights") or [], lowercase=True)
     merged_projects = user_info.get("merged_projects") or []
-    username = user_info.get("username") or ""
+    username = str(user_info.get("username") or "").strip()
 
-    global_group_set = set(global_groups)
-    for group, label in PRIVILEGED_GLOBAL_GROUP_LABELS.items():
-        if group in global_group_set:
-            return True, label, local_groups, global_groups
+    if username.startswith("~"):
+        return False, "Standard User (Unauthorised)", local_groups, global_groups
 
-    local_group_set = set(local_groups)
-    for group, label in PRIVILEGED_LOCAL_GROUP_LABELS.items():
-        if group in local_group_set:
-            return True, label, local_groups, global_groups
+    matched_global_right = _find_required_right(global_rights)
+    if matched_global_right:
+        return True, f"Temporary Account Access (global: {matched_global_right})", local_groups, global_groups
 
-    # The OAuth profile endpoint only returns groups on the central Meta-Wiki,
-    # so inspect SUL-merged wikis to recognize project-local privileges.
-    for project in merged_projects:
-        if not isinstance(project, dict):
-            continue
-        project_groups = {str(g).strip().lower() for g in (project.get("groups") or []) if g}
-        wiki_name = project.get("wiki", "project")
-        for group, label in PRIVILEGED_LOCAL_GROUP_LABELS.items():
-            if group in project_groups:
-                return True, _format_local_project_role(group, label, wiki_name), local_groups, global_groups
+    matched_local_right = _find_required_right(local_rights)
+    if matched_local_right:
+        return True, f"Temporary Account Access (local: {matched_local_right})", local_groups, global_groups
+
+    if isinstance(merged_projects, list):
+        for project in merged_projects:
+            if not isinstance(project, dict):
+                continue
+            matched_project_right = _find_required_right(project.get("rights"))
+            if matched_project_right:
+                wiki_name = str(project.get("wiki") or "project").strip() or "project"
+                return (
+                    True,
+                    f"Temporary Account Access ({wiki_name}: {matched_project_right})",
+                    local_groups,
+                    global_groups,
+                )
 
     if username and is_allowlisted_wiki_user(username):
         return True, "Allowlisted Wikimedia User", local_groups, global_groups
@@ -330,10 +359,10 @@ async def fetch_user_rights_from_meta(
     wiki_domain: str = "meta.wikimedia.org",
 ) -> Dict[str, Any]:
     """
-    Fetches global groups and per-wiki SUL account memberships via Wikimedia's
+    Fetches global rights, global groups, and per-wiki SUL account memberships via Wikimedia's
     `meta=globaluserinfo` Action API.
     Raises MetaWikiRightsFetchError when the upstream request fails or returns a non-200
-    or malformed payload, distinguishing transient API failures from normal users with no groups.
+    or malformed payload, distinguishing transient API failures from normal users without rights.
     """
     validated_domain = normalize_and_validate_wikimedia_domain(wiki_domain)
     api_url = f"https://{validated_domain}/w/api.php" if validated_domain else MEDIAWIKI_API_URL
@@ -379,8 +408,68 @@ async def fetch_user_rights_from_meta(
     global_groups = gui.get("groups")
     if not isinstance(global_groups, list):
         global_groups = gui.get("globalgroups")
+    global_rights = gui.get("rights")
     merged = gui.get("merged")
     return {
         "global_groups": global_groups if isinstance(global_groups, list) else [],
+        "global_rights": _normalize_str_list(global_rights, lowercase=True),
         "merged_projects": merged if isinstance(merged, list) else [],
     }
+
+
+async def fetch_project_user_rights(
+    client: httpx.AsyncClient,
+    username: str,
+    wiki_domain: str,
+) -> List[str]:
+    """
+    Fetches effective local user rights for an account on a specific Wikimedia project
+    using `action=query&list=users&usprop=rights`.
+    Degrades to an empty list when an individual project endpoint fails so other merged
+    wikis can still be evaluated.
+    """
+    validated_domain = normalize_and_validate_wikimedia_domain(wiki_domain)
+    if not validated_domain:
+        return []
+
+    api_url = f"https://{validated_domain}/w/api.php"
+    params = {
+        "action": "query",
+        "list": "users",
+        "ususers": username,
+        "usprop": "rights",
+        "format": "json",
+    }
+    headers = {"User-Agent": WIKIMEDIA_USER_AGENT}
+    _clear_client_cookies(client)
+    try:
+        resp = await client.get(api_url, params=params, headers=headers, timeout=10.0)
+    except Exception as exc:
+        logger.warning(f"Error querying {validated_domain} for user rights: {type(exc).__name__}")
+        return []
+    finally:
+        _clear_client_cookies(client)
+
+    if resp.status_code != 200:
+        logger.warning(f"{validated_domain} returned HTTP {resp.status_code} for user rights query")
+        return []
+
+    try:
+        data = resp.json()
+    except ValueError:
+        logger.warning(f"{validated_domain} returned invalid JSON for user rights query")
+        return []
+
+    if not isinstance(data, dict) or "error" in data:
+        return []
+
+    query_obj = data.get("query")
+    users = query_obj.get("users") if isinstance(query_obj, dict) else None
+    if not isinstance(users, list) or not users:
+        return []
+
+    first_user = users[0]
+    if not isinstance(first_user, dict) or "missing" in first_user or "invalid" in first_user:
+        return []
+
+    return _normalize_str_list(first_user.get("rights"), lowercase=True)

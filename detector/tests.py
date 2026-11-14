@@ -62,6 +62,8 @@ from detector.oauth import (
     InvalidCentralAuthTokenError,
     MetaWikiRightsFetchError,
     evaluate_wikimedia_rights,
+    extract_wikimedia_domain_from_project,
+    fetch_project_user_rights,
     fetch_user_rights_from_meta,
     is_session_rights_expired,
     normalize_and_validate_wikimedia_domain,
@@ -286,6 +288,48 @@ class DetectorAuthTests(TestCase):
         self.assertTrue(session_state)
         self.assertEqual(params["state"], [session_state])
 
+    @override_settings(
+        WIKIMEDIA_CLIENT_ID="test_client_id",
+        WIKIMEDIA_REDIRECT_URI="https://proxycheck.toolforge.org/api/v1/auth/callback",
+        WIKIMEDIA_OAUTH_URL="https://meta.wikimedia.org/w/rest.php/oauth2",
+    )
+    def test_oauth_login_persists_canonical_ip_and_clears_stale_ip(self):
+        response = self.client.get("/api/v1/auth/login/?ip=2001:0db8::01")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(self.client.session.get("oauth_post_login_ip"), "2001:db8::1")
+
+        # Starting a plain login clears any abandoned post-login IP from the session
+        second_response = self.client.get("/api/v1/auth/login/")
+        self.assertEqual(second_response.status_code, 302)
+        self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
+
+    @override_settings(
+        WIKIMEDIA_CLIENT_ID="test_client_id",
+        WIKIMEDIA_REDIRECT_URI="https://proxycheck.toolforge.org/api/v1/auth/callback",
+        WIKIMEDIA_OAUTH_URL="https://meta.wikimedia.org/w/rest.php/oauth2",
+    )
+    def test_oauth_login_ignores_invalid_or_redirect_ip_parameter(self):
+        response = self.client.get("/api/v1/auth/login/?ip=https://evil.example")
+        self.assertEqual(response.status_code, 302)
+        self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
+
+    @override_settings(
+        DEBUG=True,
+        ENABLE_TEST_AUTH=True,
+        WIKIMEDIA_CLIENT_ID="",
+        WIKIMEDIA_REDIRECT_URI="",
+    )
+    def test_oauth_login_fallback_admin_preserves_valid_ip_only(self):
+        valid_resp = self.client.get("/api/v1/auth/login/?ip=2001:0db8::01")
+        self.assertEqual(valid_resp.status_code, 302)
+        self.assertEqual(valid_resp["Location"], "/?ip=2001%3Adb8%3A%3A1")
+        self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
+
+        invalid_resp = self.client.get("/api/v1/auth/login/?ip=bad")
+        self.assertEqual(invalid_resp.status_code, 302)
+        self.assertEqual(invalid_resp["Location"], "/")
+        self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
+
     # Verify oauth_callback state validation and error handling
 
     @override_settings(
@@ -309,9 +353,14 @@ class DetectorAuthTests(TestCase):
         profile_resp.json.return_value = {
             "username": "WikiAdmin",
             "groups": ["sysop"],
+            "rights": ["read", "edit"],
         }
         mock_client.get.return_value = profile_resp
-        mock_fetch_meta.return_value = {"global_groups": ["steward"], "merged_projects": []}
+        mock_fetch_meta.return_value = {
+            "global_groups": ["steward"],
+            "global_rights": ["checkuser-temporary-account-no-preference"],
+            "merged_projects": [],
+        }
 
         session = self.client.session
         session["oauth_state"] = "valid_random_state_token_123"
@@ -370,6 +419,126 @@ class DetectorAuthTests(TestCase):
         self.assertEqual(response["Location"], "/")
         self.assertIsNone(self.client.session.get("oauth_state"))
         self.assertIsNone(self.client.session.get("wikimedia_user"))
+        mock_async_client_cls.assert_not_called()
+
+    def _configure_oauth_callback_mocks(
+        self,
+        mock_async_client_cls,
+        mock_fetch_meta,
+        *,
+        username: str = "WikiAdmin",
+        groups: list[str] | None = None,
+        global_rights: list[str] | None = None,
+    ) -> None:
+        """Configure HTTPX and Meta API mocks for OAuth callback redirect tests."""
+        mock_client = AsyncMock()
+        mock_async_client_cls.return_value.__aenter__.return_value = mock_client
+
+        token_resp = MagicMock()
+        token_resp.status_code = 200
+        token_resp.json.return_value = {"access_token": "valid_access_token"}
+        mock_client.post.return_value = token_resp
+
+        profile_resp = MagicMock()
+        profile_resp.status_code = 200
+        profile_resp.json.return_value = {
+            "username": username,
+            "groups": ["sysop"] if groups is None else groups,
+            "rights": ["read", "edit"],
+        }
+        mock_client.get.return_value = profile_resp
+        mock_fetch_meta.return_value = {
+            "global_groups": [],
+            "global_rights": ["checkuser-temporary-account"] if global_rights is None else global_rights,
+            "merged_projects": [],
+        }
+
+    @override_settings(
+        WIKIMEDIA_CLIENT_ID="test_client_id",
+        WIKIMEDIA_CLIENT_SECRET="test_client_secret",
+        WIKIMEDIA_REDIRECT_URI="https://proxycheck.toolforge.org/api/v1/auth/callback",
+    )
+    @patch("detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock)
+    @patch("detector.views.httpx.AsyncClient")
+    def test_oauth_callback_redirects_to_preserved_ip_and_pops_session_key(
+        self, mock_async_client_cls, mock_fetch_meta
+    ):
+        self._configure_oauth_callback_mocks(mock_async_client_cls, mock_fetch_meta)
+
+        session = self.client.session
+        session["oauth_state"] = "state_preserve_ip"
+        session["oauth_post_login_ip"] = "2001:db8::1"
+        session.save()
+
+        response = self.client.get("/api/v1/auth/callback/?code=auth_code_1&state=state_preserve_ip")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response["Location"], "/?ip=2001%3Adb8%3A%3A1")
+        self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
+        self.assertTrue(self.client.session["wikimedia_user"]["hasAccess"])
+
+    @override_settings(
+        WIKIMEDIA_CLIENT_ID="test_client_id",
+        WIKIMEDIA_CLIENT_SECRET="test_client_secret",
+        WIKIMEDIA_REDIRECT_URI="https://proxycheck.toolforge.org/api/v1/auth/callback",
+    )
+    @patch("detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock)
+    @patch("detector.views.httpx.AsyncClient")
+    def test_oauth_callback_without_access_ignores_and_pops_preserved_ip(self, mock_async_client_cls, mock_fetch_meta):
+        self._configure_oauth_callback_mocks(
+            mock_async_client_cls,
+            mock_fetch_meta,
+            username="RegularUser",
+            groups=["autoconfirmed"],
+            global_rights=[],
+        )
+
+        session = self.client.session
+        session["oauth_state"] = "state_unauthorised"
+        session["oauth_post_login_ip"] = "8.8.8.8"
+        session.save()
+
+        response = self.client.get("/api/v1/auth/callback/?code=auth_code_1&state=state_unauthorised")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response["Location"], "/")
+        self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
+        self.assertFalse(self.client.session["wikimedia_user"]["hasAccess"])
+
+    @override_settings(
+        WIKIMEDIA_CLIENT_ID="test_client_id",
+        WIKIMEDIA_CLIENT_SECRET="test_client_secret",
+        WIKIMEDIA_REDIRECT_URI="https://proxycheck.toolforge.org/api/v1/auth/callback",
+    )
+    @patch("detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock)
+    @patch("detector.views.httpx.AsyncClient")
+    def test_oauth_callback_ignores_invalid_session_ip_value(self, mock_async_client_cls, mock_fetch_meta):
+        self._configure_oauth_callback_mocks(mock_async_client_cls, mock_fetch_meta)
+
+        session = self.client.session
+        session["oauth_state"] = "state_bad_session_ip"
+        session["oauth_post_login_ip"] = "https://evil.example"
+        session.save()
+
+        response = self.client.get("/api/v1/auth/callback/?code=auth_code_1&state=state_bad_session_ip")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response["Location"], "/")
+        self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
+
+    @override_settings(
+        WIKIMEDIA_CLIENT_ID="test_client_id",
+        WIKIMEDIA_CLIENT_SECRET="test_client_secret",
+    )
+    @patch("detector.views.httpx.AsyncClient")
+    def test_oauth_callback_mismatched_state_clears_preserved_ip(self, mock_async_client_cls):
+        session = self.client.session
+        session["oauth_state"] = "expected_state"
+        session["oauth_post_login_ip"] = "8.8.8.8"
+        session.save()
+
+        response = self.client.get("/api/v1/auth/callback/?code=auth_code_1&state=wrong_state")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response["Location"], "/")
+        self.assertIsNone(self.client.session.get("oauth_state"))
+        self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
         mock_async_client_cls.assert_not_called()
 
     @override_settings(
@@ -1194,6 +1363,7 @@ class MetaWikiRightsAndSessionTtlTests(TestCase):
                         "id": 999,
                         "name": "RegularUser",
                         "groups": [],
+                        "rights": [],
                         "merged": [{"wiki": "enwiki", "groups": ["*", "user"]}],
                     }
                 },
@@ -1201,7 +1371,50 @@ class MetaWikiRightsAndSessionTtlTests(TestCase):
         )
         rights = asyncio.run(fetch_user_rights_from_meta(client, "RegularUser"))
         self.assertEqual(rights["global_groups"], [])
+        self.assertEqual(rights["global_rights"], [])
         self.assertEqual(len(rights["merged_projects"]), 1)
+
+        client.get.return_value = _mock_response(
+            status_code=200,
+            json_value={
+                "batchcomplete": "",
+                "query": {
+                    "globaluserinfo": {
+                        "id": 1001,
+                        "name": "GlobalRightUser",
+                        "groups": ["global-temporary-account-viewer"],
+                        "rights": ["read", "checkuser-temporary-account"],
+                        "merged": [],
+                    }
+                },
+            },
+        )
+        global_rights = asyncio.run(fetch_user_rights_from_meta(client, "GlobalRightUser"))
+        self.assertEqual(global_rights["global_rights"], ["read", "checkuser-temporary-account"])
+
+        self.assertEqual(
+            extract_wikimedia_domain_from_project({"url": "https://ja.wikipedia.org/"}),
+            "ja.wikipedia.org",
+        )
+        self.assertIsNone(extract_wikimedia_domain_from_project({"url": "https://evil.example.com"}))
+        self.assertIsNone(extract_wikimedia_domain_from_project({"url": "https://zh.wikipedia.org:8443"}))
+        self.assertIsNone(extract_wikimedia_domain_from_project({"url": "https://user@zh.wikipedia.org"}))
+
+        client.get.return_value = _mock_response(
+            status_code=200,
+            json_value={
+                "query": {"users": [{"name": "LocalRightUser", "rights": ["read", "checkuser-temporary-account"]}]}
+            },
+        )
+        project_rights = asyncio.run(fetch_project_user_rights(client, "LocalRightUser", "zh.wikipedia.org"))
+        self.assertEqual(project_rights, ["read", "checkuser-temporary-account"])
+
+        client.get.reset_mock()
+        self.assertEqual(asyncio.run(fetch_project_user_rights(client, "LocalRightUser", "evil.example.com")), [])
+        client.get.assert_not_called()
+
+        client.get.return_value = _mock_response(status_code=503, json_value={})
+        self.assertEqual(asyncio.run(fetch_project_user_rights(client, "LocalRightUser", "zh.wikipedia.org")), [])
 
     def test_fetch_user_rights_raises_on_network_or_http_or_payload_errors(self):
         error_cases = (
@@ -2275,7 +2488,7 @@ class GadgetTokenAndCorsAuthTests(TestCase):
                 return_value={
                     "username": "ZhWikiSysop",
                     "local_groups": ["*", "user", "sysop"],
-                    "rights": ["read", "edit"],
+                    "rights": ["read", "edit", "checkuser-temporary-account"],
                     "centralids": {"CentralAuth": 77},
                     "domain": "zh.wikipedia.org",
                 },
@@ -2283,7 +2496,7 @@ class GadgetTokenAndCorsAuthTests(TestCase):
             patch(
                 "detector.views.fetch_user_rights_from_meta",
                 new_callable=AsyncMock,
-                return_value={"global_groups": [], "merged_projects": []},
+                return_value={"global_groups": [], "global_rights": [], "merged_projects": []},
             ),
         ):
             text_plain_resp = self.client.post(
@@ -2456,32 +2669,74 @@ class GadgetTokenAndCorsAuthTests(TestCase):
         self.assertEqual(local_ok_resp.json()["username"], "LocalZhCheckUser")
 
     def test_exchange_gadget_token_issues_signed_token_across_rbac_groups_and_allowlist(self):
-        group_cases = (
-            ("GlobalSteward", {"global_groups": ["steward"], "merged_projects": []}),
-            ("GlobalSysop", {"global_groups": ["global-sysop"], "merged_projects": []}),
-            ("GlobalRollback", {"global_groups": ["global-rollbacker"], "merged_projects": []}),
-            ("GlobalTempViewer", {"global_groups": ["global-temporary-account-viewer"], "merged_projects": []}),
-            ("OmbudsUser", {"global_groups": ["ombuds"], "merged_projects": []}),
-            ("StaffUser", {"global_groups": ["staff"], "merged_projects": []}),
-            ("LocalSysop", {"global_groups": [], "merged_projects": [{"wiki": "enwiki", "groups": ["sysop"]}]}),
-            ("LocalAdmin", {"global_groups": [], "merged_projects": [{"wiki": "enwiki", "groups": ["administrator"]}]}),
-            ("LocalCheckUser", {"global_groups": [], "merged_projects": [{"wiki": "enwiki", "groups": ["checkuser"]}]}),
-            ("LocalArbCom", {"global_groups": [], "merged_projects": [{"wiki": "enwiki", "groups": ["arbcom"]}]}),
-            ("LocalOversight", {"global_groups": [], "merged_projects": [{"wiki": "enwiki", "groups": ["oversight"]}]}),
-            ("LocalSuppress", {"global_groups": [], "merged_projects": [{"wiki": "enwiki", "groups": ["suppress"]}]}),
+        authorized_right_cases = (
             (
-                "LocalTempViewer",
-                {"global_groups": [], "merged_projects": [{"wiki": "enwiki", "groups": ["temporary-account-viewer"]}]},
+                "GlobalTaViewer",
+                ["read"],
+                {"global_groups": [], "global_rights": ["checkuser-temporary-account"], "merged_projects": []},
+                [],
+            ),
+            (
+                "GlobalNoPrefUser",
+                ["read"],
+                {
+                    "global_groups": [],
+                    "global_rights": ["checkuser-temporary-account-no-preference"],
+                    "merged_projects": [],
+                },
+                [],
+            ),
+            (
+                "LocalTaRightUser",
+                ["read", "checkuser-temporary-account"],
+                {"global_groups": [], "global_rights": [], "merged_projects": []},
+                [],
+            ),
+            (
+                "LocalNoPrefRightUser",
+                ["read", "checkuser-temporary-account-no-preference"],
+                {"global_groups": [], "global_rights": [], "merged_projects": []},
+                [],
+            ),
+            (
+                "PrepopulatedProjectRightUser",
+                ["read"],
+                {
+                    "global_groups": [],
+                    "global_rights": [],
+                    "merged_projects": [{"wiki": "enwiki", "rights": ["checkuser-temporary-account"]}],
+                },
+                [],
+            ),
+            (
+                "FetchedProjectTaRightUser",
+                ["read"],
+                {
+                    "global_groups": [],
+                    "global_rights": [],
+                    "merged_projects": [{"wiki": "jawiki", "url": "https://ja.wikipedia.org", "groups": ["sysop"]}],
+                },
+                ["read", "checkuser-temporary-account"],
+            ),
+            (
+                "FetchedProjectNoPrefRightUser",
+                ["read"],
+                {
+                    "global_groups": [],
+                    "global_rights": [],
+                    "merged_projects": [{"wiki": "enwiki", "url": "https://en.wikipedia.org", "groups": ["checkuser"]}],
+                },
+                ["read", "checkuser-temporary-account-no-preference"],
             ),
         )
 
         with override_settings(GADGET_TOKEN_TTL_SECONDS=3600):
-            for username, rights_payload in group_cases:
+            for username, local_rights, rights_payload, project_rights in authorized_right_cases:
                 with self.subTest(username=username):
                     userinfo_stub = {
                         "username": username,
                         "local_groups": ["*", "user"],
-                        "rights": [],
+                        "rights": local_rights,
                         "centralids": {},
                         "domain": "zh.wiktionary.org",
                     }
@@ -2495,6 +2750,11 @@ class GadgetTokenAndCorsAuthTests(TestCase):
                             "detector.views.fetch_user_rights_from_meta",
                             new_callable=AsyncMock,
                             return_value=rights_payload,
+                        ),
+                        patch(
+                            "detector.views.fetch_project_user_rights",
+                            new_callable=AsyncMock,
+                            return_value=project_rights,
                         ),
                     ):
                         resp = self.client.post(
@@ -2510,6 +2770,58 @@ class GadgetTokenAndCorsAuthTests(TestCase):
                     self.assertEqual(data["expires_in"], 3600)
                     decoded = signing.loads(data["token"], salt=views.GADGET_TOKEN_SALT, max_age=3600)
                     self.assertEqual(decoded, {"u": username, "scope": "gadget"})
+
+            group_only_denied_cases = (
+                (
+                    "GroupOnlySteward",
+                    ["user"],
+                    ["read", "delete"],
+                    {"global_groups": ["steward"], "global_rights": ["read"], "merged_projects": []},
+                ),
+                (
+                    "GroupOnlyLocalSysop",
+                    ["sysop", "temporary-account-viewer"],
+                    ["read", "block"],
+                    {
+                        "global_groups": [],
+                        "global_rights": [],
+                        "merged_projects": [{"wiki": "enwiki", "url": "https://en.wikipedia.org", "groups": ["sysop"]}],
+                    },
+                ),
+            )
+            for username, local_groups, local_rights, rights_payload in group_only_denied_cases:
+                with self.subTest(denied_username=username):
+                    userinfo_stub = {
+                        "username": username,
+                        "local_groups": local_groups,
+                        "rights": local_rights,
+                        "centralids": {},
+                        "domain": "zh.wiktionary.org",
+                    }
+                    with (
+                        patch(
+                            "detector.views.verify_centralauth_userinfo",
+                            new_callable=AsyncMock,
+                            return_value=userinfo_stub,
+                        ),
+                        patch(
+                            "detector.views.fetch_user_rights_from_meta",
+                            new_callable=AsyncMock,
+                            return_value=rights_payload,
+                        ),
+                        patch(
+                            "detector.views.fetch_project_user_rights",
+                            new_callable=AsyncMock,
+                            return_value=["read", "block"],
+                        ),
+                    ):
+                        denied_resp = self.client.post(
+                            "/api/v1/auth/gadget-token",
+                            data=json.dumps({"centralauthtoken": "valid-cat", "domain": "zh.wiktionary.org"}),
+                            content_type="application/json",
+                            HTTP_ORIGIN="https://zh.wiktionary.org",
+                        )
+                    self.assertEqual(denied_resp.status_code, 403)
 
         allowlisted_userinfo = {
             "username": "allowlisted Tester",
@@ -2552,7 +2864,11 @@ class GadgetTokenAndCorsAuthTests(TestCase):
                 patch(
                     "detector.views.fetch_user_rights_from_meta",
                     new_callable=AsyncMock,
-                    return_value={"global_groups": ["steward"], "merged_projects": []},
+                    return_value={
+                        "global_groups": ["steward"],
+                        "global_rights": ["checkuser-temporary-account-no-preference"],
+                        "merged_projects": [],
+                    },
                 ),
             ):
                 exchange_resp = self.client.post(
@@ -2613,6 +2929,28 @@ class GadgetTokenAndCorsAuthTests(TestCase):
             self.assertIn("expired", expired_resp.json()["error"].lower())
 
     def test_unified_rbac_evaluator_and_oauth_callback_parity(self):
+        required_rights = (
+            "checkuser-temporary-account",
+            "checkuser-temporary-account-no-preference",
+        )
+        for right in required_rights:
+            has_global, global_label, _, _ = evaluate_wikimedia_rights({"global_rights": [right]})
+            self.assertTrue(has_global, msg=f"Expected access for global right {right}")
+            self.assertIn(right, global_label)
+
+            has_local, local_label, _, _ = evaluate_wikimedia_rights({"local_rights": [f"  {right.upper()}  "]})
+            self.assertTrue(has_local, msg=f"Expected access for local right {right}")
+            self.assertIn(right, local_label)
+
+            has_legacy_key, _, _, _ = evaluate_wikimedia_rights({"rights": [right]})
+            self.assertTrue(has_legacy_key, msg=f"Expected access for rights key {right}")
+
+            has_project, project_label, _, _ = evaluate_wikimedia_rights(
+                {"merged_projects": [{"wiki": "jawiki", "rights": [right]}]}
+            )
+            self.assertTrue(has_project, msg=f"Expected access for project right {right}")
+            self.assertIn("jawiki", project_label)
+
         for group in (
             "steward",
             "global-sysop",
@@ -2621,9 +2959,8 @@ class GadgetTokenAndCorsAuthTests(TestCase):
             "ombuds",
             "staff",
         ):
-            has_access, label, _, _ = evaluate_wikimedia_rights({"global_groups": [group]})
-            self.assertTrue(has_access, msg=f"Expected access for global group {group}")
-            self.assertTrue(label)
+            has_access, _, _, _ = evaluate_wikimedia_rights({"global_groups": [group]})
+            self.assertFalse(has_access, msg=f"Group {group} alone must not grant access without required rights")
 
         for local_group in (
             "sysop",
@@ -2633,13 +2970,30 @@ class GadgetTokenAndCorsAuthTests(TestCase):
             "oversight",
             "suppress",
             "temporary-account-viewer",
+            "checkuser-temporary-account-viewer",
         ):
-            has_access, label, _, _ = evaluate_wikimedia_rights({"local_groups": [local_group]})
-            self.assertTrue(has_access, msg=f"Expected access for local group {local_group}")
-            self.assertTrue(label)
+            has_access, _, _, _ = evaluate_wikimedia_rights({"local_groups": [local_group]})
+            self.assertFalse(has_access, msg=f"Local group {local_group} alone must not grant access")
+
+            has_merged_group, _, _, _ = evaluate_wikimedia_rights(
+                {"merged_projects": [{"wiki": "zhwiki", "groups": [local_group]}]}
+            )
+            self.assertFalse(
+                has_merged_group,
+                msg=f"Merged project group {local_group} alone must not grant access without required rights",
+            )
 
         denied, _, _, _ = evaluate_wikimedia_rights({"username": "PlainUser", "local_groups": ["*", "user"]})
         self.assertFalse(denied)
+
+        with override_settings(ALLOWED_WIKI_USERS="~2026-12345"):
+            temp_denied, _, _, _ = evaluate_wikimedia_rights(
+                {
+                    "username": "~2026-12345",
+                    "local_rights": ["checkuser-temporary-account"],
+                }
+            )
+            self.assertFalse(temp_denied)
 
         with override_settings(ALLOWED_WIKI_USERS="Allowlisted_Operator"):
             allowed, role_label, _, _ = evaluate_wikimedia_rights({"username": "allowlisted Operator"})
@@ -2678,6 +3032,220 @@ class GadgetTokenAndCorsAuthTests(TestCase):
         self.assertIsInstance(user_session, dict)
         self.assertTrue(user_session["hasAccess"])
         self.assertEqual(user_session["role"], "Allowlisted Wikimedia User")
+
+    @override_settings(
+        WIKIMEDIA_CLIENT_ID="test-id",
+        WIKIMEDIA_CLIENT_SECRET="test-secret",
+        WIKIMEDIA_REDIRECT_URI="https://proxycheck.toolforge.org/oauth/callback",
+    )
+    def test_oauth_callback_and_gadget_parity_for_cross_wiki_sysop_taiv_and_temp_accounts(self):
+        cross_wiki_cases = (
+            (
+                "CrossWikiTaAccess",
+                "jawiki",
+                "https://ja.wikipedia.org",
+                "checkuser-temporary-account",
+                "Temporary Account Access (jawiki: checkuser-temporary-account)",
+            ),
+            (
+                "CrossWikiNoPrefAccess",
+                "frwikisource",
+                "https://fr.wikisource.org",
+                "checkuser-temporary-account-no-preference",
+                "Temporary Account Access (frwikisource: checkuser-temporary-account-no-preference)",
+            ),
+        )
+
+        for username, project_wiki, project_url, granted_right, expected_role in cross_wiki_cases:
+            with self.subTest(username=username, right=granted_right):
+                session = self.client.session
+                session["oauth_state"] = f"state-{username}"
+                session.pop("wikimedia_user", None)
+                session.save()
+
+                token_resp = MagicMock(status_code=200)
+                token_resp.json.return_value = {"access_token": f"token-{username}"}
+                profile_resp = MagicMock(status_code=200)
+                profile_resp.json.return_value = {"username": username, "groups": ["*", "user"], "rights": ["read"]}
+
+                project_users_resp = MagicMock(status_code=200)
+                project_users_resp.json.return_value = {
+                    "query": {"users": [{"name": username, "rights": ["read", granted_right]}]}
+                }
+
+                async def _mock_get(
+                    url, *_args, target_profile=profile_resp, target_users=project_users_resp, **_kwargs
+                ):
+                    if "/oauth2/resource/profile" in url:
+                        return target_profile
+                    return target_users
+
+                mock_client = MagicMock()
+                mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                mock_client.__aexit__ = AsyncMock(return_value=False)
+                mock_client.post = AsyncMock(return_value=token_resp)
+                mock_client.get = AsyncMock(side_effect=_mock_get)
+
+                meta_rights = {
+                    "global_groups": [],
+                    "global_rights": [],
+                    "merged_projects": [{"wiki": project_wiki, "url": project_url, "groups": ["sysop"]}],
+                }
+
+                with (
+                    patch("detector.views.httpx.AsyncClient", return_value=mock_client),
+                    patch(
+                        "detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock, return_value=meta_rights
+                    ),
+                ):
+                    oauth_resp = self.client.get(f"/api/v1/auth/callback?code=code1&state=state-{username}")
+
+                self.assertEqual(oauth_resp.status_code, 302)
+                user_session = self.client.session.get("wikimedia_user")
+                self.assertIsInstance(user_session, dict)
+                self.assertTrue(user_session["hasAccess"])
+                self.assertEqual(user_session["role"], expected_role)
+
+                userinfo_stub = {
+                    "username": username,
+                    "local_groups": ["*", "user"],
+                    "rights": ["read"],
+                    "centralids": {},
+                    "domain": "commons.wikimedia.org",
+                }
+                with (
+                    patch(
+                        "detector.views.verify_centralauth_userinfo", new_callable=AsyncMock, return_value=userinfo_stub
+                    ),
+                    patch(
+                        "detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock, return_value=meta_rights
+                    ),
+                    patch(
+                        "detector.views.fetch_project_user_rights",
+                        new_callable=AsyncMock,
+                        return_value=["read", granted_right],
+                    ),
+                ):
+                    gadget_resp = self.client.post(
+                        "/api/v1/auth/gadget-token",
+                        data=json.dumps({"centralauthtoken": "valid-cat", "domain": "commons.wikimedia.org"}),
+                        content_type="application/json",
+                        HTTP_ORIGIN="https://commons.wikimedia.org",
+                    )
+
+                self.assertEqual(gadget_resp.status_code, 200)
+                self.assertEqual(gadget_resp.json()["username"], username)
+
+        # Verify Meta-Wiki local right fallback on transient globaluserinfo error matches gadget behavior
+        session = self.client.session
+        session["oauth_state"] = "state-local-fallback"
+        session.pop("wikimedia_user", None)
+        session.save()
+
+        token_resp = MagicMock(status_code=200)
+        token_resp.json.return_value = {"access_token": "token-local"}
+        profile_resp = MagicMock(status_code=200)
+        profile_resp.json.return_value = {
+            "username": "MetaTaivUser",
+            "groups": ["*"],
+            "rights": ["read", "checkuser-temporary-account"],
+        }
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.post = AsyncMock(return_value=token_resp)
+        mock_client.get = AsyncMock(return_value=profile_resp)
+
+        with (
+            patch("detector.views.httpx.AsyncClient", return_value=mock_client),
+            patch(
+                "detector.views.fetch_user_rights_from_meta",
+                new_callable=AsyncMock,
+                side_effect=MetaWikiRightsFetchError("Meta-Wiki HTTP 503"),
+            ),
+        ):
+            fallback_resp = self.client.get("/api/v1/auth/callback?code=code2&state=state-local-fallback")
+
+        self.assertEqual(fallback_resp.status_code, 302)
+        fallback_session = self.client.session.get("wikimedia_user")
+        self.assertIsInstance(fallback_session, dict)
+        self.assertTrue(fallback_session["hasAccess"])
+        self.assertEqual(fallback_session["role"], "Temporary Account Access (local: checkuser-temporary-account)")
+
+        # Verify group-only members without the required rights are denied on both OAuth and gadget
+        session = self.client.session
+        session["oauth_state"] = "state-group-only-denied"
+        session.pop("wikimedia_user", None)
+        session.save()
+
+        denied_profile_resp = MagicMock(status_code=200)
+        denied_profile_resp.json.return_value = {
+            "username": "GroupOnlySysop",
+            "groups": ["sysop", "temporary-account-viewer"],
+            "rights": ["read", "delete"],
+        }
+        mock_client.get = AsyncMock(return_value=denied_profile_resp)
+        denied_meta_rights = {
+            "global_groups": ["steward", "global-sysop"],
+            "global_rights": ["read", "block"],
+            "merged_projects": [{"wiki": "zhwiki", "url": "https://zh.wikipedia.org", "groups": ["sysop"]}],
+        }
+        with (
+            patch("detector.views.httpx.AsyncClient", return_value=mock_client),
+            patch(
+                "detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock, return_value=denied_meta_rights
+            ),
+            patch("detector.views.fetch_project_user_rights", new_callable=AsyncMock, return_value=["read", "delete"]),
+        ):
+            denied_oauth_resp = self.client.get("/api/v1/auth/callback?code=code2b&state=state-group-only-denied")
+
+        self.assertEqual(denied_oauth_resp.status_code, 302)
+        denied_session = self.client.session.get("wikimedia_user")
+        self.assertIsInstance(denied_session, dict)
+        self.assertFalse(denied_session["hasAccess"])
+
+        denied_userinfo = {
+            "username": "GroupOnlySysop",
+            "local_groups": ["sysop", "temporary-account-viewer"],
+            "rights": ["read", "delete"],
+            "centralids": {},
+            "domain": "zh.wikipedia.org",
+        }
+        with (
+            patch("detector.views.verify_centralauth_userinfo", new_callable=AsyncMock, return_value=denied_userinfo),
+            patch(
+                "detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock, return_value=denied_meta_rights
+            ),
+            patch("detector.views.fetch_project_user_rights", new_callable=AsyncMock, return_value=["read", "delete"]),
+        ):
+            denied_gadget_resp = self.client.post(
+                "/api/v1/auth/gadget-token",
+                data=json.dumps({"centralauthtoken": "valid-cat", "domain": "zh.wikipedia.org"}),
+                content_type="application/json",
+                HTTP_ORIGIN="https://zh.wikipedia.org",
+            )
+        self.assertEqual(denied_gadget_resp.status_code, 403)
+
+        # Verify temporary accounts are rejected via OAuth even if allowlisted
+        session = self.client.session
+        session["oauth_state"] = "state-temp-acct"
+        session.pop("wikimedia_user", None)
+        session.save()
+
+        temp_profile_resp = MagicMock(status_code=200)
+        temp_profile_resp.json.return_value = {"username": "~2026-12345", "groups": ["*"]}
+        mock_client.get = AsyncMock(return_value=temp_profile_resp)
+
+        with (
+            override_settings(ALLOWED_WIKI_USERS="~2026-12345"),
+            patch("detector.views.httpx.AsyncClient", return_value=mock_client),
+            patch("detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock) as mock_temp_meta,
+        ):
+            temp_resp = self.client.get("/api/v1/auth/callback?code=code3&state=state-temp-acct")
+
+        self.assertEqual(temp_resp.status_code, 302)
+        mock_temp_meta.assert_not_called()
+        self.assertIsNone(self.client.session.get("wikimedia_user"))
 
     def test_post_method_returns_405_with_cors_headers(self):
         resp = self.client.post(
@@ -4407,7 +4975,11 @@ class RedisDegradationAndOAuthFallbackTests(TestCase):
     @patch("detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock)
     @patch("detector.views.httpx.AsyncClient")
     def test_oauth_callback_alias_routes_authenticate_and_consume_state(self, mock_async_client_cls, mock_fetch_meta):
-        mock_fetch_meta.return_value = {"global_groups": ["steward"], "merged_projects": []}
+        mock_fetch_meta.return_value = {
+            "global_groups": ["steward"],
+            "global_rights": ["checkuser-temporary-account-no-preference"],
+            "merged_projects": [],
+        }
         alias_paths = ("/oauth/callback", "/oauth/callback/", "/api/oauth/callback")
 
         for index, route in enumerate(alias_paths):
@@ -4504,7 +5076,11 @@ class RedisDegradationAndOAuthFallbackTests(TestCase):
             status_code=200,
             json_value={"username": "StewardUser", "groups": ["user"]},
         )
-        mock_fetch_meta.return_value = {"global_groups": ["steward"], "merged_projects": []}
+        mock_fetch_meta.return_value = {
+            "global_groups": ["steward"],
+            "global_rights": ["checkuser-temporary-account-no-preference"],
+            "merged_projects": [],
+        }
 
         original_save = __import__(
             "django.contrib.sessions.backends.cache",

@@ -5,8 +5,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { resolveCommitMetadata } from '../../vite.config';
 import {
+  REQUIRED_USER_RIGHTS,
+  REQUIRED_USER_RIGHTS_SUMMARY,
   isValidIpAddress,
   canonicalizeIpAddress,
+  extractCanonicalIpFromSearch,
+  buildOAuthLoginUrl,
+  buildPageUrlWithIp,
   updateIpHistory,
   filterComparisonResults,
   simplifySecurityFlags,
@@ -178,7 +183,7 @@ test('HTTP 401 response during detection resets user session state and surfaces 
   const coordinator = createDetectionCoordinator(fakeFetch, {
     isLoggedIn: true,
     username: 'AdminUser',
-    role: 'Local Administrator (sysop)',
+    role: 'Temporary Account Access (local: checkuser-temporary-account)',
     hasAccess: true,
   });
   coordinator.state.detectionData = { ip: '1.1.1.1', comprehensiveScore: 20, results: [] };
@@ -216,7 +221,7 @@ test('Detection coordinator preserves null memory diagnostics and invokes histor
     user: {
       isLoggedIn: true,
       username: 'SysopUser',
-      role: 'Local Administrator (sysop)',
+      role: 'Temporary Account Access (local: checkuser-temporary-account)',
       hasAccess: true,
     },
     ipHistory: ['1.1.1.1'],
@@ -361,4 +366,141 @@ test('resolveCommitMetadata reads Git metadata, honours env overrides, and falls
   } finally {
     fs.rmSync(nonGitDir, { recursive: true, force: true });
   }
+});
+
+test('Login page displays required temporary-account rights notice beneath login button', () => {
+  const appVue = fs.readFileSync(path.resolve(process.cwd(), 'src/App.vue'), 'utf8');
+  assert.match(
+    appVue,
+    /class="login-btn"[\s\S]*?REQUIRED_USER_RIGHTS\[0\][\s\S]*?REQUIRED_USER_RIGHTS\[1\]/,
+  );
+  assert.match(appVue, /class="login-groups-note"[\s\S]*?right on any Wikimedia project/);
+  assert.match(appVue, /class="unauthorised-message"[\s\S]*?REQUIRED_USER_RIGHTS/);
+  assert.doesNotMatch(appVue, /This tool is designed for the following user groups:/);
+  assert.deepEqual([...REQUIRED_USER_RIGHTS], [
+    'checkuser-temporary-account',
+    'checkuser-temporary-account-no-preference',
+  ]);
+  assert.match(REQUIRED_USER_RIGHTS_SUMMARY, /checkuser-temporary-account/);
+  assert.match(REQUIRED_USER_RIGHTS_SUMMARY, /checkuser-temporary-account-no-preference/);
+});
+
+test('extractCanonicalIpFromSearch parses and canonicalizes valid ip query values', () => {
+  assert.equal(extractCanonicalIpFromSearch('?ip=%208.8.8.8%20'), '8.8.8.8');
+  assert.equal(
+    extractCanonicalIpFromSearch('?foo=bar&ip=2001:0DB8:0000:0000:0000:0000:0000:0001'),
+    '2001:db8::1',
+  );
+  assert.equal(extractCanonicalIpFromSearch('?ip=008.008.008.008'), null);
+  assert.equal(extractCanonicalIpFromSearch('?foo=bar'), null);
+  assert.equal(extractCanonicalIpFromSearch('?ip=not-an-ip'), null);
+  assert.equal(extractCanonicalIpFromSearch('?ip=https://evil.example/path'), null);
+  assert.equal(extractCanonicalIpFromSearch(null), null);
+});
+
+test('buildOAuthLoginUrl preserves canonical ip from search or fallback and drops invalid values', () => {
+  assert.equal(
+    buildOAuthLoginUrl('?ip=2001:0DB8::01', '8.8.8.8'),
+    '/api/v1/auth/login/?ip=2001%3Adb8%3A%3A1',
+  );
+  assert.equal(
+    buildOAuthLoginUrl('?foo=1', ' 8.8.8.8 '),
+    '/api/v1/auth/login/?ip=8.8.8.8',
+  );
+  assert.equal(
+    buildOAuthLoginUrl('?ip=invalid-ip', '1.1.1.1'),
+    '/api/v1/auth/login/?ip=1.1.1.1',
+  );
+  assert.equal(buildOAuthLoginUrl('?ip=invalid-ip', 'also-invalid'), '/api/v1/auth/login/');
+  assert.equal(buildOAuthLoginUrl('', null), '/api/v1/auth/login/');
+});
+
+test('buildPageUrlWithIp sets or removes canonical ip while preserving unrelated query params', () => {
+  assert.equal(
+    buildPageUrlWithIp('/', '?tab=summary&ip=8.8.8.8', '2001:0db8::01'),
+    '/?tab=summary&ip=2001%3Adb8%3A%3A1',
+  );
+  assert.equal(buildPageUrlWithIp('/', '?tab=summary&ip=8.8.8.8', null), '/?tab=summary');
+  assert.equal(buildPageUrlWithIp('/', '?ip=8.8.8.8', null), '/');
+  assert.equal(buildPageUrlWithIp('https://evil.example/steal', '?a=1', '8.8.8.8'), '/?a=1&ip=8.8.8.8');
+});
+
+test('Detection coordinator fires onDetectionSuccess only for non-stale HTTP 200 completions', async () => {
+  const succeeded: Array<{ ip: string; score: number }> = [];
+  let resolveSlowFirst: (value: any) => void = () => {};
+  let resolveFastSecond: (value: any) => void = () => {};
+
+  const slowPromise = new Promise((resolve) => {
+    resolveSlowFirst = resolve;
+  });
+  const fastPromise = new Promise((resolve) => {
+    resolveFastSecond = resolve;
+  });
+
+  const coordinator = createDetectionCoordinator(
+    (url) => (url.includes('1.1.1.1') ? (slowPromise as any) : (fastPromise as any)),
+    undefined,
+    {
+      onDetectionSuccess: (canonicalIp, data) => {
+        succeeded.push({ ip: canonicalIp, score: data.comprehensiveScore });
+      },
+    },
+  );
+
+  // Validation error does not trigger onDetectionSuccess
+  await coordinator.executeDetection('not-an-ip');
+  assert.deepEqual(succeeded, []);
+
+  // Out-of-order responses only invoke onDetectionSuccess for the latest request
+  const firstTask = coordinator.executeDetection('1.1.1.1');
+  const secondTask = coordinator.executeDetection('2001:0db8::01');
+
+  resolveFastSecond({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      ip: '2001:0db8:0000:0000:0000:0000:0000:0001',
+      comprehensiveScore: 25,
+      results: [],
+    }),
+  });
+  await secondTask;
+
+  resolveSlowFirst({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      ip: '1.1.1.1',
+      comprehensiveScore: 80,
+      results: [],
+    }),
+  });
+  await firstTask;
+
+  assert.deepEqual(succeeded, [{ ip: '2001:db8::1', score: 25 }]);
+});
+
+test('Detection coordinator skips onDetectionSuccess when HTTP 401 expires session', async () => {
+  let called = false;
+  const coordinator = createDetectionCoordinator(
+    async () => ({
+      ok: false,
+      status: 401,
+      json: async () => ({ error: 'Authentication required.' }),
+    }),
+    {
+      isLoggedIn: true,
+      username: 'AdminUser',
+      role: 'Temporary Account Access (global: checkuser-temporary-account)',
+      hasAccess: true,
+    },
+    {
+      onDetectionSuccess: () => {
+        called = true;
+      },
+    },
+  );
+
+  await coordinator.executeDetection('8.8.8.8');
+  assert.equal(called, false);
 });

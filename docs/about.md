@@ -1,6 +1,6 @@
 ## A note from the maintainer
 
-I think the Wikimedia Foundation has already given us a much fair amount of support in dealing with temporary accounts that abuse open proxies, server-hosted, commercial VPNs, or some widely shared but dedicated IP addresses to vandalise projects. However, the tools and intelligence provided through MaxMind and Spur can only go so far, particularly when dealing with those who deliberately go out of their way to use OPs and VPNs for their less-than-honourable purposes.
+I think the Wikimedia Foundation has already given us quite a fair amount of support in dealing with temporary accounts that abuse open proxies, server-hosted, commercial VPNs, or some widely shared but dedicated IP addresses to vandalise projects. However, the tools and intelligence provided through MaxMind and Spur can only go so far, particularly when dealing with those who deliberately go out of their way to use OPs and VPNs for their less-than-honourable purposes.
 
 Inspired by [IPCheck](https://tools.wmflabs.org/ipcheck/index.php), a tool originally developed by SQL (Thanks!), I felt there was still a case for having another tool in my arsenal, the one that takes a more diversified approach to identifying those IP addresses.
 

@@ -1200,5 +1200,530 @@ test('Userscript proactively refreshes expired stored tokens via TOKEN_EXPIRY_KE
   assert.equal(forbiddenHarness.isObserverDisconnected(), true);
 });
 
+interface MockDomNode {
+  tag: string;
+  props: Record<string, any>;
+  textValue: string;
+  children: MockDomNode[];
+  parent: MockDomNode | null;
+}
+
+function collectMockDomText(node: any): string {
+  if (!node) {
+    return '';
+  }
+  if (typeof node === 'string') {
+    return node;
+  }
+  if (node._node) {
+    return collectMockDomText(node._node);
+  }
+  if (typeof node.nodeType === 'number' && typeof node.textContent === 'string') {
+    return node.textContent;
+  }
+  const parts: string[] = [];
+  if (typeof node.textValue === 'string' && node.textValue) {
+    parts.push(node.textValue);
+  }
+  if (Array.isArray(node.children)) {
+    for (const child of node.children) {
+      const childText = collectMockDomText(child);
+      if (childText) {
+        parts.push(childText);
+      }
+    }
+  }
+  return parts.join(' ');
+}
+
+function createInteractiveDialogHarness(fetchImpl: (url: string, init?: any) => Promise<any>) {
+  const userscriptPath = path.resolve(process.cwd(), '../js/hydrogen-meta-userscript.js');
+  if (!fs.existsSync(userscriptPath)) {
+    return null;
+  }
+
+  const anchors: any[] = [
+    {
+      nodeType: 1,
+      textContent: '198.51.100.1',
+      dataset: {},
+      style: {},
+      nextSibling: null,
+      nextElementSibling: null,
+      classList: { contains: () => false },
+      matches: (sel: string) => sel === 'a.ext-checkuser-tempaccount-reveal-ip-anchor',
+      closest: () => null,
+      parentNode: null as any,
+    },
+  ];
+  const insertedBadges: Array<{ ip: string; badge: any; anchor: any }> = [];
+  anchors[0].parentNode = {
+    insertBefore: (badge: any) => {
+      insertedBadges.push({ ip: anchors[0].textContent, badge, anchor: anchors[0] });
+      anchors[0].nextElementSibling = badge;
+    },
+  };
+
+  let readyCallback: (() => void) | null = null;
+  const storageMap = new Map<string, string>([
+    ['proxycheck-ip-policy-consent', '1'],
+    ['proxycheck-gadget-token', 'interactive-signed-token'],
+    ['proxycheck-gadget-token-user', 'AdminTester'],
+    ['proxycheck-gadget-token-exp', String(Date.now() + 300000)],
+  ]);
+
+  function wrapNode(node: MockDomNode): any {
+    const wrapper: any = {
+      _node: node,
+      length: 1,
+      append: (...args: any[]) => {
+        for (const item of args) {
+          if (item === null || item === undefined) {
+            continue;
+          }
+          if (item._node) {
+            item._node.parent = node;
+            node.children.push(item._node);
+          } else if (typeof item === 'object' && typeof item.nodeType === 'number') {
+            node.children.push({
+              tag: '#text',
+              props: {},
+              textValue: String(item.textContent || ''),
+              children: [],
+              parent: node,
+            });
+          } else {
+            node.children.push({
+              tag: '#text',
+              props: {},
+              textValue: String(item),
+              children: [],
+              parent: node,
+            });
+          }
+        }
+        return wrapper;
+      },
+      appendTo: (target: any) => {
+        if (target && typeof target.append === 'function') {
+          target.append(wrapper);
+        }
+        return wrapper;
+      },
+      empty: () => {
+        node.children = [];
+        node.textValue = '';
+        return wrapper;
+      },
+      remove: () => {
+        if (node.parent) {
+          node.parent.children = node.parent.children.filter((child) => child !== node);
+          node.parent = null;
+        }
+        return wrapper;
+      },
+      text: (val?: string) => {
+        if (val === undefined) {
+          return collectMockDomText(node);
+        }
+        node.children = [];
+        node.textValue = String(val);
+        return wrapper;
+      },
+      html: (val?: string) => {
+        if (val === undefined) {
+          return collectMockDomText(node);
+        }
+        node.children = [];
+        node.textValue = String(val);
+        return wrapper;
+      },
+      attr: (key: string, val?: any) => {
+        if (val === undefined) {
+          return node.props[key];
+        }
+        node.props[key] = val;
+        return wrapper;
+      },
+      prop: (key: string, val?: any) => {
+        if (val === undefined) {
+          return node.props[key];
+        }
+        node.props[key] = val;
+        return wrapper;
+      },
+      css: () => wrapper,
+      on: () => wrapper,
+    };
+    return wrapper;
+  }
+
+  const jQueryStub: any = (arg: any, attrs?: Record<string, any>) => {
+    if (typeof arg === 'function') {
+      readyCallback = arg;
+      return { length: 0 };
+    }
+    if (arg && arg._node) {
+      return arg;
+    }
+    const tagMatch = typeof arg === 'string' ? arg.match(/^<([a-zA-Z0-9]+)>$/) : null;
+    if (tagMatch) {
+      const node: MockDomNode = {
+        tag: tagMatch[1].toLowerCase(),
+        props: attrs ? { ...attrs } : {},
+        textValue: attrs && attrs.text !== undefined ? String(attrs.text) : '',
+        children: [],
+        parent: null,
+      };
+      return wrapNode(node);
+    }
+    return wrapNode({
+      tag: 'div',
+      props: {},
+      textValue: '',
+      children: [],
+      parent: null,
+    });
+  };
+
+  const openedAlerts: Array<{
+    title: string;
+    messageWrapper: any;
+    resolveDialog: () => void;
+  }> = [];
+
+  const contextConfig = {
+    mediaWiki: {
+      config: {
+        get: (key: string) => {
+          if (key === 'wgUserName') return 'AdminTester';
+          if (key === 'wgUserIsTemp') return false;
+          if (key === 'wgServerName') return 'meta.wikimedia.org';
+          if (key === 'wgCanonicalSpecialPageName') return false;
+          return null;
+        },
+      },
+      storage: {
+        get: (k: string) => storageMap.get(k) ?? null,
+        set: (k: string, v: string) => storageMap.set(k, v),
+        remove: (k: string) => storageMap.delete(k),
+      },
+      loader: {
+        using: () => Promise.resolve(),
+      },
+      Api: function () {
+        return {
+          get: () =>
+            Promise.resolve({
+              centralauthtoken: { centralauthtoken: 'fresh-cat-token' },
+            }),
+        };
+      },
+      html: {
+        escape: (s: string) => s,
+      },
+    },
+    OO: {
+      ui: {
+        alert: ($message: any, opts: { title: string }) =>
+          new Promise<void>((resolve) => {
+            openedAlerts.push({
+              title: opts.title,
+              messageWrapper: $message,
+              resolveDialog: resolve,
+            });
+          }),
+      },
+    },
+    jQuery: jQueryStub,
+    window: {
+      setTimeout: globalThis.setTimeout.bind(globalThis),
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
+      setInterval: globalThis.setInterval.bind(globalThis),
+      clearInterval: globalThis.clearInterval.bind(globalThis),
+    },
+    document: {
+      body: {
+        nodeType: 1,
+        matches: () => false,
+        closest: () => null,
+        querySelectorAll: (sel: string) =>
+          sel === 'a.ext-checkuser-tempaccount-reveal-ip-anchor' ? anchors : [],
+      },
+      getElementById: () => null,
+      createElement: (tag: string) => {
+        const listeners: Record<string, Array<(ev: any) => void>> = {};
+        return {
+          tagName: tag.toUpperCase(),
+          style: {},
+          classList: { contains: (cls: string) => cls === 'proxycheck-ip-badge' },
+          addEventListener: (eventName: string, handler: (ev: any) => void) => {
+            listeners[eventName] = listeners[eventName] || [];
+            listeners[eventName].push(handler);
+          },
+          _trigger: (eventName: string) => {
+            for (const fn of listeners[eventName] || []) {
+              fn({ preventDefault: () => {}, stopPropagation: () => {} });
+            }
+          },
+        };
+      },
+      createTextNode: (text: string) => ({ nodeType: 3, textContent: text }),
+    },
+    MutationObserver: function () {
+      return {
+        observe: () => {},
+        disconnect: () => {},
+      };
+    },
+    fetch: fetchImpl,
+    console,
+    Promise,
+    Map,
+    Set,
+    Object,
+    Array,
+    String,
+    Number,
+    Boolean,
+    JSON,
+    encodeURIComponent,
+    isNaN,
+  };
+
+  return import('node:vm').then((vm) => {
+    const scriptSource = fs.readFileSync(userscriptPath, 'utf8');
+    const context = vm.createContext(contextConfig);
+    vm.runInContext(scriptSource, context);
+    if (readyCallback) {
+      (readyCallback as () => void)();
+    }
+    return { anchors, insertedBadges, openedAlerts, storageMap };
+  });
+}
+
+test('Userscript scans anchors in light mode and progressively upgrades showInfoDialog to full', async () => {
+  const recordedRequests: Array<{ url: string; method: string; body: any }> = [];
+  let resolveFullFetch: ((value: any) => void) | null = null;
+
+  const lightPayload = {
+    ip: '198.51.100.1',
+    queryMode: 'light',
+    isPartialMode: true,
+    prediction_score: 0.0,
+    getipintel_chance: null,
+    arbitrationVerdict: 'No Proxy / VPN Detected',
+    arbitrationTier: 'low',
+    isTor: false,
+    is_broadcast_ip: false,
+    recommendedCidr: '198.51.100.0/24',
+    mmdbCidr: '198.51.100.0/24',
+    results: [
+      {
+        provider: 'MaxMind',
+        status: '200 OK',
+        statusCode: 200,
+        asn: 'AS64496',
+        isp: 'Example ISP',
+        organisation: 'Example ISP',
+        location: 'United States',
+        usageType: 'isp',
+        securityFlags: [{ label: 'No Flags', isHighRisk: false }],
+      },
+      {
+        provider: 'GetIPIntel',
+        status: 'Deferred (Light Mode)',
+        statusCode: null,
+        asn: '-',
+        isp: '-',
+        organisation: '-',
+        location: '-',
+        usageType: '-',
+        securityFlags: [{ label: 'Deferred (Light Mode)', isHighRisk: false }],
+      },
+    ],
+  };
+
+  const fullPayload = {
+    ip: '198.51.100.1',
+    queryMode: 'full',
+    isPartialMode: false,
+    prediction_score: 92.4,
+    predictionLabel: '92.4% (High Risk)',
+    predictionTier: 'high',
+    getipintel_chance: 0.924,
+    arbitrationVerdict: 'High-Confidence Proxy / VPN',
+    arbitrationTier: 'high',
+    isMajorityProxyVpn: true,
+    isTor: false,
+    is_broadcast_ip: false,
+    recommendedCidr: '198.51.100.0/24',
+    mmdbCidr: '198.51.100.0/24',
+    results: [
+      {
+        provider: 'MaxMind',
+        status: '200 OK',
+        statusCode: 200,
+        asn: 'AS64496',
+        isp: 'Example ISP',
+        organisation: 'Example ISP',
+        location: 'United States',
+        usageType: 'hosting',
+        securityFlags: [{ label: 'Hosting Provider', isHighRisk: true }],
+      },
+      {
+        provider: 'GetIPIntel',
+        status: '200 OK',
+        statusCode: 200,
+        chance: 0.924,
+        asn: '-',
+        isp: '-',
+        organisation: '-',
+        location: '-',
+        usageType: 'proxy',
+        securityFlags: [{ label: 'Proxy / VPN (92.4%)', isHighRisk: true }],
+      },
+    ],
+  };
+
+  const harness = await createInteractiveDialogHarness(async (url, init) => {
+    const parsedBody = init?.body ? JSON.parse(init.body) : null;
+    recordedRequests.push({ url, method: init?.method || 'GET', body: parsedBody });
+    if (url.includes('/api/v1/detect/batch')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          results: { '198.51.100.1': lightPayload },
+          count: 1,
+          queryMode: 'light',
+        }),
+      };
+    }
+    if (url.includes('/api/v1/detect?ip=') && url.includes('mode=full')) {
+      return await new Promise((resolve) => {
+        resolveFullFetch = () =>
+          resolve({
+            ok: true,
+            status: 200,
+            json: async () => fullPayload,
+          });
+      });
+    }
+    throw new Error(`Unexpected fetch URL: ${url}`);
+  });
+  if (!harness) {
+    return;
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, 90));
+
+  // Verify the initial anchor scan uses batch light mode
+  assert.equal(recordedRequests.length, 1);
+  assert.equal(recordedRequests[0].url, 'https://proxycheck.toolforge.org/api/v1/detect/batch?compact=1');
+  assert.deepEqual(recordedRequests[0].body, { ips: ['198.51.100.1'], mode: 'light' });
+  assert.equal(harness.insertedBadges.length, 1);
+  const badgeEntry = harness.insertedBadges[0];
+  assert.equal(badgeEntry.badge.textContent, '[N/A]');
+
+  // Click badge and verify immediate dialog render plus background full request
+  badgeEntry.badge._trigger('click');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(harness.openedAlerts.length, 1);
+  const initialDialogText = collectMockDomText(harness.openedAlerts[0].messageWrapper);
+  assert.match(initialDialogText, /Loading full commercial provider intelligence\.\.\./);
+  assert.equal(recordedRequests.length, 2);
+  assert.equal(
+    recordedRequests[1].url,
+    'https://proxycheck.toolforge.org/api/v1/detect?ip=198.51.100.1&compact=1&mode=full'
+  );
+
+  // Resolve full intelligence fetch and confirm in-place dialog and badge updates
+  assert.ok(resolveFullFetch, 'Expected pending mode=full request resolver');
+  (resolveFullFetch as (value: any) => void)(null);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  const upgradedDialogText = collectMockDomText(harness.openedAlerts[0].messageWrapper);
+  assert.doesNotMatch(upgradedDialogText, /Loading full commercial provider intelligence\.\.\./);
+  assert.match(upgradedDialogText, /GetIPIntel/);
+  assert.match(upgradedDialogText, /92\.4%/);
+  assert.equal(badgeEntry.badge.textContent, '[92.4%]');
+  assert.equal(badgeEntry.anchor.style.color, '#990000');
+
+  // Close and reopen the badge to verify full intelligence is served from cache with no extra fetch
+  harness.openedAlerts[0].resolveDialog();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  badgeEntry.badge._trigger('click');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(harness.openedAlerts.length, 2);
+  assert.equal(recordedRequests.length, 2);
+  const cachedReopenText = collectMockDomText(harness.openedAlerts[1].messageWrapper);
+  assert.doesNotMatch(cachedReopenText, /Loading full commercial provider intelligence\.\.\./);
+  assert.match(cachedReopenText, /GetIPIntel/);
+  harness.openedAlerts[1].resolveDialog();
+});
+
+test('Userscript skips redundant mode=full request when light scan already has full cached sources', async () => {
+  const requests: string[] = [];
+  const completeLightPayload = {
+    ip: '198.51.100.1',
+    queryMode: 'light',
+    isPartialMode: false,
+    prediction_score: 5.0,
+    getipintel_chance: 0.05,
+    arbitrationVerdict: 'Clean',
+    arbitrationTier: 'low',
+    isTor: false,
+    is_broadcast_ip: false,
+    recommendedCidr: '198.51.100.0/24',
+    mmdbCidr: '198.51.100.0/24',
+    results: [
+      {
+        provider: 'GetIPIntel',
+        status: '200 OK',
+        statusCode: 200,
+        chance: 0.05,
+        asn: '-',
+        isp: '-',
+        organisation: '-',
+        location: '-',
+        usageType: 'isp',
+        securityFlags: [{ label: 'No Flags', isHighRisk: false }],
+      },
+    ],
+  };
+
+  const harness = await createInteractiveDialogHarness(async (url) => {
+    requests.push(url);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        results: { '198.51.100.1': completeLightPayload },
+        count: 1,
+        queryMode: 'light',
+      }),
+    };
+  });
+  if (!harness) {
+    return;
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, 90));
+  assert.equal(requests.length, 1);
+  harness.insertedBadges[0].badge._trigger('click');
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  assert.equal(harness.openedAlerts.length, 1);
+  assert.equal(requests.length, 1);
+  const dialogText = collectMockDomText(harness.openedAlerts[0].messageWrapper);
+  assert.doesNotMatch(dialogText, /Loading full commercial provider intelligence\.\.\./);
+  assert.match(dialogText, /GetIPIntel/);
+  harness.openedAlerts[0].resolveDialog();
+});
+
+
 
 

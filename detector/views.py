@@ -356,6 +356,24 @@ def _is_compact_request(request, body: Optional[Dict[str, Any]] = None) -> bool:
     return False
 
 
+def _normalize_query_mode(raw_mode: Any) -> str:
+    """Normalizes the requested detection mode to either light or full."""
+    normalized = str(raw_mode or "full").strip().lower()
+    return "light" if normalized == "light" else "full"
+
+
+def _resolve_query_mode(request, body: Optional[Dict[str, Any]] = None) -> str:
+    """Checks query parameters and optional JSON body for the detection query mode."""
+    raw_query = request.GET.get("mode")
+    if raw_query is not None and str(raw_query).strip():
+        return _normalize_query_mode(raw_query)
+    if isinstance(body, dict) and "mode" in body and body.get("mode") is not None:
+        raw_body_mode = str(body.get("mode")).strip()
+        if raw_body_mode:
+            return _normalize_query_mode(raw_body_mode)
+    return "full"
+
+
 def canonicalize_ip(raw_ip: str) -> Optional[str]:
     """Returns the canonical compressed IPv4 or IPv6 address string, or None when invalid."""
     if not isinstance(raw_ip, str):
@@ -419,13 +437,18 @@ def _build_non_public_response_payload(
     category: str,
     reason: str,
     start_time: float,
+    *,
+    query_mode: str = "full",
 ) -> Dict[str, Any]:
     """Builds a standard HTTP 200 payload for non-public or reserved IP addresses without external lookups."""
+    normalized_mode = _normalize_query_mode(query_mode)
     payload = {
         "ip": ip,
         "isNonPublic": True,
         "nonPublicCategory": category,
         "nonPublicReason": reason,
+        "queryMode": normalized_mode,
+        "isPartialMode": False,
         "is_broadcast_ip": False,
         "isTor": False,
         "torIsExit": False,
@@ -1929,10 +1952,13 @@ def aggregate_intelligence_metrics(
     }
 
 
-_ip_detect_inflight: Dict[str, asyncio.Task] = {}
+_ip_detect_inflight: Dict[Tuple[str, str], asyncio.Task] = {}
 _ip_detect_inflight_lock = threading.Lock()
 
 _DNSBL_PROVIDER_KEYS = frozenset({"spamhaus_zen", "spamcop"})
+_LIGHT_MODE_ACTIVE_PROVIDERS = frozenset(
+    {"maxmind", "tor_onionoo", "dshield", "spamhaus_zen", "spamcop", "cloudflare_radar"}
+)
 
 _PROVIDER_SPECS: Tuple[Tuple[str, str, bool, bool, Callable[[Any, str], Any]], ...] = (
     ("cloudflare_radar", "Cloudflare Radar", True, True, lambda client, ip: query_cloudflare_radar(client, ip)),
@@ -2291,6 +2317,23 @@ async def _read_provider_caches(
     return cached_providers, cached_ptr
 
 
+def _build_deferred_provider_row(provider_name: str) -> Dict[str, Any]:
+    """Builds a placeholder row when an uncached commercial source is skipped in light mode."""
+    return {
+        "provider": provider_name,
+        "status": "Deferred (Light Mode)",
+        "statusCode": None,
+        "asn": "-",
+        "isp": "-",
+        "organisation": "-",
+        "location": "-",
+        "usageType": "-",
+        "securityFlags": [{"label": "Deferred (Light Mode)", "isHighRisk": False}],
+        "isDeferred": True,
+        "rawJson": {"status": "deferred", "mode": "light"},
+    }
+
+
 def _assemble_detection_payload(
     ip: str,
     clean_results: List[Dict[str, Any]],
@@ -2300,6 +2343,8 @@ def _assemble_detection_payload(
     miss_count: int,
     cooldown_count: int,
     cached_at_timestamps: List[str],
+    query_mode: str = "full",
+    is_partial_mode: bool = False,
 ) -> Dict[str, Any]:
     aggregated = aggregate_intelligence_metrics(ip, clean_results, ptr_hostname=ptr_hostname)
     total_active = hit_count + miss_count + cooldown_count
@@ -2315,6 +2360,8 @@ def _assemble_detection_payload(
     oldest_cached_at = min(cached_at_timestamps) if cached_at_timestamps else None
     return {
         **aggregated,
+        "queryMode": _normalize_query_mode(query_mode),
+        "isPartialMode": is_partial_mode,
         "isCached": is_cached,
         "cacheMeta": {
             "status": cache_status,
@@ -2334,7 +2381,9 @@ async def _execute_detection_with_cache(
     initial_cache: Optional[
         Tuple[Dict[str, Tuple[Dict[str, Any], Optional[str]]], Optional[Tuple[Optional[str], Optional[str]]]]
     ] = None,
+    query_mode: str = "full",
 ) -> Dict[str, Any]:
+    normalized_mode = _normalize_query_mode(query_mode)
     if initial_cache is not None:
         cached_providers, cached_ptr = initial_cache
     else:
@@ -2348,10 +2397,25 @@ async def _execute_detection_with_cache(
         for provider_key, _, _, _, _ in _PROVIDER_SPECS
         if _is_provider_cache_expected(provider_key, is_ipv4)
     )
+    deferred_provider_keys = frozenset(
+        provider_key
+        for provider_key, _, _, _, _ in _PROVIDER_SPECS
+        if (
+            normalized_mode == "light"
+            and provider_key not in cached_providers
+            and provider_key not in _LIGHT_MODE_ACTIVE_PROVIDERS
+            and is_provider_configured(provider_key)
+        )
+    )
     missed_cooldown_keys = [
         provider_key
         for provider_key, _, _, supports_cooldown, _ in _PROVIDER_SPECS
-        if provider_key not in cached_providers and supports_cooldown and provider_key in cache_expected_keys
+        if (
+            provider_key not in cached_providers
+            and provider_key not in deferred_provider_keys
+            and supports_cooldown
+            and provider_key in cache_expected_keys
+        )
     ]
     active_redis = _get_redis_client()
     cooldown_entries: Dict[str, Dict[str, Any]] = {}
@@ -2367,7 +2431,11 @@ async def _execute_detection_with_cache(
     candidate_specs = [
         (idx, spec)
         for idx, spec in enumerate(_PROVIDER_SPECS)
-        if spec[0] not in cached_providers and spec[0] not in cooldown_entries
+        if (
+            spec[0] not in cached_providers
+            and spec[0] not in deferred_provider_keys
+            and spec[0] not in cooldown_entries
+        )
     ]
     quota_dt = datetime.now(timezone.utc)
     quota_candidates = [
@@ -2453,6 +2521,10 @@ async def _execute_detection_with_cache(
                     cached_at_timestamps.append(cached_at)
                 if active_redis is not None:
                     telemetry_entries.append({"provider_key": provider_key, "outcome": "cache_hit"})
+            continue
+
+        if provider_key in deferred_provider_keys:
+            clean_results.append(_build_deferred_provider_row(provider_name))
             continue
 
         if provider_key in cooldown_entries:
@@ -2638,33 +2710,35 @@ async def _execute_detection_with_cache(
         miss_count=miss_count,
         cooldown_count=cooldown_count,
         cached_at_timestamps=cached_at_timestamps,
+        query_mode=normalized_mode,
+        is_partial_mode=bool(deferred_provider_keys),
     )
 
 
-def _get_active_inflight_task(ip: str) -> Optional[asyncio.Task]:
+def _get_active_inflight_task(inflight_key: Tuple[str, str]) -> Optional[asyncio.Task]:
     with _ip_detect_inflight_lock:
-        existing = _ip_detect_inflight.get(ip)
+        existing = _ip_detect_inflight.get(inflight_key)
         if existing is None:
             return None
         try:
             task_loop = existing.get_loop()
         except Exception:
-            if _ip_detect_inflight.get(ip) is existing:
-                _ip_detect_inflight.pop(ip, None)
+            if _ip_detect_inflight.get(inflight_key) is existing:
+                _ip_detect_inflight.pop(inflight_key, None)
             return None
         if task_loop.is_closed() or existing.done():
-            if _ip_detect_inflight.get(ip) is existing:
-                _ip_detect_inflight.pop(ip, None)
+            if _ip_detect_inflight.get(inflight_key) is existing:
+                _ip_detect_inflight.pop(inflight_key, None)
             return None
         return existing
 
 
-def _release_inflight_task(ip: str, task: Optional[asyncio.Task]) -> None:
+def _release_inflight_task(inflight_key: Tuple[str, str], task: Optional[asyncio.Task]) -> None:
     if task is None:
         return
     with _ip_detect_inflight_lock:
-        if _ip_detect_inflight.get(ip) is task:
-            _ip_detect_inflight.pop(ip, None)
+        if _ip_detect_inflight.get(inflight_key) is task:
+            _ip_detect_inflight.pop(inflight_key, None)
 
 
 class _StaleInflightLoopError(Exception):
@@ -3138,20 +3212,29 @@ async def _detect_single_canonical_ip(
     start_time: float,
     *,
     compact: bool = False,
+    query_mode: str = "full",
 ) -> Dict[str, Any]:
     """Runs singleflight-coalesced intelligence detection for one canonical IP address."""
+    normalized_mode = _normalize_query_mode(query_mode)
     non_public = _classify_non_public_ip(ip)
     if non_public is not None:
-        return _build_non_public_response_payload(ip, non_public[0], non_public[1], start_time)
+        return _build_non_public_response_payload(
+            ip,
+            non_public[0],
+            non_public[1],
+            start_time,
+            query_mode=normalized_mode,
+        )
 
     current_loop = asyncio.get_running_loop()
+    inflight_key = (ip, normalized_mode)
     base_payload: Optional[Dict[str, Any]] = None
-    inflight_task = _get_active_inflight_task(ip)
+    inflight_task = _get_active_inflight_task(inflight_key)
     if inflight_task is not None:
         try:
             base_payload = await _await_inflight_task(inflight_task, current_loop)
         except _StaleInflightLoopError:
-            _release_inflight_task(ip, inflight_task)
+            _release_inflight_task(inflight_key, inflight_task)
             base_payload = None
 
     if base_payload is None:
@@ -3162,22 +3245,24 @@ async def _detect_single_canonical_ip(
             provider_key in cached_providers
             for provider_key, _, _, _, _ in _PROVIDER_SPECS
             if _is_provider_cache_expected(provider_key, is_ipv4_target)
+            and (normalized_mode != "light" or provider_key in _LIGHT_MODE_ACTIVE_PROVIDERS)
         )
         if all_cached:
             base_payload = await _execute_detection_with_cache(
                 ip,
                 initial_cache=(cached_providers, cached_ptr),
+                query_mode=normalized_mode,
             )
         else:
             with _ip_detect_inflight_lock:
-                existing_task = _ip_detect_inflight.get(ip)
+                existing_task = _ip_detect_inflight.get(inflight_key)
                 if existing_task is not None:
                     try:
                         existing_loop = existing_task.get_loop()
                     except Exception:
                         existing_loop = None
                     if existing_loop is None or existing_loop.is_closed() or existing_task.done():
-                        _ip_detect_inflight.pop(ip, None)
+                        _ip_detect_inflight.pop(inflight_key, None)
                         existing_task = None
 
                 if existing_task is not None:
@@ -3186,6 +3271,7 @@ async def _detect_single_canonical_ip(
 
                     async def _run_coalesced_detection(
                         target_ip: str = ip,
+                        target_mode: str = normalized_mode,
                         seed_cache: Optional[
                             Tuple[
                                 Dict[str, Tuple[Dict[str, Any], Optional[str]]],
@@ -3198,31 +3284,39 @@ async def _detect_single_canonical_ip(
                             return await _execute_detection_with_cache(
                                 target_ip,
                                 initial_cache=seed_cache,
+                                query_mode=target_mode,
                             )
                         finally:
-                            _release_inflight_task(target_ip, own_task)
+                            _release_inflight_task((target_ip, target_mode), own_task)
 
                     created_task = current_loop.create_task(
                         _run_coalesced_detection(
                             target_ip=ip,
+                            target_mode=normalized_mode,
                             seed_cache=(cached_providers, cached_ptr),
                         )
                     )
 
-                    def _finalize_inflight(done_task: asyncio.Task, target_ip: str = ip) -> None:
-                        _release_inflight_task(target_ip, done_task)
+                    def _finalize_inflight(
+                        done_task: asyncio.Task,
+                        task_key: Tuple[str, str] = inflight_key,
+                    ) -> None:
+                        _release_inflight_task(task_key, done_task)
                         if not done_task.cancelled():
                             done_task.exception()
 
                     created_task.add_done_callback(_finalize_inflight)
-                    _ip_detect_inflight[ip] = created_task
+                    _ip_detect_inflight[inflight_key] = created_task
                     inflight_task = created_task
 
             try:
                 base_payload = await _await_inflight_task(inflight_task, current_loop)
             except _StaleInflightLoopError:
-                _release_inflight_task(ip, inflight_task)
-                base_payload = await _execute_detection_with_cache(ip)
+                _release_inflight_task(inflight_key, inflight_task)
+                base_payload = await _execute_detection_with_cache(
+                    ip,
+                    query_mode=normalized_mode,
+                )
 
     cache_status = (base_payload.get("cacheMeta") or {}).get("status")
     if isinstance(cache_status, str) and cache_status in ("hit", "partial", "miss"):
@@ -3278,7 +3372,14 @@ async def _detect_ip_get(request):
         )
 
     is_compact = _is_compact_request(request)
-    payload = await _detect_single_canonical_ip(ip, auth_mode, start_time, compact=is_compact)
+    query_mode = _resolve_query_mode(request)
+    payload = await _detect_single_canonical_ip(
+        ip,
+        auth_mode,
+        start_time,
+        compact=is_compact,
+        query_mode=query_mode,
+    )
     response = JsonResponse(payload)
     response["Cache-Control"] = "private, max-age=300"
     return response
@@ -3395,6 +3496,7 @@ async def _detect_ip_batch_post(request):
         )
 
     is_compact = _is_compact_request(request, body)
+    query_mode = _resolve_query_mode(request, body)
     semaphore = asyncio.Semaphore(_BATCH_DETECT_CONCURRENCY)
 
     async def _detect_bounded(canonical_ip: str) -> Tuple[str, Dict[str, Any]]:
@@ -3405,6 +3507,7 @@ async def _detect_ip_batch_post(request):
                 auth_mode,
                 ip_start_time,
                 compact=is_compact,
+                query_mode=query_mode,
             )
             return canonical_ip, payload
 
@@ -3417,6 +3520,7 @@ async def _detect_ip_batch_post(request):
                 "results": results_by_ip,
                 "inputMap": input_map,
                 "count": len(results_by_ip),
+                "queryMode": query_mode,
             },
             start_time,
         )

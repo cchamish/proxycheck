@@ -104,4 +104,8 @@ test('Frontend entry, header, and stylesheet default to dark mode with an access
     userPillRule[1],
     /(?:^|[\s;])border(?:-(?:top|right|bottom|left|color|style|width))?\s*:/
   );
+  assert.doesNotMatch(
+    userPillRule[1],
+    /(?:^|[\s;])background(?:-color)?\s*:/
+  );
 });

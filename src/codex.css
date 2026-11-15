@@ -355,8 +355,6 @@ body {
   display: inline-flex;
   align-items: center;
   padding: 4px 12px;
-  background-color: var(--cdx-color-background-secondary);
-  border-radius: 9999px;
   font-size: 13px;
   font-weight: 500;
   color: var(--cdx-color-base);

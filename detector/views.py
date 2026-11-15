@@ -99,13 +99,26 @@ except Exception as redis_init_err:
     logger.warning(f"Redis initialization warning (fault tolerance active): {redis_init_err}")
     aioredis = None
 
+try:
+    from redis.exceptions import RedisError as _RedisError
+except Exception:
+    _RedisError = None
+
 _REDIS_SOCKET_TIMEOUT_SECONDS = 2.0
+_REDIS_CIRCUIT_BREAKER_DEFAULT_SECONDS = 5.0
+_REDIS_CIRCUIT_FAILURE_ERRORS: Tuple[type[BaseException], ...] = (
+    (ConnectionError, TimeoutError, OSError, _RedisError)
+    if _RedisError is not None
+    else (ConnectionError, TimeoutError, OSError)
+)
 _redis_client_lock = threading.Lock()
 _redis_clients_by_loop: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Tuple[str, Any]]" = (
     weakref.WeakKeyDictionary()
 )
 redis_client: Any = None
 _default_redis_sentinel: Any = None
+_redis_circuit_open_until: float = 0.0
+_redis_circuit_client_ref: Any = None
 if aioredis is not None:
     try:
         redis_client = aioredis.from_url(
@@ -116,19 +129,94 @@ if aioredis is not None:
             socket_connect_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
         )
         _default_redis_sentinel = redis_client
+        _redis_circuit_client_ref = redis_client
     except Exception as redis_init_err:
         logger.warning(f"Redis initialization warning (fault tolerance active): {redis_init_err}")
         redis_client = None
         _default_redis_sentinel = None
+        _redis_circuit_client_ref = None
+
+
+def _get_circuit_breaker_cooldown_seconds() -> float:
+    """Returns the configured circuit breaker cooldown in seconds."""
+    raw_value = getattr(settings, "REDIS_CIRCUIT_BREAKER_SECONDS", _REDIS_CIRCUIT_BREAKER_DEFAULT_SECONDS)
+    if isinstance(raw_value, bool):
+        return _REDIS_CIRCUIT_BREAKER_DEFAULT_SECONDS
+    try:
+        seconds = float(raw_value)
+    except (TypeError, ValueError):
+        return _REDIS_CIRCUIT_BREAKER_DEFAULT_SECONDS
+    if not math.isfinite(seconds) or seconds <= 0.0:
+        return 0.0
+    return seconds
+
+
+def _sync_circuit_client_ref_locked() -> None:
+    """Clears stale circuit state whenever the active redis_client binding changes."""
+    global _redis_circuit_open_until, _redis_circuit_client_ref
+    if redis_client is not _redis_circuit_client_ref:
+        _redis_circuit_open_until = 0.0
+        _redis_circuit_client_ref = redis_client
+
+
+def is_redis_circuit_open() -> bool:
+    """Returns True while the default Redis client circuit breaker is within its cooldown window."""
+    global _redis_circuit_open_until
+    with _redis_client_lock:
+        _sync_circuit_client_ref_locked()
+        if redis_client is None or redis_client is not _default_redis_sentinel:
+            return False
+        if _redis_circuit_open_until <= 0.0:
+            return False
+        if time.monotonic() < _redis_circuit_open_until:
+            return True
+        _redis_circuit_open_until = 0.0
+        return False
+
+
+def mark_redis_failure(exc: BaseException) -> None:
+    """Opens the short-term Redis circuit breaker after a connection or timeout error."""
+    global _redis_circuit_open_until
+    if not isinstance(exc, _REDIS_CIRCUIT_FAILURE_ERRORS):
+        return
+    cooldown_seconds = _get_circuit_breaker_cooldown_seconds()
+    with _redis_client_lock:
+        _sync_circuit_client_ref_locked()
+        if redis_client is None or redis_client is not _default_redis_sentinel:
+            return
+        if cooldown_seconds <= 0.0:
+            _redis_circuit_open_until = 0.0
+            return
+        now = time.monotonic()
+        was_closed = now >= _redis_circuit_open_until
+        candidate_until = now + cooldown_seconds
+        if candidate_until > _redis_circuit_open_until:
+            _redis_circuit_open_until = candidate_until
+        if was_closed:
+            logger.warning(f"Redis circuit breaker opened for {cooldown_seconds:.1f}s after {type(exc).__name__}")
+
+
+def reset_redis_circuit_breaker() -> None:
+    """Resets the process-local Redis circuit breaker state for deterministic tests."""
+    global _redis_circuit_open_until, _redis_circuit_client_ref
+    with _redis_client_lock:
+        _redis_circuit_open_until = 0.0
+        _redis_circuit_client_ref = redis_client
 
 
 def _get_redis_client() -> Optional[Any]:
     """Returns an async Redis client bound to the active running event loop."""
     if redis_client is None:
+        with _redis_client_lock:
+            _sync_circuit_client_ref_locked()
         return None
     if redis_client is not _default_redis_sentinel:
+        with _redis_client_lock:
+            _sync_circuit_client_ref_locked()
         return redis_client
     if aioredis is None:
+        return None
+    if is_redis_circuit_open():
         return None
 
     try:
@@ -139,6 +227,7 @@ def _get_redis_client() -> Optional[Any]:
         return None
 
     redis_url = getattr(settings, "REDIS_URL", "redis://127.0.0.1:6379/0")
+    init_err: Optional[BaseException] = None
     with _redis_client_lock:
         closed_loops = [loop for loop in list(_redis_clients_by_loop.keys()) if loop.is_closed()]
         for stale_loop in closed_loops:
@@ -158,10 +247,15 @@ def _get_redis_client() -> Optional[Any]:
             )
         except Exception as redis_loop_err:
             logger.warning(f"Redis initialization warning (fault tolerance active): {redis_loop_err}")
-            return None
+            init_err = redis_loop_err
+            loop_client = None
+        else:
+            _redis_clients_by_loop[current_loop] = (redis_url, loop_client)
+            return loop_client
 
-        _redis_clients_by_loop[current_loop] = (redis_url, loop_client)
-        return loop_client
+    if init_err is not None:
+        mark_redis_failure(init_err)
+    return None
 
 
 _PROC_RSS_CACHE_TTL_SECONDS = 1.0
@@ -1840,6 +1934,7 @@ async def _safe_redis_get(key: str) -> Optional[str]:
     try:
         raw_value = await client.get(key)
     except Exception as redis_read_err:
+        mark_redis_failure(redis_read_err)
         logger.warning(f"Redis cache read bypassed for {key} due to error: {redis_read_err}")
         return None
     if raw_value is None:
@@ -1856,6 +1951,7 @@ async def _safe_redis_set(key: str, value: str, *, ex: int) -> None:
     try:
         await client.set(key, value, ex=ex)
     except Exception as redis_write_err:
+        mark_redis_failure(redis_write_err)
         logger.warning(f"Redis cache write bypassed for {key} due to error: {redis_write_err}")
 
 
@@ -1887,6 +1983,7 @@ async def _safe_redis_mget(keys: List[str]) -> List[Optional[str]]:
         except (AttributeError, TypeError) as mget_unsupported_err:
             logger.debug("Redis mget unavailable, falling back to single reads: %s", mget_unsupported_err)
         except Exception as redis_read_err:
+            mark_redis_failure(redis_read_err)
             logger.warning(f"Redis batch cache read bypassed for {len(keys)} keys due to error: {redis_read_err}")
             return [None] * len(keys)
         else:
@@ -1934,6 +2031,7 @@ async def _safe_redis_set_many(entries: List[Tuple[str, str, int]]) -> None:
     except (AttributeError, TypeError) as pipeline_unsupported_err:
         logger.debug("Redis pipeline unavailable, falling back to single writes: %s", pipeline_unsupported_err)
     except Exception as redis_write_err:
+        mark_redis_failure(redis_write_err)
         logger.warning(f"Redis batch cache write bypassed for {len(entries)} keys due to error: {redis_write_err}")
         return
     await asyncio.gather(*(_safe_redis_set(key, value, ex=ttl_seconds) for key, value, ttl_seconds in entries))

@@ -180,6 +180,13 @@ def _get_redis_client() -> Optional[Any]:
     return detector_views._get_redis_client()
 
 
+def _mark_redis_failure(exc: BaseException) -> None:
+    """Propagates connection or timeout failures to the shared Redis circuit breaker."""
+    from detector import views as detector_views
+
+    detector_views.mark_redis_failure(exc)
+
+
 def is_provider_configured(provider_key: str) -> bool:
     """Returns True when the provider either needs no credentials or has one configured."""
     setting_name = _PROVIDER_CREDENTIAL_SETTING.get(provider_key)
@@ -434,6 +441,7 @@ async def check_and_consume_quota(
     except NotImplementedError:
         pass
     except Exception as exc:
+        _mark_redis_failure(exc)
         logger.warning(f"Quota Lua check bypassed for {provider_key} due to Redis error ({type(exc).__name__})")
         return QuotaCheckResult(allowed=True, minute_limit=rpm_limit, daily_limit=daily_limit)
 
@@ -442,6 +450,7 @@ async def check_and_consume_quota(
         if pipe_result is not None:
             return pipe_result
     except Exception as exc:
+        _mark_redis_failure(exc)
         logger.warning(f"Quota pipeline check bypassed for {provider_key} due to Redis error ({type(exc).__name__})")
 
     return QuotaCheckResult(allowed=True, minute_limit=rpm_limit, daily_limit=daily_limit)
@@ -566,6 +575,7 @@ async def record_provider_outcome(
         if inspect.isawaitable(exec_call):
             await exec_call
     except Exception as exc:
+        _mark_redis_failure(exc)
         logger.warning(f"Telemetry write bypassed for {provider_key} due to Redis error ({type(exc).__name__})")
 
 
@@ -609,6 +619,7 @@ async def record_provider_outcomes_batch(
         if inspect.isawaitable(exec_call):
             await exec_call
     except Exception as exc:
+        _mark_redis_failure(exc)
         logger.warning(f"Batch telemetry write bypassed due to Redis error ({type(exc).__name__})")
 
 
@@ -651,6 +662,7 @@ async def record_global_request_telemetry(
         if inspect.isawaitable(exec_call):
             await exec_call
     except Exception as exc:
+        _mark_redis_failure(exc)
         logger.warning(f"Global telemetry write bypassed due to Redis error ({type(exc).__name__})")
 
 
@@ -741,6 +753,7 @@ async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict
                                 _decode_hash(raw_tel_hash),
                             )
             except Exception as exc:
+                _mark_redis_failure(exc)
                 logger.warning(f"Dashboard snapshot fell back to empty telemetry ({type(exc).__name__})")
                 redis_available = False
 

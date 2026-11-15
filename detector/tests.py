@@ -6639,6 +6639,160 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         mock_async_client_cls.assert_not_called()
         mock_dns_resolve.assert_not_called()
 
+    def test_read_maxmind_sync_combines_get_with_prefix_len_without_duplicate_get(self):
+        views._maxmind_readers.clear()
+        views._maxmind_reader_stats.clear()
+        self.addCleanup(views._maxmind_readers.clear)
+        self.addCleanup(views._maxmind_reader_stats.clear)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            country_db = Path(tmpdir) / "GeoLite2-Country.mmdb"
+            country_db.write_bytes(b"stub")
+
+            reader = MagicMock()
+            reader.get_with_prefix_len.return_value = ({"country": {"iso_code": "US"}}, 24)
+            fake_maxmind_module = MagicMock()
+            fake_maxmind_module.open_database.return_value = reader
+
+            with (
+                override_settings(
+                    MAXMIND_DB_DIR=str(tmpdir),
+                    CLOUD_CIDR_DB_PATH="",
+                    HOSTING_ASN_RULES_PATH="",
+                    HOSTING_ASNS=(),
+                    HOSTING_ORG_KEYWORDS=(),
+                ),
+                patch.dict("sys.modules", {"maxminddb": fake_maxmind_module}),
+            ):
+                row = views._read_maxmind_sync("198.51.100.42")
+
+        reader.get_with_prefix_len.assert_called_once_with("198.51.100.42")
+        reader.get.assert_not_called()
+        self.assertEqual(row["status"], "200 OK")
+        self.assertEqual(row["countryCode"], "US")
+        self.assertEqual(row["prefixLength"], 24)
+        self.assertEqual(views._extract_mmdb_prefix_len(reader, "198.51.100.42"), 24)
+
+        # Unmapped record with routing prefix still avoids redundant reader.get
+        null_rec_reader = MagicMock()
+        null_rec_reader.get_with_prefix_len.return_value = (None, 20)
+        rec, prefix_len = views._lookup_mmdb_record_and_prefix(null_rec_reader, "198.51.100.42")
+        self.assertIsNone(rec)
+        self.assertEqual(prefix_len, 20)
+        null_rec_reader.get.assert_not_called()
+
+        # Distinct reader.get mock return value remains respected when configured separately
+        custom_get_reader = MagicMock()
+        custom_get_reader.get.return_value = {"country": {"iso_code": "CA"}}
+        custom_get_reader.get_with_prefix_len.return_value = ({"country": {"iso_code": "US"}}, 25)
+        rec_custom, prefix_custom = views._lookup_mmdb_record_and_prefix(custom_get_reader, "198.51.100.42")
+        self.assertEqual(rec_custom, {"country": {"iso_code": "CA"}})
+        self.assertEqual(prefix_custom, 25)
+        custom_get_reader.get.assert_called_once_with("198.51.100.42")
+
+    def test_read_maxmind_sync_warms_offline_caches_when_mmdb_missing(self):
+        from detector import adapters as detector_adapters
+
+        clear_offline_intelligence_caches()
+        self.assertFalse(detector_adapters.are_offline_intelligence_caches_warm())
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            empty_mmdb_dir = Path(tmpdir) / "empty_mmdb"
+            empty_mmdb_dir.mkdir()
+            cidr_file = Path(tmpdir) / "cloud_cidrs.json"
+            cidr_file.write_text(json.dumps([{"range": "54.239.28.64/26", "provider": "Amazon AWS"}]), encoding="utf-8")
+            rules_file = Path(tmpdir) / "hosting_asn_rules.json"
+            rules_file.write_text(
+                json.dumps({"hosts": [{"name": "Example Cloud", "asn": 64510}]}),
+                encoding="utf-8",
+            )
+
+            with override_settings(
+                MAXMIND_DB_DIR=str(empty_mmdb_dir),
+                CLOUD_CIDR_DB_PATH=str(cidr_file),
+                HOSTING_ASN_RULES_PATH=str(rules_file),
+                HOSTING_ASNS=(),
+                HOSTING_ORG_KEYWORDS=(),
+            ):
+                missing_row = views._read_maxmind_sync("54.239.28.85")
+
+        self.assertEqual(missing_row["status"], "Database Missing")
+        self.assertTrue(detector_adapters.are_offline_intelligence_caches_warm())
+
+    def test_execute_detection_with_cache_warms_offline_rules_off_event_loop(self):
+        from detector import adapters as detector_adapters
+
+        clear_offline_intelligence_caches()
+        target_ip = "54.239.28.85"
+        is_ipv4 = True
+        cached_providers = {}
+        for provider_key, provider_name, _uses_http, _cooldown, _fn in views._PROVIDER_SPECS:
+            if not views._is_provider_cache_expected(provider_key, is_ipv4):
+                continue
+            cached_providers[provider_key] = (
+                {
+                    "provider": provider_name,
+                    "status": "200 OK",
+                    "statusCode": 200,
+                    "asn": "AS16509",
+                    "isp": "Amazon.com, Inc.",
+                    "organisation": "Amazon.com, Inc.",
+                    "location": "United States",
+                    "usageType": "hosting",
+                    "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
+                    "countryCode": "US",
+                    "rawJson": {},
+                },
+                "2026-11-16T00:00:00+00:00",
+            )
+        initial_cache = (cached_providers, (None, "2026-11-16T00:00:00+00:00"))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cidr_file = Path(tmpdir) / "cloud_cidrs.json"
+            cidr_file.write_text(json.dumps([{"range": "54.239.28.64/26", "provider": "Amazon AWS"}]), encoding="utf-8")
+            rules_file = Path(tmpdir) / "hosting_asn_rules.json"
+            rules_file.write_text(json.dumps({"hosts": []}), encoding="utf-8")
+
+            original_warm = detector_adapters.warm_offline_intelligence_caches
+            warm_threads = []
+            event_loop_thread_id = None
+
+            def _tracked_warm():
+                warm_threads.append(threading.get_ident())
+                return original_warm()
+
+            async def _run():
+                nonlocal event_loop_thread_id
+                event_loop_thread_id = threading.get_ident()
+                first_payload = await views._execute_detection_with_cache(
+                    target_ip,
+                    initial_cache=initial_cache,
+                )
+                second_payload = await views._execute_detection_with_cache(
+                    target_ip,
+                    initial_cache=initial_cache,
+                )
+                return first_payload, second_payload
+
+            with (
+                override_settings(
+                    CLOUD_CIDR_DB_PATH=str(cidr_file),
+                    HOSTING_ASN_RULES_PATH=str(rules_file),
+                    HOSTING_ASNS=(),
+                    HOSTING_ORG_KEYWORDS=(),
+                ),
+                patch("detector.views.redis_client", None),
+                patch("detector.views.warm_offline_intelligence_caches", side_effect=_tracked_warm),
+            ):
+                first_payload, second_payload = asyncio.run(_run())
+
+        self.assertEqual(len(warm_threads), 1)
+        self.assertNotEqual(warm_threads[0], event_loop_thread_id)
+        self.assertTrue(detector_adapters.are_offline_intelligence_caches_warm())
+        self.assertEqual(first_payload["cloudCidr"], "54.239.28.64/26")
+        self.assertEqual(first_payload["cloudProvider"], "Amazon AWS")
+        self.assertEqual(second_payload["cloudCidr"], "54.239.28.64/26")
+
 
 class FlagBasedArbitrationTests(SimpleTestCase):
     """Tests for flag and Proxycheck risk arbitrage."""

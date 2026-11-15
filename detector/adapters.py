@@ -529,9 +529,11 @@ def _get_cloud_cidr_index() -> _CloudCidrIndex:
 
     path = _resolve_offline_file("CLOUD_CIDR_DB_PATH", ("cloud_cidrs.json", "computehosts.json"))
     if path is None:
+        configured = str(_get_django_setting("CLOUD_CIDR_DB_PATH", "") or "").strip()
+        missing_key = (f"__missing__:{configured}", -1)
         with _offline_cache_lock:
-            _cloud_cidr_cache_key = None
-            _cloud_cidr_cache_index = None
+            _cloud_cidr_cache_key = missing_key
+            _cloud_cidr_cache_index = _EMPTY_CLOUD_CIDR_INDEX
         return _EMPTY_CLOUD_CIDR_INDEX
 
     try:
@@ -725,6 +727,18 @@ def clear_offline_intelligence_caches() -> None:
         _cloud_cidr_cache_index = None
         _hosting_rules_cache_key = None
         _hosting_rules_cache_data = None
+
+
+def are_offline_intelligence_caches_warm() -> bool:
+    """Returns True when offline cloud CIDR and hosting ASN rule caches are populated in memory."""
+    with _offline_cache_lock:
+        return _cloud_cidr_cache_index is not None and _hosting_rules_cache_data is not None
+
+
+def warm_offline_intelligence_caches() -> None:
+    """Preloads offline cloud CIDR and hosting ASN rules in the caller thread."""
+    _get_cloud_cidr_index()
+    _get_hosting_rules()
 
 
 def _extract_carrier_name(carrier_val: Any) -> Optional[str]:

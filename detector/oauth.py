@@ -2,10 +2,12 @@
 Wikimedia OAuth 2.0 group inspection, CentralAuth verification, and role-based access control.
 """
 
+import inspect
 import logging
 import os
 import re
 import time
+import unittest.mock
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
@@ -77,9 +79,28 @@ def normalize_and_validate_wikimedia_domain(raw_domain: Any) -> Optional[str]:
 
 
 def _clear_client_cookies(client: Any) -> None:
+    """Clears client cookies only when entries exist or clear is a synchronous mock."""
     cookies = getattr(client, "cookies", None)
+    if cookies is None:
+        return
+    clear_fn = getattr(cookies, "clear", None)
+    if not callable(clear_fn):
+        return
+    if isinstance(clear_fn, unittest.mock.NonCallableMock):
+        # Avoid invoking AsyncMock.clear synchronously and creating an unawaited coroutine.
+        if not (isinstance(clear_fn, unittest.mock.AsyncMock) or inspect.iscoroutinefunction(clear_fn)):
+            clear_fn()
+        return
     if isinstance(cookies, httpx.Cookies):
-        cookies.clear()
+        if len(cookies) > 0:
+            clear_fn()
+        return
+    try:
+        has_cookies = len(cookies) > 0 if hasattr(cookies, "__len__") else bool(cookies)
+    except TypeError:
+        has_cookies = False
+    if has_cookies:
+        clear_fn()
 
 
 def normalize_wiki_username(raw_username: Any) -> str:

@@ -697,12 +697,14 @@ async def _close_http_client_safely(client: Any) -> None:
 
 
 def _build_cookieless_http_client() -> httpx.AsyncClient:
-    cookies = httpx.Cookies()
-    cookies.jar.set_policy(http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
+    # Pass the CookieJar directly because httpx.AsyncClient copies httpx.Cookies into a new default jar.
+    cookie_jar = http.cookiejar.CookieJar(
+        policy=http.cookiejar.DefaultCookiePolicy(allowed_domains=[]),
+    )
     return httpx.AsyncClient(
         timeout=10.0,
         limits=_DEFAULT_HTTP_LIMITS,
-        cookies=cookies,
+        cookies=cookie_jar,
         event_hooks={"request": [_strip_request_cookie_header]},
     )
 

@@ -61,6 +61,7 @@ from detector.oauth import (
     CentralAuthVerificationError,
     InvalidCentralAuthTokenError,
     MetaWikiRightsFetchError,
+    _clear_client_cookies,
     evaluate_wikimedia_rights,
     extract_wikimedia_domain_from_project,
     fetch_project_user_rights,
@@ -4132,6 +4133,100 @@ class HttpClientLifecycleTests(TestCase):
             self.assertFalse(fresh_client.is_closed)
         finally:
             await views._close_http_client_safely(fresh_client)
+
+    async def test_cookieless_http_client_enforces_empty_cookie_policy_and_strips_request_cookies(self):
+        captured_cookie_headers = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            captured_cookie_headers.append(request.headers.get("cookie"))
+            return httpx.Response(
+                200,
+                headers=[("Set-Cookie", "centralauth_Session=leak; Domain=.wikipedia.org; Path=/")],
+                json={"ok": True},
+            )
+
+        client = views._build_cookieless_http_client()
+        try:
+            self.assertEqual(client.cookies.jar._policy.allowed_domains(), ())
+            client._transport = httpx.MockTransport(_handler)
+
+            await client.get("https://zh.wikipedia.org/w/api.php", headers={"Cookie": "injected=1"})
+            await client.get("https://meta.wikimedia.org/w/api.php")
+
+            self.assertEqual(len(client.cookies), 0)
+            self.assertEqual(captured_cookie_headers, [None, None])
+        finally:
+            await views._close_http_client_safely(client)
+
+    def test_clear_client_cookies_skips_empty_cookies_and_supports_mocks(self):
+        empty_client = SimpleNamespace(cookies=httpx.Cookies())
+        with patch.object(empty_client.cookies.jar, "clear", wraps=empty_client.cookies.jar.clear) as spy_jar_clear:
+            _clear_client_cookies(empty_client)
+            spy_jar_clear.assert_not_called()
+
+        populated_client = SimpleNamespace(cookies=httpx.Cookies({"GeoIP": "US"}))
+        _clear_client_cookies(populated_client)
+        self.assertEqual(len(populated_client.cookies), 0)
+
+        mock_method_client = SimpleNamespace(cookies=httpx.Cookies())
+        with patch.object(mock_method_client.cookies, "clear") as mock_clear:
+            _clear_client_cookies(mock_method_client)
+            mock_clear.assert_called_once()
+
+        magic_client = MagicMock()
+        _clear_client_cookies(magic_client)
+        magic_client.cookies.clear.assert_called_once()
+
+        with warnings.catch_warnings(record=True) as recorded_warnings:
+            warnings.simplefilter("always")
+            _clear_client_cookies(None)
+            _clear_client_cookies(SimpleNamespace(cookies=None))
+            _clear_client_cookies(AsyncMock())
+
+        runtime_warnings = [w for w in recorded_warnings if issubclass(w.category, RuntimeWarning)]
+        self.assertEqual(runtime_warnings, [])
+
+    async def test_concurrent_wikimedia_api_calls_on_cookieless_client_preserve_isolation(self):
+        captured_requests = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            captured_requests.append(
+                (str(request.url), request.headers.get("cookie"), request.headers.get("user-agent"))
+            )
+            query = str(request.url)
+            if "meta=userinfo" in query:
+                payload = {"query": {"userinfo": {"id": 42, "name": "StewardUser", "groups": ["sysop"], "rights": []}}}
+            elif "meta=globaluserinfo" in query:
+                payload = {"query": {"globaluserinfo": {"groups": ["steward"], "rights": [], "merged": []}}}
+            else:
+                payload = {"query": {"users": [{"name": "StewardUser", "rights": ["checkuser-temporary-account"]}]}}
+            return httpx.Response(
+                200,
+                headers=[("Set-Cookie", "GeoIP=US; Path=/"), ("Set-Cookie", "centralauth_Session=leak; Path=/")],
+                json=payload,
+            )
+
+        client = views._build_cookieless_http_client()
+        try:
+            client._transport = httpx.MockTransport(_handler)
+            with patch.object(client.cookies.jar, "clear", wraps=client.cookies.jar.clear) as spy_jar_clear:
+                userinfo, meta_rights, project_rights = await asyncio.gather(
+                    verify_centralauth_userinfo(client, "valid-token", wiki_domain="zh.wikipedia.org"),
+                    fetch_user_rights_from_meta(client, "StewardUser"),
+                    fetch_project_user_rights(client, "StewardUser", "zh.wikipedia.org"),
+                )
+
+            spy_jar_clear.assert_not_called()
+            self.assertEqual(len(client.cookies), 0)
+            self.assertEqual(userinfo["username"], "StewardUser")
+            self.assertEqual(meta_rights["global_groups"], ["steward"])
+            self.assertEqual(project_rights, ["checkuser-temporary-account"])
+            self.assertEqual(len(captured_requests), 3)
+            for _url, cookie_hdr, ua_hdr in captured_requests:
+                self.assertIsNone(cookie_hdr)
+                self.assertIn("ProxyCheck/1.0", ua_hdr or "")
+        finally:
+            await views._close_http_client_safely(client)
 
 
 class AsyncDnsAndDnsblTests(TestCase):

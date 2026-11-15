@@ -1057,18 +1057,12 @@ body {
 }
 
 .cdx-dialog.about-note-dialog {
-  width: min(680px, calc(100vw - 2rem));
+  width: min(760px, calc(100vw - 2rem));
 }
 
 .about-note-content {
   color: var(--cdx-color-base);
   line-height: 1.6;
-}
-
-.about-note-content h2 {
-  margin: 0 0 16px;
-  color: var(--cdx-color-emphasized);
-  font-size: 1.25rem;
 }
 
 .about-note-content p {

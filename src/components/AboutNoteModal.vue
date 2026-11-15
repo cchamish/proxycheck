@@ -1,7 +1,7 @@
 <template>
   <cdx-dialog
     v-model:open="dialogOpen"
-    title="A note from the maintainer"
+    :title="aboutTitle"
     :use-close-button="true"
     :default-action="{ label: 'Close' }"
     class="about-note-dialog"
@@ -47,19 +47,28 @@ function renderInlineMarkdown(value: string): string {
   return html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
 }
 
+function getHeadingText(value: string): string {
+  const firstLine = value.replace(/\r\n/g, '\n').trim().split('\n')[0]?.trim() ?? '';
+  return firstLine.replace(/^#{1,6}\s+/, '');
+}
+
 function renderMarkdown(value: string): string {
   const blocks = value.replace(/\r\n/g, '\n').trim().split(/\n{2,}/);
   return blocks
-    .map((block) => {
+    .map((block, index) => {
       const lines = block.split('\n');
       const firstLine = lines[0].trim();
-      if (firstLine.startsWith('# ')) {
-        return `<h2>${renderInlineMarkdown(firstLine.slice(2))}</h2>`;
+      if (index === 0 && /^#{1,6}\s+/.test(firstLine)) {
+        return '';
+      }
+      if (/^#{1,6}\s+/.test(firstLine)) {
+        return `<h2>${renderInlineMarkdown(firstLine.replace(/^#{1,6}\s+/, ''))}</h2>`;
       }
       return `<p>${renderInlineMarkdown(lines.join(' '))}</p>`;
     })
     .join('');
 }
 
+const aboutTitle = computed(() => getHeadingText(aboutMarkdown));
 const aboutHtml = computed(() => renderMarkdown(aboutMarkdown));
 </script>

@@ -1057,11 +1057,19 @@ body {
 }
 
 .cdx-dialog.about-note-dialog {
-  width: min(760px, calc(100vw - 2rem));
+  width: min(900px, calc(100vw - 2rem));
+}
+
+.about-note-dialog .cdx-dialog__header .cdx-dialog__header__title {
+  font-family: var(--cdx-font-family);
+  font-size: 18px;
+  letter-spacing: normal;
 }
 
 .about-note-content {
   color: var(--cdx-color-base);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+  font-size: 12px;
   line-height: 1.6;
 }
 

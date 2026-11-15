@@ -56,7 +56,7 @@ from detector.adapters import (
     match_cloud_cidr,
     match_hosting_asn_or_org,
 )
-from detector.middleware import AsyncWhiteNoiseMiddleware
+from detector.middleware import AsyncWhiteNoiseMiddleware, ResilientSessionMiddleware
 from detector.oauth import (
     CentralAuthVerificationError,
     InvalidCentralAuthTokenError,
@@ -5867,6 +5867,276 @@ class AsgiSmokeTests(SimpleTestCase):
                 self.assertEqual(static_bytes, b"console.log('ok');\n")
                 self.assertEqual(api_bytes, b"async-ok")
                 self.assertEqual(async_called, ["/api/v1/auth/user/"])
+
+    def test_resilient_session_middleware_skips_sync_bridging_for_stateless_api_requests(self):
+        import django.utils.deprecation as django_deprecation
+
+        sync_factory = RequestFactory()
+        sync_middleware = ResilientSessionMiddleware(lambda req: HttpResponse("sync-ok"))
+        self.assertFalse(sync_middleware.async_mode)
+        self.assertFalse(iscoroutinefunction(sync_middleware))
+        sync_resp = sync_middleware(sync_factory.get("/api/v1/detect?ip=8.8.8.8"))
+        self.assertEqual(sync_resp.content, b"sync-ok")
+
+        observed_requests = []
+
+        async def async_next(request):
+            observed_requests.append(
+                {
+                    "path": request.path,
+                    "has_session": hasattr(request, "session"),
+                    "session_key": request.session.session_key,
+                    "accessed": request.session.accessed,
+                    "modified": request.session.modified,
+                }
+            )
+            return HttpResponse("async-ok")
+
+        async_middleware = ResilientSessionMiddleware(async_next)
+        self.assertTrue(async_middleware.async_mode)
+        self.assertTrue(iscoroutinefunction(async_middleware))
+
+        async_factory = AsyncRequestFactory()
+        real_sync_to_async = django_deprecation.sync_to_async
+        bridged_calls = []
+
+        def spy_sync_to_async(func, *args, **kwargs):
+            bridged_calls.append(getattr(func, "__qualname__", repr(func)))
+            return real_sync_to_async(func, *args, **kwargs)
+
+        async def _exercise_stateless_requests():
+            stateless_requests = [
+                async_factory.options("/api/v1/detect"),
+                async_factory.options("/api/v1/auth/gadget-token/"),
+                async_factory.post("/api/v1/auth/gadget-token"),
+                async_factory.post("/api/v1/auth/gadget-token/"),
+                async_factory.get(
+                    "/api/v1/detect?ip=8.8.8.8",
+                    headers={
+                        "Authorization": "Bearer signed-gadget-token",
+                        "Cookie": "proxycheck_sessionid=existing-session-key",
+                    },
+                ),
+                async_factory.post(
+                    "/api/v1/detect/batch",
+                    data="{}",
+                    content_type="application/json",
+                    headers={"Authorization": "bearer lower-scheme-token"},
+                ),
+            ]
+            for req in stateless_requests:
+                resp = await async_middleware(req)
+                self.assertEqual(resp.status_code, 200)
+
+        with (
+            patch("django.utils.deprecation.sync_to_async", side_effect=spy_sync_to_async),
+            patch(
+                "django.contrib.sessions.backends.cache.SessionStore.load",
+                side_effect=AssertionError("Session backend load should not be called"),
+            ),
+            patch(
+                "django.contrib.sessions.backends.cache.SessionStore.save",
+                side_effect=AssertionError("Session backend save should not be called"),
+            ),
+        ):
+            asyncio.run(_exercise_stateless_requests())
+
+        self.assertEqual(bridged_calls, [])
+        self.assertEqual(len(observed_requests), 6)
+        for item in observed_requests:
+            self.assertTrue(item["has_session"])
+            self.assertIsNone(item["session_key"])
+            self.assertFalse(item["accessed"])
+            self.assertFalse(item["modified"])
+
+        observed_requests.clear()
+        bridged_calls.clear()
+
+        async def _exercise_session_requests():
+            no_auth_req = async_factory.get(
+                "/api/v1/detect?ip=8.8.8.8",
+                headers={"Cookie": "proxycheck_sessionid=web-session-key"},
+            )
+            basic_auth_req = async_factory.get(
+                "/api/v1/detect?ip=8.8.8.8",
+                headers={
+                    "Authorization": "Basic dXNlcjpwYXNz",
+                    "Cookie": "proxycheck_sessionid=web-session-key-2",
+                },
+            )
+            blank_auth_req = async_factory.get(
+                "/api/v1/detect?ip=8.8.8.8",
+                headers={
+                    "Authorization": "   ",
+                    "Cookie": "proxycheck_sessionid=web-session-key-3",
+                },
+            )
+            for req in (no_auth_req, basic_auth_req, blank_auth_req):
+                resp = await async_middleware(req)
+                self.assertEqual(resp.status_code, 200)
+
+        with patch("django.utils.deprecation.sync_to_async", side_effect=spy_sync_to_async):
+            asyncio.run(_exercise_session_requests())
+
+        self.assertEqual(
+            [item["session_key"] for item in observed_requests],
+            ["web-session-key", "web-session-key-2", "web-session-key-3"],
+        )
+        self.assertEqual(
+            bridged_calls,
+            [
+                "SessionMiddleware.process_request",
+                "ResilientSessionMiddleware.process_response",
+                "SessionMiddleware.process_request",
+                "ResilientSessionMiddleware.process_response",
+                "SessionMiddleware.process_request",
+                "ResilientSessionMiddleware.process_response",
+            ],
+        )
+
+        async def async_mutating_next(request):
+            request.session["oauth_state"] = "state_value"
+            return HttpResponse("mutated")
+
+        mutating_middleware = ResilientSessionMiddleware(async_mutating_next)
+        outage_req = async_factory.get("/api/v1/auth/login/")
+        with (
+            patch(
+                "django.contrib.sessions.backends.cache.SessionStore.save",
+                side_effect=redis.exceptions.ConnectionError("Redis offline"),
+            ),
+            self.assertLogs("detector.middleware", level="WARNING"),
+        ):
+            outage_resp = asyncio.run(mutating_middleware(outage_req))
+
+        self.assertEqual(outage_resp.status_code, 200)
+        self.assertFalse(outage_req.session.modified)
+        self.assertIn("Cookie", outage_resp.headers.get("Vary", ""))
+        self.assertNotIn("proxycheck_sessionid", outage_resp.cookies)
+
+        conflict_req = async_factory.get("/api/v1/auth/login/")
+        with patch(
+            "django.contrib.sessions.backends.cache.SessionStore.save",
+            side_effect=UpdateError("concurrent logout"),
+        ):
+            with self.assertRaises(SessionInterrupted):
+                asyncio.run(mutating_middleware(conflict_req))
+
+        release_save = threading.Event()
+        unblocked_in_time = []
+
+        async def _exercise_concurrent_stateless_during_blocked_session_thread():
+            loop = asyncio.get_running_loop()
+            save_started = asyncio.Event()
+
+            def blocking_save(store_self, *args, **kwargs):
+                loop.call_soon_threadsafe(save_started.set)
+                unblocked_in_time.append(release_save.wait(timeout=2.0))
+
+            with patch(
+                "django.contrib.sessions.backends.cache.SessionStore.save",
+                autospec=True,
+                side_effect=blocking_save,
+            ):
+                slow_task = asyncio.create_task(mutating_middleware(async_factory.get("/api/v1/auth/login/")))
+                await save_started.wait()
+                bearer_resp = await async_middleware(
+                    async_factory.get(
+                        "/api/v1/detect?ip=8.8.8.8",
+                        headers={"Authorization": "Bearer signed-gadget-token"},
+                    )
+                )
+                release_save.set()
+                slow_resp = await slow_task
+                return bearer_resp, slow_resp
+
+        concurrent_bearer_resp, concurrent_slow_resp = asyncio.run(
+            _exercise_concurrent_stateless_during_blocked_session_thread()
+        )
+
+        self.assertEqual(unblocked_in_time, [True])
+        self.assertEqual(concurrent_bearer_resp.status_code, 200)
+        self.assertEqual(concurrent_slow_resp.status_code, 200)
+
+    def test_asgi_detect_bearer_bypasses_session_while_session_auth_degrades_safely(self):
+        import django.utils.deprecation as django_deprecation
+
+        bearer_token = views.issue_gadget_token("SysopUser")
+        real_sync_to_async = django_deprecation.sync_to_async
+        bridged_calls = []
+
+        def spy_sync_to_async(func, *args, **kwargs):
+            bridged_calls.append(getattr(func, "__qualname__", repr(func)))
+            return real_sync_to_async(func, *args, **kwargs)
+
+        async def _run_stateless_requests():
+            bearer_resp = await self.async_client.get(
+                "/api/v1/detect?ip=127.0.0.1",
+                headers={"Authorization": f"Bearer {bearer_token}"},
+            )
+            options_resp = await self.async_client.options(
+                "/api/v1/detect",
+                headers={"Origin": "https://meta.wikimedia.org"},
+            )
+            gadget_options_resp = await self.async_client.options(
+                "/api/v1/auth/gadget-token/",
+                headers={"Origin": "https://meta.wikimedia.org"},
+            )
+            return bearer_resp, options_resp, gadget_options_resp
+
+        with (
+            patch("django.utils.deprecation.sync_to_async", side_effect=spy_sync_to_async),
+            patch(
+                "django.contrib.sessions.backends.cache.SessionStore.load",
+                side_effect=redis.exceptions.ConnectionError("Redis unavailable"),
+            ) as mock_load,
+            patch(
+                "django.contrib.sessions.backends.cache.SessionStore.save",
+                side_effect=redis.exceptions.ConnectionError("Redis unavailable"),
+            ) as mock_save,
+        ):
+            bearer_resp, options_resp, gadget_options_resp = asyncio.run(_run_stateless_requests())
+
+        self.assertEqual(bearer_resp.status_code, 200)
+        self.assertEqual(bearer_resp.json()["ip"], "127.0.0.1")
+        self.assertEqual(options_resp.status_code, 204)
+        self.assertEqual(gadget_options_resp.status_code, 204)
+        mock_load.assert_not_called()
+        mock_save.assert_not_called()
+        self.assertFalse(
+            any("SessionMiddleware" in name for name in bridged_calls),
+            f"Unexpected session sync bridging on stateless requests: {bridged_calls}",
+        )
+
+        async def _setup_and_run_session_requests():
+            session = await self.async_client.asession()
+            session["wikimedia_user"] = {
+                "isLoggedIn": True,
+                "username": "SysopUser",
+                "role": "Local Administrator (sysop)",
+                "hasAccess": True,
+                "localGroups": ["sysop"],
+                "globalGroups": [],
+                "rights_updated_at": time.time(),
+            }
+            await session.asave()
+            ok_resp = await self.async_client.get("/api/v1/detect?ip=127.0.0.1")
+            with (
+                patch(
+                    "django.contrib.sessions.backends.cache.SessionStore.load",
+                    side_effect=redis.exceptions.ConnectionError("Redis load outage"),
+                ),
+                self.assertLogs("detector.views", level="WARNING"),
+            ):
+                degraded_resp = await self.async_client.get("/api/v1/detect?ip=127.0.0.1")
+            return ok_resp, degraded_resp
+
+        session_ok_resp, session_degraded_resp = asyncio.run(_setup_and_run_session_requests())
+        self.assertEqual(session_ok_resp.status_code, 200)
+        self.assertEqual(session_ok_resp.json()["ip"], "127.0.0.1")
+        self.assertIn("Cookie", session_ok_resp.headers.get("Vary", ""))
+        self.assertEqual(session_degraded_resp.status_code, 401)
+        self.assertIn("Cookie", session_degraded_resp.headers.get("Vary", ""))
 
 
 class CommercialProviderMetadataAdapterTests(SimpleTestCase):

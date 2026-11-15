@@ -738,4 +738,255 @@ test('App.vue gates the API Quota & Health dashboard modal to authorised adminis
   assert.match(dashboardModalVue, /OK \/ CACHE HIT \/ 429 \/ QUOTA BLOCKED/);
 });
 
+test('Userscript micro-batcher coalesces 20 IP anchors into one batch POST and falls back on 404 or 405', async () => {
+  const userscriptPath = path.resolve(process.cwd(), '../js/hydrogen-meta-userscript.js');
+  if (!fs.existsSync(userscriptPath)) {
+    return;
+  }
+  const vm = await import('node:vm');
+  const scriptSource = fs.readFileSync(userscriptPath, 'utf8');
+
+  function createHarness(fetchImpl: (url: string, init?: any) => Promise<any>, anchorCount: number) {
+    const anchors: any[] = [];
+    const insertedBadges: any[] = [];
+
+    for (let i = 1; i <= anchorCount; i += 1) {
+      const anchor: any = {
+        nodeType: 1,
+        textContent: `198.51.100.${i}`,
+        dataset: {},
+        style: {},
+        nextSibling: null,
+        nextElementSibling: null,
+        classList: { contains: () => false },
+        matches: (sel: string) => sel === 'a.ext-checkuser-tempaccount-reveal-ip-anchor',
+        closest: () => null,
+      };
+      anchor.parentNode = {
+        insertBefore: (badge: any) => {
+          insertedBadges.push({ ip: anchor.textContent, badge });
+          anchor.nextElementSibling = badge;
+        },
+      };
+      anchors.push(anchor);
+    }
+
+    let readyCallback: (() => void) | null = null;
+    const storageMap = new Map<string, string>([
+      ['proxycheck-ip-policy-consent', '1'],
+      ['proxycheck-gadget-token', 'initial-signed-token'],
+      ['proxycheck-gadget-token-user', 'AdminTester'],
+    ]);
+
+    const mwStub = {
+      config: {
+        get: (key: string) => {
+          if (key === 'wgUserName') return 'AdminTester';
+          if (key === 'wgUserIsTemp') return false;
+          if (key === 'wgServerName') return 'meta.wikimedia.org';
+          if (key === 'wgCanonicalSpecialPageName') return false;
+          return null;
+        },
+      },
+      storage: {
+        get: (k: string) => storageMap.get(k) ?? null,
+        set: (k: string, v: string) => storageMap.set(k, v),
+        remove: (k: string) => storageMap.delete(k),
+      },
+      loader: {
+        using: () => Promise.resolve(),
+      },
+      Api: function () {
+        return {
+          get: () =>
+            Promise.resolve({
+              centralauthtoken: { centralauthtoken: 'fresh-cat-token' },
+            }),
+        };
+      },
+      html: {
+        escape: (s: string) => s,
+      },
+    };
+
+    const jQueryStub: any = (arg: any) => {
+      if (typeof arg === 'function') {
+        readyCallback = arg;
+      }
+      return { length: 0 };
+    };
+
+    const documentStub = {
+      body: {
+        nodeType: 1,
+        matches: () => false,
+        closest: () => null,
+        querySelectorAll: (sel: string) =>
+          sel === 'a.ext-checkuser-tempaccount-reveal-ip-anchor' ? anchors : [],
+      },
+      getElementById: () => null,
+      createElement: (tag: string) => ({
+        tagName: tag.toUpperCase(),
+        style: {},
+        classList: { contains: (cls: string) => cls === 'proxycheck-ip-badge' },
+        addEventListener: () => {},
+      }),
+      createTextNode: (text: string) => ({ nodeType: 3, textContent: text }),
+    };
+
+    const windowStub: any = {
+      setTimeout: globalThis.setTimeout.bind(globalThis),
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
+      setInterval: globalThis.setInterval.bind(globalThis),
+      clearInterval: globalThis.clearInterval.bind(globalThis),
+    };
+
+    const context = vm.createContext({
+      mediaWiki: mwStub,
+      jQuery: jQueryStub,
+      window: windowStub,
+      document: documentStub,
+      MutationObserver: function () {
+        return { observe: () => {}, disconnect: () => {} };
+      },
+      fetch: fetchImpl,
+      console,
+      Promise,
+      Map,
+      Set,
+      Object,
+      Array,
+      String,
+      Number,
+      Boolean,
+      JSON,
+      encodeURIComponent,
+      isNaN,
+    });
+
+    vm.runInContext(scriptSource, context);
+    if (readyCallback) {
+      (readyCallback as () => void)();
+    }
+
+    return { anchors, insertedBadges };
+  }
+
+  // Verify 20 simultaneous IP anchors coalesce into a single batch POST request
+  const batchCalls: Array<{ url: string; method: string; body: any; auth: string }> = [];
+  const harness20 = createHarness(async (url, init) => {
+    const parsedBody = init?.body ? JSON.parse(init.body) : null;
+    batchCalls.push({
+      url,
+      method: init?.method || 'GET',
+      body: parsedBody,
+      auth: init?.headers?.Authorization || '',
+    });
+    const results: Record<string, any> = {};
+    for (const ip of parsedBody.ips) {
+      results[ip] = {
+        ip,
+        isNonPublic: false,
+        prediction_score: 75,
+        getipintel_chance: 0.75,
+        is_broadcast_ip: false,
+        isTor: false,
+        isMajorityProxyVpn: true,
+        arbitrationVerdict: 'Confirmed Proxy / VPN (5/8 Sources)',
+        arbitrationTier: 'destructive',
+        recommendedCidr: `${ip}/24`,
+        mmdbCidr: `${ip}/24`,
+        results: [],
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        results,
+        count: parsedBody.ips.length,
+      }),
+    };
+  }, 20);
+
+  await new Promise((resolve) => setTimeout(resolve, 90));
+
+  assert.equal(batchCalls.length, 1);
+  assert.equal(batchCalls[0].url, 'https://proxycheck.toolforge.org/api/v1/detect/batch');
+  assert.equal(batchCalls[0].method, 'POST');
+  assert.equal(batchCalls[0].body.ips.length, 20);
+  assert.equal(harness20.insertedBadges.length, 20);
+
+  // Verify HTTP 401 on batch triggers one token refresh and retries the batch
+  const retryCalls: string[] = [];
+  let firstBatchAttempt = true;
+  const harness401 = createHarness(async (url, init) => {
+    retryCalls.push(url);
+    if (url.endsWith('/api/v1/auth/gadget-token')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ token: 'refreshed-signed-token', username: 'AdminTester', expires_in: 3600 }),
+      };
+    }
+    if (firstBatchAttempt) {
+      firstBatchAttempt = false;
+      return { ok: false, status: 401, json: async () => ({ error: 'Expired' }) };
+    }
+    const parsedBody = JSON.parse(init.body);
+    assert.equal(init.headers.Authorization, 'Bearer refreshed-signed-token');
+    const results: Record<string, any> = {};
+    for (const ip of parsedBody.ips) {
+      results[ip] = {
+        ip,
+        isNonPublic: true,
+        nonPublicCategory: 'documentation',
+        nonPublicReason: 'Documentation Reserved Address',
+        results: [],
+      };
+    }
+    return { ok: true, status: 200, json: async () => ({ results, count: parsedBody.ips.length }) };
+  }, 3);
+
+  await new Promise((resolve) => setTimeout(resolve, 90));
+  assert.deepEqual(retryCalls, [
+    'https://proxycheck.toolforge.org/api/v1/detect/batch',
+    'https://proxycheck.toolforge.org/api/v1/auth/gadget-token',
+    'https://proxycheck.toolforge.org/api/v1/detect/batch',
+  ]);
+  assert.equal(harness401.insertedBadges.length, 3);
+
+  // Verify HTTP 404 on batch smoothly degrades all items in the batch to single-IP GET requests
+  const fallbackCalls: string[] = [];
+  const harness404 = createHarness(async (url) => {
+    fallbackCalls.push(url);
+    if (url.endsWith('/api/v1/detect/batch')) {
+      return { ok: false, status: 404, json: async () => ({ error: 'Not found' }) };
+    }
+    const ipParam = new URL(url).searchParams.get('ip') || '198.51.100.1';
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ip: ipParam,
+        isNonPublic: false,
+        prediction_score: 10,
+        getipintel_chance: 0.1,
+        is_broadcast_ip: false,
+        isTor: false,
+        isMajorityProxyVpn: false,
+        arbitrationVerdict: 'Clean Residential / Direct (0/8 Sources)',
+        arbitrationTier: 'success',
+        results: [],
+      }),
+    };
+  }, 4);
+
+  await new Promise((resolve) => setTimeout(resolve, 90));
+  assert.equal(fallbackCalls[0], 'https://proxycheck.toolforge.org/api/v1/detect/batch');
+  assert.equal(fallbackCalls.filter((u) => u.includes('/api/v1/detect?ip=')).length, 4);
+  assert.equal(harness404.insertedBadges.length, 4);
+});
+
+
 

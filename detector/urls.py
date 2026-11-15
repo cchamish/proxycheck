@@ -11,6 +11,8 @@ from . import views
 urlpatterns = [
     path("detect", views.detect_ip, name="detect_ip"),
     path("detect/", views.detect_ip),
+    path("detect/batch", views.detect_ip_batch, name="detect_ip_batch"),
+    path("detect/batch/", views.detect_ip_batch),
     path("auth/user/", views.get_current_user, name="auth_user"),
     re_path(r"^auth/user$", views.get_current_user),
     path("auth/login/", views.oauth_login, name="auth_login"),

@@ -7781,3 +7781,234 @@ class RedisBatchingAndCacheCompletenessTests(TestCase):
         self.assertEqual(statuses["SpamCop"], "Skipped (IPv6)")
         self.assertEqual(statuses["IPHunter"], "No API Key")
         self.assertEqual(statuses["MaxMind"], "Database Missing")
+
+
+class BatchDetectionEndpointTests(TestCase):
+    """Tests for the batch IP detection endpoint covering authentication, validation, CORS, and mixed IP lookups."""
+
+    def setUp(self):
+        views._ip_detect_inflight.clear()
+        dns_patcher = patch(
+            "dns.asyncresolver.Resolver.resolve",
+            new_callable=AsyncMock,
+            side_effect=dns.resolver.NXDOMAIN(),
+        )
+        dns_patcher.start()
+        self.addCleanup(dns_patcher.stop)
+
+    def tearDown(self):
+        views._ip_detect_inflight.clear()
+
+    @staticmethod
+    def _stub_provider(name: str) -> dict:
+        return {
+            "provider": name,
+            "status": "No API Key",
+            "statusCode": None,
+            "asn": "-",
+            "isp": "-",
+            "organisation": "-",
+            "location": "-",
+            "usageType": "-",
+            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
+            "rawJson": {"status": "error", "message": "API key not configured"},
+        }
+
+    def _patch_all_providers(self):
+        provider_map = (
+            ("detector.views.query_cloudflare_radar", "Cloudflare Radar"),
+            ("detector.views.query_abuseipdb", "AbuseIPDB"),
+            ("detector.views.query_ipdata", "IPData"),
+            ("detector.views.query_ipregistry", "IPRegistry"),
+            ("detector.views.query_ip2location", "IP2Location"),
+            ("detector.views.query_getipintel", "GetIPIntel"),
+            ("detector.views.query_proxycheck", "Proxycheck"),
+            ("detector.views.query_iphub", "IPHub"),
+            ("detector.views.query_iphunter", "IPHunter"),
+            ("detector.views.query_maxmind", "MaxMind"),
+            ("detector.views.query_tor_onionoo", "Tor Onionoo"),
+            ("detector.views.query_stopforumspam", "StopForumSpam"),
+            ("detector.views.query_dshield", "DShield"),
+        )
+        for target, name in provider_map:
+            patcher = patch(target, new_callable=AsyncMock, return_value=self._stub_provider(name))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_batch_detect_unauthenticated_and_unauthorised_requests(self):
+        for route in ("/api/v1/detect/batch", "/api/v1/detect/batch/"):
+            with self.subTest(route=route):
+                unauth_resp = self.client.post(
+                    route,
+                    data=json.dumps({"ips": ["1.1.1.1"]}),
+                    content_type="application/json",
+                    HTTP_ORIGIN="https://meta.wikimedia.org",
+                )
+                self.assertEqual(unauth_resp.status_code, 401)
+                self.assertIn("error", unauth_resp.json())
+                self.assertEqual(
+                    unauth_resp.headers.get("Access-Control-Allow-Origin"),
+                    "https://meta.wikimedia.org",
+                )
+
+                bad_token_resp = self.client.post(
+                    route,
+                    data=json.dumps({"ips": ["1.1.1.1"]}),
+                    content_type="application/json",
+                    HTTP_AUTHORIZATION="Bearer invalid-gadget-token",
+                    HTTP_ORIGIN="https://meta.wikimedia.org",
+                )
+                self.assertEqual(bad_token_resp.status_code, 401)
+
+        session = self.client.session
+        session["wikimedia_user"] = {
+            "isLoggedIn": True,
+            "username": "UnprivilegedEditor",
+            "role": "Standard User (Unauthorised)",
+            "hasAccess": False,
+            "localGroups": ["user"],
+            "globalGroups": [],
+        }
+        session.save()
+
+        forbidden_resp = self.client.post(
+            "/api/v1/detect/batch",
+            data=json.dumps({"ips": ["1.1.1.1"]}),
+            content_type="application/json",
+        )
+        self.assertEqual(forbidden_resp.status_code, 403)
+        self.assertIn("error", forbidden_resp.json())
+
+    def test_batch_detect_options_preflight_and_method_guard(self):
+        for route in ("/api/v1/detect/batch", "/api/v1/detect/batch/"):
+            with self.subTest(route=route):
+                options_resp = self.client.options(
+                    route,
+                    HTTP_ORIGIN="https://zh.wikipedia.org",
+                )
+                self.assertEqual(options_resp.status_code, 204)
+                self.assertEqual(
+                    options_resp.headers.get("Access-Control-Allow-Origin"),
+                    "https://zh.wikipedia.org",
+                )
+                self.assertEqual(
+                    options_resp.headers.get("Access-Control-Allow-Methods"),
+                    "POST, OPTIONS",
+                )
+                self.assertIn("Authorization", options_resp.headers.get("Access-Control-Allow-Headers", ""))
+                self.assertIn("Content-Type", options_resp.headers.get("Access-Control-Allow-Headers", ""))
+                self.assertEqual(options_resp.headers.get("Access-Control-Max-Age"), "86400")
+
+                get_resp = self.client.get(
+                    route,
+                    HTTP_ORIGIN="https://zh.wikipedia.org",
+                )
+                self.assertEqual(get_resp.status_code, 405)
+                self.assertEqual(
+                    get_resp.headers.get("Access-Control-Allow-Origin"),
+                    "https://zh.wikipedia.org",
+                )
+
+    def test_batch_detect_rejects_empty_oversized_and_invalid_ip_lists_with_400(self):
+        bearer_token = views.issue_gadget_token("SysopUser")
+        headers = {
+            "HTTP_AUTHORIZATION": f"Bearer {bearer_token}",
+            "HTTP_ORIGIN": "https://meta.wikimedia.org",
+        }
+
+        too_many_unique = [f"198.51.100.{idx}" for idx in range(1, 27)]
+        too_many_raw = ["1.1.1.1"] * 51
+
+        invalid_payloads = (
+            "{malformed-json",
+            json.dumps(["1.1.1.1"]),
+            json.dumps({}),
+            json.dumps({"ips": []}),
+            json.dumps({"ips": "1.1.1.1"}),
+            json.dumps({"ips": [12345]}),
+            json.dumps({"ips": ["   "]}),
+            json.dumps({"ips": ["1.1.1.1", "999.999.999.999"]}),
+            json.dumps({"ips": ["fe80::1%"]}),
+            json.dumps({"ips": too_many_unique}),
+            json.dumps({"ips": too_many_raw}),
+        )
+
+        for raw_body in invalid_payloads:
+            with self.subTest(raw_body=raw_body[:60]):
+                resp = self.client.post(
+                    "/api/v1/detect/batch",
+                    data=raw_body,
+                    content_type="application/json",
+                    **headers,
+                )
+                self.assertEqual(resp.status_code, 400)
+                body = resp.json()
+                self.assertEqual(body.get("error"), "invalid_batch")
+                self.assertTrue(body.get("message"))
+                self.assertEqual(
+                    resp.headers.get("Access-Control-Allow-Origin"),
+                    "https://meta.wikimedia.org",
+                )
+
+    @patch("detector.views.redis_client", None)
+    def test_batch_detect_returns_mixed_public_and_non_public_results_with_deduplication(self):
+        self._patch_all_providers()
+        bearer_token = views.issue_gadget_token("SysopUser")
+
+        batch_ips = [
+            "1.1.1.1",
+            "2001:4860:4860:0000:0000:0000:0000:8888",
+            "2001:4860:4860::8888",
+            "127.0.0.1",
+            "192.168.1.50",
+            "fe80::1%eth0",
+        ]
+        resp = self.client.post(
+            "/api/v1/detect/batch/",
+            data=json.dumps({"ips": batch_ips}),
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {bearer_token}",
+            HTTP_ORIGIN="https://meta.wikimedia.org",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.headers.get("Access-Control-Allow-Origin"), "https://meta.wikimedia.org")
+
+        payload = resp.json()
+        self.assertEqual(payload["count"], 5)
+        self.assertIn("durationSeconds", payload)
+        self.assertIn("memoryMb", payload)
+        self.assertEqual(
+            set(payload["results"].keys()),
+            {"1.1.1.1", "2001:4860:4860::8888", "127.0.0.1", "192.168.1.50", "fe80::1"},
+        )
+        self.assertEqual(
+            payload["inputMap"]["2001:4860:4860:0000:0000:0000:0000:8888"],
+            "2001:4860:4860::8888",
+        )
+        self.assertEqual(payload["inputMap"]["fe80::1%eth0"], "fe80::1")
+
+        public_v4 = payload["results"]["1.1.1.1"]
+        self.assertEqual(public_v4["ip"], "1.1.1.1")
+        self.assertFalse(public_v4.get("isNonPublic", False))
+        self.assertEqual(len(public_v4["results"]), 14)
+
+        public_v6 = payload["results"]["2001:4860:4860::8888"]
+        self.assertEqual(public_v6["ip"], "2001:4860:4860::8888")
+        self.assertFalse(public_v6.get("isNonPublic", False))
+        self.assertEqual(len(public_v6["results"]), 14)
+
+        loopback_res = payload["results"]["127.0.0.1"]
+        self.assertTrue(loopback_res["isNonPublic"])
+        self.assertEqual(loopback_res["nonPublicCategory"], "loopback")
+        self.assertEqual(loopback_res["results"], [])
+
+        private_res = payload["results"]["192.168.1.50"]
+        self.assertTrue(private_res["isNonPublic"])
+        self.assertEqual(private_res["nonPublicCategory"], "private")
+        self.assertEqual(private_res["results"], [])
+
+        link_local_res = payload["results"]["fe80::1"]
+        self.assertTrue(link_local_res["isNonPublic"])
+        self.assertEqual(link_local_res["nonPublicCategory"], "link_local")
+        self.assertEqual(link_local_res["results"], [])
+

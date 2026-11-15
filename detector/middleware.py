@@ -28,6 +28,31 @@ def is_session_backend_error(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and "cache is unavailable" in str(exc).lower()
 
 
+_GADGET_TOKEN_PATHS = ("/api/v1/auth/gadget-token", "/api/v1/auth/gadget-token/")
+
+
+def _is_stateless_api_request(request) -> bool:
+    """Return True for stateless API requests that do not read or write session state."""
+    method = (getattr(request, "method", None) or "").upper()
+    path = getattr(request, "path_info", None) or getattr(request, "path", "") or ""
+    if method == "OPTIONS" and path.startswith("/api/v1/"):
+        return True
+    if path in _GADGET_TOKEN_PATHS:
+        return True
+    if path.startswith("/api/v1/detect"):
+        headers = getattr(request, "headers", None)
+        auth_header = ""
+        if hasattr(headers, "get"):
+            auth_header = headers.get("Authorization")
+            if auth_header is None:
+                auth_header = headers.get("authorization", "")
+        if isinstance(auth_header, bytes):
+            auth_header = auth_header.decode("latin1", errors="ignore")
+        if str(auth_header).strip().lower().startswith("bearer "):
+            return True
+    return False
+
+
 class ResilientSessionMiddleware(SessionMiddleware):
     """Prevents cache session backend outages from raising HTTP 500 during response persistence."""
 
@@ -47,6 +72,13 @@ class ResilientSessionMiddleware(SessionMiddleware):
             )
             patch_vary_headers(response, ("Cookie",))
             return response
+
+    async def __acall__(self, request):
+        if _is_stateless_api_request(request):
+            # Attach an untouched session handle so downstream middleware attribute checks pass without sync bridging
+            request.session = self.SessionStore()
+            return await self.get_response(request)
+        return await super().__acall__(request)
 
 
 _STATIC_STREAM_CHUNK_SIZE = 65536

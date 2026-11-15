@@ -2741,73 +2741,46 @@ async def _exchange_gadget_token_post(request):
     )
 
 
-async def detect_ip(request):
-    """
-    Aggregates IP intelligence across upstream providers with non-public IP interception,
-    singleflight coalescing, tiered per-provider Redis caching, and cooldown circuit breaking.
-    """
-    if request.method == "OPTIONS":
-        return _apply_detect_cors_headers(request, HttpResponse(status=204))
-
-    if request.method != "GET":
-        return _apply_detect_cors_headers(
-            request,
-            JsonResponse({"error": "Method not allowed"}, status=405),
-        )
-
-    response = await _detect_ip_get(request)
-    return _apply_detect_cors_headers(request, response)
+MAX_BATCH_IPS = 25
+_MAX_RAW_BATCH_IPS = 50
+_BATCH_DETECT_CONCURRENCY = 6
 
 
-async def _detect_ip_get(request):
-    start_time = time.perf_counter()
-
+async def _authenticate_detect_request(request) -> Tuple[Optional[str], Optional[JsonResponse]]:
+    """Validates gadget Bearer token or Wikimedia session credentials for IP detection endpoints."""
     auth_header = request.headers.get("Authorization")
     if auth_header is not None and str(auth_header).strip():
         token_user, token_error = _verify_gadget_bearer_token(str(auth_header))
         if token_error or not token_user:
-            return JsonResponse(
+            return None, JsonResponse(
                 {"error": token_error or "Invalid authentication token."},
                 status=401,
             )
-        auth_mode = "gadget"
-    else:
-        session_user = await _get_session_user(request)
-        if not isinstance(session_user, dict) or not session_user.get("isLoggedIn"):
-            return JsonResponse(
-                {"error": "Authentication required. Please log in with Wikimedia."},
-                status=401,
-            )
-        if not session_user.get("hasAccess"):
-            return JsonResponse(
-                {"error": "Access denied. Insufficient Wikimedia user rights."},
-                status=403,
-            )
-        auth_mode = "session"
+        return "gadget", None
 
-    raw_ip = request.GET.get("ip")
-    if raw_ip is None or not str(raw_ip).strip():
-        return JsonResponse(
-            {
-                "error": "invalid_ip",
-                "message": "Missing required ip query parameter. Please provide a valid IPv4 or IPv6 address.",
-            },
-            status=400,
+    session_user = await _get_session_user(request)
+    if not isinstance(session_user, dict) or not session_user.get("isLoggedIn"):
+        return None, JsonResponse(
+            {"error": "Authentication required. Please log in with Wikimedia."},
+            status=401,
         )
-
-    ip = canonicalize_ip(str(raw_ip))
-    if not ip:
-        return JsonResponse(
-            {
-                "error": "invalid_ip",
-                "message": "Invalid IP address format. Please provide a valid IPv4 or IPv6 address.",
-            },
-            status=400,
+    if not session_user.get("hasAccess"):
+        return None, JsonResponse(
+            {"error": "Access denied. Insufficient Wikimedia user rights."},
+            status=403,
         )
+    return "session", None
 
+
+async def _detect_single_canonical_ip(
+    ip: str,
+    auth_mode: str,
+    start_time: float,
+) -> Dict[str, Any]:
+    """Runs singleflight-coalesced intelligence detection for one canonical IP address."""
     non_public = _classify_non_public_ip(ip)
     if non_public is not None:
-        return JsonResponse(_build_non_public_response_payload(ip, non_public[0], non_public[1], start_time))
+        return _build_non_public_response_payload(ip, non_public[0], non_public[1], start_time)
 
     current_loop = asyncio.get_running_loop()
     base_payload: Optional[Dict[str, Any]] = None
@@ -2893,7 +2866,189 @@ async def _detect_ip_get(request):
     if isinstance(cache_status, str) and cache_status in ("hit", "partial", "miss"):
         await record_global_request_telemetry(cache_status, auth_mode)
 
-    return JsonResponse(_attach_request_diagnostics(base_payload, start_time))
+    return _attach_request_diagnostics(base_payload, start_time)
+
+
+async def detect_ip(request):
+    """
+    Aggregates IP intelligence across upstream providers with non-public IP interception,
+    singleflight coalescing, tiered per-provider Redis caching, and cooldown circuit breaking.
+    """
+    if request.method == "OPTIONS":
+        return _apply_detect_cors_headers(request, HttpResponse(status=204))
+
+    if request.method != "GET":
+        return _apply_detect_cors_headers(
+            request,
+            JsonResponse({"error": "Method not allowed"}, status=405),
+        )
+
+    response = await _detect_ip_get(request)
+    return _apply_detect_cors_headers(request, response)
+
+
+async def _detect_ip_get(request):
+    start_time = time.perf_counter()
+
+    auth_mode, auth_error_response = await _authenticate_detect_request(request)
+    if auth_error_response is not None or auth_mode is None:
+        return auth_error_response
+
+    raw_ip = request.GET.get("ip")
+    if raw_ip is None or not str(raw_ip).strip():
+        return JsonResponse(
+            {
+                "error": "invalid_ip",
+                "message": "Missing required ip query parameter. Please provide a valid IPv4 or IPv6 address.",
+            },
+            status=400,
+        )
+
+    ip = canonicalize_ip(str(raw_ip))
+    if not ip:
+        return JsonResponse(
+            {
+                "error": "invalid_ip",
+                "message": "Invalid IP address format. Please provide a valid IPv4 or IPv6 address.",
+            },
+            status=400,
+        )
+
+    payload = await _detect_single_canonical_ip(ip, auth_mode, start_time)
+    return JsonResponse(payload)
+
+
+@csrf_exempt
+async def detect_ip_batch(request):
+    """
+    Executes bounded-concurrency batch IP intelligence detection for up to MAX_BATCH_IPS
+    addresses in a single POST request.
+    """
+    if request.method == "OPTIONS":
+        return _apply_detect_cors_headers(
+            request,
+            HttpResponse(status=204),
+            methods="POST, OPTIONS",
+        )
+
+    if request.method != "POST":
+        return _apply_detect_cors_headers(
+            request,
+            JsonResponse({"error": "Method not allowed"}, status=405),
+            methods="POST, OPTIONS",
+        )
+
+    response = await _detect_ip_batch_post(request)
+    return _apply_detect_cors_headers(request, response, methods="POST, OPTIONS")
+
+
+async def _detect_ip_batch_post(request):
+    start_time = time.perf_counter()
+
+    auth_mode, auth_error_response = await _authenticate_detect_request(request)
+    if auth_error_response is not None or auth_mode is None:
+        return auth_error_response
+
+    try:
+        raw_body = request.body.decode("utf-8-sig") if request.body else ""
+        body = json.loads(raw_body) if raw_body.strip() else None
+    except UnicodeDecodeError, ValueError:
+        return JsonResponse(
+            {
+                "error": "invalid_batch",
+                "message": "Invalid JSON request body.",
+            },
+            status=400,
+        )
+
+    if not isinstance(body, dict):
+        return JsonResponse(
+            {
+                "error": "invalid_batch",
+                "message": "Request body must be a JSON object containing an ips array.",
+            },
+            status=400,
+        )
+
+    raw_ips = body.get("ips")
+    if not isinstance(raw_ips, list) or not raw_ips:
+        return JsonResponse(
+            {
+                "error": "invalid_batch",
+                "message": "The ips parameter must be a non-empty array of IP addresses.",
+            },
+            status=400,
+        )
+
+    if len(raw_ips) > _MAX_RAW_BATCH_IPS:
+        return JsonResponse(
+            {
+                "error": "invalid_batch",
+                "message": f"Batch request exceeds maximum allowed raw entries ({_MAX_RAW_BATCH_IPS}).",
+            },
+            status=400,
+        )
+
+    unique_canonical_ips: List[str] = []
+    seen_canonical: Set[str] = set()
+    input_map: Dict[str, str] = {}
+
+    for item in raw_ips:
+        if not isinstance(item, str) or not item.strip():
+            return JsonResponse(
+                {
+                    "error": "invalid_batch",
+                    "message": "Each entry in ips must be a non-empty IP address string.",
+                },
+                status=400,
+            )
+        canonical = canonicalize_ip(item)
+        if not canonical:
+            return JsonResponse(
+                {
+                    "error": "invalid_batch",
+                    "message": f"Invalid IP address format: {item.strip()[:64]}",
+                },
+                status=400,
+            )
+        input_map[item] = canonical
+        stripped_item = item.strip()
+        if stripped_item != item:
+            input_map[stripped_item] = canonical
+        if canonical not in seen_canonical:
+            seen_canonical.add(canonical)
+            unique_canonical_ips.append(canonical)
+
+    if len(unique_canonical_ips) > MAX_BATCH_IPS:
+        return JsonResponse(
+            {
+                "error": "invalid_batch",
+                "message": f"Batch request exceeds maximum of {MAX_BATCH_IPS} unique IP addresses.",
+            },
+            status=400,
+        )
+
+    semaphore = asyncio.Semaphore(_BATCH_DETECT_CONCURRENCY)
+
+    async def _detect_bounded(canonical_ip: str) -> Tuple[str, Dict[str, Any]]:
+        async with semaphore:
+            ip_start_time = time.perf_counter()
+            payload = await _detect_single_canonical_ip(canonical_ip, auth_mode, ip_start_time)
+            return canonical_ip, payload
+
+    pairs = await asyncio.gather(*(_detect_bounded(ip) for ip in unique_canonical_ips))
+    results_by_ip: Dict[str, Dict[str, Any]] = dict(pairs)
+
+    return JsonResponse(
+        _attach_request_diagnostics(
+            {
+                "results": results_by_ip,
+                "inputMap": input_map,
+                "count": len(results_by_ip),
+            },
+            start_time,
+        )
+    )
 
 
 _SESSION_UNAVAILABLE_ERROR = "Authentication session storage is temporarily unavailable."

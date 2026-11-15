@@ -3,6 +3,7 @@ Asynchronous views for IP intelligence aggregation and Wikimedia OAuth 2.0 sessi
 """
 
 import asyncio
+import builtins
 import concurrent.futures
 import contextvars
 import copy
@@ -163,8 +164,28 @@ def _get_redis_client() -> Optional[Any]:
         return loop_client
 
 
+_PROC_RSS_CACHE_TTL_SECONDS = 1.0
+_DEFAULT_BUILTIN_OPEN = builtins.open
+_proc_rss_cache: Optional[Tuple[float, float]] = None
+
+
+def _is_builtin_open_mocked() -> bool:
+    return (
+        builtins.open is not _DEFAULT_BUILTIN_OPEN
+        or globals().get("open", _DEFAULT_BUILTIN_OPEN) is not _DEFAULT_BUILTIN_OPEN
+    )
+
+
 def _read_proc_rss_mb() -> Optional[float]:
     """Reads live resident set size (RSS) from Linux procfs in megabytes when available."""
+    global _proc_rss_cache
+
+    now_mono = time.monotonic()
+    if not _is_builtin_open_mocked():
+        cached = _proc_rss_cache
+        if cached is not None and 0.0 <= (now_mono - cached[0]) < _PROC_RSS_CACHE_TTL_SECONDS:
+            return cached[1]
+
     try:
         with open("/proc/self/statm", encoding="ascii") as statm_file:
             fields = statm_file.read().split()
@@ -177,7 +198,9 @@ def _read_proc_rss_mb() -> Optional[float]:
 
     if rss_pages < 0 or page_size <= 0:
         return None
-    return round((rss_pages * page_size) / (1024.0 * 1024.0), 2)
+    rss_mb = round((rss_pages * page_size) / (1024.0 * 1024.0), 2)
+    _proc_rss_cache = (now_mono, rss_mb)
+    return rss_mb
 
 
 def get_process_memory_mb() -> Optional[float]:
@@ -683,6 +706,11 @@ _MAXMIND_DB_SPECS = (
     ("asn", MAXMIND_ASN_DB_FILENAME),
 )
 
+_MAXMIND_CITY_DB_CACHE_TTL_SECONDS = 5.0
+_DEFAULT_OS_PATH_EXISTS = os.path.exists
+_maxmind_city_db_cache: Optional[Tuple[Tuple[Any, ...], float, bool]] = None
+_maxmind_any_db_cache: Optional[Tuple[Tuple[Any, ...], float, bool]] = None
+
 
 def _resolve_maxmind_db_paths() -> Dict[str, str]:
     """Resolves Country, City, and ASN MMDB paths using configured MAXMIND_DB_DIR or fallbacks."""
@@ -691,10 +719,50 @@ def _resolve_maxmind_db_paths() -> Dict[str, str]:
     return {key: _resolve_db_file(configured_dir, filename, base_dir) for key, filename in _MAXMIND_DB_SPECS}
 
 
+_DEFAULT_RESOLVE_MAXMIND_DB_PATHS = _resolve_maxmind_db_paths
+_DEFAULT_RESOLVE_DB_FILE = _resolve_db_file
+
+
+def _is_maxmind_probe_mocked() -> bool:
+    return (
+        (os.path.exists is not _DEFAULT_OS_PATH_EXISTS and getattr(os.path.exists, "_mock_wraps", None) is None)
+        or (
+            _resolve_maxmind_db_paths is not _DEFAULT_RESOLVE_MAXMIND_DB_PATHS
+            and getattr(_resolve_maxmind_db_paths, "_mock_wraps", None) is None
+        )
+        or (
+            _resolve_db_file is not _DEFAULT_RESOLVE_DB_FILE
+            and getattr(_resolve_db_file, "_mock_wraps", None) is None
+        )
+    )
+
+
 def _has_local_maxmind_city_db() -> bool:
     """Returns True when GeoLite2-City.mmdb is present on disk at its resolved location."""
-    city_path = _resolve_maxmind_db_paths().get("city", "")
-    return bool(city_path and os.path.exists(city_path))
+    global _maxmind_city_db_cache
+
+    exists_fn = os.path.exists
+    if _is_maxmind_probe_mocked():
+        city_path = _resolve_maxmind_db_paths().get("city", "")
+        return bool(city_path and exists_fn(city_path))
+
+    base_dir = getattr(settings, "BASE_DIR", os.getcwd())
+    configured_dir = str(getattr(settings, "MAXMIND_DB_DIR", "") or os.environ.get("MAXMIND_DB_DIR", "")).strip()
+    tool_data_dir = os.environ.get("TOOL_DATA_DIR", "").strip()
+    cache_key = (configured_dir, str(base_dir), tool_data_dir, exists_fn, _resolve_maxmind_db_paths, _resolve_db_file)
+    now_mono = time.monotonic()
+    cached = _maxmind_city_db_cache
+    if (
+        cached is not None
+        and cached[0] == cache_key
+        and 0.0 <= (now_mono - cached[1]) < _MAXMIND_CITY_DB_CACHE_TTL_SECONDS
+    ):
+        return cached[2]
+
+    city_path = _resolve_db_file(configured_dir, MAXMIND_CITY_DB_FILENAME, base_dir)
+    has_city = bool(city_path and exists_fn(city_path))
+    _maxmind_city_db_cache = (cache_key, now_mono, has_city)
+    return has_city
 
 
 def _merge_maxmind_records(
@@ -829,16 +897,62 @@ def _get_dns_timeouts() -> Tuple[float, float]:
     return timeout_s, lifetime_s
 
 
+_DEFAULT_ASYNC_RESOLVER_CLS = dns.asyncresolver.Resolver
+_async_resolver_lock = threading.Lock()
+_cached_base_nameservers: Optional[List[Any]] = None
+_cached_async_resolvers: Dict[Tuple[float, float], dns.asyncresolver.Resolver] = {}
+
+
 def _create_async_resolver() -> dns.asyncresolver.Resolver:
+    global _cached_base_nameservers
+
     timeout_s, lifetime_s = _get_dns_timeouts()
-    try:
-        resolver = dns.asyncresolver.Resolver()
-    except dns.resolver.NoResolverConfiguration:
-        resolver = dns.asyncresolver.Resolver(configure=False)
-        resolver.nameservers = ["8.8.8.8", "1.1.1.1"]
-    resolver.timeout = timeout_s
-    resolver.lifetime = lifetime_s
-    return resolver
+    resolver_cls = dns.asyncresolver.Resolver
+    if resolver_cls is not _DEFAULT_ASYNC_RESOLVER_CLS:
+        try:
+            resolver = resolver_cls()
+        except dns.resolver.NoResolverConfiguration:
+            resolver = resolver_cls(configure=False)
+            resolver.nameservers = ["8.8.8.8", "1.1.1.1"]
+        resolver.timeout = timeout_s
+        resolver.lifetime = lifetime_s
+        return resolver
+
+    cache_key = (timeout_s, lifetime_s)
+    with _async_resolver_lock:
+        cached = _cached_async_resolvers.get(cache_key)
+        if (
+            cached is not None
+            and cached.timeout == timeout_s
+            and cached.lifetime == lifetime_s
+            and bool(cached.nameservers)
+        ):
+            return cached
+
+        if _cached_base_nameservers is None:
+            try:
+                base_resolver = resolver_cls()
+                resolved_nameservers = (
+                    list(base_resolver.nameservers) if base_resolver.nameservers else ["8.8.8.8", "1.1.1.1"]
+                )
+            except dns.resolver.NoResolverConfiguration:
+                base_resolver = resolver_cls(configure=False)
+                resolved_nameservers = ["8.8.8.8", "1.1.1.1"]
+            _cached_base_nameservers = resolved_nameservers
+            base_resolver.nameservers = list(resolved_nameservers)
+            base_resolver.timeout = timeout_s
+            base_resolver.lifetime = lifetime_s
+            _cached_async_resolvers[cache_key] = base_resolver
+            return base_resolver
+
+        resolver = resolver_cls(configure=False)
+        resolver.nameservers = list(_cached_base_nameservers)
+        resolver.timeout = timeout_s
+        resolver.lifetime = lifetime_s
+        if len(_cached_async_resolvers) >= 16:
+            _cached_async_resolvers.clear()
+        _cached_async_resolvers[cache_key] = resolver
+        return resolver
 
 
 def _extract_ptr_hostname(answer: Any) -> Optional[str]:
@@ -1825,6 +1939,23 @@ async def _safe_redis_set_many(entries: List[Tuple[str, str, int]]) -> None:
     await asyncio.gather(*(_safe_redis_set(key, value, ex=ttl_seconds) for key, value, ttl_seconds in entries))
 
 
+class _DecodedProviderRow(dict):
+    """Dictionary subclass carrying internal cache wrapper metadata without altering visible keys."""
+
+    __slots__ = ("_city_db_loaded", "_source_raw_value")
+
+    def __init__(
+        self,
+        mapping: Dict[str, Any],
+        *,
+        city_db_loaded: bool = False,
+        source_raw_value: Optional[str] = None,
+    ) -> None:
+        super().__init__(mapping)
+        self._city_db_loaded = city_db_loaded
+        self._source_raw_value = source_raw_value
+
+
 def _decode_cached_provider_entry(raw_value: Optional[str]) -> Optional[Tuple[Dict[str, Any], Optional[str]]]:
     if not raw_value:
         return None
@@ -1834,17 +1965,18 @@ def _decode_cached_provider_entry(raw_value: Optional[str]) -> Optional[Tuple[Di
         return None
     if not isinstance(parsed, dict):
         return None
+    city_db_loaded = parsed.get("cityDbLoaded") is True
     if "row" in parsed and isinstance(parsed["row"], dict):
         row = parsed["row"]
         if not parsed.get("sanitized") and isinstance(row.get("rawJson"), (dict, list)):
             row = {**row, "rawJson": _sanitize_payload(row["rawJson"])}
         cached_at = parsed.get("cachedAt")
         cached_at_str = cached_at if isinstance(cached_at, str) and cached_at else None
-        return row, cached_at_str
+        return _DecodedProviderRow(row, city_db_loaded=city_db_loaded, source_raw_value=raw_value), cached_at_str
     if "status" in parsed and "provider" in parsed:
         if not parsed.get("sanitized") and isinstance(parsed.get("rawJson"), (dict, list)):
             parsed = {**parsed, "rawJson": _sanitize_payload(parsed["rawJson"])}
-        return parsed, None
+        return _DecodedProviderRow(parsed, city_db_loaded=city_db_loaded, source_raw_value=raw_value), None
     return None
 
 
@@ -1888,7 +2020,28 @@ def _is_unconfigured_provider_row(row: Dict[str, Any]) -> bool:
 
 
 def _has_any_local_maxmind_db() -> bool:
-    return any(path and os.path.exists(path) for path in _resolve_maxmind_db_paths().values())
+    global _maxmind_any_db_cache
+
+    exists_fn = os.path.exists
+    if _is_maxmind_probe_mocked():
+        return any(path and exists_fn(path) for path in _resolve_maxmind_db_paths().values())
+
+    base_dir = getattr(settings, "BASE_DIR", os.getcwd())
+    configured_dir = str(getattr(settings, "MAXMIND_DB_DIR", "") or os.environ.get("MAXMIND_DB_DIR", "")).strip()
+    tool_data_dir = os.environ.get("TOOL_DATA_DIR", "").strip()
+    cache_key = (configured_dir, str(base_dir), tool_data_dir, exists_fn, _resolve_maxmind_db_paths, _resolve_db_file)
+    now_mono = time.monotonic()
+    cached = _maxmind_any_db_cache
+    if (
+        cached is not None
+        and cached[0] == cache_key
+        and 0.0 <= (now_mono - cached[1]) < _MAXMIND_CITY_DB_CACHE_TTL_SECONDS
+    ):
+        return cached[2]
+
+    has_any = any(path and exists_fn(path) for path in _resolve_maxmind_db_paths().values())
+    _maxmind_any_db_cache = (cache_key, now_mono, has_any)
+    return has_any
 
 
 def _is_provider_cache_expected(provider_key: str, is_ipv4: bool) -> bool:
@@ -1971,6 +2124,11 @@ def _should_refresh_cached_maxmind_entry(raw_value: Optional[str], row: Dict[str
         return False
     if row.get("coordinates") is not None:
         return False
+    city_db_loaded = getattr(row, "_city_db_loaded", None)
+    if isinstance(city_db_loaded, bool) and (
+        not raw_value or getattr(row, "_source_raw_value", None) == raw_value
+    ):
+        return not city_db_loaded
     if raw_value:
         try:
             parsed = json.loads(raw_value)

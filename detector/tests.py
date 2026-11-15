@@ -6793,6 +6793,116 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         self.assertEqual(first_payload["cloudProvider"], "Amazon AWS")
         self.assertEqual(second_payload["cloudCidr"], "54.239.28.64/26")
 
+    def test_should_refresh_cached_maxmind_entry_respects_city_db_loaded_flag(self):
+        views._maxmind_city_db_cache = None
+        self.addCleanup(setattr, views, "_maxmind_city_db_cache", None)
+
+        base_row = {
+            "provider": "MaxMind",
+            "status": "200 OK",
+            "statusCode": 200,
+            "asn": "AS137718",
+            "isp": "Beijing Volcano Engine",
+            "organisation": "Beijing Volcano Engine",
+            "location": "China",
+            "usageType": "isp",
+            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
+            "countryCode": "CN",
+            "rawJson": {"country": {"iso_code": "CN"}},
+        }
+        raw_loaded_true = json.dumps(
+            {
+                "row": base_row,
+                "cachedAt": "2026-11-16T00:00:00+00:00",
+                "sanitized": True,
+                "cityDbLoaded": True,
+            }
+        )
+        raw_loaded_false = json.dumps(
+            {
+                "row": base_row,
+                "cachedAt": "2026-11-16T00:00:00+00:00",
+                "sanitized": True,
+                "cityDbLoaded": False,
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            city_db = Path(tmpdir) / "GeoLite2-City.mmdb"
+            city_db.write_bytes(b"stub")
+
+            with override_settings(MAXMIND_DB_DIR=str(tmpdir)):
+                with patch("detector.views.json.loads", wraps=json.loads) as spy_loads:
+                    decoded_true = views._decode_cached_provider_entry(raw_loaded_true)
+                    self.assertIsNotNone(decoded_true)
+                    self.assertEqual(set(decoded_true[0].keys()), set(base_row.keys()))
+                    should_refresh_true = views._should_refresh_cached_maxmind_entry(
+                        raw_loaded_true,
+                        decoded_true[0],
+                    )
+                    self.assertFalse(should_refresh_true)
+                    self.assertEqual(spy_loads.call_count, 1)
+
+                with patch("detector.views.json.loads", wraps=json.loads) as spy_loads:
+                    decoded_false = views._decode_cached_provider_entry(raw_loaded_false)
+                    self.assertIsNotNone(decoded_false)
+                    self.assertEqual(set(decoded_false[0].keys()), set(base_row.keys()))
+                    should_refresh_false = views._should_refresh_cached_maxmind_entry(
+                        raw_loaded_false,
+                        decoded_false[0],
+                    )
+                    self.assertTrue(should_refresh_false)
+                    self.assertEqual(spy_loads.call_count, 1)
+
+                # Direct calls with a plain dictionary preserve original fallback decoding
+                self.assertFalse(views._should_refresh_cached_maxmind_entry(raw_loaded_true, dict(base_row)))
+                self.assertTrue(views._should_refresh_cached_maxmind_entry(raw_loaded_false, dict(base_row)))
+
+                # Repeated checks within the TTL window reuse the cached city DB presence result
+                views._maxmind_city_db_cache = None
+                with patch("detector.views._resolve_db_file", wraps=views._resolve_db_file) as spy_resolve:
+                    self.assertTrue(views._has_local_maxmind_city_db())
+                    self.assertTrue(views._has_local_maxmind_city_db())
+                    self.assertEqual(spy_resolve.call_count, 1)
+
+        with patch("detector.views.os.path.exists", return_value=False):
+            self.assertFalse(views._has_local_maxmind_city_db())
+            self.assertFalse(views._should_refresh_cached_maxmind_entry(raw_loaded_false, dict(base_row)))
+
+    def test_async_resolver_and_proc_rss_hot_path_caches(self):
+        from unittest.mock import mock_open
+
+        views._cached_async_resolvers.clear()
+        self.addCleanup(views._cached_async_resolvers.clear)
+
+        with override_settings(DNS_QUERY_TIMEOUT_SECONDS=2.0, DNS_QUERY_LIFETIME_SECONDS=2.0):
+            first_resolver = views._create_async_resolver()
+            second_resolver = views._create_async_resolver()
+            self.assertIs(first_resolver, second_resolver)
+
+        with override_settings(DNS_QUERY_TIMEOUT_SECONDS=1.5, DNS_QUERY_LIFETIME_SECONDS=3.0):
+            custom_resolver = views._create_async_resolver()
+            self.assertEqual(custom_resolver.timeout, 1.5)
+            self.assertEqual(custom_resolver.lifetime, 3.0)
+            self.assertIs(custom_resolver, views._create_async_resolver())
+
+        views._proc_rss_cache = None
+        self.addCleanup(setattr, views, "_proc_rss_cache", None)
+
+        with (
+            patch("builtins.open", mock_open(read_data="4096 2048 0 0 0 0 0\n")),
+            patch.object(views.os, "sysconf", return_value=4096, create=True),
+        ):
+            sampled_rss = views._read_proc_rss_mb()
+        self.assertEqual(sampled_rss, 8.0)
+
+        # Unmocked call within one second returns the cached RSS sample without opening procfs
+        self.assertEqual(views._read_proc_rss_mb(), 8.0)
+
+        # Mocking builtins.open bypasses the cached sample immediately
+        with patch("builtins.open", side_effect=OSError("procfs unavailable")):
+            self.assertIsNone(views._read_proc_rss_mb())
+
 
 class FlagBasedArbitrationTests(SimpleTestCase):
     """Tests for flag and Proxycheck risk arbitrage."""

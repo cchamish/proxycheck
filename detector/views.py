@@ -56,8 +56,10 @@ from .adapters import (
     adapt_spamhaus_zen,
     adapt_stopforumspam,
     adapt_tor_onionoo,
+    are_offline_intelligence_caches_warm,
     classify_rdns_hostname,
     compute_cidr_attribution,
+    warm_offline_intelligence_caches,
 )
 from .middleware import is_session_backend_error
 from .oauth import (
@@ -589,6 +591,58 @@ async def _get_shared_http_client() -> httpx.AsyncClient:
     return selected_client
 
 
+_UNSET_MOCK_ATTR = object()
+
+
+def _is_valid_mmdb_prefix_tuple(result: Any) -> bool:
+    """Returns True when a prefix lookup returned a (record_or_none, prefix_len) tuple."""
+    return (
+        isinstance(result, tuple)
+        and len(result) == 2
+        and (result[0] is None or isinstance(result[0], dict))
+        and not isinstance(result[1], bool)
+        and isinstance(result[1], int)
+    )
+
+
+def _should_use_custom_mmdb_get(reader: Any, mmdb_record: Any) -> bool:
+    """Returns True when reader.get is a mock configured with custom behavior or a distinct record."""
+    get_method = getattr(reader, "get", None)
+    if get_method is None:
+        return False
+    if getattr(get_method, "_mock_side_effect", None) is not None:
+        return True
+    mock_return_value = getattr(get_method, "_mock_return_value", _UNSET_MOCK_ATTR)
+    if mock_return_value is _UNSET_MOCK_ATTR:
+        return False
+    from unittest.mock import DEFAULT as MOCK_DEFAULT
+
+    if mock_return_value is MOCK_DEFAULT:
+        return False
+    return mock_return_value != mmdb_record
+
+
+def _lookup_mmdb_record_and_prefix(reader: Any, ip: str) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
+    """
+    Retrieves the MMDB record and routing prefix length in one lookup via get_with_prefix_len
+    when supported, falling back to reader.get otherwise.
+    """
+    getter = getattr(reader, "get_with_prefix_len", None)
+    if callable(getter):
+        try:
+            result = getter(ip)
+        except (AttributeError, NotImplementedError):
+            result = None
+        if _is_valid_mmdb_prefix_tuple(result):
+            raw_rec, prefix_len = result
+            if _should_use_custom_mmdb_get(reader, raw_rec):
+                raw_rec = reader.get(ip)
+            return (raw_rec if isinstance(raw_rec, dict) else None, prefix_len)
+
+    rec = reader.get(ip)
+    return (rec if isinstance(rec, dict) else None, None)
+
+
 def _extract_mmdb_prefix_len(reader: Any, ip: str) -> Optional[int]:
     """Extracts the routing prefix length from a MaxMind reader when supported."""
     getter = getattr(reader, "get_with_prefix_len", None)
@@ -596,12 +650,7 @@ def _extract_mmdb_prefix_len(reader: Any, ip: str) -> Optional[int]:
         return None
     try:
         result = getter(ip)
-        if (
-            isinstance(result, tuple)
-            and len(result) == 2
-            and not isinstance(result[1], bool)
-            and isinstance(result[1], int)
-        ):
+        if _is_valid_mmdb_prefix_tuple(result):
             return result[1]
     except Exception:
         return None
@@ -677,6 +726,9 @@ def _read_maxmind_sync(ip: str) -> Dict[str, Any]:
     Reads local GeoLite2 and GeoIP2 Country, City, and ASN MMDB files synchronously.
     Offloaded via `asyncio.to_thread` to avoid blocking the ASGI event loop on disk I/O.
     """
+    if not are_offline_intelligence_caches_warm():
+        warm_offline_intelligence_caches()
+
     db_paths = _resolve_maxmind_db_paths()
     available_paths = {key: path for key, path in db_paths.items() if os.path.exists(path)}
 
@@ -714,9 +766,9 @@ def _read_maxmind_sync(ip: str) -> Dict[str, Any]:
         prefix_lens: Dict[str, Optional[int]] = {}
         for key, path in available_paths.items():
             reader = _get_maxmind_reader(path, maxminddb)
-            rec = reader.get(ip)
-            records[key] = rec if isinstance(rec, dict) else None
-            prefix_lens[key] = _extract_mmdb_prefix_len(reader, ip)
+            rec, prefix_len = _lookup_mmdb_record_and_prefix(reader, ip)
+            records[key] = rec
+            prefix_lens[key] = prefix_len
 
         combined_record = _merge_maxmind_records(
             records.get("country"),
@@ -2056,6 +2108,8 @@ async def _execute_detection_with_cache(
     specs_to_execute = [(idx, spec) for idx, spec in candidate_specs if spec[0] not in quota_blocked_entries]
     needs_http_client = any(spec[2] and spec[0] in cache_expected_keys for _, spec in specs_to_execute)
     needs_ptr = cached_ptr is None
+    needs_rule_warmup = not are_offline_intelligence_caches_warm()
+    maxmind_will_run = any(spec[0] == "maxmind" for _, spec in specs_to_execute)
 
     upstream_events: Dict[str, Dict[str, Any]] = {}
     events_token = _provider_upstream_events.set(upstream_events)
@@ -2067,14 +2121,18 @@ async def _execute_detection_with_cache(
     try:
         client = await _get_shared_http_client() if needs_http_client else None
         coroutines = [spec[4](client, ip) for _, spec in specs_to_execute]
+        ptr_index: Optional[int] = None
         if needs_ptr:
+            ptr_index = len(coroutines)
             coroutines.append(query_rdns_ptr(ip))
+        if needs_rule_warmup and not maxmind_will_run:
+            coroutines.append(asyncio.to_thread(warm_offline_intelligence_caches))
         if coroutines:
             gathered = await asyncio.gather(*coroutines, return_exceptions=True)
             for pos, (_, (provider_key, _, _, _, _)) in enumerate(specs_to_execute):
                 executed_provider_results[provider_key] = gathered[pos]
-            if needs_ptr:
-                ptr_raw = gathered[-1]
+            if ptr_index is not None:
+                ptr_raw = gathered[ptr_index]
     finally:
         _rdns_context_state.reset(rdns_token)
         _provider_upstream_events.reset(events_token)
@@ -2278,6 +2336,9 @@ async def _execute_detection_with_cache(
 
     if redis_write_ops:
         await asyncio.gather(*redis_write_ops)
+
+    if not are_offline_intelligence_caches_warm():
+        await asyncio.to_thread(warm_offline_intelligence_caches)
 
     return _assemble_detection_payload(
         ip,

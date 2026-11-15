@@ -8720,3 +8720,262 @@ class BatchDetectionEndpointTests(TestCase):
         self.assertEqual(link_local_res["nonPublicCategory"], "link_local")
         self.assertEqual(link_local_res["results"], [])
 
+
+class CompactResponseAndCacheControlTests(TestCase):
+    """Tests for compact response stripping, cache control headers, and shared cache preservation."""
+
+    def setUp(self):
+        views._ip_detect_inflight.clear()
+        views._http_client_instance = None
+        views._http_client_loop = None
+        dns_patcher = patch(
+            "dns.asyncresolver.Resolver.resolve",
+            new_callable=AsyncMock,
+            side_effect=dns.resolver.NXDOMAIN(),
+        )
+        dns_patcher.start()
+        self.addCleanup(dns_patcher.stop)
+
+    def tearDown(self):
+        views._ip_detect_inflight.clear()
+        views._http_client_instance = None
+        views._http_client_loop = None
+
+    @staticmethod
+    def _stub_provider(name: str) -> dict:
+        return {
+            "provider": name,
+            "status": "200 OK",
+            "statusCode": 200,
+            "asn": "AS15169",
+            "isp": "Google LLC",
+            "organisation": "Google LLC",
+            "location": "United States",
+            "usageType": "isp",
+            "countryCode": "US",
+            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
+            "rawJson": {"provider": name, "count": 10},
+        }
+
+    def _patch_all_providers(self):
+        provider_map = (
+            ("detector.views.query_cloudflare_radar", "Cloudflare Radar"),
+            ("detector.views.query_abuseipdb", "AbuseIPDB"),
+            ("detector.views.query_ipdata", "IPData"),
+            ("detector.views.query_ipregistry", "IPRegistry"),
+            ("detector.views.query_ip2location", "IP2Location"),
+            ("detector.views.query_getipintel", "GetIPIntel"),
+            ("detector.views.query_proxycheck", "Proxycheck"),
+            ("detector.views.query_iphub", "IPHub"),
+            ("detector.views.query_iphunter", "IPHunter"),
+            ("detector.views.query_maxmind", "MaxMind"),
+            ("detector.views.query_tor_onionoo", "Tor Onionoo"),
+            ("detector.views.query_stopforumspam", "StopForumSpam"),
+            ("detector.views.query_dshield", "DShield"),
+        )
+        for target, name in provider_map:
+            patcher = patch(target, new_callable=AsyncMock, return_value=self._stub_provider(name))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_strip_raw_json_from_payload_helper_does_not_mutate_input(self):
+        original_row = {"provider": "IPData", "status": "200 OK", "rawJson": {"count": "5"}}
+        original_payload = {"ip": "8.8.8.8", "results": [original_row, "non-dict-row"]}
+
+        stripped = views._strip_raw_json_from_payload(original_payload)
+
+        self.assertIsNot(stripped, original_payload)
+        self.assertIsNot(stripped["results"], original_payload["results"])
+        self.assertIsNot(stripped["results"][0], original_row)
+        self.assertNotIn("rawJson", stripped["results"][0])
+        self.assertEqual(stripped["results"][0]["provider"], "IPData")
+        self.assertEqual(stripped["results"][1], "non-dict-row")
+        self.assertIn("rawJson", original_row)
+
+        no_results_payload = {"ip": "8.8.8.8"}
+        self.assertEqual(views._strip_raw_json_from_payload(no_results_payload), no_results_payload)
+
+    @patch("detector.views.redis_client", None)
+    def test_detect_ip_compact_strips_raw_json_and_sets_cache_control_header(self):
+        self._patch_all_providers()
+        _login_authorised(self)
+
+        for query_suffix in ("&compact=1", "&compact=true", "&compact=TRUE", "&compact=yes"):
+            with self.subTest(query_suffix=query_suffix):
+                resp = self.client.get(f"/api/v1/detect?ip=8.8.8.8{query_suffix}")
+                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(resp.headers.get("Cache-Control"), "private, max-age=300")
+                payload = resp.json()
+                self.assertEqual(len(payload["results"]), 14)
+                for row in payload["results"]:
+                    self.assertNotIn("rawJson", row)
+
+        for query_suffix in ("", "&compact=0", "&compact=false"):
+            with self.subTest(query_suffix=query_suffix or "default"):
+                resp = self.client.get(f"/api/v1/detect?ip=8.8.8.8{query_suffix}")
+                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(resp.headers.get("Cache-Control"), "private, max-age=300")
+                payload = resp.json()
+                self.assertEqual(len(payload["results"]), 14)
+                for row in payload["results"]:
+                    self.assertIn("rawJson", row)
+
+    def test_detect_ip_error_responses_omit_cache_control_header(self):
+        unauth_resp = self.client.get("/api/v1/detect?ip=8.8.8.8&compact=1")
+        self.assertEqual(unauth_resp.status_code, 401)
+        self.assertIsNone(unauth_resp.headers.get("Cache-Control"))
+
+        session = self.client.session
+        session["wikimedia_user"] = {
+            "isLoggedIn": True,
+            "username": "UnprivilegedEditor",
+            "role": "Standard User (Unauthorised)",
+            "hasAccess": False,
+            "localGroups": ["user"],
+            "globalGroups": [],
+        }
+        session.save()
+        forbidden_resp = self.client.get("/api/v1/detect?ip=8.8.8.8&compact=1")
+        self.assertEqual(forbidden_resp.status_code, 403)
+        self.assertIsNone(forbidden_resp.headers.get("Cache-Control"))
+
+        _login_authorised(self)
+        bad_ip_resp = self.client.get("/api/v1/detect?ip=not-an-ip&compact=1")
+        self.assertEqual(bad_ip_resp.status_code, 400)
+        self.assertIsNone(bad_ip_resp.headers.get("Cache-Control"))
+
+    async def test_compact_singleflight_does_not_strip_raw_json_from_concurrent_full_request(self):
+        provider_calls = {"count": 0}
+
+        def _make_slow_ok(name):
+            async def _impl(client, ip):
+                if name == "Proxycheck":
+                    provider_calls["count"] += 1
+                    await asyncio.sleep(0.03)
+                return self._stub_provider(name)
+
+            return _impl
+
+        auth_headers = {"Authorization": f"Bearer {views.issue_gadget_token('SysopUser')}"}
+        factory = AsyncRequestFactory()
+        compact_req = factory.get("/api/v1/detect?ip=8.8.4.4&compact=1", headers=auth_headers)
+        full_req = factory.get("/api/v1/detect?ip=8.8.4.4", headers=auth_headers)
+
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        with (
+            patch("detector.views.redis_client", None),
+            patch("detector.views._get_shared_http_client", AsyncMock(return_value=mock_client)),
+            patch("detector.views.query_maxmind", AsyncMock(return_value=dict(MAXMIND_STUB))),
+            patch("detector.views.query_rdns_ptr", AsyncMock(return_value="dns.google")),
+            patch("detector.views.query_cloudflare_radar", side_effect=_make_slow_ok("Cloudflare Radar")),
+            patch("detector.views.query_abuseipdb", side_effect=_make_slow_ok("AbuseIPDB")),
+            patch("detector.views.query_ipdata", side_effect=_make_slow_ok("IPData")),
+            patch("detector.views.query_ipregistry", side_effect=_make_slow_ok("IPRegistry")),
+            patch("detector.views.query_ip2location", side_effect=_make_slow_ok("IP2Location")),
+            patch("detector.views.query_getipintel", side_effect=_make_slow_ok("GetIPIntel")),
+            patch("detector.views.query_proxycheck", side_effect=_make_slow_ok("Proxycheck")),
+            patch("detector.views.query_iphub", side_effect=_make_slow_ok("IPHub")),
+            patch("detector.views.query_iphunter", side_effect=_make_slow_ok("IPHunter")),
+            patch("detector.views.query_tor_onionoo", side_effect=_make_slow_ok("Tor Onionoo")),
+            patch("detector.views.query_stopforumspam", side_effect=_make_slow_ok("StopForumSpam")),
+            patch("detector.views.query_dshield", side_effect=_make_slow_ok("DShield")),
+        ):
+            compact_resp, full_resp = await asyncio.gather(
+                views.detect_ip(compact_req),
+                views.detect_ip(full_req),
+            )
+
+        self.assertEqual(provider_calls["count"], 1)
+        self.assertEqual(compact_resp.status_code, 200)
+        self.assertEqual(full_resp.status_code, 200)
+        self.assertEqual(compact_resp.headers.get("Cache-Control"), "private, max-age=300")
+        self.assertEqual(full_resp.headers.get("Cache-Control"), "private, max-age=300")
+
+        compact_payload = json.loads(compact_resp.content)
+        full_payload = json.loads(full_resp.content)
+        for row in compact_payload["results"]:
+            self.assertNotIn("rawJson", row)
+        for row in full_payload["results"]:
+            self.assertIn("rawJson", row)
+
+    @override_settings(**TEST_UPSTREAM_SECRETS)
+    def test_compact_miss_preserves_redis_raw_json_and_ipdata_telemetry(self):
+        fake_redis = FakeAsyncRedis()
+        _login_authorised(self)
+
+        async def fake_get(url, **kwargs):
+            return ProactiveQuotaAndTelemetryTests._build_provider_http_response(url, ip="8.8.8.8")
+
+        fake_resolver = MagicMock()
+        fake_resolver.resolve = AsyncMock(side_effect=ProactiveQuotaAndTelemetryTests._clean_dns_side_effect)
+
+        with (
+            patch("detector.views.redis_client", fake_redis),
+            patch("detector.views.httpx.AsyncClient") as mock_client_cls,
+            patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver),
+            patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
+        ):
+            _patch_async_client(mock_client_cls, fake_get)
+            compact_resp = self.client.get("/api/v1/detect?ip=8.8.8.8&compact=1")
+            full_cached_resp = self.client.get("/api/v1/detect?ip=8.8.8.8")
+            compact_cached_resp = self.client.get("/api/v1/detect?ip=8.8.8.8&compact=true")
+
+        self.assertEqual(compact_resp.status_code, 200)
+        self.assertEqual(compact_resp.headers.get("Cache-Control"), "private, max-age=300")
+        for row in compact_resp.json()["results"]:
+            self.assertNotIn("rawJson", row)
+
+        # Ensure IPData usage count was still extracted from rawJson before stripping the response
+        ipdata_key = next(key for key in fake_redis.hashes if key.startswith("proxycheck:v1:telemetry:ipdata:day:"))
+        self.assertEqual(fake_redis.hashes[ipdata_key].get("upstream_used"), "142")
+
+        self.assertEqual(full_cached_resp.status_code, 200)
+        full_payload = full_cached_resp.json()
+        self.assertTrue(full_payload["isCached"])
+        for row in full_payload["results"]:
+            self.assertIn("rawJson", row)
+
+        self.assertEqual(compact_cached_resp.status_code, 200)
+        compact_cached_payload = compact_cached_resp.json()
+        self.assertTrue(compact_cached_payload["isCached"])
+        for row in compact_cached_payload["results"]:
+            self.assertNotIn("rawJson", row)
+
+    @patch("detector.views.redis_client", None)
+    def test_batch_detect_compact_strips_raw_json_when_requested(self):
+        self._patch_all_providers()
+        bearer_token = views.issue_gadget_token("SysopUser")
+        headers = {"HTTP_AUTHORIZATION": f"Bearer {bearer_token}"}
+
+        query_compact_resp = self.client.post(
+            "/api/v1/detect/batch?compact=1",
+            data=json.dumps({"ips": ["1.1.1.1"]}),
+            content_type="application/json",
+            **headers,
+        )
+        self.assertEqual(query_compact_resp.status_code, 200)
+        for row in query_compact_resp.json()["results"]["1.1.1.1"]["results"]:
+            self.assertNotIn("rawJson", row)
+
+        body_compact_resp = self.client.post(
+            "/api/v1/detect/batch",
+            data=json.dumps({"ips": ["1.1.1.1"], "compact": True}),
+            content_type="application/json",
+            **headers,
+        )
+        self.assertEqual(body_compact_resp.status_code, 200)
+        for row in body_compact_resp.json()["results"]["1.1.1.1"]["results"]:
+            self.assertNotIn("rawJson", row)
+
+        default_resp = self.client.post(
+            "/api/v1/detect/batch",
+            data=json.dumps({"ips": ["1.1.1.1"]}),
+            content_type="application/json",
+            **headers,
+        )
+        self.assertEqual(default_resp.status_code, 200)
+        for row in default_resp.json()["results"]["1.1.1.1"]["results"]:
+            self.assertIn("rawJson", row)
+
+

@@ -6,7 +6,6 @@ import asyncio
 import builtins
 import concurrent.futures
 import contextvars
-import copy
 import http.cookiejar
 import inspect
 import ipaddress
@@ -87,7 +86,6 @@ from .quota_telemetry import (
     is_provider_configured,
     record_global_request_telemetry,
     record_provider_outcomes_batch,
-    refund_consumed_quota,
 )
 
 logger = logging.getLogger(__name__)
@@ -145,7 +143,7 @@ def _get_circuit_breaker_cooldown_seconds() -> float:
         return _REDIS_CIRCUIT_BREAKER_DEFAULT_SECONDS
     try:
         seconds = float(raw_value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return _REDIS_CIRCUIT_BREAKER_DEFAULT_SECONDS
     if not math.isfinite(seconds) or seconds <= 0.0:
         return 0.0
@@ -808,7 +806,7 @@ def _lookup_mmdb_record_and_prefix(reader: Any, ip: str) -> Tuple[Optional[Dict[
     if callable(getter):
         try:
             result = getter(ip)
-        except (AttributeError, NotImplementedError):
+        except AttributeError, NotImplementedError:
             result = None
         if _is_valid_mmdb_prefix_tuple(result):
             raw_rec, prefix_len = result
@@ -884,10 +882,7 @@ def _is_maxmind_probe_mocked() -> bool:
             _resolve_maxmind_db_paths is not _DEFAULT_RESOLVE_MAXMIND_DB_PATHS
             and getattr(_resolve_maxmind_db_paths, "_mock_wraps", None) is None
         )
-        or (
-            _resolve_db_file is not _DEFAULT_RESOLVE_DB_FILE
-            and getattr(_resolve_db_file, "_mock_wraps", None) is None
-        )
+        or (_resolve_db_file is not _DEFAULT_RESOLVE_DB_FILE and getattr(_resolve_db_file, "_mock_wraps", None) is None)
     )
 
 
@@ -2289,9 +2284,7 @@ def _should_refresh_cached_maxmind_entry(raw_value: Optional[str], row: Dict[str
     if row.get("coordinates") is not None:
         return False
     city_db_loaded = getattr(row, "_city_db_loaded", None)
-    if isinstance(city_db_loaded, bool) and (
-        not raw_value or getattr(row, "_source_raw_value", None) == raw_value
-    ):
+    if isinstance(city_db_loaded, bool) and (not raw_value or getattr(row, "_source_raw_value", None) == raw_value):
         return not city_db_loaded
     if raw_value:
         try:

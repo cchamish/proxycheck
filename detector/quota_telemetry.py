@@ -544,7 +544,7 @@ async def _clamp_negative_quota_counters(
     if not tracked_ops or not isinstance(results, (list, tuple)):
         return
     negative_targets: List[Tuple[str, int]] = []
-    for op_meta, raw_val in zip(tracked_ops, results):
+    for op_meta, raw_val in zip(tracked_ops, results, strict=False):
         if op_meta is None:
             continue
         if isinstance(raw_val, int) and not isinstance(raw_val, bool) and raw_val < 0:

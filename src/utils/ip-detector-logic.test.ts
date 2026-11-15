@@ -738,143 +738,173 @@ test('App.vue gates the API Quota & Health dashboard modal to authorised adminis
   assert.match(dashboardModalVue, /OK \/ CACHE HIT \/ 429 \/ QUOTA BLOCKED/);
 });
 
+async function createUserscriptTestHarness(
+  fetchImpl: (url: string, init?: any) => Promise<any>,
+  anchorCount: number,
+  options?: {
+    initialStorageEntries?: Array<[string, string]>;
+    storageDisabled?: boolean;
+  }
+) {
+  const userscriptPath = path.resolve(process.cwd(), '../js/hydrogen-meta-userscript.js');
+  if (!fs.existsSync(userscriptPath)) {
+    return null;
+  }
+  const vm = await import('node:vm');
+  const scriptSource = fs.readFileSync(userscriptPath, 'utf8');
+  const anchors: any[] = [];
+  const insertedBadges: any[] = [];
+
+  for (let i = 1; i <= anchorCount; i += 1) {
+    const anchor: any = {
+      nodeType: 1,
+      textContent: `198.51.100.${i}`,
+      dataset: {},
+      style: {},
+      nextSibling: null,
+      nextElementSibling: null,
+      classList: { contains: () => false },
+      matches: (sel: string) => sel === 'a.ext-checkuser-tempaccount-reveal-ip-anchor',
+      closest: () => null,
+    };
+    anchor.parentNode = {
+      insertBefore: (badge: any) => {
+        insertedBadges.push({ ip: anchor.textContent, badge });
+        anchor.nextElementSibling = badge;
+      },
+    };
+    anchors.push(anchor);
+  }
+
+  let readyCallback: (() => void) | null = null;
+  let observerDisconnected = false;
+  const storageMap = new Map<string, string>(
+    options?.initialStorageEntries ?? [
+      ['proxycheck-ip-policy-consent', '1'],
+      ['proxycheck-gadget-token', 'initial-signed-token'],
+      ['proxycheck-gadget-token-user', 'AdminTester'],
+    ]
+  );
+
+  const mwStub = {
+    config: {
+      get: (key: string) => {
+        if (key === 'wgUserName') return 'AdminTester';
+        if (key === 'wgUserIsTemp') return false;
+        if (key === 'wgServerName') return 'meta.wikimedia.org';
+        if (key === 'wgCanonicalSpecialPageName') return false;
+        return null;
+      },
+    },
+    storage: options?.storageDisabled
+      ? {
+          get: (k: string) => (k === 'proxycheck-ip-policy-consent' ? '1' : false),
+          set: () => false,
+          remove: () => false,
+        }
+      : {
+          get: (k: string) => storageMap.get(k) ?? null,
+          set: (k: string, v: string) => storageMap.set(k, v),
+          remove: (k: string) => storageMap.delete(k),
+        },
+    loader: {
+      using: () => Promise.resolve(),
+    },
+    Api: function () {
+      return {
+        get: () =>
+          Promise.resolve({
+            centralauthtoken: { centralauthtoken: 'fresh-cat-token' },
+          }),
+      };
+    },
+    html: {
+      escape: (s: string) => s,
+    },
+  };
+
+  const jQueryStub: any = (arg: any) => {
+    if (typeof arg === 'function') {
+      readyCallback = arg;
+    }
+    return { length: 0 };
+  };
+
+  const documentStub = {
+    body: {
+      nodeType: 1,
+      matches: () => false,
+      closest: () => null,
+      querySelectorAll: (sel: string) =>
+        sel === 'a.ext-checkuser-tempaccount-reveal-ip-anchor' ? anchors : [],
+    },
+    getElementById: () => null,
+    createElement: (tag: string) => ({
+      tagName: tag.toUpperCase(),
+      style: {},
+      classList: { contains: (cls: string) => cls === 'proxycheck-ip-badge' },
+      addEventListener: () => {},
+    }),
+    createTextNode: (text: string) => ({ nodeType: 3, textContent: text }),
+  };
+
+  const windowStub: any = {
+    setTimeout: globalThis.setTimeout.bind(globalThis),
+    clearTimeout: globalThis.clearTimeout.bind(globalThis),
+    setInterval: globalThis.setInterval.bind(globalThis),
+    clearInterval: globalThis.clearInterval.bind(globalThis),
+  };
+
+  const context = vm.createContext({
+    mediaWiki: mwStub,
+    jQuery: jQueryStub,
+    window: windowStub,
+    document: documentStub,
+    MutationObserver: function () {
+      return {
+        observe: () => {},
+        disconnect: () => {
+          observerDisconnected = true;
+        },
+      };
+    },
+    fetch: fetchImpl,
+    console,
+    Promise,
+    Map,
+    Set,
+    Object,
+    Array,
+    String,
+    Number,
+    Boolean,
+    JSON,
+    encodeURIComponent,
+    isNaN,
+  });
+
+  vm.runInContext(scriptSource, context);
+  if (readyCallback) {
+    (readyCallback as () => void)();
+  }
+
+  return {
+    anchors,
+    insertedBadges,
+    storageMap,
+    isObserverDisconnected: () => observerDisconnected,
+  };
+}
+
 test('Userscript micro-batcher coalesces 20 IP anchors into one batch POST and falls back on 404 or 405', async () => {
   const userscriptPath = path.resolve(process.cwd(), '../js/hydrogen-meta-userscript.js');
   if (!fs.existsSync(userscriptPath)) {
     return;
   }
-  const vm = await import('node:vm');
-  const scriptSource = fs.readFileSync(userscriptPath, 'utf8');
-
-  function createHarness(fetchImpl: (url: string, init?: any) => Promise<any>, anchorCount: number) {
-    const anchors: any[] = [];
-    const insertedBadges: any[] = [];
-
-    for (let i = 1; i <= anchorCount; i += 1) {
-      const anchor: any = {
-        nodeType: 1,
-        textContent: `198.51.100.${i}`,
-        dataset: {},
-        style: {},
-        nextSibling: null,
-        nextElementSibling: null,
-        classList: { contains: () => false },
-        matches: (sel: string) => sel === 'a.ext-checkuser-tempaccount-reveal-ip-anchor',
-        closest: () => null,
-      };
-      anchor.parentNode = {
-        insertBefore: (badge: any) => {
-          insertedBadges.push({ ip: anchor.textContent, badge });
-          anchor.nextElementSibling = badge;
-        },
-      };
-      anchors.push(anchor);
-    }
-
-    let readyCallback: (() => void) | null = null;
-    const storageMap = new Map<string, string>([
-      ['proxycheck-ip-policy-consent', '1'],
-      ['proxycheck-gadget-token', 'initial-signed-token'],
-      ['proxycheck-gadget-token-user', 'AdminTester'],
-    ]);
-
-    const mwStub = {
-      config: {
-        get: (key: string) => {
-          if (key === 'wgUserName') return 'AdminTester';
-          if (key === 'wgUserIsTemp') return false;
-          if (key === 'wgServerName') return 'meta.wikimedia.org';
-          if (key === 'wgCanonicalSpecialPageName') return false;
-          return null;
-        },
-      },
-      storage: {
-        get: (k: string) => storageMap.get(k) ?? null,
-        set: (k: string, v: string) => storageMap.set(k, v),
-        remove: (k: string) => storageMap.delete(k),
-      },
-      loader: {
-        using: () => Promise.resolve(),
-      },
-      Api: function () {
-        return {
-          get: () =>
-            Promise.resolve({
-              centralauthtoken: { centralauthtoken: 'fresh-cat-token' },
-            }),
-        };
-      },
-      html: {
-        escape: (s: string) => s,
-      },
-    };
-
-    const jQueryStub: any = (arg: any) => {
-      if (typeof arg === 'function') {
-        readyCallback = arg;
-      }
-      return { length: 0 };
-    };
-
-    const documentStub = {
-      body: {
-        nodeType: 1,
-        matches: () => false,
-        closest: () => null,
-        querySelectorAll: (sel: string) =>
-          sel === 'a.ext-checkuser-tempaccount-reveal-ip-anchor' ? anchors : [],
-      },
-      getElementById: () => null,
-      createElement: (tag: string) => ({
-        tagName: tag.toUpperCase(),
-        style: {},
-        classList: { contains: (cls: string) => cls === 'proxycheck-ip-badge' },
-        addEventListener: () => {},
-      }),
-      createTextNode: (text: string) => ({ nodeType: 3, textContent: text }),
-    };
-
-    const windowStub: any = {
-      setTimeout: globalThis.setTimeout.bind(globalThis),
-      clearTimeout: globalThis.clearTimeout.bind(globalThis),
-      setInterval: globalThis.setInterval.bind(globalThis),
-      clearInterval: globalThis.clearInterval.bind(globalThis),
-    };
-
-    const context = vm.createContext({
-      mediaWiki: mwStub,
-      jQuery: jQueryStub,
-      window: windowStub,
-      document: documentStub,
-      MutationObserver: function () {
-        return { observe: () => {}, disconnect: () => {} };
-      },
-      fetch: fetchImpl,
-      console,
-      Promise,
-      Map,
-      Set,
-      Object,
-      Array,
-      String,
-      Number,
-      Boolean,
-      JSON,
-      encodeURIComponent,
-      isNaN,
-    });
-
-    vm.runInContext(scriptSource, context);
-    if (readyCallback) {
-      (readyCallback as () => void)();
-    }
-
-    return { anchors, insertedBadges };
-  }
 
   // Verify 20 simultaneous IP anchors coalesce into a single batch POST request
   const batchCalls: Array<{ url: string; method: string; body: any; auth: string }> = [];
-  const harness20 = createHarness(async (url, init) => {
+  const harness20 = (await createUserscriptTestHarness(async (url, init) => {
     const parsedBody = init?.body ? JSON.parse(init.body) : null;
     batchCalls.push({
       url,
@@ -907,7 +937,7 @@ test('Userscript micro-batcher coalesces 20 IP anchors into one batch POST and f
         count: parsedBody.ips.length,
       }),
     };
-  }, 20);
+  }, 20))!;
 
   await new Promise((resolve) => setTimeout(resolve, 90));
 
@@ -920,7 +950,7 @@ test('Userscript micro-batcher coalesces 20 IP anchors into one batch POST and f
   // Verify HTTP 401 on batch triggers one token refresh and retries the batch
   const retryCalls: string[] = [];
   let firstBatchAttempt = true;
-  const harness401 = createHarness(async (url, init) => {
+  const harness401 = (await createUserscriptTestHarness(async (url, init) => {
     retryCalls.push(url);
     if (url.endsWith('/api/v1/auth/gadget-token')) {
       return {
@@ -946,7 +976,7 @@ test('Userscript micro-batcher coalesces 20 IP anchors into one batch POST and f
       };
     }
     return { ok: true, status: 200, json: async () => ({ results, count: parsedBody.ips.length }) };
-  }, 3);
+  }, 3))!;
 
   await new Promise((resolve) => setTimeout(resolve, 90));
   assert.deepEqual(retryCalls, [
@@ -958,7 +988,7 @@ test('Userscript micro-batcher coalesces 20 IP anchors into one batch POST and f
 
   // Verify HTTP 404 on batch smoothly degrades all items in the batch to single-IP GET requests
   const fallbackCalls: string[] = [];
-  const harness404 = createHarness(async (url) => {
+  const harness404 = (await createUserscriptTestHarness(async (url) => {
     fallbackCalls.push(url);
     if (url.endsWith('/api/v1/detect/batch')) {
       return { ok: false, status: 404, json: async () => ({ error: 'Not found' }) };
@@ -980,12 +1010,194 @@ test('Userscript micro-batcher coalesces 20 IP anchors into one batch POST and f
         results: [],
       }),
     };
-  }, 4);
+  }, 4))!;
 
   await new Promise((resolve) => setTimeout(resolve, 90));
   assert.equal(fallbackCalls[0], 'https://proxycheck.toolforge.org/api/v1/detect/batch');
   assert.equal(fallbackCalls.filter((u) => u.includes('/api/v1/detect?ip=')).length, 4);
   assert.equal(harness404.insertedBadges.length, 4);
+});
+
+test('Userscript proactively refreshes expired stored tokens via TOKEN_EXPIRY_KEY and blocks on 403', async () => {
+  const userscriptPath = path.resolve(process.cwd(), '../js/hydrogen-meta-userscript.js');
+  if (!fs.existsSync(userscriptPath)) {
+    return;
+  }
+
+  function makeNonPublicBatchResponse(ip: string) {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        results: {
+          [ip]: {
+            ip,
+            isNonPublic: true,
+            nonPublicCategory: 'documentation',
+            nonPublicReason: 'Documentation Reserved Address',
+            results: [],
+          },
+        },
+        count: 1,
+      }),
+    };
+  }
+
+  // Expired TOKEN_EXPIRY_KEY triggers a proactive token exchange before sending any detection request
+  const expiredCalls: Array<{ url: string; auth: string }> = [];
+  const beforeExchangeMs = Date.now();
+  const expiredHarness = (await createUserscriptTestHarness(
+    async (url, init) => {
+      expiredCalls.push({ url, auth: init?.headers?.Authorization || '' });
+      if (url.endsWith('/api/v1/auth/gadget-token')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ token: 'proactively-refreshed-token', username: 'AdminTester', expires_in: 3600 }),
+        };
+      }
+      return makeNonPublicBatchResponse('198.51.100.1');
+    },
+    1,
+    {
+      initialStorageEntries: [
+        ['proxycheck-ip-policy-consent', '1'],
+        ['proxycheck-gadget-token', 'stale-signed-token'],
+        ['proxycheck-gadget-token-user', 'AdminTester'],
+        ['proxycheck-gadget-token-exp', String(Date.now() - 1000)],
+      ],
+    }
+  ))!;
+
+  await new Promise((resolve) => setTimeout(resolve, 90));
+  const afterExchangeMs = Date.now();
+
+  assert.deepEqual(expiredCalls, [
+    { url: 'https://proxycheck.toolforge.org/api/v1/auth/gadget-token', auth: '' },
+    {
+      url: 'https://proxycheck.toolforge.org/api/v1/detect/batch?compact=1',
+      auth: 'Bearer proactively-refreshed-token',
+    },
+  ]);
+  assert.equal(expiredHarness.storageMap.get('proxycheck-gadget-token'), 'proactively-refreshed-token');
+  const storedExpiryMs = Number(expiredHarness.storageMap.get('proxycheck-gadget-token-exp'));
+  assert.ok(
+    storedExpiryMs >= beforeExchangeMs + 3540 * 1000 && storedExpiryMs <= afterExchangeMs + 3540 * 1000,
+    `Expected stored expiry within 59-minute buffer window, got ${storedExpiryMs}`
+  );
+
+  // Corrupt TOKEN_EXPIRY_KEY also clears stored credentials and triggers proactive refresh
+  const corruptCalls: string[] = [];
+  await createUserscriptTestHarness(
+    async (url) => {
+      corruptCalls.push(url);
+      if (url.endsWith('/api/v1/auth/gadget-token')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ token: 'recovered-token', username: 'AdminTester', expires_in: 3600 }),
+        };
+      }
+      return makeNonPublicBatchResponse('198.51.100.1');
+    },
+    1,
+    {
+      initialStorageEntries: [
+        ['proxycheck-ip-policy-consent', '1'],
+        ['proxycheck-gadget-token', 'corrupt-expiry-token'],
+        ['proxycheck-gadget-token-user', 'AdminTester'],
+        ['proxycheck-gadget-token-exp', 'not-a-timestamp'],
+      ],
+    }
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 90));
+  assert.deepEqual(corruptCalls, [
+    'https://proxycheck.toolforge.org/api/v1/auth/gadget-token',
+    'https://proxycheck.toolforge.org/api/v1/detect/batch?compact=1',
+  ]);
+
+  // Unexpired TOKEN_EXPIRY_KEY reuses the cached token without hitting the exchange endpoint
+  const validCalls: Array<{ url: string; auth: string }> = [];
+  await createUserscriptTestHarness(
+    async (url, init) => {
+      validCalls.push({ url, auth: init?.headers?.Authorization || '' });
+      return makeNonPublicBatchResponse('198.51.100.1');
+    },
+    1,
+    {
+      initialStorageEntries: [
+        ['proxycheck-ip-policy-consent', '1'],
+        ['proxycheck-gadget-token', 'fresh-cached-token'],
+        ['proxycheck-gadget-token-user', 'AdminTester'],
+        ['proxycheck-gadget-token-exp', String(Date.now() + 120000)],
+      ],
+    }
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 90));
+  assert.deepEqual(validCalls, [
+    {
+      url: 'https://proxycheck.toolforge.org/api/v1/detect/batch?compact=1',
+      auth: 'Bearer fresh-cached-token',
+    },
+  ]);
+
+  // Disabled mw.storage returning false still exchanges a token and proceeds cleanly in memory
+  const disabledStorageCalls: Array<{ url: string; auth: string }> = [];
+  await createUserscriptTestHarness(
+    async (url, init) => {
+      disabledStorageCalls.push({ url, auth: init?.headers?.Authorization || '' });
+      if (url.endsWith('/api/v1/auth/gadget-token')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ token: 'memory-only-token', username: 'AdminTester', expires_in: 3600 }),
+        };
+      }
+      return makeNonPublicBatchResponse('198.51.100.1');
+    },
+    1,
+    { storageDisabled: true }
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 90));
+  assert.deepEqual(disabledStorageCalls, [
+    { url: 'https://proxycheck.toolforge.org/api/v1/auth/gadget-token', auth: '' },
+    {
+      url: 'https://proxycheck.toolforge.org/api/v1/detect/batch?compact=1',
+      auth: 'Bearer memory-only-token',
+    },
+  ]);
+
+  // HTTP 403 clears token, user, and expiry keys and halts access without retrying token exchange
+  const forbiddenCalls: string[] = [];
+  const forbiddenHarness = (await createUserscriptTestHarness(
+    async (url) => {
+      forbiddenCalls.push(url);
+      return {
+        ok: false,
+        status: 403,
+        json: async () => ({ error: 'Access denied. Insufficient Wikimedia user rights.' }),
+      };
+    },
+    1,
+    {
+      initialStorageEntries: [
+        ['proxycheck-ip-policy-consent', '1'],
+        ['proxycheck-gadget-token', 'revoked-token'],
+        ['proxycheck-gadget-token-user', 'AdminTester'],
+        ['proxycheck-gadget-token-exp', String(Date.now() + 120000)],
+      ],
+    }
+  ))!;
+
+  await new Promise((resolve) => setTimeout(resolve, 90));
+  assert.deepEqual(forbiddenCalls, ['https://proxycheck.toolforge.org/api/v1/detect/batch?compact=1']);
+  assert.equal(forbiddenHarness.storageMap.has('proxycheck-gadget-token'), false);
+  assert.equal(forbiddenHarness.storageMap.has('proxycheck-gadget-token-user'), false);
+  assert.equal(forbiddenHarness.storageMap.has('proxycheck-gadget-token-exp'), false);
+  assert.equal(forbiddenHarness.isObserverDisconnected(), true);
 });
 
 

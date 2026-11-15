@@ -3113,6 +3113,105 @@ class GadgetTokenAndCorsAuthTests(TestCase):
             self.assertEqual(expired_resp.status_code, 401)
             self.assertIn("expired", expired_resp.json()["error"].lower())
 
+    def test_gadget_bearer_token_rejects_temporary_accounts_and_enforces_restricted_allowlist(self):
+        self._patch_all_providers()
+        self.assertEqual(views.DEFAULT_GADGET_TOKEN_TTL_SECONDS, 3600)
+
+        with patch("detector.views.redis_client", None):
+            for temp_username in ("~2026-12345", " ~2026-99999 "):
+                temp_token = views.issue_gadget_token(temp_username)
+                verified_user, verified_err = views._verify_gadget_bearer_token(f"Bearer {temp_token}")
+                self.assertIsNone(verified_user)
+                self.assertEqual(verified_err, "Invalid authentication token.")
+
+                with override_settings(
+                    RESTRICT_TO_ALLOWED_WIKI_USERS=True,
+                    ALLOWED_WIKI_USERS="~2026-12345, ~2026-99999",
+                ):
+                    temp_resp = self.client.get(
+                        "/api/v1/detect?ip=8.8.8.8",
+                        HTTP_ORIGIN="https://zh.wikipedia.org",
+                        HTTP_AUTHORIZATION=f"Bearer {temp_token}",
+                    )
+                self.assertEqual(temp_resp.status_code, 401)
+
+            steward_userinfo = {
+                "username": "StewardOperator",
+                "local_groups": ["*", "user"],
+                "rights": [],
+                "centralids": {},
+                "domain": "zh.wikipedia.org",
+            }
+            with (
+                patch(
+                    "detector.views.verify_centralauth_userinfo",
+                    new_callable=AsyncMock,
+                    return_value=steward_userinfo,
+                ),
+                patch(
+                    "detector.views.fetch_user_rights_from_meta",
+                    new_callable=AsyncMock,
+                    return_value={
+                        "global_groups": ["steward"],
+                        "global_rights": ["checkuser-temporary-account"],
+                        "merged_projects": [],
+                    },
+                ),
+            ):
+                exchange_resp = self.client.post(
+                    "/api/v1/auth/gadget-token",
+                    data=json.dumps({"centralauthtoken": "valid-cat", "domain": "zh.wikipedia.org"}),
+                    content_type="application/json",
+                    HTTP_ORIGIN="https://zh.wikipedia.org",
+                )
+            self.assertEqual(exchange_resp.status_code, 200)
+            steward_token = exchange_resp.json()["token"]
+            self.assertEqual(exchange_resp.json()["expires_in"], 3600)
+
+            with (
+                override_settings(
+                    RESTRICT_TO_ALLOWED_WIKI_USERS=True,
+                    ALLOWED_WIKI_USERS="Allowlisted_Operator",
+                ),
+                patch.dict(os.environ, {"ALLOWED_WIKI_USERS": "Allowlisted_Operator"}),
+            ):
+                denied_detect = self.client.get(
+                    "/api/v1/detect?ip=8.8.8.8",
+                    HTTP_ORIGIN="https://zh.wikipedia.org",
+                    HTTP_AUTHORIZATION=f"Bearer {steward_token}",
+                )
+                self.assertEqual(denied_detect.status_code, 403)
+                self.assertEqual(
+                    denied_detect.json(),
+                    {"error": "Access denied. Insufficient Wikimedia user rights."},
+                )
+                self.assertEqual(
+                    denied_detect.headers.get("Access-Control-Allow-Origin"),
+                    "https://zh.wikipedia.org",
+                )
+
+                denied_batch = self.client.post(
+                    "/api/v1/detect/batch",
+                    data=json.dumps({"ips": ["8.8.8.8"]}),
+                    content_type="application/json",
+                    HTTP_ORIGIN="https://zh.wikipedia.org",
+                    HTTP_AUTHORIZATION=f"Bearer {steward_token}",
+                )
+                self.assertEqual(denied_batch.status_code, 403)
+                self.assertEqual(
+                    denied_batch.json(),
+                    {"error": "Access denied. Insufficient Wikimedia user rights."},
+                )
+
+                allowlisted_token = views.issue_gadget_token("allowlisted_Operator")
+                allowed_detect = self.client.get(
+                    "/api/v1/detect?ip=8.8.8.8",
+                    HTTP_ORIGIN="https://zh.wikipedia.org",
+                    HTTP_AUTHORIZATION=f"Bearer {allowlisted_token}",
+                )
+                self.assertEqual(allowed_detect.status_code, 200)
+                self.assertEqual(allowed_detect.json()["ip"], "8.8.8.8")
+
     def test_unified_rbac_evaluator_and_oauth_callback_parity(self):
         required_rights = (
             "checkuser-temporary-account",

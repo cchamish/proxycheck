@@ -4947,6 +4947,7 @@ class LoopIsolationAndSessionSettingsTests(TestCase):
             views._http_clients_by_loop.clear()
         with views._redis_client_lock:
             views._redis_clients_by_loop.clear()
+        views.reset_redis_circuit_breaker()
 
     def test_redis_client_reused_within_loop_and_isolated_across_closed_loops(self):
         created_clients = []
@@ -5162,6 +5163,7 @@ class RedisDegradationAndOAuthFallbackTests(TestCase):
         views._ip_detect_inflight.clear()
         with views._redis_client_lock:
             views._redis_clients_by_loop.clear()
+        views.reset_redis_circuit_breaker()
 
     async def test_safe_redis_helpers_degrade_on_connection_and_timeout_errors(self):
         failures = (
@@ -5278,6 +5280,178 @@ class RedisDegradationAndOAuthFallbackTests(TestCase):
                     self.assertFalse(payload["isCached"])
                     self.assertEqual(payload["cacheMeta"]["status"], "miss")
                     self.assertTrue(any("Redis cache" in line for line in captured_logs.output))
+
+    @override_settings(REDIS_CIRCUIT_BREAKER_SECONDS=5.0)
+    async def test_redis_circuit_breaker_opens_on_timeout_and_recovers_after_cooldown(self):
+        from detector import quota_telemetry
+
+        monotonic_clock = [100.0]
+        loop_client = MagicMock(name="default-loop-redis")
+        loop_client.get = AsyncMock(side_effect=[redis.exceptions.TimeoutError("Timed out"), "cached-ok"])
+        loop_client.set = AsyncMock(return_value=True)
+
+        views.reset_redis_circuit_breaker()
+        with (
+            patch.object(views.aioredis, "from_url", return_value=loop_client),
+            patch("detector.views.time.monotonic", side_effect=lambda: monotonic_clock[0]),
+        ):
+            self.assertFalse(views.is_redis_circuit_open())
+            self.assertIs(views._get_redis_client(), loop_client)
+
+            # Non-connection exceptions must not trip the circuit breaker
+            views.mark_redis_failure(ValueError("unexpected serialization error"))
+            self.assertFalse(views.is_redis_circuit_open())
+
+            with self.assertLogs("detector.views", level="WARNING") as captured_logs:
+                first_read = await views._safe_redis_get("proxycheck:v1:prov:proxycheck:8.8.8.8")
+
+            self.assertIsNone(first_read)
+            self.assertTrue(views.is_redis_circuit_open())
+            self.assertTrue(any("circuit breaker opened" in line for line in captured_logs.output))
+            self.assertEqual(loop_client.get.await_count, 1)
+
+            # Within the cooldown window, client acquisition fails open immediately without calling Redis
+            monotonic_clock[0] = 104.9
+            self.assertIsNone(views._get_redis_client())
+            self.assertIsNone(quota_telemetry._get_redis_client())
+            self.assertIsNone(await views._safe_redis_get("proxycheck:v1:prov:proxycheck:8.8.8.8"))
+            await views._safe_redis_set("proxycheck:v1:prov:proxycheck:8.8.8.8", "{}", ex=60)
+            self.assertEqual(loop_client.get.await_count, 1)
+            self.assertEqual(loop_client.set.await_count, 0)
+
+            # Once the cooldown elapses, the default client resumes automatically
+            monotonic_clock[0] = 105.0
+            self.assertFalse(views.is_redis_circuit_open())
+            self.assertIs(views._get_redis_client(), loop_client)
+            recovered_read = await views._safe_redis_get("proxycheck:v1:prov:proxycheck:8.8.8.8")
+            self.assertEqual(recovered_read, "cached-ok")
+            self.assertEqual(loop_client.get.await_count, 2)
+
+            # Write errors also trip the breaker and explicit reset closes it immediately
+            loop_client.set = AsyncMock(side_effect=ConnectionError("Connection reset by peer"))
+            await views._safe_redis_set("proxycheck:v1:prov:proxycheck:8.8.8.8", "{}", ex=60)
+            self.assertTrue(views.is_redis_circuit_open())
+            self.assertIsNone(views._get_redis_client())
+            views.reset_redis_circuit_breaker()
+            self.assertFalse(views.is_redis_circuit_open())
+            self.assertIs(views._get_redis_client(), loop_client)
+
+    @override_settings(REDIS_CIRCUIT_BREAKER_SECONDS=5.0)
+    @patch(
+        "dns.asyncresolver.Resolver.resolve",
+        new_callable=AsyncMock,
+        side_effect=_ptr_or_clean_dns_side_effect(ptr_hostname="dns.google."),
+    )
+    @patch("detector.views.query_dshield", new_callable=AsyncMock)
+    @patch("detector.views.query_stopforumspam", new_callable=AsyncMock)
+    @patch("detector.views.query_tor_onionoo", new_callable=AsyncMock)
+    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
+    @patch("detector.views.query_iphunter", new_callable=AsyncMock)
+    @patch("detector.views.query_iphub", new_callable=AsyncMock)
+    @patch("detector.views.query_proxycheck", new_callable=AsyncMock)
+    @patch("detector.views.query_getipintel", new_callable=AsyncMock)
+    @patch("detector.views.query_ip2location", new_callable=AsyncMock)
+    @patch("detector.views.query_ipregistry", new_callable=AsyncMock)
+    @patch("detector.views.query_ipdata", new_callable=AsyncMock)
+    @patch("detector.views.query_abuseipdb", new_callable=AsyncMock)
+    @patch("detector.views.query_cloudflare_radar", new_callable=AsyncMock)
+    async def test_redis_circuit_breaker_short_circuits_multistage_detect_request(
+        self,
+        mock_cf,
+        mock_abuse,
+        mock_ipdata,
+        mock_ipreg,
+        mock_ip2loc,
+        mock_gii,
+        mock_pc,
+        mock_iphub,
+        mock_iphunter,
+        mock_mm,
+        mock_tor,
+        mock_sfs,
+        mock_dshield,
+        _mock_dns,
+    ):
+        from django.test import AsyncClient
+
+        for mock_fn, name in (
+            (mock_cf, "Cloudflare Radar"),
+            (mock_abuse, "AbuseIPDB"),
+            (mock_ipdata, "IPData"),
+            (mock_ipreg, "IPRegistry"),
+            (mock_ip2loc, "IP2Location"),
+            (mock_gii, "GetIPIntel"),
+            (mock_pc, "Proxycheck"),
+            (mock_iphub, "IPHub"),
+            (mock_iphunter, "IPHunter"),
+            (mock_tor, "Tor Onionoo"),
+            (mock_sfs, "StopForumSpam"),
+            (mock_dshield, "DShield"),
+        ):
+            mock_fn.return_value = {
+                "provider": name,
+                "status": "200 OK",
+                "statusCode": 200,
+                "asn": "AS15169",
+                "isp": "Google",
+                "organisation": "Google",
+                "location": "United States",
+                "usageType": "isp",
+                "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
+                "countryCode": "US",
+                "rawJson": {},
+            }
+        mock_mm.return_value = dict(MAXMIND_STUB)
+
+        loop_client = MagicMock(name="hanging-default-loop-redis")
+        loop_client.mget = AsyncMock(side_effect=redis.exceptions.TimeoutError("Socket read timed out"))
+        loop_client.get = AsyncMock(side_effect=redis.exceptions.TimeoutError("Unexpected get call"))
+        loop_client.set = AsyncMock(side_effect=redis.exceptions.TimeoutError("Unexpected set call"))
+        loop_client.eval = AsyncMock(side_effect=redis.exceptions.TimeoutError("Unexpected eval call"))
+        loop_client.pipeline = MagicMock(side_effect=AssertionError("Pipeline should be skipped once circuit is open"))
+
+        bearer_token = views.issue_gadget_token("SysopUser")
+        asgi_client = AsyncClient()
+        views.reset_redis_circuit_breaker()
+
+        with (
+            patch.object(views.aioredis, "from_url", return_value=loop_client),
+            patch("detector.views.time.monotonic", return_value=200.0),
+        ):
+            resp = await asgi_client.get(
+                "/api/v1/detect?ip=8.8.8.8",
+                headers={"Authorization": f"Bearer {bearer_token}"},
+            )
+            self.assertEqual(resp.status_code, 200)
+            self.assertTrue(views.is_redis_circuit_open())
+            # Only the first cache-read stage contacts Redis; cooldown, quota, cache write, and telemetry fail open cleanly
+            self.assertEqual(loop_client.mget.await_count, 1)
+            self.assertEqual(loop_client.get.await_count, 0)
+            self.assertEqual(loop_client.set.await_count, 0)
+            self.assertEqual(loop_client.eval.await_count, 0)
+            self.assertEqual(loop_client.pipeline.call_count, 0)
+
+    @override_settings(REDIS_CIRCUIT_BREAKER_SECONDS=5.0)
+    async def test_redis_circuit_breaker_isolates_custom_mock_client_patches(self):
+        from detector import quota_telemetry
+
+        mock_redis = MagicMock(name="patched-mock-redis")
+        mock_redis.get = AsyncMock(side_effect=redis.exceptions.ConnectionError("Simulated mock outage"))
+        mock_redis.eval = AsyncMock(side_effect=redis.exceptions.ConnectionError("Simulated Lua outage"))
+        failing_pipe = MagicMock()
+        failing_pipe.execute = AsyncMock(side_effect=redis.exceptions.TimeoutError("Simulated pipe outage"))
+        mock_redis.pipeline = MagicMock(return_value=failing_pipe)
+
+        views.reset_redis_circuit_breaker()
+        with patch("detector.views.redis_client", mock_redis):
+            self.assertIsNone(await views._safe_redis_get("proxycheck:v1:prov:proxycheck:8.8.8.8"))
+            quota_res = await quota_telemetry.check_and_consume_quota("ipdata")
+            self.assertTrue(quota_res.allowed)
+            self.assertFalse(views.is_redis_circuit_open())
+            self.assertIs(views._get_redis_client(), mock_redis)
+
+        # Restoring the default client leaves the circuit closed
+        self.assertFalse(views.is_redis_circuit_open())
 
     @override_settings(
         WIKIMEDIA_CLIENT_ID="test_client_id",

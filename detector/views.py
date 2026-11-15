@@ -87,6 +87,7 @@ from .quota_telemetry import (
     is_provider_configured,
     record_global_request_telemetry,
     record_provider_outcomes_batch,
+    refund_consumed_quota,
 )
 
 logger = logging.getLogger(__name__)
@@ -1392,6 +1393,7 @@ def _record_upstream_event(
     reason: str = "",
     cooldown_seconds: Optional[int] = None,
     is_timeout: bool = False,
+    is_transport_error: bool = False,
     upstream_remaining: Optional[int] = None,
     upstream_limit: Optional[int] = None,
     upstream_used: Optional[int] = None,
@@ -1404,6 +1406,7 @@ def _record_upstream_event(
             "reason": reason,
             "cooldownSeconds": cooldown_seconds,
             "isTimeout": is_timeout,
+            "isTransportError": is_transport_error,
             "upstreamRemaining": upstream_remaining,
             "upstreamLimit": upstream_limit,
             "upstreamUsed": upstream_used,
@@ -1450,6 +1453,7 @@ async def _fetch_upstream_json(
             reason=reason,
             cooldown_seconds=default_cooldown,
             is_timeout=is_timeout,
+            is_transport_error=True,
         )
         return {"status": "error", "message": safe_message}, 502
 
@@ -2446,6 +2450,7 @@ async def _execute_detection_with_cache(
         if spec[0] != "maxmind" and (is_ipv4 or spec[0] not in _DNSBL_PROVIDER_KEYS) and is_provider_configured(spec[0])
     ]
     quota_blocked_entries: Dict[str, Dict[str, Any]] = {}
+    quota_consumed_keys: Set[str] = set()
     if active_redis is not None and quota_candidates:
         quota_results = await asyncio.gather(
             *(check_and_consume_quota(provider_key, now_dt=quota_dt) for provider_key in quota_candidates)
@@ -2464,6 +2469,8 @@ async def _execute_detection_with_cache(
                     "limit": quota_res.limit,
                     "cooldownSeconds": cooldown_secs,
                 }
+            else:
+                quota_consumed_keys.add(provider_key)
 
     specs_to_execute = [(idx, spec) for idx, spec in candidate_specs if spec[0] not in quota_blocked_entries]
     needs_http_client = any(spec[2] and spec[0] in cache_expected_keys for _, spec in specs_to_execute)
@@ -2596,6 +2603,11 @@ async def _execute_detection_with_cache(
                 else:
                     outcome_name = None
 
+                should_refund_quota = bool(
+                    provider_key in quota_consumed_keys
+                    and (miss_triggered_exception or (event and event.get("isTransportError") is True))
+                )
+
                 if outcome_name is not None:
                     telemetry_entries.append(
                         {
@@ -2604,6 +2616,7 @@ async def _execute_detection_with_cache(
                             "upstream_remaining": upstream_remaining,
                             "upstream_limit": upstream_limit,
                             "upstream_used": upstream_used,
+                            "refund_quota": should_refund_quota,
                         }
                     )
 

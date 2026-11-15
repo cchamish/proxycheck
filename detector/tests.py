@@ -8497,6 +8497,103 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
             "proxycheck:v1:telemetry:global:day:20261115",
         )
 
+    @override_settings(
+        **TEST_UPSTREAM_SECRETS,
+        GETIPINTEL_RPM_LIMIT=1,
+        GETIPINTEL_DAILY_LIMIT=5000,
+        PROXYCHECK_RPM_LIMIT=1,
+        PROXYCHECK_DAILY_LIMIT=1000,
+        ABUSEIPDB_RPM_LIMIT=10,
+        ABUSEIPDB_DAILY_LIMIT=100,
+        IPDATA_RPM_LIMIT=10,
+        IPDATA_DAILY_LIMIT=100,
+    )
+    def test_transport_errors_and_timeouts_refund_quota_while_http_responses_retain_quota(self):
+        fake_redis = FakeAsyncRedis()
+        _login_authorised(self)
+
+        async def fake_get(url, **kwargs):
+            if "getipintel.net" in url:
+                raise httpx.ConnectError("connection refused by upstream")
+            if "proxycheck.io" in url:
+                raise httpx.TimeoutException("read timed out")
+            if "abuseipdb.com" in url:
+                resp = _mock_response(status_code=429, json_value={"errors": [{"detail": "Rate limit"}]})
+                resp.headers = {"Retry-After": "60"}
+                return resp
+            return self._build_provider_http_response(url, ip="8.8.8.8")
+
+        fake_resolver = MagicMock()
+        fake_resolver.resolve = AsyncMock(side_effect=self._clean_dns_side_effect)
+
+        with (
+            patch("detector.views.redis_client", fake_redis),
+            patch("detector.views.httpx.AsyncClient") as mock_client_cls,
+            patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver),
+            patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
+        ):
+            _patch_async_client(mock_client_cls, fake_get)
+            response = self.client.get("/api/v1/detect?ip=8.8.8.8")
+
+        self.assertEqual(response.status_code, 200)
+
+        # ConnectError and TimeoutException must roll back both minute and daily quota counters to zero
+        for refunded_provider in ("getipintel", "proxycheck"):
+            min_key = next(
+                key for key in fake_redis.strings if key.startswith(f"proxycheck:v1:quota:{refunded_provider}:min:")
+            )
+            day_key = next(
+                key for key in fake_redis.strings if key.startswith(f"proxycheck:v1:quota:{refunded_provider}:day:")
+            )
+            self.assertEqual(fake_redis.strings[min_key], "0")
+            self.assertEqual(fake_redis.strings[day_key], "0")
+
+        # Valid HTTP 200 and HTTP 429 responses must retain their consumed quota count
+        for retained_provider in ("abuseipdb", "ipdata"):
+            min_key = next(
+                key for key in fake_redis.strings if key.startswith(f"proxycheck:v1:quota:{retained_provider}:min:")
+            )
+            day_key = next(
+                key for key in fake_redis.strings if key.startswith(f"proxycheck:v1:quota:{retained_provider}:day:")
+            )
+            self.assertEqual(fake_redis.strings[min_key], "1")
+            self.assertEqual(fake_redis.strings[day_key], "1")
+
+    def test_refund_consumed_quota_clamps_at_zero_and_fails_open_on_redis_error(self):
+        from datetime import datetime, timezone
+        from asgiref.sync import async_to_sync
+        from detector import quota_telemetry
+
+        fake_redis = FakeAsyncRedis()
+        sample_dt = datetime(2026, 11, 16, 5, 30, tzinfo=timezone.utc)
+        min_key = quota_telemetry._quota_minute_key("getipintel", sample_dt)
+        day_key = quota_telemetry._quota_daily_key("getipintel", sample_dt)
+
+        with patch("detector.views.redis_client", fake_redis):
+            quota_res = async_to_sync(quota_telemetry.check_and_consume_quota)("getipintel", now_dt=sample_dt)
+            self.assertTrue(quota_res.allowed)
+            self.assertEqual(fake_redis.strings[min_key], "1")
+            self.assertEqual(fake_redis.strings[day_key], "1")
+
+            # First refund decrements counters from 1 to 0
+            async_to_sync(quota_telemetry.refund_consumed_quota)("getipintel", now_dt=sample_dt)
+            self.assertEqual(fake_redis.strings[min_key], "0")
+            self.assertEqual(fake_redis.strings[day_key], "0")
+
+            # Repeated refund on zeroed counters must clamp back to 0 rather than going negative
+            async_to_sync(quota_telemetry.refund_consumed_quota)("getipintel", now_dt=sample_dt)
+            self.assertEqual(fake_redis.strings[min_key], "0")
+            self.assertEqual(fake_redis.strings[day_key], "0")
+
+            # Unknown provider keys are ignored without writing Redis keys
+            async_to_sync(quota_telemetry.refund_consumed_quota)("unknown_provider", now_dt=sample_dt)
+            self.assertFalse(any("unknown_provider" in k for k in fake_redis.strings))
+
+        failing_client = MagicMock()
+        failing_client.pipeline = MagicMock(side_effect=ConnectionError("redis offline"))
+        with patch("detector.views.redis_client", failing_client):
+            async_to_sync(quota_telemetry.refund_consumed_quota)("getipintel", now_dt=sample_dt)
+
 
 class _BatchingFakeRedis(FakeAsyncRedis):
     """In-memory Redis double that records single reads, batch reads and pipeline flushes."""

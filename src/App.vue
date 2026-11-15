@@ -34,6 +34,18 @@
             Log out
           </cdx-button>
         </template>
+        <cdx-button
+          action="default"
+          weight="normal"
+          size="medium"
+          class="theme-toggle-btn"
+          :aria-label="themeToggleAriaLabel"
+          :title="themeToggleAriaLabel"
+          @click="handleToggleTheme"
+        >
+          <cdx-icon :icon="themeToggleIcon" size="small" />
+          <span>{{ themeToggleText }}</span>
+        </cdx-button>
       </div>
     </header>
 
@@ -365,7 +377,7 @@
             rel="noopener noreferrer"
             title="Hosted on Wikimedia Toolforge"
           >
-            <img :src="toolforgeLogo" alt="Toolforge" class="footer-logo">
+            <img :src="toolforgeLogo" alt="Toolforge" class="footer-logo footer-logo--toolforge">
           </a>
           <a
             href="https://wikitech.wikimedia.org/wiki/Help:Cloud_Services_introduction"
@@ -373,7 +385,7 @@
             rel="noopener noreferrer"
             title="Powered by Wikimedia Cloud Services"
           >
-            <img :src="wmcsLogo" alt="Powered by Wikimedia Cloud Services" class="footer-logo">
+            <img :src="activeWmcsLogo" alt="Powered by Wikimedia Cloud Services" class="footer-logo">
           </a>
         </div>
       </div>
@@ -386,13 +398,24 @@ import { reactive, toRefs, ref, computed, watch, onMounted, onUnmounted } from '
 import proxycheckLogo from './assets/Proxycheck.svg';
 import toolforgeLogo from './assets/Toolforge.svg';
 import wmcsLogo from './assets/WMCS.svg';
+import wmcsDarkLogo from './assets/WMCS-dark.svg';
 import {
   CdxTextInput,
   CdxButton,
   CdxCard,
+  CdxIcon,
   CdxMessage,
 } from '@wikimedia/codex';
 import ProviderDashboardModal from './components/ProviderDashboardModal.vue';
+import {
+  applyThemeToDocument,
+  getNextTheme,
+  normalizeTheme,
+  readStoredTheme,
+  saveStoredTheme,
+  THEME_STORAGE_KEY,
+  type ThemeMode,
+} from './utils/theme';
 import {
   REQUIRED_USER_RIGHTS,
   buildOAuthLoginUrl,
@@ -414,6 +437,40 @@ import {
   type DetectionResponse,
   type ProviderRawResult,
 } from './utils/ip-detector-logic';
+
+const BRIGHT_ICON = {
+  path: 'm7.866 15.696-2 3.464-1.732-1 2-3.464zm8 2.464-1.732 1-2-3.464 1.732-1zM10 6a4 4 0 1 1 0 8 4 4 0 0 1 0-8m0 2a2 2 0 1 0 0 4 2 2 0 0 0 0-4m-6 3H0V9h4zm16 0h-4V9h4zM7.866 4.304l-1.732 1-2-3.464 1.732-1zm8-2.464-2 3.464-1.732-1 2-3.464z',
+};
+
+const MOON_ICON = {
+  path: 'M11.426 2.525c-1.287 2.085-1.379 4.72 0 6.948 1.385 2.239 3.924 3.522 6.575 3.525l.85 1.525a9.27 9.27 0 0 1-3.515 3.285c-4.54 2.445-10.375 1.018-13.037-3.283C-.39 10.18 1.24 4.657 5.814 2.191A10 10 0 0 1 10.577 1zm-2.511.644a8 8 0 0 0-2.153.783C3.137 5.905 1.954 10.166 4 13.472c2.073 3.352 6.726 4.547 10.387 2.575a7.5 7.5 0 0 0 1.687-1.236c-2.562-.496-4.916-1.97-6.35-4.286a8.5 8.5 0 0 1-.81-7.356Z',
+};
+
+const theme = ref<ThemeMode>(readStoredTheme());
+applyThemeToDocument(theme.value);
+
+const themeToggleIcon = computed(() => (theme.value === 'dark' ? BRIGHT_ICON : MOON_ICON));
+const themeToggleText = computed(() => (theme.value === 'dark' ? 'Light mode' : 'Dark mode'));
+const themeToggleAriaLabel = computed(() =>
+  theme.value === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'
+);
+const activeWmcsLogo = computed(() => (theme.value === 'dark' ? wmcsDarkLogo : wmcsLogo));
+
+function handleToggleTheme(): void {
+  const nextTheme = getNextTheme(theme.value);
+  theme.value = nextTheme;
+  saveStoredTheme(nextTheme);
+  applyThemeToDocument(nextTheme);
+}
+
+function handleThemeStorageSync(event: StorageEvent): void {
+  if (event.key !== THEME_STORAGE_KEY) {
+    return;
+  }
+  const syncedTheme = normalizeTheme(event.newValue);
+  theme.value = syncedTheme;
+  applyThemeToDocument(syncedTheme);
+}
 
 const HISTORY_STORAGE_KEY = 'proxy_detector_ip_history';
 
@@ -746,6 +803,7 @@ function getInitialIpParam(): string {
 let relativeTimeTimer: ReturnType<typeof setInterval> | null = null;
 
 onMounted(async () => {
+  window.addEventListener('storage', handleThemeStorageSync);
   relativeTimeTimer = setInterval(() => {
     nowTimestampMs.value = Date.now();
   }, 30_000);
@@ -760,6 +818,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  window.removeEventListener('storage', handleThemeStorageSync);
   if (relativeTimeTimer !== null) {
     clearInterval(relativeTimeTimer);
     relativeTimeTimer = null;

@@ -15,9 +15,9 @@ from django.urls import include, path, re_path
 from detector import views as detector_views
 
 _FALLBACK_SPA_HTML = """<!doctype html>
-<html lang="en-GB">
+<html lang="en-GB" data-theme="dark">
 <head><meta charset="utf-8"><title>Proxy Detector</title></head>
-<body><div id="app">Loading Proxy Detector...</div></body>
+<body style="margin:0;background:#101418;color:#eaecf0;"><div id="app">Loading Proxy Detector...</div></body>
 </html>"""
 
 

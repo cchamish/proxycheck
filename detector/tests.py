@@ -725,6 +725,27 @@ class CredentialRedactionTests(TestCase):
         self.assertEqual(cleaned.count("***REDACTED***"), 2)
 
     @override_settings(**EMPTY_UPSTREAM_SECRETS)
+    def test_sanitize_error_message_detects_dynamic_override_settings_key_changes(self):
+        with patch.dict(os.environ, EMPTY_UPSTREAM_SECRETS):
+            with override_settings(IPDATA_API_KEY="first-dynamic-key-1001"):
+                first_cached = views._configured_secret_values()
+                second_cached = views._configured_secret_values()
+                self.assertIs(first_cached, second_cached)
+                first_cleaned = views._sanitize_error_message(
+                    "Upstream rejected key first-dynamic-key-1001 with Bearer tok-abc123"
+                )
+                self.assertNotIn("first-dynamic-key-1001", first_cleaned)
+                self.assertNotIn("tok-abc123", first_cleaned)
+                self.assertIn("Bearer ***REDACTED***", first_cleaned)
+
+            with override_settings(IPDATA_API_KEY="rotated-dynamic-key-2002"):
+                rotated_cached = views._configured_secret_values()
+                self.assertIsNot(first_cached, rotated_cached)
+                rotated_cleaned = views._sanitize_error_message("Upstream rejected key rotated-dynamic-key-2002")
+                self.assertNotIn("rotated-dynamic-key-2002", rotated_cleaned)
+                self.assertIn("***REDACTED***", rotated_cleaned)
+
+    @override_settings(**EMPTY_UPSTREAM_SECRETS)
     def test_sanitize_ignores_empty_settings_and_handles_non_strings(self):
         with patch.dict(os.environ, EMPTY_UPSTREAM_SECRETS):
             self.assertEqual(views._sanitize_error_message("plain upstream failure"), "plain upstream failure")
@@ -1041,6 +1062,46 @@ class AggregationAndCacheIntegrityTests(TestCase):
         out_rows = {row["provider"]: row for row in aggregated["results"]}
         self.assertEqual(out_rows["IPData"]["securityFlags"], [{"label": "Hosting", "isHighRisk": True}])
         self.assertEqual(out_rows["IPRegistry"]["securityFlags"], [{"label": "Proxy", "isHighRisk": True}])
+
+        # Mutating returned securityFlags must not pollute the caller input list or flag dictionaries
+        out_rows["IPRegistry"]["securityFlags"][0]["label"] = "Mutated"
+        out_rows["IPRegistry"]["securityFlags"].append({"label": "Extra", "isHighRisk": False})
+        self.assertEqual(input_rows[1]["securityFlags"], [{"label": "Proxy", "isHighRisk": True}])
+        self.assertIs(out_rows["IPData"]["rawJson"], input_rows[0]["rawJson"])
+
+    def test_sanitized_cache_entry_skips_redundant_payload_sanitization_on_hit(self):
+        sanitized_entry = json.dumps(
+            {
+                "row": {
+                    "provider": "IPData",
+                    "status": "200 OK",
+                    "statusCode": 200,
+                    "rawJson": {"ip": "8.8.8.8"},
+                },
+                "cachedAt": "2026-11-15T08:00:00+00:00",
+                "sanitized": True,
+            }
+        )
+        legacy_entry = json.dumps(
+            {
+                "row": {
+                    "provider": "IPData",
+                    "status": "200 OK",
+                    "statusCode": 200,
+                    "rawJson": {"detail": "url?key=secret123"},
+                },
+                "cachedAt": "2026-11-15T08:00:00+00:00",
+            }
+        )
+        with patch("detector.views._sanitize_payload", wraps=views._sanitize_payload) as spy_sanitize:
+            decoded_sanitized = views._decode_cached_provider_entry(sanitized_entry)
+            self.assertIsNotNone(decoded_sanitized)
+            self.assertEqual(spy_sanitize.call_count, 0)
+
+            decoded_legacy = views._decode_cached_provider_entry(legacy_entry)
+            self.assertIsNotNone(decoded_legacy)
+            self.assertGreater(spy_sanitize.call_count, 0)
+            self.assertIn("key=***REDACTED***", decoded_legacy[0]["rawJson"]["detail"])
 
     @patch("dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock)
     @patch("detector.views.query_maxmind", new_callable=AsyncMock)

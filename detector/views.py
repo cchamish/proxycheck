@@ -320,6 +320,7 @@ REDACTED_PLACEHOLDER = "***REDACTED***"
 # Matches credential-bearing query parameters such as key=, api-key=, access_token= or contact=,
 # including quoted values as they appear in Python reprs
 _SENSITIVE_QUERY_PATTERN = re.compile(r"(?i)((?:api[_-]?key|key|token|secret|contact|pass(?:word)?)=['\"]?)[^&\s'\"]+")
+_BEARER_TOKEN_PATTERN = re.compile(r"(?i)(Bearer\s+)[^\s'\"\\,;]+")
 
 _SECRET_SETTING_NAMES = (
     "CLOUDFLARE_RADAR_TOKEN",
@@ -337,12 +338,20 @@ _SECRET_SETTING_NAMES = (
 # Very short values would redact ordinary words, and no real provider issues keys this short
 _MIN_SECRET_LENGTH = 4
 
+_secret_values_cache: Optional[Tuple[Tuple[Tuple[Optional[str], Any], ...], Tuple[str, ...]]] = None
 
-def _configured_secret_values() -> List[str]:
+
+def _configured_secret_values() -> Tuple[str, ...]:
     """Collects configured credentials from the environment and settings, longest first."""
+    global _secret_values_cache
+    fingerprint = tuple((os.environ.get(name), getattr(settings, name, "")) for name in _SECRET_SETTING_NAMES)
+    cached = _secret_values_cache
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
+
     values = set()
-    for name in _SECRET_SETTING_NAMES:
-        for candidate in (os.environ.get(name), getattr(settings, name, "")):
+    for env_val, setting_val in fingerprint:
+        for candidate in (env_val, setting_val):
             if not isinstance(candidate, str):
                 continue
             stripped = candidate.strip()
@@ -351,7 +360,9 @@ def _configured_secret_values() -> List[str]:
             values.add(stripped)
             # httpx percent-encodes query values, so the encoded form can show up in error text too
             values.add(quote(stripped, safe=""))
-    return sorted(values, key=len, reverse=True)
+    resolved = tuple(sorted(values, key=len, reverse=True))
+    _secret_values_cache = (fingerprint, resolved)
+    return resolved
 
 
 def _sanitize_error_message(err_str: str) -> str:
@@ -360,7 +371,7 @@ def _sanitize_error_message(err_str: str) -> str:
         return ""
     text = err_str if isinstance(err_str, str) else str(err_str)
     text = _SENSITIVE_QUERY_PATTERN.sub(lambda m: m.group(1) + REDACTED_PLACEHOLDER, text)
-    text = re.sub(r"(?i)(Bearer\s+)[^\s'\"\\,;]+", r"\1" + REDACTED_PLACEHOLDER, text)
+    text = _BEARER_TOKEN_PATTERN.sub(r"\1" + REDACTED_PLACEHOLDER, text)
     for secret_value in _configured_secret_values():
         text = text.replace(secret_value, REDACTED_PLACEHOLDER)
     return text
@@ -1390,7 +1401,14 @@ def aggregate_intelligence_metrics(
     tor_summary: Optional[str] = None
 
     normalized_results: List[Dict[str, Any]] = [
-        copy.deepcopy(item) for item in (clean_results or []) if isinstance(item, dict)
+        {
+            **item,
+            "securityFlags": [dict(f) for f in item["securityFlags"] if isinstance(f, dict)]
+            if isinstance(item.get("securityFlags"), list)
+            else item.get("securityFlags"),
+        }
+        for item in (clean_results or [])
+        if isinstance(item, dict)
     ]
     comparison_results: List[Dict[str, Any]] = []
 
@@ -1686,10 +1704,14 @@ def _decode_cached_provider_entry(raw_value: Optional[str]) -> Optional[Tuple[Di
         return None
     if "row" in parsed and isinstance(parsed["row"], dict):
         row = parsed["row"]
+        if not parsed.get("sanitized") and isinstance(row.get("rawJson"), (dict, list)):
+            row = {**row, "rawJson": _sanitize_payload(row["rawJson"])}
         cached_at = parsed.get("cachedAt")
         cached_at_str = cached_at if isinstance(cached_at, str) and cached_at else None
         return row, cached_at_str
     if "status" in parsed and "provider" in parsed:
+        if not parsed.get("sanitized") and isinstance(parsed.get("rawJson"), (dict, list)):
+            parsed = {**parsed, "rawJson": _sanitize_payload(parsed["rawJson"])}
         return parsed, None
     return None
 
@@ -1972,8 +1994,6 @@ async def _execute_detection_with_cache(
         if provider_key in cached_providers:
             row, cached_at = cached_providers[provider_key]
             row_copy = dict(row)
-            if isinstance(row_copy.get("rawJson"), (dict, list)):
-                row_copy["rawJson"] = _sanitize_payload(row_copy["rawJson"])
             row_copy["isCached"] = True
             if cached_at:
                 row_copy["cachedAt"] = cached_at
@@ -2065,7 +2085,7 @@ async def _execute_detection_with_cache(
                     )
 
             if _is_provider_result_cacheable(row):
-                entry_payload: Dict[str, Any] = {"row": row, "cachedAt": now_iso}
+                entry_payload: Dict[str, Any] = {"row": row, "cachedAt": now_iso, "sanitized": True}
                 if provider_key == "maxmind":
                     entry_payload["cityDbLoaded"] = _has_local_maxmind_city_db()
                 cache_entry = json.dumps(entry_payload)

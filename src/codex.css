@@ -968,6 +968,24 @@ body {
   text-decoration-color: var(--cdx-color-primary);
 }
 
+.footer-about-link {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--cdx-color-diagnostic-underline);
+  text-underline-offset: 2px;
+  cursor: pointer;
+  transition: color 0.15s, text-decoration-color 0.15s;
+}
+
+.footer-about-link:hover {
+  color: var(--cdx-color-primary);
+  text-decoration-color: var(--cdx-color-primary);
+}
+
 .cached-pill {
   display: inline-flex;
   align-items: center;
@@ -1036,6 +1054,27 @@ body {
 .cdx-dialog.provider-dashboard-dialog {
   max-width: 1120px;
   width: calc(100vw - 2rem);
+}
+
+.cdx-dialog.about-note-dialog {
+  width: min(760px, calc(100vw - 2rem));
+}
+
+.about-note-content {
+  color: var(--cdx-color-base);
+  line-height: 1.6;
+}
+
+.about-note-content p {
+  margin: 0 0 16px;
+}
+
+.about-note-content p:last-child {
+  margin-bottom: 0;
+}
+
+.about-note-content a {
+  color: var(--cdx-color-primary);
 }
 
 .dashboard-modal-content {

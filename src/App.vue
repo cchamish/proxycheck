@@ -354,6 +354,14 @@
       <div class="footer-left">
         <span class="diagnostic-text">
           &copy; 2026 &middot;
+          <button
+            type="button"
+            class="footer-about-link"
+            @click="isAboutOpen = true"
+          >
+            About
+          </button>
+          &middot;
           <a
             v-if="repoBaseUrl"
             :href="`${repoBaseUrl}/commit/${commitHash}`"
@@ -389,6 +397,8 @@
         </div>
       </div>
     </footer>
+
+    <about-note-modal v-model:open="isAboutOpen" />
   </div>
 </template>
 
@@ -405,6 +415,7 @@ import {
   CdxIcon,
   CdxMessage,
 } from '@wikimedia/codex';
+import AboutNoteModal from './components/AboutNoteModal.vue';
 import ProviderDashboardModal from './components/ProviderDashboardModal.vue';
 import {
   applyThemeToDocument,
@@ -517,6 +528,7 @@ const uiState = reactive<DetectionCoordinatorState>({
 });
 
 const isDashboardOpen = ref(false);
+const isAboutOpen = ref(false);
 const isAdminUser = computed(() => isAuthorisedAdminUser(user.value));
 
 const {

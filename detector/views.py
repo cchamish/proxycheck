@@ -2732,7 +2732,7 @@ _WIKIMEDIA_ORIGIN_RE = re.compile(
 _LOCAL_DEV_ORIGIN_RE = re.compile(r"^https?://(?:localhost|127\.0\.0\.1)(?::\d{1,5})?$")
 
 GADGET_TOKEN_SALT = "proxycheck.gadget.auth.v1"  # noqa: S105
-DEFAULT_GADGET_TOKEN_TTL_SECONDS = 604800
+DEFAULT_GADGET_TOKEN_TTL_SECONDS = 3600
 
 
 def _get_gadget_token_ttl_seconds() -> int:
@@ -2775,7 +2775,11 @@ def _verify_gadget_bearer_token(auth_header: str) -> Tuple[Optional[str], Option
     if not isinstance(username, str) or not username.strip():
         return None, "Invalid authentication token."
 
-    return username.strip(), None
+    cleaned_username = username.strip()
+    if cleaned_username.startswith("~"):
+        return None, "Invalid authentication token."
+
+    return cleaned_username, None
 
 
 def _is_allowed_wikimedia_origin(origin: Optional[str]) -> bool:
@@ -3106,6 +3110,11 @@ async def _authenticate_detect_request(request) -> Tuple[Optional[str], Optional
             return None, JsonResponse(
                 {"error": token_error or "Invalid authentication token."},
                 status=401,
+            )
+        if getattr(settings, "RESTRICT_TO_ALLOWED_WIKI_USERS", False) and not is_allowlisted_wiki_user(token_user):
+            return None, JsonResponse(
+                {"error": "Access denied. Insufficient Wikimedia user rights."},
+                status=403,
             )
         return "gadget", None
 

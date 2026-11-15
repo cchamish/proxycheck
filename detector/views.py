@@ -19,7 +19,7 @@ import threading
 import time
 import weakref
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import quote, urlencode
 
 import dns.asyncresolver
@@ -1087,7 +1087,7 @@ async def _fetch_upstream_json(
     url: str,
     *,
     headers: Optional[Dict[str, str]] = None,
-    timeout: float = 8.0,
+    timeout: Optional[Union[float, httpx.Timeout]] = None,
     follow_redirects: bool = False,
 ) -> Tuple[Any, int]:
     """
@@ -1095,11 +1095,13 @@ async def _fetch_upstream_json(
     and records HTTP 429, 5xx, or timeout signals for per-provider circuit breaking.
     """
     default_cooldown, _, _ = _get_cooldown_bounds()
+    request_kwargs: Dict[str, Any] = {"follow_redirects": follow_redirects}
+    if headers is not None:
+        request_kwargs["headers"] = headers
+    if timeout is not None:
+        request_kwargs["timeout"] = timeout
     try:
-        if headers is not None:
-            resp = await client.get(url, headers=headers, timeout=timeout, follow_redirects=follow_redirects)
-        else:
-            resp = await client.get(url, timeout=timeout, follow_redirects=follow_redirects)
+        resp = await client.get(url, **request_kwargs)
     except Exception as exc:
         is_timeout = isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError, TimeoutError))
         reason = "Upstream Timeout" if is_timeout else f"Upstream Exception ({type(exc).__name__})"
@@ -1309,21 +1311,34 @@ async def query_dshield(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
         "User-Agent": USER_AGENT_HEADER,
         "Accept": "application/json",
     }
+    owned_events_token = None
+    events = _provider_upstream_events.get()
+    if not isinstance(events, dict):
+        events = {}
+        owned_events_token = _provider_upstream_events.set(events)
+
     payload: Any = None
     status_code = 502
-    for idx, (host, url) in enumerate(endpoints):
-        payload, status_code = await _fetch_upstream_json(
-            client,
-            "dshield",
-            "DShield",
-            url,
-            headers=headers,
-            timeout=5.0,
-            follow_redirects=True,
-        )
-        if status_code < 500 or idx == len(endpoints) - 1:
-            break
-        logger.warning(f"DShield primary endpoint {host} returned {status_code}; retrying fallback endpoint")
+    try:
+        for idx, (host, url) in enumerate(endpoints):
+            started_at = time.monotonic()
+            payload, status_code = await _fetch_upstream_json(
+                client,
+                "dshield",
+                "DShield",
+                url,
+                headers=headers,
+                timeout=10.0,
+                follow_redirects=True,
+            )
+            elapsed = time.monotonic() - started_at
+            is_timeout = bool((events.get("dshield") or {}).get("isTimeout"))
+            if is_timeout or elapsed > 5.0 or status_code not in (502, 503, 504) or idx == len(endpoints) - 1:
+                break
+            logger.warning(f"DShield primary endpoint {host} returned {status_code}; retrying fallback endpoint")
+    finally:
+        if owned_events_token is not None:
+            _provider_upstream_events.reset(owned_events_token)
     return adapt_dshield(payload, status_code=status_code)
 
 

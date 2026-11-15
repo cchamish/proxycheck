@@ -4478,6 +4478,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
             captured["url"] = url
             captured["headers"] = kwargs.get("headers") or {}
             captured["follow_redirects"] = kwargs.get("follow_redirects")
+            captured["timeout"] = kwargs.get("timeout")
             return _mock_response(status_code=200, json_value={"ip": {"attacks": 0, "count": 0}})
 
         client = AsyncMock()
@@ -4486,6 +4487,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         self.assertEqual(captured["url"], "https://isc.sans.edu/api/ip/198.51.100.5?json")
         self.assertIn("ProxyCheck", captured["headers"].get("User-Agent", ""))
         self.assertTrue(captured["follow_redirects"])
+        self.assertEqual(captured["timeout"], 10.0)
 
     def test_dshield_retries_fallback_and_isolates_follow_redirects(self):
         # Verify the shared HTTP client and unrelated providers keep redirects disabled by default
@@ -4496,16 +4498,46 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
 
         async def _default_get(url, **kwargs):
             default_capture["follow_redirects"] = kwargs.get("follow_redirects")
+            default_capture["has_timeout_kwarg"] = "timeout" in kwargs
+            default_capture["timeout"] = kwargs.get("timeout")
             return _mock_response(status_code=200, json_value={"success": 1, "ip": {"appears": 0}})
 
         default_client = AsyncMock()
         default_client.get.side_effect = _default_get
         asyncio.run(views.query_stopforumspam(default_client, "198.51.100.5"))
         self.assertFalse(default_capture["follow_redirects"])
+        self.assertTrue(default_capture["has_timeout_kwarg"])
+        self.assertEqual(default_capture["timeout"], 5.0)
+
+        # Calling _fetch_upstream_json without timeout lets the client default timeout apply
+        asyncio.run(
+            views._fetch_upstream_json(
+                default_client,
+                "dshield",
+                "DShield",
+                "https://isc.sans.edu/api/ip/198.51.100.5?json",
+            )
+        )
+        self.assertFalse(default_capture["has_timeout_kwarg"])
+
+        # Passing an explicit httpx.Timeout overrides the client default timeout
+        custom_timeout = httpx.Timeout(12.0)
+        asyncio.run(
+            views._fetch_upstream_json(
+                default_client,
+                "dshield",
+                "DShield",
+                "https://isc.sans.edu/api/ip/198.51.100.5?json",
+                timeout=custom_timeout,
+            )
+        )
+        self.assertTrue(default_capture["has_timeout_kwarg"])
+        self.assertIs(default_capture["timeout"], custom_timeout)
 
         failure_modes = (
             ("network_error", httpx.ConnectError("connection reset")),
             ("http_503", _mock_response(status_code=503, text="<html>Service Unavailable</html>")),
+            ("http_504", _mock_response(status_code=504, text="<html>Gateway Timeout</html>")),
             (
                 "non_json_200",
                 _mock_response(
@@ -4524,7 +4556,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
                 token = views._provider_upstream_events.set(upstream_events)
 
                 async def _fallback_get(url, outcome=primary_outcome, captured_urls=attempted, **kwargs):
-                    captured_urls.append((url, kwargs.get("follow_redirects")))
+                    captured_urls.append((url, kwargs.get("follow_redirects"), kwargs.get("timeout")))
                     if "isc.sans.edu" in url:
                         if isinstance(outcome, Exception):
                             raise outcome
@@ -4544,8 +4576,8 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
                 self.assertEqual(
                     attempted,
                     [
-                        ("https://isc.sans.edu/api/ip/198.51.100.5?json", True),
-                        ("https://www.dshield.org/api/ip/198.51.100.5?json", True),
+                        ("https://isc.sans.edu/api/ip/198.51.100.5?json", True, 10.0),
+                        ("https://www.dshield.org/api/ip/198.51.100.5?json", True, 10.0),
                     ],
                 )
                 self.assertFalse(upstream_events["dshield"]["trigger"])
@@ -4567,6 +4599,77 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         with self.assertLogs("detector.views", level="WARNING"):
             failed_result = asyncio.run(views.query_dshield(both_bad_client, "198.51.100.5"))
         self.assertEqual(failed_result["status"], "502 Error")
+
+    def test_dshield_skips_fallback_on_timeout_slow_failure_or_non_gateway_status(self):
+        # ReadTimeout on the primary endpoint must return immediately without hitting the fallback host
+        timeout_urls = []
+        upstream_events = {}
+        token = views._provider_upstream_events.set(upstream_events)
+
+        async def _timeout_get(url, **kwargs):
+            timeout_urls.append((url, kwargs.get("timeout")))
+            raise httpx.ReadTimeout("timed out after 10s")
+
+        timeout_client = AsyncMock()
+        timeout_client.get.side_effect = _timeout_get
+        try:
+            with self.assertLogs("detector.views", level="ERROR"):
+                timeout_result = asyncio.run(views.query_dshield(timeout_client, "198.51.100.5"))
+        finally:
+            views._provider_upstream_events.reset(token)
+
+        self.assertEqual(timeout_result["status"], "502 Error")
+        self.assertEqual(timeout_urls, [("https://isc.sans.edu/api/ip/198.51.100.5?json", 10.0)])
+        self.assertTrue(upstream_events["dshield"]["isTimeout"])
+
+        # A primary error arriving after 5 seconds must also skip fallback to avoid doubling latency
+        slow_error_urls = []
+
+        async def _slow_error_get(url, **kwargs):
+            slow_error_urls.append((url, kwargs.get("timeout")))
+            return _mock_response(status_code=503, text="Slow gateway error")
+
+        slow_error_client = AsyncMock()
+        slow_error_client.get.side_effect = _slow_error_get
+        with (
+            patch.object(views, "time", SimpleNamespace(monotonic=MagicMock(side_effect=[100.0, 105.31]))),
+            self.assertLogs("detector.views", level="WARNING"),
+        ):
+            slow_error_result = asyncio.run(views.query_dshield(slow_error_client, "198.51.100.5"))
+
+        self.assertEqual(slow_error_result["status"], "503 Error")
+        self.assertEqual(slow_error_urls, [("https://isc.sans.edu/api/ip/198.51.100.5?json", 10.0)])
+
+        # A primary 200 response arriving after 5.31 seconds succeeds cleanly under the 10s budget
+        slow_ok_urls = []
+
+        async def _slow_ok_get(url, **kwargs):
+            slow_ok_urls.append((url, kwargs.get("timeout")))
+            return _mock_response(status_code=200, json_value={"ip": {"attacks": 0, "count": 0}})
+
+        slow_ok_client = AsyncMock()
+        slow_ok_client.get.side_effect = _slow_ok_get
+        with patch.object(views, "time", SimpleNamespace(monotonic=MagicMock(side_effect=[200.0, 205.31]))):
+            slow_ok_result = asyncio.run(views.query_dshield(slow_ok_client, "198.51.100.5"))
+
+        self.assertEqual(slow_ok_result["status"], "200 OK")
+        self.assertEqual(slow_ok_urls, [("https://isc.sans.edu/api/ip/198.51.100.5?json", 10.0)])
+
+        # Non-gateway statuses such as HTTP 500 or HTTP 429 do not trigger fallback
+        for status in (500, 429):
+            with self.subTest(status=status):
+                attempted = []
+
+                async def _status_get(url, code=status, seen=attempted, **kwargs):
+                    seen.append(url)
+                    return _mock_response(status_code=code, text="error")
+
+                status_client = AsyncMock()
+                status_client.get.side_effect = _status_get
+                with self.assertLogs("detector.views", level="WARNING"):
+                    res = asyncio.run(views.query_dshield(status_client, "198.51.100.5"))
+                self.assertEqual(len(attempted), 1)
+                self.assertEqual(res["statusCode"], status)
 
     @patch(
         "dns.asyncresolver.Resolver.resolve",

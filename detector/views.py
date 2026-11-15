@@ -2715,24 +2715,6 @@ async def _execute_detection_with_cache(
     )
 
 
-def _get_active_inflight_task(inflight_key: Tuple[str, str]) -> Optional[asyncio.Task]:
-    with _ip_detect_inflight_lock:
-        existing = _ip_detect_inflight.get(inflight_key)
-        if existing is None:
-            return None
-        try:
-            task_loop = existing.get_loop()
-        except Exception:
-            if _ip_detect_inflight.get(inflight_key) is existing:
-                _ip_detect_inflight.pop(inflight_key, None)
-            return None
-        if task_loop.is_closed() or existing.done():
-            if _ip_detect_inflight.get(inflight_key) is existing:
-                _ip_detect_inflight.pop(inflight_key, None)
-            return None
-        return existing
-
-
 def _release_inflight_task(inflight_key: Tuple[str, str], task: Optional[asyncio.Task]) -> None:
     if task is None:
         return
@@ -3228,95 +3210,65 @@ async def _detect_single_canonical_ip(
 
     current_loop = asyncio.get_running_loop()
     inflight_key = (ip, normalized_mode)
-    base_payload: Optional[Dict[str, Any]] = None
-    inflight_task = _get_active_inflight_task(inflight_key)
-    if inflight_task is not None:
-        try:
-            base_payload = await _await_inflight_task(inflight_task, current_loop)
-        except _StaleInflightLoopError:
-            _release_inflight_task(inflight_key, inflight_task)
-            base_payload = None
-
-    if base_payload is None:
-        cached_providers, cached_ptr = await _read_provider_caches(ip)
-        is_ipv4_target = _reverse_ipv4_octets(ip) is not None
-        # Skipped or unconfigured sources never reach the cache, so only expected sources decide a full hit
-        all_cached = cached_ptr is not None and all(
-            provider_key in cached_providers
-            for provider_key, _, _, _, _ in _PROVIDER_SPECS
-            if _is_provider_cache_expected(provider_key, is_ipv4_target)
-            and (normalized_mode != "light" or provider_key in _LIGHT_MODE_ACTIVE_PROVIDERS)
-        )
-        if all_cached:
-            base_payload = await _execute_detection_with_cache(
-                ip,
-                initial_cache=(cached_providers, cached_ptr),
-                query_mode=normalized_mode,
-            )
-        else:
-            with _ip_detect_inflight_lock:
-                existing_task = _ip_detect_inflight.get(inflight_key)
-                if existing_task is not None:
-                    try:
-                        existing_loop = existing_task.get_loop()
-                    except Exception:
-                        existing_loop = None
-                    if existing_loop is None or existing_loop.is_closed() or existing_task.done():
-                        _ip_detect_inflight.pop(inflight_key, None)
-                        existing_task = None
-
-                if existing_task is not None:
-                    inflight_task = existing_task
-                else:
-
-                    async def _run_coalesced_detection(
-                        target_ip: str = ip,
-                        target_mode: str = normalized_mode,
-                        seed_cache: Optional[
-                            Tuple[
-                                Dict[str, Tuple[Dict[str, Any], Optional[str]]],
-                                Optional[Tuple[Optional[str], Optional[str]]],
-                            ]
-                        ] = None,
-                    ) -> Dict[str, Any]:
-                        own_task = asyncio.current_task()
-                        try:
-                            return await _execute_detection_with_cache(
-                                target_ip,
-                                initial_cache=seed_cache,
-                                query_mode=target_mode,
-                            )
-                        finally:
-                            _release_inflight_task((target_ip, target_mode), own_task)
-
-                    created_task = current_loop.create_task(
-                        _run_coalesced_detection(
-                            target_ip=ip,
-                            target_mode=normalized_mode,
-                            seed_cache=(cached_providers, cached_ptr),
-                        )
-                    )
-
-                    def _finalize_inflight(
-                        done_task: asyncio.Task,
-                        task_key: Tuple[str, str] = inflight_key,
-                    ) -> None:
-                        _release_inflight_task(task_key, done_task)
-                        if not done_task.cancelled():
-                            done_task.exception()
-
-                    created_task.add_done_callback(_finalize_inflight)
-                    _ip_detect_inflight[inflight_key] = created_task
-                    inflight_task = created_task
-
+    # Register the shared task before any await so that concurrent callers for the same key never
+    # read the provider caches or run detection a second time, whether or not the caches are warm
+    with _ip_detect_inflight_lock:
+        existing_task = _ip_detect_inflight.get(inflight_key)
+        if existing_task is not None:
             try:
-                base_payload = await _await_inflight_task(inflight_task, current_loop)
-            except _StaleInflightLoopError:
-                _release_inflight_task(inflight_key, inflight_task)
-                base_payload = await _execute_detection_with_cache(
-                    ip,
-                    query_mode=normalized_mode,
+                existing_loop = existing_task.get_loop()
+            except Exception:
+                existing_loop = None
+            if existing_loop is None or existing_loop.is_closed() or existing_task.done():
+                _ip_detect_inflight.pop(inflight_key, None)
+                existing_task = None
+
+        if existing_task is not None:
+            inflight_task = existing_task
+        else:
+
+            async def _run_coalesced_detection(
+                target_ip: str = ip,
+                target_mode: str = normalized_mode,
+            ) -> Dict[str, Any]:
+                own_task = asyncio.current_task()
+                try:
+                    cached_providers, cached_ptr = await _read_provider_caches(target_ip)
+                    return await _execute_detection_with_cache(
+                        target_ip,
+                        initial_cache=(cached_providers, cached_ptr),
+                        query_mode=target_mode,
+                    )
+                finally:
+                    _release_inflight_task((target_ip, target_mode), own_task)
+
+            created_task = current_loop.create_task(
+                _run_coalesced_detection(
+                    target_ip=ip,
+                    target_mode=normalized_mode,
                 )
+            )
+
+            def _finalize_inflight(
+                done_task: asyncio.Task,
+                task_key: Tuple[str, str] = inflight_key,
+            ) -> None:
+                _release_inflight_task(task_key, done_task)
+                if not done_task.cancelled():
+                    done_task.exception()
+
+            created_task.add_done_callback(_finalize_inflight)
+            _ip_detect_inflight[inflight_key] = created_task
+            inflight_task = created_task
+
+    try:
+        base_payload = await _await_inflight_task(inflight_task, current_loop)
+    except _StaleInflightLoopError:
+        _release_inflight_task(inflight_key, inflight_task)
+        base_payload = await _execute_detection_with_cache(
+            ip,
+            query_mode=normalized_mode,
+        )
 
     cache_status = (base_payload.get("cacheMeta") or {}).get("status")
     if isinstance(cache_status, str) and cache_status in ("hit", "partial", "miss"):

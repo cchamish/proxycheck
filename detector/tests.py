@@ -3792,6 +3792,70 @@ class SingleflightCoalescingTests(TestCase):
 
         self.assertEqual(len(views._ip_detect_inflight), 0)
 
+    async def test_five_concurrent_requests_read_provider_caches_once(self):
+        cache_reads = {"count": 0}
+        detection_runs = {"count": 0}
+
+        async def _slow_cache_read(ip):
+            cache_reads["count"] += 1
+            # Yield long enough for every other request to reach the singleflight check
+            await asyncio.sleep(0.03)
+            return {}, ("dns.google", "2026-01-01T00:00:00+00:00")
+
+        async def _fake_detection(ip, *, initial_cache=None, query_mode="full"):
+            detection_runs["count"] += 1
+            self.assertEqual(initial_cache, ({}, ("dns.google", "2026-01-01T00:00:00+00:00")))
+            return {
+                "ip": ip,
+                "ptrHostname": "dns.google",
+                "queryMode": query_mode,
+                "results": [],
+                "cacheMeta": {"status": "hit"},
+            }
+
+        auth_headers = {"Authorization": f"Bearer {views.issue_gadget_token('SysopUser')}"}
+        factory = AsyncRequestFactory()
+        requests = [factory.get("/api/v1/detect?ip=8.8.4.4", headers=auth_headers) for _ in range(5)]
+
+        with (
+            patch("detector.views._read_provider_caches", side_effect=_slow_cache_read),
+            patch("detector.views._execute_detection_with_cache", side_effect=_fake_detection),
+            patch("detector.views.record_global_request_telemetry", AsyncMock()),
+        ):
+            responses = await asyncio.gather(*(views.detect_ip(req) for req in requests))
+
+        self.assertEqual(cache_reads["count"], 1)
+        self.assertEqual(detection_runs["count"], 1)
+        for resp in responses:
+            self.assertEqual(resp.status_code, 200)
+            payload = json.loads(resp.content)
+            self.assertEqual(payload["ip"], "8.8.4.4")
+            self.assertIn("durationSeconds", payload)
+        self.assertEqual(len(views._ip_detect_inflight), 0)
+
+    async def test_concurrent_waiters_receive_independent_payload_copies(self):
+        shared_payload = {"ip": "8.8.4.4", "results": [], "cacheMeta": {"status": "miss"}}
+
+        async def _slow_cache_read(ip):
+            await asyncio.sleep(0.02)
+            return {}, None
+
+        with (
+            patch("detector.views._read_provider_caches", side_effect=_slow_cache_read),
+            patch("detector.views._execute_detection_with_cache", AsyncMock(return_value=shared_payload)),
+            patch("detector.views.record_global_request_telemetry", AsyncMock()),
+        ):
+            payloads = await asyncio.gather(
+                *(views._detect_single_canonical_ip("8.8.4.4", "gadget", time.perf_counter()) for _ in range(5))
+            )
+
+        self.assertEqual(len({id(payload) for payload in payloads}), 5)
+        for payload in payloads:
+            self.assertIsNot(payload, shared_payload)
+            self.assertIn("durationSeconds", payload)
+        self.assertNotIn("durationSeconds", shared_payload)
+        self.assertEqual(len(views._ip_detect_inflight), 0)
+
 
 class PerProviderCacheAndCircuitBreakerTests(TestCase):
     """Tests per-provider tiered TTL caching and HTTP 429 or 5xx cooldown circuit breaking."""
@@ -8575,8 +8639,12 @@ class RedisBatchingAndCacheCompletenessTests(TestCase):
         self.assertEqual(payload["cacheMeta"]["hitCount"], expected_hits)
         self.assertEqual(payload["ptrHostname"], "dns.google")
 
-        # The fast path never spawns a coalesced task, never builds the HTTP client and never reads cooldowns
-        release_spy.assert_not_called()
+        # The fast path runs through exactly one coalesced task, which is released by both its finally block
+        # and its done callback, and it never builds the HTTP client or reads cooldowns
+        released_calls = [call.args for call in release_spy.call_args_list]
+        self.assertEqual(len(released_calls), 2)
+        self.assertEqual({task_key for task_key, _ in released_calls}, {(target_ip, "full")})
+        self.assertEqual(len({released_task for _, released_task in released_calls}), 1)
         shared_client.assert_not_awaited()
         mock_dns_resolve.assert_not_called()
         read_keys = [call.args[0] for call in mock_redis.get.await_args_list]

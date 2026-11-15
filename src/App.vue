@@ -43,8 +43,7 @@
           :title="themeToggleAriaLabel"
           @click="handleToggleTheme"
         >
-          <cdx-icon :icon="themeToggleIcon" size="small" />
-          <span>{{ themeToggleText }}</span>
+          <cdx-icon :icon="themeToggleIcon" size="medium" />
         </cdx-button>
       </div>
     </header>
@@ -450,7 +449,6 @@ const theme = ref<ThemeMode>(readStoredTheme());
 applyThemeToDocument(theme.value);
 
 const themeToggleIcon = computed(() => (theme.value === 'dark' ? BRIGHT_ICON : MOON_ICON));
-const themeToggleText = computed(() => (theme.value === 'dark' ? 'Light mode' : 'Dark mode'));
 const themeToggleAriaLabel = computed(() =>
   theme.value === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'
 );

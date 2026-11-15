@@ -330,8 +330,11 @@ body {
   gap: 12px;
 }
 
-.theme-toggle-btn {
+.cdx-button.theme-toggle-btn {
   flex-shrink: 0;
+  min-width: 34px;
+  min-height: 34px;
+  padding: 0;
 }
 
 @media (max-width: 640px) {

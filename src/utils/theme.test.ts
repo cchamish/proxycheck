@@ -85,7 +85,10 @@ test('Frontend entry, header, and stylesheet default to dark mode with an access
   assert.match(indexHtml, /localStorage\.getItem\('proxy_detector_theme'\)\s*===\s*'light'/);
 
   const appVue = fs.readFileSync(path.resolve(process.cwd(), 'src/App.vue'), 'utf8');
-  assert.match(appVue, /<\/template>\s*<cdx-button[\s\S]*?class="theme-toggle-btn"[\s\S]*?@click="handleToggleTheme"/);
+  assert.match(
+    appVue,
+    /<\/template>\s*<cdx-button[\s\S]*?class="theme-toggle-btn"[\s\S]*?:aria-label="themeToggleAriaLabel"[\s\S]*?@click="handleToggleTheme"\s*>\s*<cdx-icon\s+:icon="themeToggleIcon"[^>]*\/>\s*<\/cdx-button>/
+  );
   assert.match(appVue, /WMCS-dark\.svg/);
 
   const codexCss = fs.readFileSync(path.resolve(process.cwd(), 'src/codex.css'), 'utf8');

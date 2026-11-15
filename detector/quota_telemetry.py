@@ -65,6 +65,8 @@ _DEFAULT_QUOTA_LIMITS: Dict[str, Tuple[int, int]] = {
     "dshield": (1000, 0),
 }
 
+PROVIDER_QUOTA_SPECS = _DEFAULT_QUOTA_LIMITS
+
 _QUOTA_CONSUME_LUA = """
 local min_key = KEYS[1]
 local day_key = KEYS[2]
@@ -510,6 +512,94 @@ def extract_upstream_rate_limit(
     return upstream_remaining, upstream_limit, upstream_used
 
 
+def _queue_quota_refund_commands(
+    pipe: Any,
+    provider_key: str,
+    *,
+    now_dt: datetime,
+    _tracked_ops: Optional[List[Optional[Tuple[str, int]]]] = None,
+) -> bool:
+    """Queues Redis DECR commands for minute and daily quota windows."""
+    if not provider_key or PROVIDER_QUOTA_SPECS.get(provider_key) is None:
+        return False
+    decr_fn = getattr(pipe, "decr", None)
+    if not callable(decr_fn):
+        return False
+    min_key = _quota_minute_key(provider_key, now_dt)
+    day_key = _quota_daily_key(provider_key, now_dt)
+    decr_fn(min_key)
+    decr_fn(day_key)
+    if _tracked_ops is not None:
+        _tracked_ops.append((min_key, MINUTE_QUOTA_TTL_SECONDS))
+        _tracked_ops.append((day_key, DAILY_QUOTA_TTL_SECONDS))
+    return True
+
+
+async def _clamp_negative_quota_counters(
+    pipeline_fn: Any,
+    tracked_ops: List[Optional[Tuple[str, int]]],
+    results: Any,
+) -> None:
+    """Resets any quota counter that dropped below zero back to zero with its window TTL."""
+    if not tracked_ops or not isinstance(results, (list, tuple)):
+        return
+    negative_targets: List[Tuple[str, int]] = []
+    for op_meta, raw_val in zip(tracked_ops, results):
+        if op_meta is None:
+            continue
+        if isinstance(raw_val, int) and not isinstance(raw_val, bool) and raw_val < 0:
+            negative_targets.append(op_meta)
+    if not negative_targets:
+        return
+    clamp_pipe = pipeline_fn(transaction=False)
+    set_fn = getattr(clamp_pipe, "set", None)
+    exec_fn = getattr(clamp_pipe, "execute", None)
+    if not callable(set_fn) or not callable(exec_fn):
+        return
+    for key, ttl_seconds in negative_targets:
+        set_fn(key, 0, ex=ttl_seconds)
+    clamp_call = exec_fn()
+    if inspect.isawaitable(clamp_call):
+        await clamp_call
+
+
+async def refund_consumed_quota(
+    provider_key: str,
+    *,
+    now_dt: Optional[datetime] = None,
+) -> None:
+    """
+    Rolls back a pre-consumed minute and daily quota unit when an upstream request
+    fails due to a transport error or timeout before receiving a valid HTTP response.
+    """
+    if not provider_key or PROVIDER_QUOTA_SPECS.get(provider_key) is None:
+        return
+    client = _get_redis_client()
+    if client is None:
+        return
+    pipeline_fn = getattr(client, "pipeline", None)
+    if not callable(pipeline_fn):
+        return
+
+    current_dt = now_dt or datetime.now(timezone.utc)
+    try:
+        pipe = pipeline_fn(transaction=False)
+        tracked_ops: List[Optional[Tuple[str, int]]] = []
+        if not _queue_quota_refund_commands(
+            pipe,
+            provider_key,
+            now_dt=current_dt,
+            _tracked_ops=tracked_ops,
+        ):
+            return
+        exec_call = pipe.execute()
+        results = await exec_call if inspect.isawaitable(exec_call) else None
+        await _clamp_negative_quota_counters(pipeline_fn, tracked_ops, results)
+    except Exception as exc:
+        _mark_redis_failure(exc)
+        logger.warning(f"Quota refund bypassed for {provider_key} due to Redis error ({type(exc).__name__})")
+
+
 def _queue_provider_telemetry_commands(
     pipe: Any,
     provider_key: str,
@@ -519,11 +609,15 @@ def _queue_provider_telemetry_commands(
     upstream_remaining: Optional[int] = None,
     upstream_limit: Optional[int] = None,
     upstream_used: Optional[int] = None,
+    refund_quota: bool = False,
+    _tracked_ops: Optional[List[Optional[Tuple[str, int]]]] = None,
 ) -> None:
     if outcome not in VALID_PROVIDER_OUTCOMES:
         return
     tel_key = _provider_telemetry_key(provider_key, now_dt)
     pipe.hincrby(tel_key, outcome, 1)
+    if _tracked_ops is not None:
+        _tracked_ops.append(None)
 
     fields: Dict[str, str] = {}
     if outcome in {"ok", "429", "5xx", "timeout"}:
@@ -536,8 +630,20 @@ def _queue_provider_telemetry_commands(
         fields["upstream_used"] = str(upstream_used)
     if fields:
         pipe.hset(tel_key, mapping=fields)
+        if _tracked_ops is not None:
+            _tracked_ops.append(None)
 
     pipe.expire(tel_key, TELEMETRY_TTL_SECONDS)
+    if _tracked_ops is not None:
+        _tracked_ops.append(None)
+
+    if refund_quota:
+        _queue_quota_refund_commands(
+            pipe,
+            provider_key,
+            now_dt=now_dt,
+            _tracked_ops=_tracked_ops,
+        )
 
 
 async def record_provider_outcome(
@@ -547,6 +653,7 @@ async def record_provider_outcome(
     upstream_remaining: Optional[int] = None,
     upstream_limit: Optional[int] = None,
     upstream_used: Optional[int] = None,
+    refund_quota: bool = False,
     now_dt: Optional[datetime] = None,
 ) -> None:
     """Records a single anonymised per-provider outcome into Redis daily telemetry hashes."""
@@ -562,6 +669,7 @@ async def record_provider_outcome(
     current_dt = now_dt or datetime.now(timezone.utc)
     try:
         pipe = pipeline_fn(transaction=False)
+        tracked_ops: List[Optional[Tuple[str, int]]] = []
         _queue_provider_telemetry_commands(
             pipe,
             provider_key,
@@ -570,10 +678,12 @@ async def record_provider_outcome(
             upstream_remaining=upstream_remaining,
             upstream_limit=upstream_limit,
             upstream_used=upstream_used,
+            refund_quota=refund_quota,
+            _tracked_ops=tracked_ops,
         )
         exec_call = pipe.execute()
-        if inspect.isawaitable(exec_call):
-            await exec_call
+        results = await exec_call if inspect.isawaitable(exec_call) else None
+        await _clamp_negative_quota_counters(pipeline_fn, tracked_ops, results)
     except Exception as exc:
         _mark_redis_failure(exc)
         logger.warning(f"Telemetry write bypassed for {provider_key} due to Redis error ({type(exc).__name__})")
@@ -597,27 +707,40 @@ async def record_provider_outcomes_batch(
     current_dt = now_dt or datetime.now(timezone.utc)
     try:
         pipe = pipeline_fn(transaction=False)
+        tracked_ops: List[Optional[Tuple[str, int]]] = []
         queued = False
         for entry in entries:
             outcome = entry.get("outcome")
             provider_key = entry.get("provider_key")
-            if not provider_key or outcome not in VALID_PROVIDER_OUTCOMES:
+            refund_quota = bool(entry.get("refund_quota", False))
+            if not provider_key:
                 continue
-            queued = True
-            _queue_provider_telemetry_commands(
-                pipe,
-                provider_key,
-                outcome,
-                now_dt=current_dt,
-                upstream_remaining=entry.get("upstream_remaining"),
-                upstream_limit=entry.get("upstream_limit"),
-                upstream_used=entry.get("upstream_used"),
-            )
+            if outcome in VALID_PROVIDER_OUTCOMES:
+                queued = True
+                _queue_provider_telemetry_commands(
+                    pipe,
+                    provider_key,
+                    outcome,
+                    now_dt=current_dt,
+                    upstream_remaining=entry.get("upstream_remaining"),
+                    upstream_limit=entry.get("upstream_limit"),
+                    upstream_used=entry.get("upstream_used"),
+                    refund_quota=refund_quota,
+                    _tracked_ops=tracked_ops,
+                )
+            elif refund_quota:
+                if _queue_quota_refund_commands(
+                    pipe,
+                    provider_key,
+                    now_dt=current_dt,
+                    _tracked_ops=tracked_ops,
+                ):
+                    queued = True
         if not queued:
             return
         exec_call = pipe.execute()
-        if inspect.isawaitable(exec_call):
-            await exec_call
+        results = await exec_call if inspect.isawaitable(exec_call) else None
+        await _clamp_negative_quota_counters(pipeline_fn, tracked_ops, results)
     except Exception as exc:
         _mark_redis_failure(exc)
         logger.warning(f"Batch telemetry write bypassed due to Redis error ({type(exc).__name__})")

@@ -377,17 +377,45 @@ def _sanitize_payload(value: Any) -> Any:
     return value
 
 
+def _extract_response_log_details(resp: Any) -> Tuple[str, str]:
+    """Extracts a sanitized content type and 120-character body preview for warning logs."""
+    content_type = "unknown"
+    headers = getattr(resp, "headers", None)
+    getter = getattr(headers, "get", None) if headers is not None else None
+    if callable(getter):
+        for header_name in ("Content-Type", "content-type"):
+            candidate = getter(header_name)
+            if isinstance(candidate, str) and candidate.strip():
+                cleaned_ct = " ".join(_sanitize_error_message(candidate).split())
+                content_type = cleaned_ct[:64] or "unknown"
+                break
+
+    raw_text = getattr(resp, "text", "")
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        return content_type, "<empty>"
+    sanitized_text = " ".join(_sanitize_error_message(raw_text).split())
+    if len(sanitized_text) > 120:
+        return content_type, f"{sanitized_text[:117]}..."
+    return content_type, sanitized_text
+
+
+def _parse_upstream_json_with_error(resp: httpx.Response) -> Tuple[Any, int, Optional[str]]:
+    """Decodes an upstream response body and returns any JSON parsing error class name."""
+    try:
+        return resp.json(), resp.status_code, None
+    except ValueError as exc:
+        status_code = 502 if resp.status_code == 200 else resp.status_code
+        return {"status": "error", "message": _sanitize_error_message(resp.text or "")}, status_code, type(exc).__name__
+
+
 def _parse_upstream_json(resp: httpx.Response) -> Tuple[Any, int]:
     """
     Decodes an upstream response body. Non-JSON bodies such as HTML gateway pages are returned as a
     sanitized error payload, and a 200 status is rewritten to 502 so adapters treat it as a format error.
     Non-dict JSON is passed through and rejected by the adapters themselves.
     """
-    try:
-        return resp.json(), resp.status_code
-    except ValueError:
-        status_code = 502 if resp.status_code == 200 else resp.status_code
-        return {"status": "error", "message": _sanitize_error_message(resp.text or "")}, status_code
+    payload, status_code, _ = _parse_upstream_json_with_error(resp)
+    return payload, status_code
 
 
 _maxmind_lock = threading.Lock()
@@ -1060,6 +1088,7 @@ async def _fetch_upstream_json(
     *,
     headers: Optional[Dict[str, str]] = None,
     timeout: float = 8.0,
+    follow_redirects: bool = False,
 ) -> Tuple[Any, int]:
     """
     Executes an upstream GET request, parses JSON safely, redacts leaked secrets on error,
@@ -1068,9 +1097,9 @@ async def _fetch_upstream_json(
     default_cooldown, _, _ = _get_cooldown_bounds()
     try:
         if headers is not None:
-            resp = await client.get(url, headers=headers, timeout=timeout)
+            resp = await client.get(url, headers=headers, timeout=timeout, follow_redirects=follow_redirects)
         else:
-            resp = await client.get(url, timeout=timeout)
+            resp = await client.get(url, timeout=timeout, follow_redirects=follow_redirects)
     except Exception as exc:
         is_timeout = isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError, TimeoutError))
         reason = "Upstream Timeout" if is_timeout else f"Upstream Exception ({type(exc).__name__})"
@@ -1093,7 +1122,18 @@ async def _fetch_upstream_json(
         return {"status": "error", "message": safe_message}, 502
 
     raw_status = getattr(resp, "status_code", 502)
-    payload, parsed_status = _parse_upstream_json(resp)
+    payload, parsed_status, parse_error = _parse_upstream_json_with_error(resp)
+    if isinstance(raw_status, int) and raw_status != 200:
+        content_type, body_preview = _extract_response_log_details(resp)
+        logger.warning(
+            f"{provider_label} returned HTTP {raw_status} (Content-Type: {content_type}; body: {body_preview})"
+        )
+    elif parse_error is not None:
+        content_type, body_preview = _extract_response_log_details(resp)
+        logger.warning(
+            f"{provider_label} returned non-JSON HTTP {raw_status} body ({parse_error} -> {parsed_status}; "
+            f"Content-Type: {content_type}; body: {body_preview})"
+        )
     upstream_remaining, upstream_limit, upstream_used = extract_upstream_rate_limit(
         resp,
         payload if raw_status == 200 and parsed_status == 200 else None,
@@ -1261,12 +1301,29 @@ async def query_stopforumspam(client: httpx.AsyncClient, ip: str) -> Dict[str, A
 
 
 async def query_dshield(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
-    url = f"https://www.dshield.org/api/ip/{ip}?json"
+    endpoints = (
+        ("isc.sans.edu", f"https://isc.sans.edu/api/ip/{ip}?json"),
+        ("www.dshield.org", f"https://www.dshield.org/api/ip/{ip}?json"),
+    )
     headers = {
         "User-Agent": USER_AGENT_HEADER,
         "Accept": "application/json",
     }
-    payload, status_code = await _fetch_upstream_json(client, "dshield", "DShield", url, headers=headers, timeout=5.0)
+    payload: Any = None
+    status_code = 502
+    for idx, (host, url) in enumerate(endpoints):
+        payload, status_code = await _fetch_upstream_json(
+            client,
+            "dshield",
+            "DShield",
+            url,
+            headers=headers,
+            timeout=5.0,
+            follow_redirects=True,
+        )
+        if status_code < 500 or idx == len(endpoints) - 1:
+            break
+        logger.warning(f"DShield primary endpoint {host} returned {status_code}; retrying fallback endpoint")
     return adapt_dshield(payload, status_code=status_code)
 
 

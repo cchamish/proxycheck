@@ -3693,7 +3693,7 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
             return _mock_response(
                 status_code=200, json_value={"success": 1, "ip": {"appears": 0, "frequency": 0, "confidence": 0.0}}
             )
-        if "dshield.org" in url:
+        if "sans.edu" in url or "dshield" in url:
             return _mock_response(status_code=200, json_value={"ip": {"attacks": 0, "count": 0}})
         return _mock_response(
             status_code=200,
@@ -4463,18 +4463,110 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         clean = adapt_dshield({"ip": {"attacks": 0, "count": 0, "threatfeeds": []}}, status_code=200)
         self.assertEqual(clean["usageType"], "Clean (No Activity)")
 
+        null_metrics = adapt_dshield(
+            {"ip": {"number": "198.51.100.5", "count": None, "attacks": None, "maxrisk": None}},
+            status_code=200,
+        )
+        self.assertEqual(null_metrics["status"], "200 OK")
+        self.assertEqual(null_metrics["attacks"], 0)
+        self.assertEqual(null_metrics["count"], 0)
+        self.assertEqual(null_metrics["usageType"], "Clean (No Activity)")
+
         captured = {}
 
         async def _get(url, **kwargs):
             captured["url"] = url
             captured["headers"] = kwargs.get("headers") or {}
+            captured["follow_redirects"] = kwargs.get("follow_redirects")
             return _mock_response(status_code=200, json_value={"ip": {"attacks": 0, "count": 0}})
 
         client = AsyncMock()
         client.get.side_effect = _get
         asyncio.run(views.query_dshield(client, "198.51.100.5"))
-        self.assertEqual(captured["url"], "https://www.dshield.org/api/ip/198.51.100.5?json")
+        self.assertEqual(captured["url"], "https://isc.sans.edu/api/ip/198.51.100.5?json")
         self.assertIn("ProxyCheck", captured["headers"].get("User-Agent", ""))
+        self.assertTrue(captured["follow_redirects"])
+
+    def test_dshield_retries_fallback_and_isolates_follow_redirects(self):
+        # Verify the shared HTTP client and unrelated providers keep redirects disabled by default
+        shared_client = asyncio.run(views._get_shared_http_client())
+        self.assertFalse(shared_client.follow_redirects)
+
+        default_capture = {}
+
+        async def _default_get(url, **kwargs):
+            default_capture["follow_redirects"] = kwargs.get("follow_redirects")
+            return _mock_response(status_code=200, json_value={"success": 1, "ip": {"appears": 0}})
+
+        default_client = AsyncMock()
+        default_client.get.side_effect = _default_get
+        asyncio.run(views.query_stopforumspam(default_client, "198.51.100.5"))
+        self.assertFalse(default_capture["follow_redirects"])
+
+        failure_modes = (
+            ("network_error", httpx.ConnectError("connection reset")),
+            ("http_503", _mock_response(status_code=503, text="<html>Service Unavailable</html>")),
+            (
+                "non_json_200",
+                _mock_response(
+                    status_code=200,
+                    json_error=json.JSONDecodeError("Expecting value", "<html>proxy error</html>", 0),
+                    text="<html>proxy error</html>",
+                ),
+            ),
+        )
+        for label, primary_outcome in failure_modes:
+            with self.subTest(case=label):
+                if not isinstance(primary_outcome, Exception):
+                    primary_outcome.headers = {"Content-Type": "text/html"}
+                attempted = []
+                upstream_events = {}
+                token = views._provider_upstream_events.set(upstream_events)
+
+                async def _fallback_get(url, outcome=primary_outcome, captured_urls=attempted, **kwargs):
+                    captured_urls.append((url, kwargs.get("follow_redirects")))
+                    if "isc.sans.edu" in url:
+                        if isinstance(outcome, Exception):
+                            raise outcome
+                        return outcome
+                    return _mock_response(status_code=200, json_value={"ip": {"attacks": 3, "count": 1}})
+
+                fallback_client = AsyncMock()
+                fallback_client.get.side_effect = _fallback_get
+                try:
+                    with self.assertLogs("detector.views", level="WARNING") as captured_logs:
+                        result = asyncio.run(views.query_dshield(fallback_client, "198.51.100.5"))
+                finally:
+                    views._provider_upstream_events.reset(token)
+
+                self.assertEqual(result["status"], "200 OK")
+                self.assertEqual(result["attacks"], 3)
+                self.assertEqual(
+                    attempted,
+                    [
+                        ("https://isc.sans.edu/api/ip/198.51.100.5?json", True),
+                        ("https://www.dshield.org/api/ip/198.51.100.5?json", True),
+                    ],
+                )
+                self.assertFalse(upstream_events["dshield"]["trigger"])
+                self.assertTrue(any("retrying fallback endpoint" in line for line in captured_logs.output))
+
+        # When both endpoints fail with gateway errors, DShield still degrades cleanly to 502 Error
+        both_bad_client = AsyncMock()
+
+        async def _both_bad(url, **kwargs):
+            resp = _mock_response(
+                status_code=200,
+                json_error=json.JSONDecodeError("Expecting value", "<xml/>", 0),
+                text="<xml>error</xml>",
+            )
+            resp.headers = {"Content-Type": "application/xml"}
+            return resp
+
+        both_bad_client.get.side_effect = _both_bad
+        with self.assertLogs("detector.views", level="WARNING"):
+            failed_result = asyncio.run(views.query_dshield(both_bad_client, "198.51.100.5"))
+        self.assertEqual(failed_result["status"], "502 Error")
 
     @patch(
         "dns.asyncresolver.Resolver.resolve",
@@ -4514,7 +4606,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
                         "ip": {"appears": 1, "frequency": 25, "confidence": 96.5, "lastseen": "2026-11-12 09:00:00"},
                     },
                 )
-            if "dshield.org" in url:
+            if "sans.edu" in url or "dshield" in url:
                 return _mock_response(
                     status_code=200,
                     json_value={
@@ -4760,6 +4852,55 @@ class LoopIsolationAndSessionSettingsTests(TestCase):
         self.assertEqual(payload["status"], "error")
         self.assertIn("ReadTimeout", payload["message"])
         self.assertTrue(any("ReadTimeout" in line for line in captured_logs.output))
+
+    async def test_fetch_upstream_json_warns_with_sanitized_preview_on_non_json_and_non_200(self):
+        long_html = "<html><body>upstream failure key=secret_token_999 " + ("x" * 180) + "</body></html>"
+        non_json_resp = _mock_response(
+            status_code=200,
+            json_error=json.JSONDecodeError("Expecting value", long_html, 0),
+            text=long_html,
+        )
+        non_json_resp.headers = {"Content-Type": "text/html; charset=utf-8"}
+        mock_client = AsyncMock()
+        mock_client.get.return_value = non_json_resp
+
+        with self.assertLogs("detector.views", level="WARNING") as warning_logs:
+            payload, status_code = await views._fetch_upstream_json(
+                mock_client,
+                "dshield",
+                "DShield",
+                "https://isc.sans.edu/api/ip/8.8.8.8?json",
+            )
+
+        self.assertEqual(status_code, 502)
+        self.assertEqual(payload["status"], "error")
+        self.assertTrue(all(record.levelname == "WARNING" for record in warning_logs.records))
+        warning_text = "\n".join(warning_logs.output)
+        self.assertIn("JSONDecodeError", warning_text)
+        self.assertIn("502", warning_text)
+        self.assertIn("text/html; charset=utf-8", warning_text)
+        self.assertIn("key=***REDACTED***", warning_text)
+        self.assertNotIn("secret_token_999", warning_text)
+        body_fragment = warning_logs.records[0].getMessage().split("body: ", 1)[1][:-1]
+        self.assertLessEqual(len(body_fragment), 120)
+
+        denied_resp = _mock_response(status_code=403, text="Forbidden by edge WAF")
+        denied_resp.headers = {"Content-Type": "text/plain"}
+        mock_client.get.return_value = denied_resp
+
+        with self.assertLogs("detector.views", level="WARNING") as status_logs:
+            _, denied_status = await views._fetch_upstream_json(
+                mock_client,
+                "dshield",
+                "DShield",
+                "https://isc.sans.edu/api/ip/8.8.8.8?json",
+            )
+
+        self.assertEqual(denied_status, 403)
+        status_text = "\n".join(status_logs.output)
+        self.assertIn("HTTP 403", status_text)
+        self.assertIn("text/plain", status_text)
+        self.assertIn("Forbidden by edge WAF", status_text)
 
     def test_session_engine_uses_cache_and_production_cache_uses_redis(self):
         from django.conf import settings as django_settings

@@ -322,6 +322,40 @@ def _attach_request_diagnostics(payload: Dict[str, Any], start_time: float) -> D
     }
 
 
+def _strip_raw_json_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Returns a shallow copy of payload without rawJson keys on provider result rows."""
+    if isinstance(payload, dict) and isinstance(payload.get("results"), list):
+        return {
+            **payload,
+            "results": [
+                {k: v for k, v in row.items() if k != "rawJson"} if isinstance(row, dict) else row
+                for row in payload["results"]
+            ],
+        }
+    return payload
+
+
+def _parse_compact_flag(raw_value: Any) -> bool:
+    """Interprets boolean, integer, or string compact flags."""
+    if isinstance(raw_value, bool):
+        return raw_value
+    if isinstance(raw_value, int):
+        return raw_value == 1
+    if isinstance(raw_value, str):
+        return raw_value.strip().lower() in ("1", "true", "yes")
+    return False
+
+
+def _is_compact_request(request, body: Optional[Dict[str, Any]] = None) -> bool:
+    """Checks query parameters and optional JSON body for compact mode requests."""
+    raw_query = request.GET.get("compact")
+    if raw_query is not None and str(raw_query).strip():
+        return _parse_compact_flag(str(raw_query))
+    if isinstance(body, dict) and "compact" in body:
+        return _parse_compact_flag(body.get("compact"))
+    return False
+
+
 def canonicalize_ip(raw_ip: str) -> Optional[str]:
     """Returns the canonical compressed IPv4 or IPv6 address string, or None when invalid."""
     if not isinstance(raw_ip, str):
@@ -3093,6 +3127,8 @@ async def _detect_single_canonical_ip(
     ip: str,
     auth_mode: str,
     start_time: float,
+    *,
+    compact: bool = False,
 ) -> Dict[str, Any]:
     """Runs singleflight-coalesced intelligence detection for one canonical IP address."""
     non_public = _classify_non_public_ip(ip)
@@ -3183,7 +3219,8 @@ async def _detect_single_canonical_ip(
     if isinstance(cache_status, str) and cache_status in ("hit", "partial", "miss"):
         await record_global_request_telemetry(cache_status, auth_mode)
 
-    return _attach_request_diagnostics(base_payload, start_time)
+    response_payload = _strip_raw_json_from_payload(base_payload) if compact else base_payload
+    return _attach_request_diagnostics(response_payload, start_time)
 
 
 async def detect_ip(request):
@@ -3231,8 +3268,11 @@ async def _detect_ip_get(request):
             status=400,
         )
 
-    payload = await _detect_single_canonical_ip(ip, auth_mode, start_time)
-    return JsonResponse(payload)
+    is_compact = _is_compact_request(request)
+    payload = await _detect_single_canonical_ip(ip, auth_mode, start_time, compact=is_compact)
+    response = JsonResponse(payload)
+    response["Cache-Control"] = "private, max-age=300"
+    return response
 
 
 @csrf_exempt
@@ -3345,12 +3385,18 @@ async def _detect_ip_batch_post(request):
             status=400,
         )
 
+    is_compact = _is_compact_request(request, body)
     semaphore = asyncio.Semaphore(_BATCH_DETECT_CONCURRENCY)
 
     async def _detect_bounded(canonical_ip: str) -> Tuple[str, Dict[str, Any]]:
         async with semaphore:
             ip_start_time = time.perf_counter()
-            payload = await _detect_single_canonical_ip(canonical_ip, auth_mode, ip_start_time)
+            payload = await _detect_single_canonical_ip(
+                canonical_ip,
+                auth_mode,
+                ip_start_time,
+                compact=is_compact,
+            )
             return canonical_ip, payload
 
     pairs = await asyncio.gather(*(_detect_bounded(ip) for ip in unique_canonical_ips))

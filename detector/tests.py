@@ -16,6 +16,7 @@ import time
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlparse
 
@@ -8539,7 +8540,9 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
 
     def test_refund_consumed_quota_clamps_at_zero_and_fails_open_on_redis_error(self):
         from datetime import datetime, timezone
+
         from asgiref.sync import async_to_sync
+
         from detector import quota_telemetry
 
         fake_redis = FakeAsyncRedis()
@@ -9636,5 +9639,3 @@ class TwoTierQueryModeTests(TestCase):
         self.assertIsNone(light_payload["getipintel_chance"])
         mocks["getipintel"].assert_awaited_once()
         self.assertEqual(len(views._ip_detect_inflight), 0)
-
-

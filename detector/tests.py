@@ -7508,3 +7508,254 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
             quota_telemetry._global_telemetry_key(sample_dt),
             "proxycheck:v1:telemetry:global:day:20261115",
         )
+
+
+class _BatchingFakeRedis(FakeAsyncRedis):
+    """In-memory Redis double that records single reads, batch reads and pipeline flushes."""
+
+    def __init__(self):
+        super().__init__()
+        self.get_calls = []
+        self.mget_calls = []
+        self.pipeline_calls = []
+
+    async def get(self, key):
+        self.get_calls.append(key)
+        return await super().get(key)
+
+    async def mget(self, keys):
+        self.mget_calls.append(list(keys))
+        return [self.strings.get(key) for key in keys]
+
+    def pipeline(self, transaction=True):
+        self.pipeline_calls.append(transaction)
+        return super().pipeline(transaction=transaction)
+
+
+class RedisBatchingAndCacheCompletenessTests(TestCase):
+    """Tests for batched Redis reads and writes and for the full cache hit check on partial source sets."""
+
+    IPV6_TARGET = "2001:4860:4860::8888"
+
+    def setUp(self):
+        views._http_client_instance = None
+        views._http_client_loop = None
+
+    def tearDown(self):
+        views._http_client_instance = None
+        views._http_client_loop = None
+
+    @staticmethod
+    def _cached_row_entry(provider_name):
+        return json.dumps(
+            {
+                "row": {
+                    "provider": provider_name,
+                    "status": "200 OK",
+                    "statusCode": 200,
+                    "asn": "AS15169",
+                    "isp": "Google",
+                    "organisation": "Google",
+                    "location": "United States",
+                    "usageType": "isp",
+                    "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
+                    "countryCode": "US",
+                    "rawJson": {},
+                },
+                "cachedAt": "2026-11-13T08:00:00+00:00",
+                "sanitized": True,
+            }
+        )
+
+    async def test_mget_reads_all_keys_in_one_round_trip(self):
+        fake_redis = _BatchingFakeRedis()
+        fake_redis.strings["proxycheck:v1:prov:ipdata:8.8.8.8"] = "cached-ipdata"
+        fake_redis.strings["proxycheck:v1:prov:ptr:8.8.8.8"] = b"cached-ptr"
+        keys = [
+            "proxycheck:v1:prov:ipdata:8.8.8.8",
+            "proxycheck:v1:prov:iphub:8.8.8.8",
+            "proxycheck:v1:prov:ptr:8.8.8.8",
+        ]
+
+        with patch("detector.views.redis_client", fake_redis):
+            values = await views._safe_redis_mget(keys)
+
+        self.assertEqual(values, ["cached-ipdata", None, "cached-ptr"])
+        self.assertEqual(fake_redis.mget_calls, [keys])
+        self.assertEqual(fake_redis.get_calls, [])
+
+    async def test_mget_falls_back_to_single_reads_for_get_only_mocks(self):
+        cache_store = {"proxycheck:v1:prov:ipdata:8.8.8.8": "cached-ipdata"}
+        mock_redis = MagicMock()
+        mock_redis.get = AsyncMock(side_effect=lambda key: cache_store.get(key))
+        keys = ["proxycheck:v1:prov:ipdata:8.8.8.8", "proxycheck:v1:prov:iphub:8.8.8.8"]
+
+        with patch("detector.views.redis_client", mock_redis):
+            values = await views._safe_redis_mget(keys)
+
+        self.assertEqual(values, ["cached-ipdata", None])
+        self.assertEqual(sorted(call.args[0] for call in mock_redis.get.await_args_list), sorted(keys))
+
+    async def test_mget_falls_back_when_client_has_no_mget(self):
+        fake_redis = FakeAsyncRedis()
+        fake_redis.strings["proxycheck:v1:prov:ipdata:8.8.8.8"] = "cached-ipdata"
+
+        with patch("detector.views.redis_client", fake_redis):
+            values = await views._safe_redis_mget(
+                ["proxycheck:v1:prov:ipdata:8.8.8.8", "proxycheck:v1:prov:iphub:8.8.8.8"]
+            )
+
+        self.assertEqual(values, ["cached-ipdata", None])
+
+    async def test_mget_degrades_to_empty_values_on_connection_errors(self):
+        mock_redis = MagicMock()
+        mock_redis.mget = AsyncMock(side_effect=redis.exceptions.ConnectionError("redis offline"))
+        mock_redis.get = AsyncMock(return_value="should-not-be-read")
+        keys = ["proxycheck:v1:prov:ipdata:8.8.8.8", "proxycheck:v1:prov:iphub:8.8.8.8"]
+
+        with (
+            patch("detector.views.redis_client", mock_redis),
+            self.assertLogs("detector.views", level="WARNING") as logs,
+        ):
+            values = await views._safe_redis_mget(keys)
+
+        self.assertEqual(values, [None, None])
+        mock_redis.get.assert_not_awaited()
+        self.assertTrue(any("redis offline" in line for line in logs.output))
+
+    async def test_mget_without_client_or_keys_returns_empty_values(self):
+        with patch("detector.views.redis_client", None):
+            self.assertEqual(await views._safe_redis_mget(["a", "b"]), [None, None])
+        with patch("detector.views.redis_client", _BatchingFakeRedis()):
+            self.assertEqual(await views._safe_redis_mget([]), [])
+
+    async def test_set_many_flushes_entries_through_one_pipeline(self):
+        fake_redis = _BatchingFakeRedis()
+        entries = [
+            ("proxycheck:v1:prov:ipdata:8.8.8.8", "row-a", 3600),
+            ("proxycheck:v1:cooldown:iphub", "cooldown-b", 120),
+        ]
+
+        with patch("detector.views.redis_client", fake_redis):
+            await views._safe_redis_set_many(entries)
+
+        self.assertEqual(fake_redis.pipeline_calls, [False])
+        self.assertEqual(fake_redis.strings["proxycheck:v1:prov:ipdata:8.8.8.8"], "row-a")
+        self.assertEqual(fake_redis.strings["proxycheck:v1:cooldown:iphub"], "cooldown-b")
+        self.assertEqual(fake_redis.ttls["proxycheck:v1:prov:ipdata:8.8.8.8"], 3600)
+        self.assertEqual(fake_redis.ttls["proxycheck:v1:cooldown:iphub"], 120)
+
+    async def test_set_many_falls_back_to_single_writes_for_set_only_mocks(self):
+        mock_redis = MagicMock()
+        mock_redis.set = AsyncMock()
+        entries = [
+            ("proxycheck:v1:prov:ipdata:8.8.8.8", "row-a", 3600),
+            ("proxycheck:v1:prov:ptr:8.8.8.8", "row-b", 900),
+        ]
+
+        with patch("detector.views.redis_client", mock_redis):
+            await views._safe_redis_set_many(entries)
+
+        written = {call.args[0]: (call.args[1], call.kwargs["ex"]) for call in mock_redis.set.await_args_list}
+        self.assertEqual(
+            written,
+            {
+                "proxycheck:v1:prov:ipdata:8.8.8.8": ("row-a", 3600),
+                "proxycheck:v1:prov:ptr:8.8.8.8": ("row-b", 900),
+            },
+        )
+
+    async def test_set_many_logs_and_skips_writes_when_pipeline_fails(self):
+        failing_pipe = MagicMock()
+        failing_pipe.execute = AsyncMock(side_effect=redis.exceptions.TimeoutError("redis timed out"))
+        mock_redis = MagicMock()
+        mock_redis.pipeline = MagicMock(return_value=failing_pipe)
+        mock_redis.set = AsyncMock()
+
+        with (
+            patch("detector.views.redis_client", mock_redis),
+            self.assertLogs("detector.views", level="WARNING") as logs,
+        ):
+            await views._safe_redis_set_many([("proxycheck:v1:prov:ipdata:8.8.8.8", "row-a", 3600)])
+
+        mock_redis.set.assert_not_awaited()
+        self.assertTrue(any("redis timed out" in line for line in logs.output))
+
+    async def test_read_provider_caches_uses_single_mget(self):
+        fake_redis = _BatchingFakeRedis()
+        fake_redis.strings["proxycheck:v1:prov:ipdata:8.8.8.8"] = self._cached_row_entry("IPData")
+
+        with patch("detector.views.redis_client", fake_redis):
+            cached_providers, cached_ptr = await views._read_provider_caches("8.8.8.8")
+
+        self.assertEqual(list(cached_providers), ["ipdata"])
+        self.assertIsNone(cached_ptr)
+        self.assertEqual(len(fake_redis.mget_calls), 1)
+        self.assertEqual(len(fake_redis.mget_calls[0]), len(views._PROVIDER_SPECS) + 1)
+        self.assertEqual(fake_redis.get_calls, [])
+
+    @override_settings(**{**TEST_UPSTREAM_SECRETS, "IPHUNTER_API_KEY": ""})
+    def test_provider_cache_expectation_skips_dnsbl_on_ipv6_and_unconfigured_sources(self):
+        with patch("detector.views._has_any_local_maxmind_db", return_value=True):
+            self.assertTrue(views._is_provider_cache_expected("spamhaus_zen", True))
+            self.assertFalse(views._is_provider_cache_expected("spamhaus_zen", False))
+            self.assertFalse(views._is_provider_cache_expected("spamcop", False))
+            self.assertFalse(views._is_provider_cache_expected("iphunter", True))
+            self.assertTrue(views._is_provider_cache_expected("ipdata", False))
+            self.assertTrue(views._is_provider_cache_expected("tor_onionoo", False))
+            self.assertTrue(views._is_provider_cache_expected("maxmind", False))
+        with patch("detector.views._has_any_local_maxmind_db", return_value=False):
+            self.assertFalse(views._is_provider_cache_expected("maxmind", True))
+
+    @override_settings(**{**TEST_UPSTREAM_SECRETS, "IPHUNTER_API_KEY": ""})
+    @patch("dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock)
+    def test_ipv6_with_all_expected_sources_cached_takes_full_hit_fast_path(self, mock_dns_resolve):
+        target_ip = views.canonicalize_ip(self.IPV6_TARGET)
+        uncached_keys = {"spamhaus_zen", "spamcop", "iphunter", "maxmind"}
+        cache_store = {}
+        for provider_key, provider_name, _, _, _ in views._PROVIDER_SPECS:
+            if provider_key not in uncached_keys:
+                cache_store[views._provider_cache_key(provider_key, target_ip)] = self._cached_row_entry(provider_name)
+        cache_store[views._provider_cache_key("ptr", target_ip)] = json.dumps(
+            {"hostname": "dns.google", "status": "ok", "cachedAt": "2026-11-13T08:30:00+00:00"}
+        )
+
+        mock_redis = MagicMock()
+        mock_redis.get = AsyncMock(side_effect=lambda key: cache_store.get(key))
+        mock_redis.set = AsyncMock()
+        shared_client = AsyncMock()
+        _login_authorised(self)
+
+        with (
+            patch("detector.views.redis_client", mock_redis),
+            patch("detector.views._has_any_local_maxmind_db", return_value=False),
+            patch("detector.views.query_maxmind", AsyncMock(return_value=dict(MAXMIND_STUB))),
+            patch("detector.views._get_shared_http_client", shared_client),
+            patch("detector.views._release_inflight_task", wraps=views._release_inflight_task) as release_spy,
+        ):
+            response = self.client.get(f"/api/v1/detect?ip={self.IPV6_TARGET}")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["isCached"])
+        self.assertEqual(payload["cacheMeta"]["status"], "hit")
+        self.assertFalse(payload["cacheMeta"]["isPartial"])
+        self.assertEqual(payload["cacheMeta"]["missCount"], 0)
+        self.assertEqual(payload["cacheMeta"]["cooldownCount"], 0)
+        expected_hits = len(views._PROVIDER_SPECS) - len(uncached_keys) + 1
+        self.assertEqual(payload["cacheMeta"]["hitCount"], expected_hits)
+        self.assertEqual(payload["ptrHostname"], "dns.google")
+
+        # The fast path never spawns a coalesced task, never builds the HTTP client and never reads cooldowns
+        release_spy.assert_not_called()
+        shared_client.assert_not_awaited()
+        mock_dns_resolve.assert_not_called()
+        read_keys = [call.args[0] for call in mock_redis.get.await_args_list]
+        self.assertFalse(any(":cooldown:" in key for key in read_keys))
+        mock_redis.set.assert_not_awaited()
+
+        statuses = {row["provider"]: row["status"] for row in payload["results"]}
+        self.assertEqual(statuses["Spamhaus ZEN"], "Skipped (IPv6)")
+        self.assertEqual(statuses["SpamCop"], "Skipped (IPv6)")
+        self.assertEqual(statuses["IPHunter"], "No API Key")
+        self.assertEqual(statuses["MaxMind"], "Database Missing")

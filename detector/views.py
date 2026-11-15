@@ -1693,6 +1693,86 @@ async def _safe_redis_set(key: str, value: str, *, ex: int) -> None:
         logger.warning(f"Redis cache write bypassed for {key} due to error: {redis_write_err}")
 
 
+def _decode_redis_text_value(raw_value: Any) -> Optional[str]:
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, bytes):
+        return raw_value.decode("utf-8", errors="replace")
+    return raw_value if isinstance(raw_value, str) else None
+
+
+def _discard_pending_awaitable(pending: Any) -> None:
+    """Closes a coroutine that will never be awaited so it does not emit a runtime warning."""
+    close_method = getattr(pending, "close", None)
+    if inspect.iscoroutine(pending) and callable(close_method):
+        close_method()
+
+
+async def _safe_redis_mget(keys: List[str]) -> List[Optional[str]]:
+    """Reads several keys in one round trip, falling back to single reads for clients without mget."""
+    client = _get_redis_client()
+    if client is None or not keys:
+        return [None] * len(keys)
+    mget_method = getattr(client, "mget", None)
+    if callable(mget_method):
+        try:
+            pending = mget_method(keys)
+            raw_values = await pending if inspect.isawaitable(pending) else pending
+        except (AttributeError, TypeError) as mget_unsupported_err:
+            logger.debug("Redis mget unavailable, falling back to single reads: %s", mget_unsupported_err)
+        except Exception as redis_read_err:
+            logger.warning(f"Redis batch cache read bypassed for {len(keys)} keys due to error: {redis_read_err}")
+            return [None] * len(keys)
+        else:
+            # Test doubles without a real mget hand back mock objects, so only trust a list of matching length
+            if isinstance(raw_values, (list, tuple)) and len(raw_values) == len(keys):
+                return [_decode_redis_text_value(raw_value) for raw_value in raw_values]
+    return list(await asyncio.gather(*(_safe_redis_get(key) for key in keys)))
+
+
+async def _try_pipelined_set_many(client: Any, entries: List[Tuple[str, str, int]]) -> bool:
+    """Returns False when the client cannot pipeline writes so the caller can fall back to single writes."""
+    pipeline_factory = getattr(client, "pipeline", None)
+    if not callable(pipeline_factory):
+        return False
+    pipe = pipeline_factory(transaction=False)
+    if inspect.isawaitable(pipe):
+        _discard_pending_awaitable(pipe)
+        return False
+    queue_set = getattr(pipe, "set", None)
+    execute = getattr(pipe, "execute", None)
+    if not callable(queue_set) or not callable(execute):
+        return False
+    for key, value, ttl_seconds in entries:
+        queued = queue_set(key, value, ex=ttl_seconds)
+        if inspect.isawaitable(queued):
+            _discard_pending_awaitable(queued)
+            return False
+    pending = execute()
+    if not inspect.isawaitable(pending):
+        return False
+    results = await pending
+    return isinstance(results, (list, tuple)) and len(results) == len(entries)
+
+
+async def _safe_redis_set_many(entries: List[Tuple[str, str, int]]) -> None:
+    """Writes several keys with expiry in one pipelined round trip, falling back to single writes."""
+    if not entries:
+        return
+    client = _get_redis_client()
+    if client is None:
+        return
+    try:
+        if await _try_pipelined_set_many(client, entries):
+            return
+    except (AttributeError, TypeError) as pipeline_unsupported_err:
+        logger.debug("Redis pipeline unavailable, falling back to single writes: %s", pipeline_unsupported_err)
+    except Exception as redis_write_err:
+        logger.warning(f"Redis batch cache write bypassed for {len(entries)} keys due to error: {redis_write_err}")
+        return
+    await asyncio.gather(*(_safe_redis_set(key, value, ex=ttl_seconds) for key, value, ttl_seconds in entries))
+
+
 def _decode_cached_provider_entry(raw_value: Optional[str]) -> Optional[Tuple[Dict[str, Any], Optional[str]]]:
     if not raw_value:
         return None
@@ -1753,6 +1833,22 @@ def _is_unconfigured_provider_row(row: Dict[str, Any]) -> bool:
         and row.get("status") in ("No API Key", "Database Missing", "Skipped (IPv6)")
         and row.get("statusCode") is None
     )
+
+
+def _has_any_local_maxmind_db() -> bool:
+    return any(path and os.path.exists(path) for path in _resolve_maxmind_db_paths().values())
+
+
+def _is_provider_cache_expected(provider_key: str, is_ipv4: bool) -> bool:
+    """Returns False for sources that never write a cache entry for this address family or configuration."""
+    if not is_ipv4 and provider_key in _DNSBL_PROVIDER_KEYS:
+        return False
+    if not is_provider_configured(provider_key):
+        return False
+    # MaxMind needs no credential but answers Database Missing, which is never cached, without local MMDB files
+    if provider_key == "maxmind" and not _has_any_local_maxmind_db():
+        return False
+    return True
 
 
 def _is_provider_result_cacheable(row: Any) -> bool:
@@ -1841,7 +1937,7 @@ async def _read_provider_caches(
         return {}, None
     keys = [_provider_cache_key(provider_key, ip) for provider_key, _, _, _, _ in _PROVIDER_SPECS]
     keys.append(_provider_cache_key("ptr", ip))
-    raw_values = await asyncio.gather(*(_safe_redis_get(key) for key in keys))
+    raw_values = await _safe_redis_mget(keys)
     cached_providers: Dict[str, Tuple[Dict[str, Any], Optional[str]]] = {}
     for idx, (provider_key, _, _, _, _) in enumerate(_PROVIDER_SPECS):
         decoded = _decode_cached_provider_entry(raw_values[idx])
@@ -1903,18 +1999,23 @@ async def _execute_detection_with_cache(
         cached_providers, cached_ptr = await _read_provider_caches(ip)
 
     is_ipv4 = _reverse_ipv4_octets(ip) is not None
+    # Sources that are skipped for this address or lack configuration answer statically, so they need
+    # neither a cooldown lookup nor the shared HTTP client
+    cache_expected_keys = frozenset(
+        provider_key
+        for provider_key, _, _, _, _ in _PROVIDER_SPECS
+        if _is_provider_cache_expected(provider_key, is_ipv4)
+    )
     missed_cooldown_keys = [
         provider_key
         for provider_key, _, _, supports_cooldown, _ in _PROVIDER_SPECS
-        if provider_key not in cached_providers
-        and supports_cooldown
-        and (is_ipv4 or provider_key not in _DNSBL_PROVIDER_KEYS)
+        if provider_key not in cached_providers and supports_cooldown and provider_key in cache_expected_keys
     ]
     active_redis = _get_redis_client()
     cooldown_entries: Dict[str, Dict[str, Any]] = {}
     if active_redis is not None and missed_cooldown_keys:
-        raw_cooldowns = await asyncio.gather(
-            *(_safe_redis_get(_provider_cooldown_key(provider_key)) for provider_key in missed_cooldown_keys)
+        raw_cooldowns = await _safe_redis_mget(
+            [_provider_cooldown_key(provider_key) for provider_key in missed_cooldown_keys]
         )
         for provider_key, raw_cd in zip(missed_cooldown_keys, raw_cooldowns, strict=True):
             decoded_cd = _decode_cooldown_entry(raw_cd)
@@ -1953,7 +2054,7 @@ async def _execute_detection_with_cache(
                 }
 
     specs_to_execute = [(idx, spec) for idx, spec in candidate_specs if spec[0] not in quota_blocked_entries]
-    needs_http_client = any(spec[2] for _, spec in specs_to_execute)
+    needs_http_client = any(spec[2] and spec[0] in cache_expected_keys for _, spec in specs_to_execute)
     needs_ptr = cached_ptr is None
 
     upstream_events: Dict[str, Dict[str, Any]] = {}
@@ -1979,7 +2080,7 @@ async def _execute_detection_with_cache(
         _provider_upstream_events.reset(events_token)
 
     clean_results: List[Dict[str, Any]] = []
-    redis_write_ops = []
+    redis_set_entries: List[Tuple[str, str, int]] = []
     telemetry_entries: List[Dict[str, Any]] = []
     now_dt = datetime.now(timezone.utc)
     now_iso = now_dt.isoformat()
@@ -2089,11 +2190,11 @@ async def _execute_detection_with_cache(
                 if provider_key == "maxmind":
                     entry_payload["cityDbLoaded"] = _has_local_maxmind_city_db()
                 cache_entry = json.dumps(entry_payload)
-                redis_write_ops.append(
-                    _safe_redis_set(
+                redis_set_entries.append(
+                    (
                         _provider_cache_key(provider_key, ip),
                         cache_entry,
-                        ex=_get_provider_cache_ttl(provider_key),
+                        _get_provider_cache_ttl(provider_key),
                     )
                 )
             elif supports_cooldown:
@@ -2129,11 +2230,11 @@ async def _execute_detection_with_cache(
                             "until": until_iso,
                         }
                     )
-                    redis_write_ops.append(
-                        _safe_redis_set(
+                    redis_set_entries.append(
+                        (
                             _provider_cooldown_key(provider_key),
                             cooldown_payload,
-                            ex=cd_seconds,
+                            cd_seconds,
                         )
                     )
 
@@ -2161,14 +2262,17 @@ async def _execute_detection_with_cache(
                     "cachedAt": now_iso,
                 }
             )
-            redis_write_ops.append(
-                _safe_redis_set(
+            redis_set_entries.append(
+                (
                     _provider_cache_key("ptr", ip),
                     ptr_entry,
-                    ex=_get_provider_cache_ttl("ptr"),
+                    _get_provider_cache_ttl("ptr"),
                 )
             )
 
+    redis_write_ops = []
+    if redis_set_entries:
+        redis_write_ops.append(_safe_redis_set_many(redis_set_entries))
     if active_redis is not None and telemetry_entries:
         redis_write_ops.append(record_provider_outcomes_batch(telemetry_entries, now_dt=now_dt))
 
@@ -2717,7 +2821,13 @@ async def _detect_ip_get(request):
 
     if base_payload is None:
         cached_providers, cached_ptr = await _read_provider_caches(ip)
-        all_cached = len(cached_providers) == len(_PROVIDER_SPECS) and cached_ptr is not None
+        is_ipv4_target = _reverse_ipv4_octets(ip) is not None
+        # Skipped or unconfigured sources never reach the cache, so only expected sources decide a full hit
+        all_cached = cached_ptr is not None and all(
+            provider_key in cached_providers
+            for provider_key, _, _, _, _ in _PROVIDER_SPECS
+            if _is_provider_cache_expected(provider_key, is_ipv4_target)
+        )
         if all_cached:
             base_payload = await _execute_detection_with_cache(
                 ip,

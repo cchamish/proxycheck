@@ -15,7 +15,7 @@
           <cdx-button
             v-if="isAdminUser"
             action="default"
-            weight="normal"
+            weight="quiet"
             size="medium"
             class="admin-dashboard-btn"
             @click="isDashboardOpen = true"
@@ -36,7 +36,7 @@
         </template>
         <cdx-button
           action="default"
-          weight="normal"
+          weight="quiet"
           size="medium"
           class="theme-toggle-btn"
           :aria-label="themeToggleAriaLabel"

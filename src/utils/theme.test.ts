@@ -87,11 +87,21 @@ test('Frontend entry, header, and stylesheet default to dark mode with an access
   const appVue = fs.readFileSync(path.resolve(process.cwd(), 'src/App.vue'), 'utf8');
   assert.match(
     appVue,
-    /<\/template>\s*<cdx-button[\s\S]*?class="theme-toggle-btn"[\s\S]*?:aria-label="themeToggleAriaLabel"[\s\S]*?@click="handleToggleTheme"\s*>\s*<cdx-icon\s+:icon="themeToggleIcon"[^>]*\/>\s*<\/cdx-button>/
+    /<cdx-button[^>]*?weight="quiet"[^>]*?class="admin-dashboard-btn"/
+  );
+  assert.match(
+    appVue,
+    /<\/template>\s*<cdx-button[^>]*?weight="quiet"[^>]*?class="theme-toggle-btn"[^>]*?:aria-label="themeToggleAriaLabel"[\s\S]*?@click="handleToggleTheme"\s*>\s*<cdx-icon\s+:icon="themeToggleIcon"[^>]*\/>\s*<\/cdx-button>/
   );
   assert.match(appVue, /WMCS-dark\.svg/);
 
   const codexCss = fs.readFileSync(path.resolve(process.cwd(), 'src/codex.css'), 'utf8');
   assert.match(codexCss, /:root\s*\{[\s\S]*?color-scheme:\s*dark;/);
   assert.match(codexCss, /html\[data-theme='light'\]\s*\{[\s\S]*?color-scheme:\s*light;/);
+  const userPillRule = codexCss.match(/\.user-pill\s*\{([^}]*)\}/);
+  assert.ok(userPillRule);
+  assert.doesNotMatch(
+    userPillRule[1],
+    /(?:^|[\s;])border(?:-(?:top|right|bottom|left|color|style|width))?\s*:/
+  );
 });

@@ -250,6 +250,7 @@ ALLOWED_WIKI_USERS = os.environ.get("ALLOWED_WIKI_USERS", "")
 
 PROVIDER_STATIC_CACHE_TTL_SECONDS = _parse_positive_int_env("PROVIDER_STATIC_CACHE_TTL_SECONDS", 86400)
 PROVIDER_DYNAMIC_CACHE_TTL_SECONDS = _parse_positive_int_env("PROVIDER_DYNAMIC_CACHE_TTL_SECONDS", 7200)
+GETIPINTEL_STABLE_CACHE_TTL_SECONDS = _parse_positive_int_env("GETIPINTEL_STABLE_CACHE_TTL_SECONDS", 259200)
 PROVIDER_COOLDOWN_DEFAULT_SECONDS = _parse_positive_int_env("PROVIDER_COOLDOWN_DEFAULT_SECONDS", 120)
 PROVIDER_COOLDOWN_MIN_SECONDS = _parse_positive_int_env("PROVIDER_COOLDOWN_MIN_SECONDS", 60)
 PROVIDER_COOLDOWN_MAX_SECONDS = _parse_positive_int_env("PROVIDER_COOLDOWN_MAX_SECONDS", 300)
@@ -339,9 +340,10 @@ def _standard_data_directories(base_dir: Path | str, *, tool_data_dir: Optional[
         base_path / "data",
         base_path,
     ]
-    tool_data_dir = _expand_configured_path(os.environ.get("TOOL_DATA_DIR", ""))
-    if tool_data_dir:
-        expanded_tool_dir = Path(tool_data_dir)
+    raw_tool_dir = os.environ.get("TOOL_DATA_DIR", "") if tool_data_dir is None else tool_data_dir
+    resolved_tool_dir = _expand_configured_path(raw_tool_dir)
+    if resolved_tool_dir:
+        expanded_tool_dir = Path(resolved_tool_dir)
         directories.append(expanded_tool_dir / "www" / "python" / "data")
         directories.append(expanded_tool_dir / "data")
     home_dir = Path.home()

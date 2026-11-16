@@ -1,6 +1,7 @@
 """Middleware utilities for async static file serving and resilient session persistence."""
 
 import asyncio
+import contextlib
 import logging
 
 from asgiref.sync import iscoroutinefunction, markcoroutinefunction
@@ -62,10 +63,8 @@ class ResilientSessionMiddleware(SessionMiddleware):
         except Exception as exc:
             if not is_session_backend_error(exc):
                 raise
-            try:
+            with contextlib.suppress(AttributeError):
                 request.session.modified = False
-            except AttributeError:
-                pass
             logger.warning(
                 "Response session persistence skipped due to cache backend unavailability (%s)",
                 type(exc).__name__,

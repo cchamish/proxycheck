@@ -15,11 +15,12 @@ import math
 import os
 import re
 import secrets
+import sqlite3
 import threading
 import time
 import weakref
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, TypeVar, Union
 from urllib.parse import quote, urlencode
 
 import dns.asyncresolver
@@ -78,6 +79,8 @@ from .oauth import (
     verify_centralauth_userinfo,
 )
 from .offline_dbs import (
+    _get_file_stat_signature,
+    _get_positive_int_setting,
     collect_offline_databases_status,
     get_maxmind_newest_mtime_iso,
     get_stopforumspam_db_version,
@@ -101,13 +104,13 @@ logger = logging.getLogger(__name__)
 # Short socket timeouts prevent a degraded Toolforge Redis instance from stalling upstream queries.
 try:
     import redis.asyncio as aioredis
-except Exception as redis_init_err:
+except ImportError as redis_init_err:
     logger.warning(f"Redis initialization warning (fault tolerance active): {redis_init_err}")
     aioredis = None
 
 try:
     from redis.exceptions import RedisError as _RedisError
-except Exception:
+except ImportError:
     _RedisError = None
 
 _REDIS_SOCKET_TIMEOUT_SECONDS = 2.0
@@ -117,6 +120,7 @@ _REDIS_CIRCUIT_FAILURE_ERRORS: Tuple[type[BaseException], ...] = (
     if _RedisError is not None
     else (ConnectionError, TimeoutError, OSError)
 )
+_REDIS_INIT_ERRORS: Tuple[type[BaseException], ...] = (*_REDIS_CIRCUIT_FAILURE_ERRORS, ValueError)
 _redis_client_lock = threading.Lock()
 _redis_clients_by_loop: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Tuple[str, Any]]" = (
     weakref.WeakKeyDictionary()
@@ -136,7 +140,7 @@ if aioredis is not None:
         )
         _default_redis_sentinel = redis_client
         _redis_circuit_client_ref = redis_client
-    except Exception as redis_init_err:
+    except _REDIS_INIT_ERRORS as redis_init_err:
         logger.warning(f"Redis initialization warning (fault tolerance active): {redis_init_err}")
         redis_client = None
         _default_redis_sentinel = None
@@ -251,7 +255,7 @@ def _get_redis_client() -> Optional[Any]:
                 socket_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
                 socket_connect_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
             )
-        except Exception as redis_loop_err:
+        except _REDIS_INIT_ERRORS as redis_loop_err:
             logger.warning(f"Redis initialization warning (fault tolerance active): {redis_loop_err}")
             init_err = redis_loop_err
             loop_client = None
@@ -315,7 +319,7 @@ def get_process_memory_mb() -> Optional[float]:
         usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         # Linux reports ru_maxrss in KiB.
         return round(usage / 1024.0, 2)
-    except Exception:
+    except ImportError, OSError, AttributeError:
         return None
 
 
@@ -578,7 +582,7 @@ def _sanitize_payload(value: Any) -> Any:
 
 
 def _extract_response_log_details(resp: Any) -> Tuple[str, str]:
-    """Extracts a sanitized content type and 120-character body preview for warning logs."""
+    """Extracts a sanitised content type and 120-character body preview for warning logs."""
     content_type = "unknown"
     headers = getattr(resp, "headers", None)
     getter = getattr(headers, "get", None) if headers is not None else None
@@ -617,15 +621,6 @@ _http_client_lock = threading.Lock()
 _http_clients_by_loop: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Any]" = weakref.WeakKeyDictionary()
 
 
-def _get_file_stat_signature(db_path: str) -> Optional[Tuple[int, int]]:
-    """Returns an mtime and size signature for detecting updated MMDB files on disk."""
-    try:
-        stat_result = os.stat(db_path)
-    except OSError:
-        return None
-    return (stat_result.st_mtime_ns, stat_result.st_size)
-
-
 def _get_maxmind_reader(db_path: str, maxminddb_module: Any) -> Any:
     """Returns a cached MaxMind reader, reopening it automatically when the file changes on disk."""
     current_sig = _get_file_stat_signature(db_path)
@@ -640,7 +635,7 @@ def _get_maxmind_reader(db_path: str, maxminddb_module: Any) -> Any:
     if stale_reader is not None:
         try:
             stale_reader.close()
-        except Exception as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             logger.debug(f"Failed to close superseded MaxMind reader: {exc}")
     with _maxmind_lock:
         reader = _maxmind_readers.get(db_path)
@@ -660,7 +655,7 @@ def _evict_maxmind_reader(db_path: str) -> None:
     if reader is not None:
         try:
             reader.close()
-        except Exception as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             logger.debug(f"Failed to close MaxMind reader: {exc}")
 
 
@@ -693,7 +688,7 @@ async def _close_http_client_safely(client: Any) -> None:
         maybe_coro = aclose_fn()
         if inspect.isawaitable(maybe_coro):
             await maybe_coro
-    except Exception as exc:
+    except (httpx.HTTPError, RuntimeError, OSError) as exc:
         logger.debug(f"Ignoring error while closing superseded HTTP client: {exc}")
 
 
@@ -764,7 +759,7 @@ def _is_valid_mmdb_prefix_tuple(result: Any) -> bool:
 
 
 def _should_use_custom_mmdb_get(reader: Any, mmdb_record: Any) -> bool:
-    """Returns True when reader.get is a mock configured with custom behavior or a distinct record."""
+    """Returns True when reader.get is a mock configured with custom behaviour or a distinct record."""
     get_method = getattr(reader, "get", None)
     if get_method is None:
         return False
@@ -972,7 +967,7 @@ def _read_maxmind_sync(ip: str) -> Dict[str, Any]:
             combined_record["_offline_db_updated_at"] = offline_updated_at
 
         return adapt_maxmind(combined_record, has_db=True, status_code=200, ip=ip)
-    except Exception as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         for path in db_paths.values():
             _evict_maxmind_reader(path)
         safe_message = _sanitize_error_message(str(exc))
@@ -1107,7 +1102,7 @@ async def query_rdns_ptr(ip: str) -> Optional[str]:
     state = _rdns_context_state.get()
     try:
         qname = dns.reversename.from_address(ip)
-    except Exception:
+    except ValueError, dns.exception.DNSException:
         if isinstance(state, dict):
             state["status"] = "error"
         return None
@@ -1136,7 +1131,7 @@ async def query_rdns_ptr(ip: str) -> Optional[str]:
         if isinstance(state, dict):
             state["status"] = "timeout"
         return None
-    except dns.resolver.NoNameservers, dns.exception.DNSException, Exception:
+    except dns.resolver.NoNameservers, dns.exception.DNSException, OSError:
         if isinstance(state, dict):
             state["status"] = "error"
         return None
@@ -1234,7 +1229,7 @@ async def _query_dnsbl_zone(
             "codes": [],
             "error": safe_message,
         }, 504
-    except (dns.resolver.NoNameservers, dns.exception.DNSException, Exception) as exc:
+    except (dns.resolver.NoNameservers, dns.exception.DNSException, OSError) as exc:
         safe_message = _sanitize_error_message(str(exc) or "DNS resolution failed")
         logger.warning(f"{provider_label} DNS query failed for {qname}: {safe_message}")
         _record_upstream_event(
@@ -1297,13 +1292,6 @@ MAX_COOLDOWN_SECONDS = 300
 _provider_upstream_events: contextvars.ContextVar[Optional[Dict[str, Dict[str, Any]]]] = contextvars.ContextVar(
     "_provider_upstream_events", default=None
 )
-
-
-def _get_positive_int_setting(name: str, default: int) -> int:
-    configured = getattr(settings, name, default)
-    if isinstance(configured, bool) or not isinstance(configured, int) or configured <= 0:
-        return default
-    return configured
 
 
 def _is_stable_getipintel_result(row: Optional[Dict[str, Any]]) -> bool:
@@ -1430,7 +1418,7 @@ async def _fetch_upstream_json(
         request_kwargs["timeout"] = timeout
     try:
         resp = await client.get(url, **request_kwargs)
-    except Exception as exc:
+    except (httpx.HTTPError, asyncio.TimeoutError, TimeoutError, OSError) as exc:
         is_timeout = isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError, TimeoutError))
         reason = "Upstream Timeout" if is_timeout else f"Upstream Exception ({type(exc).__name__})"
         raw_message = str(exc).strip()
@@ -1628,7 +1616,7 @@ async def query_tor_onionoo(client: httpx.AsyncClient, ip: str) -> Dict[str, Any
 def _read_stopforumspam_sync(ip: str) -> Dict[str, Any]:
     try:
         lookup = query_stopforumspam_offline(ip)
-    except Exception as exc:
+    except (OSError, sqlite3.Error, ValueError) as exc:
         safe_message = _sanitize_error_message(str(exc))
         logger.error("Error querying StopForumSpam offline database: %s", safe_message)
         return adapt_stopforumspam({"success": 0, "error": safe_message}, status_code=500, has_db=True)
@@ -1870,7 +1858,7 @@ def aggregate_intelligence_metrics(
         prediction_label = "Needs Human Review"
         prediction_tier = "neutral"
 
-    # Treat a single hosting tag as an outlier when at least five sources report clean residential usage and no behavioral threats exist.
+    # Treat a single hosting tag as an outlier when at least five sources report clean residential usage and no behavioural threats exist.
     is_isolated_hosting_outlier = (
         not has_anonymizer_flag
         and behavioral_threat_votes == 0
@@ -2016,32 +2004,7 @@ def _provider_cooldown_key(provider_key: str) -> str:
     return f"{REDIS_KEY_NAMESPACE}:cooldown:{provider_key}"
 
 
-async def _safe_redis_get(key: str) -> Optional[str]:
-    client = _get_redis_client()
-    if client is None:
-        return None
-    try:
-        raw_value = await client.get(key)
-    except Exception as redis_read_err:
-        mark_redis_failure(redis_read_err)
-        logger.warning(f"Redis cache read bypassed for {key} due to error: {redis_read_err}")
-        return None
-    if raw_value is None:
-        return None
-    if isinstance(raw_value, bytes):
-        return raw_value.decode("utf-8", errors="replace")
-    return str(raw_value) if isinstance(raw_value, str) else None
-
-
-async def _safe_redis_set(key: str, value: str, *, ex: int) -> None:
-    client = _get_redis_client()
-    if client is None:
-        return
-    try:
-        await client.set(key, value, ex=ex)
-    except Exception as redis_write_err:
-        mark_redis_failure(redis_write_err)
-        logger.warning(f"Redis cache write bypassed for {key} due to error: {redis_write_err}")
+_T = TypeVar("_T")
 
 
 def _decode_redis_text_value(raw_value: Any) -> Optional[str]:
@@ -2050,6 +2013,33 @@ def _decode_redis_text_value(raw_value: Any) -> Optional[str]:
     if isinstance(raw_value, bytes):
         return raw_value.decode("utf-8", errors="replace")
     return raw_value if isinstance(raw_value, str) else None
+
+
+async def _run_redis_cache_op(
+    operation_label: str,
+    target_desc: str,
+    operation: Callable[[Any], Awaitable[_T]],
+    *,
+    default: Any = None,
+) -> Any:
+    client = _get_redis_client()
+    if client is None:
+        return default
+    try:
+        return await operation(client)
+    except _REDIS_CIRCUIT_FAILURE_ERRORS as redis_err:
+        mark_redis_failure(redis_err)
+        logger.warning(f"Redis cache {operation_label} bypassed for {target_desc} due to error: {redis_err}")
+        return default
+
+
+async def _safe_redis_get(key: str) -> Optional[str]:
+    raw_value = await _run_redis_cache_op("read", key, lambda client: client.get(key))
+    return _decode_redis_text_value(raw_value)
+
+
+async def _safe_redis_set(key: str, value: str, *, ex: int) -> None:
+    await _run_redis_cache_op("write", key, lambda client: client.set(key, value, ex=ex))
 
 
 def _discard_pending_awaitable(pending: Any) -> None:
@@ -2071,7 +2061,7 @@ async def _safe_redis_mget(keys: List[str]) -> List[Optional[str]]:
             raw_values = await pending if inspect.isawaitable(pending) else pending
         except (AttributeError, TypeError) as mget_unsupported_err:
             logger.debug("Redis mget unavailable, falling back to single reads: %s", mget_unsupported_err)
-        except Exception as redis_read_err:
+        except _REDIS_CIRCUIT_FAILURE_ERRORS as redis_read_err:
             mark_redis_failure(redis_read_err)
             logger.warning(f"Redis batch cache read bypassed for {len(keys)} keys due to error: {redis_read_err}")
             return [None] * len(keys)
@@ -2119,7 +2109,7 @@ async def _safe_redis_set_many(entries: List[Tuple[str, str, int]]) -> None:
             return
     except (AttributeError, TypeError) as pipeline_unsupported_err:
         logger.debug("Redis pipeline unavailable, falling back to single writes: %s", pipeline_unsupported_err)
-    except Exception as redis_write_err:
+    except _REDIS_CIRCUIT_FAILURE_ERRORS as redis_write_err:
         mark_redis_failure(redis_write_err)
         logger.warning(f"Redis batch cache write bypassed for {len(entries)} keys due to error: {redis_write_err}")
         return
@@ -2152,7 +2142,7 @@ def _decode_cached_provider_entry(raw_value: Optional[str]) -> Optional[Tuple[Di
         return None
     try:
         parsed = json.loads(raw_value)
-    except Exception:
+    except ValueError, TypeError:
         return None
     if not isinstance(parsed, dict):
         return None
@@ -2200,7 +2190,7 @@ def _decode_cached_ptr_entry(raw_value: Optional[str]) -> Optional[Tuple[Optiona
         return None
     try:
         parsed = json.loads(raw_value)
-    except Exception:
+    except ValueError, TypeError:
         return None
     if not isinstance(parsed, dict):
         return None
@@ -2219,7 +2209,7 @@ def _decode_cooldown_entry(raw_value: Optional[str]) -> Optional[Dict[str, Any]]
         return None
     try:
         parsed = json.loads(raw_value)
-    except Exception:
+    except ValueError, TypeError:
         return None
     if isinstance(parsed, dict):
         return parsed
@@ -2268,9 +2258,7 @@ def _is_provider_cache_expected(provider_key: str, is_ipv4: bool) -> bool:
     # Offline databases answer Database Missing or Offline DB Missing uncached when local files are absent
     if provider_key == "maxmind" and not _has_any_local_maxmind_db():
         return False
-    if provider_key == "stopforumspam" and not has_any_local_stopforumspam_db():
-        return False
-    return True
+    return not (provider_key == "stopforumspam" and not has_any_local_stopforumspam_db())
 
 
 def _is_provider_result_cacheable(row: Any) -> bool:
@@ -3297,7 +3285,7 @@ async def _detect_single_canonical_ip(
         if existing_task is not None:
             try:
                 existing_loop = existing_task.get_loop()
-            except Exception:
+            except AttributeError, RuntimeError:
                 existing_loop = None
             if existing_loop is None or existing_loop.is_closed() or existing_task.done():
                 _ip_detect_inflight.pop(inflight_key, None)
@@ -3945,7 +3933,8 @@ async def oauth_callback(request):
             if has_access and post_login_ip:
                 redirect_target = f"/?{urlencode({'ip': post_login_ip})}"
             logger.info(f"User {username} successfully authenticated with role: {role_label}")
-    except Exception as exc:
+    # Top-level OAuth callback boundary prevents upstream or runtime failures from leaking tokens in error pages
+    except Exception as exc:  # noqa: BLE001
         logger.error(f"OAuth callback processing error ({type(exc).__name__})")
 
     return HttpResponseRedirect(redirect_target)
@@ -3971,7 +3960,7 @@ async def switch_test_role(request):
 
     try:
         body = json.loads(request.body.decode("utf-8")) if request.body else {}
-    except Exception:
+    except ValueError, UnicodeDecodeError:
         body = {}
 
     target = body.get("role", "sysop")

@@ -565,43 +565,6 @@ async def _clamp_negative_quota_counters(
         await clamp_call
 
 
-async def refund_consumed_quota(
-    provider_key: str,
-    *,
-    now_dt: Optional[datetime] = None,
-) -> None:
-    """
-    Rolls back a pre-consumed minute and daily quota unit when an upstream request
-    fails due to a transport error or timeout before receiving a valid HTTP response.
-    """
-    if not provider_key or PROVIDER_QUOTA_SPECS.get(provider_key) is None:
-        return
-    client = _get_redis_client()
-    if client is None:
-        return
-    pipeline_fn = getattr(client, "pipeline", None)
-    if not callable(pipeline_fn):
-        return
-
-    current_dt = now_dt or datetime.now(timezone.utc)
-    try:
-        pipe = pipeline_fn(transaction=False)
-        tracked_ops: List[Optional[Tuple[str, int]]] = []
-        if not _queue_quota_refund_commands(
-            pipe,
-            provider_key,
-            now_dt=current_dt,
-            _tracked_ops=tracked_ops,
-        ):
-            return
-        exec_call = pipe.execute()
-        results = await exec_call if inspect.isawaitable(exec_call) else None
-        await _clamp_negative_quota_counters(pipeline_fn, tracked_ops, results)
-    except Exception as exc:
-        _mark_redis_failure(exc)
-        logger.warning(f"Quota refund bypassed for {provider_key} due to Redis error ({type(exc).__name__})")
-
-
 def _queue_provider_telemetry_commands(
     pipe: Any,
     provider_key: str,
@@ -646,49 +609,6 @@ def _queue_provider_telemetry_commands(
             now_dt=now_dt,
             _tracked_ops=_tracked_ops,
         )
-
-
-async def record_provider_outcome(
-    provider_key: str,
-    outcome: str,
-    *,
-    upstream_remaining: Optional[int] = None,
-    upstream_limit: Optional[int] = None,
-    upstream_used: Optional[int] = None,
-    refund_quota: bool = False,
-    now_dt: Optional[datetime] = None,
-) -> None:
-    """Records a single anonymised per-provider outcome into Redis daily telemetry hashes."""
-    if outcome not in VALID_PROVIDER_OUTCOMES:
-        return
-    client = _get_redis_client()
-    if client is None:
-        return
-    pipeline_fn = getattr(client, "pipeline", None)
-    if not callable(pipeline_fn):
-        return
-
-    current_dt = now_dt or datetime.now(timezone.utc)
-    try:
-        pipe = pipeline_fn(transaction=False)
-        tracked_ops: List[Optional[Tuple[str, int]]] = []
-        _queue_provider_telemetry_commands(
-            pipe,
-            provider_key,
-            outcome,
-            now_dt=current_dt,
-            upstream_remaining=upstream_remaining,
-            upstream_limit=upstream_limit,
-            upstream_used=upstream_used,
-            refund_quota=refund_quota,
-            _tracked_ops=tracked_ops,
-        )
-        exec_call = pipe.execute()
-        results = await exec_call if inspect.isawaitable(exec_call) else None
-        await _clamp_negative_quota_counters(pipeline_fn, tracked_ops, results)
-    except Exception as exc:
-        _mark_redis_failure(exc)
-        logger.warning(f"Telemetry write bypassed for {provider_key} due to Redis error ({type(exc).__name__})")
 
 
 async def record_provider_outcomes_batch(

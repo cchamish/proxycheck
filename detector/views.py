@@ -608,23 +608,11 @@ def _parse_upstream_json_with_error(resp: httpx.Response) -> Tuple[Any, int, Opt
         return {"status": "error", "message": _sanitize_error_message(resp.text or "")}, status_code, type(exc).__name__
 
 
-def _parse_upstream_json(resp: httpx.Response) -> Tuple[Any, int]:
-    """
-    Decodes an upstream response body. Non-JSON bodies such as HTML gateway pages are returned as a
-    sanitized error payload, and a 200 status is rewritten to 502 so adapters treat it as a format error.
-    Non-dict JSON is passed through and rejected by the adapters themselves.
-    """
-    payload, status_code, _ = _parse_upstream_json_with_error(resp)
-    return payload, status_code
-
-
 _maxmind_lock = threading.Lock()
 _maxmind_readers: Dict[str, Any] = {}
 _maxmind_reader_stats: Dict[str, Optional[Tuple[int, int]]] = {}
 _missing_city_db_logged_paths: set[str] = set()
 
-_http_client_instance: Optional[Any] = None
-_http_client_loop: Optional[asyncio.AbstractEventLoop] = None
 _http_client_lock = threading.Lock()
 _http_clients_by_loop: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Any]" = weakref.WeakKeyDictionary()
 
@@ -727,16 +715,11 @@ async def _get_shared_http_client() -> httpx.AsyncClient:
     Returns a reusable cookieless httpx.AsyncClient bound to the currently running event loop.
     Isolated per event loop so concurrent worker threads never close each other's active clients.
     """
-    global _http_client_instance, _http_client_loop
-
     current_loop = asyncio.get_running_loop()
     stale_clients: List[Any] = []
     selected_client: Optional[Any] = None
 
     with _http_client_lock:
-        if _http_client_instance is None and _http_client_loop is None:
-            _http_clients_by_loop.clear()
-
         closed_loops = [
             loop
             for loop in list(_http_clients_by_loop.keys())
@@ -746,18 +729,6 @@ async def _get_shared_http_client() -> httpx.AsyncClient:
             dead_client = _http_clients_by_loop.pop(dead_loop, None)
             if dead_client is not None:
                 stale_clients.append(dead_client)
-
-        if _http_client_instance is not None:
-            tracked_in_live_loop = (
-                isinstance(_http_client_loop, asyncio.AbstractEventLoop)
-                and not _http_client_loop.is_closed()
-                and _http_clients_by_loop.get(_http_client_loop) is _http_client_instance
-            )
-            if not tracked_in_live_loop:
-                if _http_client_instance not in stale_clients:
-                    stale_clients.append(_http_client_instance)
-                _http_client_instance = None
-                _http_client_loop = None
 
         existing_client = _http_clients_by_loop.get(current_loop)
         if (
@@ -769,8 +740,6 @@ async def _get_shared_http_client() -> httpx.AsyncClient:
         else:
             new_client = _build_cookieless_http_client()
             _http_clients_by_loop[current_loop] = new_client
-            _http_client_instance = new_client
-            _http_client_loop = current_loop
             selected_client = new_client
 
     for stale_client in stale_clients:
@@ -830,20 +799,6 @@ def _lookup_mmdb_record_and_prefix(reader: Any, ip: str) -> Tuple[Optional[Dict[
 
     rec = reader.get(ip)
     return (rec if isinstance(rec, dict) else None, None)
-
-
-def _extract_mmdb_prefix_len(reader: Any, ip: str) -> Optional[int]:
-    """Extracts the routing prefix length from a MaxMind reader when supported."""
-    getter = getattr(reader, "get_with_prefix_len", None)
-    if not callable(getter):
-        return None
-    try:
-        result = getter(ip)
-        if _is_valid_mmdb_prefix_tuple(result):
-            return result[1]
-    except Exception:
-        return None
-    return None
 
 
 def _resolve_db_file(configured_path: str, filename: str, base_dir: Any) -> str:
@@ -1670,10 +1625,6 @@ async def query_tor_onionoo(client: httpx.AsyncClient, ip: str) -> Dict[str, Any
     return adapt_tor_onionoo(payload, status_code=status_code, ip=ip)
 
 
-def _has_any_local_stopforumspam_db() -> bool:
-    return has_any_local_stopforumspam_db()
-
-
 def _read_stopforumspam_sync(ip: str) -> Dict[str, Any]:
     try:
         lookup = query_stopforumspam_offline(ip)
@@ -2317,7 +2268,7 @@ def _is_provider_cache_expected(provider_key: str, is_ipv4: bool) -> bool:
     # Offline databases answer Database Missing or Offline DB Missing uncached when local files are absent
     if provider_key == "maxmind" and not _has_any_local_maxmind_db():
         return False
-    if provider_key == "stopforumspam" and not _has_any_local_stopforumspam_db():
+    if provider_key == "stopforumspam" and not has_any_local_stopforumspam_db():
         return False
     return True
 
@@ -2692,17 +2643,6 @@ async def _execute_detection_with_cache(
             upstream_remaining = event.get("upstreamRemaining") if event else None
             upstream_limit = event.get("upstreamLimit") if event else None
             upstream_used = event.get("upstreamUsed") if event else None
-            if provider_key == "ipdata" and upstream_used is None and _is_provider_result_cacheable(row):
-                raw_json = row.get("rawJson")
-                if isinstance(raw_json, dict) and raw_json.get("count") is not None:
-                    _, fallback_limit, fallback_used = extract_upstream_rate_limit(None, raw_json, "ipdata")
-                    if fallback_used is not None:
-                        upstream_used = fallback_used
-                        if upstream_limit is None and fallback_limit is not None:
-                            upstream_limit = fallback_limit
-                        if upstream_remaining is None and upstream_limit is not None and upstream_limit > 0:
-                            upstream_remaining = max(0, upstream_limit - upstream_used)
-
             if not _is_unconfigured_provider_row(row):
                 is_timeout_outcome = bool(
                     (event and event.get("isTimeout"))

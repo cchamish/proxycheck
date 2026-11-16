@@ -679,7 +679,6 @@ def _login_authorised(test_case):
 
 
 def _patch_async_client(mock_async_client_cls, get_side_effect):
-    views._http_client_instance = None
     mock_client = AsyncMock()
     mock_client.get.side_effect = get_side_effect
     mock_client.__aenter__.return_value = mock_client
@@ -2368,14 +2367,6 @@ class GadgetTokenAndCorsAuthTests(TestCase):
         )
         dns_patcher.start()
         self.addCleanup(dns_patcher.stop)
-        views._http_client_instance = None
-        views._http_client_loop = None
-        self.addCleanup(self._reset_http_client)
-
-    @staticmethod
-    def _reset_http_client():
-        views._http_client_instance = None
-        views._http_client_loop = None
 
     @staticmethod
     def _stub_provider(name):
@@ -3618,8 +3609,6 @@ class SingleflightCoalescingTests(TestCase):
 
     def tearDown(self):
         views._ip_detect_inflight.clear()
-        views._http_client_instance = None
-        views._http_client_loop = None
 
     async def test_five_concurrent_requests_for_uncached_ip_call_upstream_once(self):
         provider_calls = {"count": 0}
@@ -3842,10 +3831,6 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
 
     def setUp(self):
         _login_authorised(self)
-
-    def tearDown(self):
-        views._http_client_instance = None
-        views._http_client_loop = None
 
     def test_retry_after_header_parsed_and_clamped_within_cooldown_bounds(self):
         self.assertEqual(views._parse_retry_after_seconds("15"), 60)
@@ -4117,13 +4102,7 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
 class HttpClientLifecycleTests(TestCase):
     """Tests shared httpx.AsyncClient connection pool limits and safe cleanup across loops."""
 
-    def tearDown(self):
-        views._http_client_instance = None
-        views._http_client_loop = None
-
     async def test_shared_http_client_configures_explicit_connection_limits(self):
-        views._http_client_instance = None
-        views._http_client_loop = None
         client = await views._get_shared_http_client()
         try:
             self.assertEqual(views._DEFAULT_HTTP_LIMITS.max_connections, 100)
@@ -4133,22 +4112,6 @@ class HttpClientLifecycleTests(TestCase):
             self.assertEqual(pool_limits._max_keepalive_connections, 20)
         finally:
             await views._close_http_client_safely(client)
-
-    async def test_rebuilding_shared_client_safely_closes_stale_instance_when_aclose_raises(self):
-        stale_client = MagicMock()
-        stale_client.is_closed = False
-        stale_client.aclose = AsyncMock(side_effect=RuntimeError("Event loop is closed"))
-        views._http_client_instance = stale_client
-        views._http_client_loop = object()
-
-        fresh_client = await views._get_shared_http_client()
-        try:
-            stale_client.aclose.assert_awaited_once()
-            self.assertIsNot(fresh_client, stale_client)
-            self.assertIsInstance(fresh_client, httpx.AsyncClient)
-            self.assertFalse(fresh_client.is_closed)
-        finally:
-            await views._close_http_client_safely(fresh_client)
 
     async def test_cookieless_http_client_enforces_empty_cookie_policy_and_strips_request_cookies(self):
         captured_cookie_headers = []
@@ -4250,10 +4213,6 @@ class AsyncDnsAndDnsblTests(TestCase):
 
     def setUp(self):
         _login_authorised(self)
-
-    def tearDown(self):
-        views._http_client_instance = None
-        views._http_client_loop = None
 
     async def test_async_ptr_success_nxdomain_and_resolver_timeouts(self):
         with override_settings(DNS_QUERY_TIMEOUT_SECONDS=1.5, DNS_QUERY_LIFETIME_SECONDS=3.0):
@@ -4563,13 +4522,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
     """Tests for Proxycheck extended parameters, Tor Onionoo, StopForumSpam, and DShield feeds."""
 
     def setUp(self):
-        views._http_client_instance = None
-        views._http_client_loop = None
         _login_authorised(self)
-
-    def tearDown(self):
-        views._http_client_instance = None
-        views._http_client_loop = None
 
     def test_query_proxycheck_attaches_extended_flags_and_extracts_port_and_last_seen(self):
         captured = {}
@@ -5238,8 +5191,6 @@ class LoopIsolationAndSessionSettingsTests(TestCase):
     """Tests per-loop Redis and HTTP client isolation, empty error logging, and Redis sessions."""
 
     def tearDown(self):
-        views._http_client_instance = None
-        views._http_client_loop = None
         with views._http_client_lock:
             views._http_clients_by_loop.clear()
         with views._redis_client_lock:
@@ -7390,7 +7341,6 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         self.assertEqual(row["status"], "200 OK")
         self.assertEqual(row["countryCode"], "US")
         self.assertEqual(row["prefixLength"], 24)
-        self.assertEqual(views._extract_mmdb_prefix_len(reader, "198.51.100.42"), 24)
 
         # Unmapped record with routing prefix still avoids redundant reader.get
         null_rec_reader = MagicMock()
@@ -7801,14 +7751,6 @@ class FakeAsyncRedis:
 
 class ProactiveQuotaAndTelemetryTests(TestCase):
     """Tests for multi-window proactive quota protection, anonymised telemetry, and admin dashboard access."""
-
-    def setUp(self):
-        views._http_client_instance = None
-        views._http_client_loop = None
-
-    def tearDown(self):
-        views._http_client_instance = None
-        views._http_client_loop = None
 
     @staticmethod
     def _build_provider_http_response(url, ip="8.8.8.8"):
@@ -8590,44 +8532,6 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
             self.assertEqual(fake_redis.strings[min_key], "1")
             self.assertEqual(fake_redis.strings[day_key], "1")
 
-    def test_refund_consumed_quota_clamps_at_zero_and_fails_open_on_redis_error(self):
-        from datetime import datetime, timezone
-
-        from asgiref.sync import async_to_sync
-
-        from detector import quota_telemetry
-
-        fake_redis = FakeAsyncRedis()
-        sample_dt = datetime(2026, 11, 16, 5, 30, tzinfo=timezone.utc)
-        min_key = quota_telemetry._quota_minute_key("getipintel", sample_dt)
-        day_key = quota_telemetry._quota_daily_key("getipintel", sample_dt)
-
-        with patch("detector.views.redis_client", fake_redis):
-            quota_res = async_to_sync(quota_telemetry.check_and_consume_quota)("getipintel", now_dt=sample_dt)
-            self.assertTrue(quota_res.allowed)
-            self.assertEqual(fake_redis.strings[min_key], "1")
-            self.assertEqual(fake_redis.strings[day_key], "1")
-
-            # First refund decrements counters from 1 to 0
-            async_to_sync(quota_telemetry.refund_consumed_quota)("getipintel", now_dt=sample_dt)
-            self.assertEqual(fake_redis.strings[min_key], "0")
-            self.assertEqual(fake_redis.strings[day_key], "0")
-
-            # Repeated refund on zeroed counters must clamp back to 0 rather than going negative
-            async_to_sync(quota_telemetry.refund_consumed_quota)("getipintel", now_dt=sample_dt)
-            self.assertEqual(fake_redis.strings[min_key], "0")
-            self.assertEqual(fake_redis.strings[day_key], "0")
-
-            # Unknown provider keys are ignored without writing Redis keys
-            async_to_sync(quota_telemetry.refund_consumed_quota)("unknown_provider", now_dt=sample_dt)
-            self.assertFalse(any("unknown_provider" in k for k in fake_redis.strings))
-
-        failing_client = MagicMock()
-        failing_client.pipeline = MagicMock(side_effect=ConnectionError("redis offline"))
-        with patch("detector.views.redis_client", failing_client):
-            async_to_sync(quota_telemetry.refund_consumed_quota)("getipintel", now_dt=sample_dt)
-
-
 class _BatchingFakeRedis(FakeAsyncRedis):
     """In-memory Redis double that records single reads, batch reads and pipeline flushes."""
 
@@ -8654,14 +8558,6 @@ class RedisBatchingAndCacheCompletenessTests(TestCase):
     """Tests for batched Redis reads and writes and for the full cache hit check on partial source sets."""
 
     IPV6_TARGET = "2001:4860:4860::8888"
-
-    def setUp(self):
-        views._http_client_instance = None
-        views._http_client_loop = None
-
-    def tearDown(self):
-        views._http_client_instance = None
-        views._http_client_loop = None
 
     @staticmethod
     def _cached_row_entry(provider_name):
@@ -8847,7 +8743,6 @@ class RedisBatchingAndCacheCompletenessTests(TestCase):
         with (
             patch("detector.views.redis_client", mock_redis),
             patch("detector.views._has_any_local_maxmind_db", return_value=False),
-            patch("detector.views._has_any_local_stopforumspam_db", return_value=True),
             patch("detector.views.query_maxmind", AsyncMock(return_value=dict(MAXMIND_STUB))),
             patch("detector.views._get_shared_http_client", shared_client),
             patch("detector.views._release_inflight_task", wraps=views._release_inflight_task) as release_spy,
@@ -9119,8 +9014,6 @@ class CompactResponseAndCacheControlTests(TestCase):
 
     def setUp(self):
         views._ip_detect_inflight.clear()
-        views._http_client_instance = None
-        views._http_client_loop = None
         dns_patcher = patch(
             "dns.asyncresolver.Resolver.resolve",
             new_callable=AsyncMock,
@@ -9131,8 +9024,6 @@ class CompactResponseAndCacheControlTests(TestCase):
 
     def tearDown(self):
         views._ip_detect_inflight.clear()
-        views._http_client_instance = None
-        views._http_client_loop = None
 
     @staticmethod
     def _stub_provider(name: str) -> dict:
@@ -9377,13 +9268,9 @@ class TwoTierQueryModeTests(TestCase):
 
     def setUp(self):
         views._ip_detect_inflight.clear()
-        views._http_client_instance = None
-        views._http_client_loop = None
 
     def tearDown(self):
         views._ip_detect_inflight.clear()
-        views._http_client_instance = None
-        views._http_client_loop = None
 
     @staticmethod
     def _build_ok_row(provider_name: str, *, chance: Optional[float] = None) -> dict:
@@ -9444,9 +9331,6 @@ class TwoTierQueryModeTests(TestCase):
         mm_db_patcher.start()
         self.addCleanup(mm_db_patcher.stop)
 
-        sfs_db_patcher = patch("detector.views._has_any_local_stopforumspam_db", return_value=True)
-        sfs_db_patcher.start()
-        self.addCleanup(sfs_db_patcher.stop)
         return mocks
 
     def test_light_mode_skips_uncached_commercial_sources_and_quota(self):

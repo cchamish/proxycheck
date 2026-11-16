@@ -471,6 +471,43 @@ async def check_and_consume_quota(
     return QuotaCheckResult(allowed=True, minute_limit=rpm_limit, daily_limit=daily_limit)
 
 
+def _normalize_response_headers(headers: Any) -> Dict[str, Any]:
+    normalized: Dict[str, Any] = {}
+    if headers is None:
+        return normalized
+    items_fn = getattr(headers, "items", None)
+    if not callable(items_fn):
+        return normalized
+    try:
+        raw_items = items_fn()
+        if isinstance(raw_items, Iterable):
+            for key, value in raw_items:
+                if isinstance(key, str):
+                    normalized[key.strip().lower()] = value
+    except AttributeError, TypeError, ValueError:
+        return {}
+    return normalized
+
+
+def _lookup_int_header(
+    headers: Any,
+    normalized_headers: Dict[str, Any],
+    candidates: Tuple[str, ...],
+) -> Optional[int]:
+    getter = getattr(headers, "get", None)
+    for header_name in candidates:
+        if header_name in normalized_headers:
+            parsed = _parse_non_negative_int(normalized_headers[header_name])
+            if parsed is not None:
+                return parsed
+        if callable(getter):
+            for variant in (header_name, header_name.title()):
+                parsed = _parse_non_negative_int(getter(variant))
+                if parsed is not None:
+                    return parsed
+    return None
+
+
 def extract_upstream_rate_limit(
     resp: Any,
     payload: Any = None,
@@ -481,36 +518,14 @@ def extract_upstream_rate_limit(
     or IPData response bodies. Returns (upstream_remaining, upstream_limit, upstream_used).
     """
     headers = getattr(resp, "headers", None)
-    normalized_headers: Dict[str, Any] = {}
-    if headers is not None:
-        items_fn = getattr(headers, "items", None)
-        if callable(items_fn):
-            try:
-                raw_items = items_fn()
-                if isinstance(raw_items, Iterable):
-                    for key, value in raw_items:
-                        if isinstance(key, str):
-                            normalized_headers[key.strip().lower()] = value
-            except AttributeError, TypeError, ValueError:
-                normalized_headers = {}
+    normalized_headers = _normalize_response_headers(headers)
 
-    def _lookup_header(candidates: Tuple[str, ...]) -> Optional[int]:
-        for header_name in candidates:
-            if header_name in normalized_headers:
-                parsed = _parse_non_negative_int(normalized_headers[header_name])
-                if parsed is not None:
-                    return parsed
-            getter = getattr(headers, "get", None)
-            if callable(getter):
-                for variant in (header_name, header_name.title()):
-                    candidate_val = getter(variant)
-                    parsed = _parse_non_negative_int(candidate_val)
-                    if parsed is not None:
-                        return parsed
-        return None
-
-    upstream_remaining = _lookup_header(("x-ratelimit-remaining", "ratelimit-remaining", "x-rate-limit-remaining"))
-    upstream_limit = _lookup_header(("x-ratelimit-limit", "ratelimit-limit", "x-rate-limit-limit"))
+    upstream_remaining = _lookup_int_header(
+        headers, normalized_headers, ("x-ratelimit-remaining", "ratelimit-remaining", "x-rate-limit-remaining")
+    )
+    upstream_limit = _lookup_int_header(
+        headers, normalized_headers, ("x-ratelimit-limit", "ratelimit-limit", "x-rate-limit-limit")
+    )
     upstream_used: Optional[int] = None
 
     if provider_key == "ipdata" and isinstance(payload, dict):
@@ -741,6 +756,184 @@ def _safe_optional_hash_int(hash_data: Dict[str, str], field: str) -> Optional[i
     return _parse_non_negative_int(hash_data.get(field))
 
 
+def _decode_redis_str(raw_value: Any) -> Optional[str]:
+    if isinstance(raw_value, bytes):
+        return raw_value.decode("utf-8", errors="replace")
+    return raw_value if isinstance(raw_value, str) else None
+
+
+def _decode_pipeline_provider_row(results: Any, idx: int) -> Tuple[int, int, int, Optional[str], Dict[str, str]]:
+    base = 1 + (idx * 5)
+    min_val = _parse_non_negative_int(_decode_redis_str(results[base]) if isinstance(results[base], bytes) else results[base])
+    day_val = _parse_non_negative_int(
+        _decode_redis_str(results[base + 1]) if isinstance(results[base + 1], bytes) else results[base + 1]
+    )
+    raw_ttl = results[base + 2]
+    ttl_val = raw_ttl if isinstance(raw_ttl, int) and not isinstance(raw_ttl, bool) and raw_ttl > 0 else 0
+    cd_str = _decode_redis_str(results[base + 3])
+    return min_val or 0, day_val or 0, ttl_val, cd_str, _decode_hash(results[base + 4])
+
+
+async def _fetch_dashboard_pipeline_data(
+    client: Any,
+    specs: Tuple[Any, ...],
+    current_dt: datetime,
+    cooldown_key_fn: Any,
+) -> Tuple[bool, Dict[str, str], Dict[str, Tuple[int, int, int, Optional[str], Dict[str, str]]]]:
+    """Fetches global telemetry and per-provider quota/cooldown metrics in a single Redis pipeline."""
+    if client is None:
+        return False, {}, {}
+    pipeline_fn = getattr(client, "pipeline", None)
+    if not callable(pipeline_fn):
+        return False, {}, {}
+
+    try:
+        pipe = pipeline_fn(transaction=False)
+        pipe.hgetall(_global_telemetry_key(current_dt))
+        for provider_key, _, _, _, _ in specs:
+            cooldown_key = cooldown_key_fn(provider_key)
+            pipe.get(_quota_minute_key(provider_key, current_dt))
+            pipe.get(_quota_daily_key(provider_key, current_dt))
+            pipe.ttl(cooldown_key)
+            pipe.get(cooldown_key)
+            pipe.hgetall(_provider_telemetry_key(provider_key, current_dt))
+
+        exec_call = pipe.execute()
+        if not inspect.isawaitable(exec_call):
+            return False, {}, {}
+        results = await exec_call
+        expected_len = 1 + (len(specs) * 5)
+        if not isinstance(results, (list, tuple)) or len(results) != expected_len:
+            return False, {}, {}
+        global_hash = _decode_hash(results[0])
+        provider_rows = {
+            provider_key: _decode_pipeline_provider_row(results, idx)
+            for idx, (provider_key, _, _, _, _) in enumerate(specs)
+        }
+        return True, global_hash, provider_rows
+    except _REDIS_ERRORS as exc:
+        _mark_redis_failure(exc)
+        logger.warning(f"Dashboard snapshot fell back to empty telemetry ({type(exc).__name__})")
+        return False, {}, {}
+
+
+def _decode_cooldown_reason(cooldown_ttl: int, cd_raw: Optional[str]) -> Optional[str]:
+    if cooldown_ttl <= 0 or not cd_raw:
+        return None
+    try:
+        parsed_cd = json.loads(cd_raw)
+        if isinstance(parsed_cd, dict) and isinstance(parsed_cd.get("reason"), str):
+            return parsed_cd["reason"]
+    except ValueError:
+        return None
+    return None
+
+
+def _resolve_provider_dashboard_status(
+    provider_key: str,
+    *,
+    configured: bool,
+    cooldown_ttl: int,
+    minute_used: int,
+    rpm_limit: int,
+    daily_used: int,
+    daily_limit: int,
+    has_maxmind_db: bool,
+    has_sfs_db: bool,
+) -> Tuple[str, str]:
+    if provider_key == "maxmind" and not has_maxmind_db:
+        return "db_missing", "Database Missing"
+    if provider_key == "stopforumspam" and not has_sfs_db:
+        return "db_missing", "Offline DB Missing"
+    if not configured:
+        return "no_api_key", "No API Key"
+    if cooldown_ttl > 0:
+        return "cooldown", f"Cooldown ({cooldown_ttl}s)"
+    minute_exhausted = rpm_limit > 0 and minute_used >= rpm_limit
+    daily_exhausted = daily_limit > 0 and daily_used >= daily_limit
+    if minute_exhausted or daily_exhausted:
+        return "quota_guarded", "Quota Guarded"
+    return "healthy", "Healthy"
+
+
+def _build_provider_dashboard_entry(
+    provider_key: str,
+    provider_name: str,
+    uses_http: bool,
+    pipeline_row: Tuple[int, int, int, Optional[str], Dict[str, str]],
+    *,
+    has_maxmind_db: bool,
+    has_sfs_db: bool,
+) -> Dict[str, Any]:
+    configured = is_provider_configured(provider_key)
+    rpm_limit, daily_limit = get_provider_quota_limits(provider_key)
+    minute_used, daily_used, cooldown_ttl, cd_raw, tel_hash = pipeline_row
+    status_key, status_label = _resolve_provider_dashboard_status(
+        provider_key,
+        configured=configured,
+        cooldown_ttl=cooldown_ttl,
+        minute_used=minute_used,
+        rpm_limit=rpm_limit,
+        daily_used=daily_used,
+        daily_limit=daily_limit,
+        has_maxmind_db=has_maxmind_db,
+        has_sfs_db=has_sfs_db,
+    )
+    return {
+        "key": provider_key,
+        "name": provider_name,
+        "usesHttp": uses_http,
+        "configured": configured,
+        "status": status_label,
+        "statusKey": status_key,
+        "cooldownTtlSeconds": cooldown_ttl,
+        "cooldownReason": _decode_cooldown_reason(cooldown_ttl, cd_raw),
+        "minuteUsed": minute_used,
+        "minuteLimit": rpm_limit,
+        "dailyUsed": daily_used,
+        "dailyLimit": daily_limit,
+        "upstreamRemaining": _safe_optional_hash_int(tel_hash, "upstream_remaining"),
+        "upstreamLimit": _safe_optional_hash_int(tel_hash, "upstream_limit"),
+        "upstreamUsed": _safe_optional_hash_int(tel_hash, "upstream_used"),
+        "lastStatusAt": tel_hash.get("last_status_at") or None,
+        "telemetry": {
+            "ok": _safe_hash_int(tel_hash, "ok"),
+            "cacheHit": _safe_hash_int(tel_hash, "cache_hit"),
+            "rateLimited429": _safe_hash_int(tel_hash, "429"),
+            "error5xx": _safe_hash_int(tel_hash, "5xx"),
+            "timeout": _safe_hash_int(tel_hash, "timeout"),
+            "quotaBlocked": _safe_hash_int(tel_hash, "quota_blocked"),
+        },
+    }
+
+
+def _build_global_dashboard_summary(
+    global_hash: Dict[str, str],
+    providers_out: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    auth_session = _safe_hash_int(global_hash, "auth_session")
+    auth_gadget = _safe_hash_int(global_hash, "auth_gadget")
+    cache_hit = _safe_hash_int(global_hash, "cache_hit")
+    cache_partial = _safe_hash_int(global_hash, "cache_partial")
+    cache_miss = _safe_hash_int(global_hash, "cache_miss")
+    cache_total = cache_hit + cache_partial + cache_miss
+    total_requests = max(cache_total, auth_session + auth_gadget)
+    hit_rate_percent = round((cache_hit / cache_total) * 100.0, 1) if cache_total > 0 else 0.0
+
+    return {
+        "totalRequestsToday": total_requests,
+        "authSession": auth_session,
+        "authGadget": auth_gadget,
+        "cacheHit": cache_hit,
+        "cachePartial": cache_partial,
+        "cacheMiss": cache_miss,
+        "fullCacheHitRatePercent": hit_rate_percent,
+        "totalQuotaBlocksToday": sum(entry["telemetry"]["quotaBlocked"] for entry in providers_out),
+        "activeCooldownCount": sum(1 for entry in providers_out if entry["statusKey"] == "cooldown"),
+        "activeQuotaGuardCount": sum(1 for entry in providers_out if entry["statusKey"] == "quota_guarded"),
+    }
+
+
 async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict[str, Any]:
     """
     Aggregates global request telemetry and all provider quota, cooldown TTL, and status
@@ -750,78 +943,12 @@ async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict
 
     current_dt = now_dt or datetime.now(timezone.utc)
     specs = detector_views._PROVIDER_SPECS
-    client = _get_redis_client()
-
-    redis_available = False
-    global_hash: Dict[str, str] = {}
-    provider_pipeline_rows: Dict[str, Tuple[int, int, int, Optional[str], Dict[str, str]]] = {}
-
-    if client is not None:
-        pipeline_fn = getattr(client, "pipeline", None)
-        if callable(pipeline_fn):
-            try:
-                pipe = pipeline_fn(transaction=False)
-                pipe.hgetall(_global_telemetry_key(current_dt))
-                for provider_key, _, _, _, _ in specs:
-                    pipe.get(_quota_minute_key(provider_key, current_dt))
-                    pipe.get(_quota_daily_key(provider_key, current_dt))
-                    pipe.ttl(detector_views._provider_cooldown_key(provider_key))
-                    pipe.get(detector_views._provider_cooldown_key(provider_key))
-                    pipe.hgetall(_provider_telemetry_key(provider_key, current_dt))
-
-                exec_call = pipe.execute()
-                if inspect.isawaitable(exec_call):
-                    results = await exec_call
-                    expected_len = 1 + (len(specs) * 5)
-                    if isinstance(results, (list, tuple)) and len(results) == expected_len:
-                        redis_available = True
-                        global_hash = _decode_hash(results[0])
-                        for idx, (provider_key, _, _, _, _) in enumerate(specs):
-                            base = 1 + (idx * 5)
-                            raw_min = results[base]
-                            raw_day = results[base + 1]
-                            raw_ttl = results[base + 2]
-                            raw_cd_payload = results[base + 3]
-                            raw_tel_hash = results[base + 4]
-
-                            min_val = _parse_non_negative_int(
-                                raw_min.decode("utf-8", errors="replace") if isinstance(raw_min, bytes) else raw_min
-                            )
-                            day_val = _parse_non_negative_int(
-                                raw_day.decode("utf-8", errors="replace") if isinstance(raw_day, bytes) else raw_day
-                            )
-                            ttl_val = (
-                                raw_ttl
-                                if isinstance(raw_ttl, int) and not isinstance(raw_ttl, bool) and raw_ttl > 0
-                                else 0
-                            )
-                            cd_str = (
-                                raw_cd_payload.decode("utf-8", errors="replace")
-                                if isinstance(raw_cd_payload, bytes)
-                                else (raw_cd_payload if isinstance(raw_cd_payload, str) else None)
-                            )
-                            provider_pipeline_rows[provider_key] = (
-                                min_val or 0,
-                                day_val or 0,
-                                ttl_val,
-                                cd_str,
-                                _decode_hash(raw_tel_hash),
-                            )
-            except _REDIS_ERRORS as exc:
-                _mark_redis_failure(exc)
-                logger.warning(f"Dashboard snapshot fell back to empty telemetry ({type(exc).__name__})")
-                redis_available = False
-
-    auth_session = _safe_hash_int(global_hash, "auth_session")
-    auth_gadget = _safe_hash_int(global_hash, "auth_gadget")
-    cache_hit = _safe_hash_int(global_hash, "cache_hit")
-    cache_partial = _safe_hash_int(global_hash, "cache_partial")
-    cache_miss = _safe_hash_int(global_hash, "cache_miss")
-
-    cache_total = cache_hit + cache_partial + cache_miss
-    auth_total = auth_session + auth_gadget
-    total_requests = max(cache_total, auth_total)
-    hit_rate_percent = round((cache_hit / cache_total) * 100.0, 1) if cache_total > 0 else 0.0
+    redis_available, global_hash, provider_pipeline_rows = await _fetch_dashboard_pipeline_data(
+        _get_redis_client(),
+        specs,
+        current_dt,
+        detector_views._provider_cooldown_key,
+    )
 
     offline_databases = await asyncio.to_thread(collect_offline_databases_status, now_dt=current_dt)
     has_maxmind_db = any(
@@ -831,104 +958,23 @@ async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict
         entry.get("key", "").startswith("stopforumspam_") and entry.get("exists") for entry in offline_databases
     )
 
-    providers_out: List[Dict[str, Any]] = []
-    total_quota_blocks_today = 0
-    active_cooldown_count = 0
-    active_quota_guard_count = 0
-
-    for provider_key, provider_name, uses_http, _supports_cooldown, _ in specs:
-        configured = is_provider_configured(provider_key)
-        rpm_limit, daily_limit = get_provider_quota_limits(provider_key)
-        minute_used, daily_used, cooldown_ttl, cd_raw, tel_hash = provider_pipeline_rows.get(
-            provider_key, (0, 0, 0, None, {})
+    providers_out = [
+        _build_provider_dashboard_entry(
+            provider_key,
+            provider_name,
+            uses_http,
+            provider_pipeline_rows.get(provider_key, (0, 0, 0, None, {})),
+            has_maxmind_db=has_maxmind_db,
+            has_sfs_db=has_sfs_db,
         )
-
-        cooldown_reason: Optional[str] = None
-        if cooldown_ttl > 0 and cd_raw:
-            try:
-                parsed_cd = json.loads(cd_raw)
-                if isinstance(parsed_cd, dict) and isinstance(parsed_cd.get("reason"), str):
-                    cooldown_reason = parsed_cd["reason"]
-            except ValueError:
-                cooldown_reason = None
-
-        quota_blocked = _safe_hash_int(tel_hash, "quota_blocked")
-        total_quota_blocks_today += quota_blocked
-
-        minute_exhausted = rpm_limit > 0 and minute_used >= rpm_limit
-        daily_exhausted = daily_limit > 0 and daily_used >= daily_limit
-
-        if provider_key == "maxmind" and not has_maxmind_db:
-            status_key = "db_missing"
-            status_label = "Database Missing"
-        elif provider_key == "stopforumspam" and not has_sfs_db:
-            status_key = "db_missing"
-            status_label = "Offline DB Missing"
-        elif not configured:
-            status_key = "no_api_key"
-            status_label = "No API Key"
-        elif cooldown_ttl > 0:
-            status_key = "cooldown"
-            status_label = f"Cooldown ({cooldown_ttl}s)"
-            active_cooldown_count += 1
-        elif minute_exhausted or daily_exhausted:
-            status_key = "quota_guarded"
-            status_label = "Quota Guarded"
-            active_quota_guard_count += 1
-        else:
-            status_key = "healthy"
-            status_label = "Healthy"
-
-        upstream_remaining = _safe_optional_hash_int(tel_hash, "upstream_remaining")
-        upstream_limit = _safe_optional_hash_int(tel_hash, "upstream_limit")
-        upstream_used = _safe_optional_hash_int(tel_hash, "upstream_used")
-        last_status_at = tel_hash.get("last_status_at") or None
-
-        providers_out.append(
-            {
-                "key": provider_key,
-                "name": provider_name,
-                "usesHttp": uses_http,
-                "configured": configured,
-                "status": status_label,
-                "statusKey": status_key,
-                "cooldownTtlSeconds": cooldown_ttl,
-                "cooldownReason": cooldown_reason,
-                "minuteUsed": minute_used,
-                "minuteLimit": rpm_limit,
-                "dailyUsed": daily_used,
-                "dailyLimit": daily_limit,
-                "upstreamRemaining": upstream_remaining,
-                "upstreamLimit": upstream_limit,
-                "upstreamUsed": upstream_used,
-                "lastStatusAt": last_status_at,
-                "telemetry": {
-                    "ok": _safe_hash_int(tel_hash, "ok"),
-                    "cacheHit": _safe_hash_int(tel_hash, "cache_hit"),
-                    "rateLimited429": _safe_hash_int(tel_hash, "429"),
-                    "error5xx": _safe_hash_int(tel_hash, "5xx"),
-                    "timeout": _safe_hash_int(tel_hash, "timeout"),
-                    "quotaBlocked": quota_blocked,
-                },
-            }
-        )
+        for provider_key, provider_name, uses_http, _supports_cooldown, _ in specs
+    ]
 
     return {
         "generatedAt": current_dt.isoformat(),
         "dateBucket": current_dt.strftime("%Y%m%d"),
         "redisAvailable": redis_available,
-        "global": {
-            "totalRequestsToday": total_requests,
-            "authSession": auth_session,
-            "authGadget": auth_gadget,
-            "cacheHit": cache_hit,
-            "cachePartial": cache_partial,
-            "cacheMiss": cache_miss,
-            "fullCacheHitRatePercent": hit_rate_percent,
-            "totalQuotaBlocksToday": total_quota_blocks_today,
-            "activeCooldownCount": active_cooldown_count,
-            "activeQuotaGuardCount": active_quota_guard_count,
-        },
+        "global": _build_global_dashboard_summary(global_hash, providers_out),
         "providers": providers_out,
         "offlineDatabases": offline_databases,
     }

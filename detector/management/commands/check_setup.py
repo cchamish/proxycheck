@@ -159,10 +159,9 @@ class BastionJobCheck:
     covered_by: str = ""
 
 
-def _build_env_specs() -> Tuple[EnvVarSpec, ...]:
-    """Returns all scanned environment variable definitions in display order."""
-    specs: List[EnvVarSpec] = [
-        # Hard-required core settings
+def _build_core_and_oauth_env_specs() -> Tuple[EnvVarSpec, ...]:
+    """Returns required core and production/Toolforge OAuth environment variable specs."""
+    return (
         EnvVarSpec(
             name="DJANGO_SECRET_KEY",
             tier="required",
@@ -187,7 +186,6 @@ def _build_env_specs() -> Tuple[EnvVarSpec, ...]:
             default_display="(unset)",
             description="Wikimedia OAuth 2.0 application client secret",
         ),
-        # Production and Toolforge recommended settings
         EnvVarSpec(
             name="DJANGO_ALLOWED_HOSTS",
             tier="recommended",
@@ -244,312 +242,106 @@ def _build_env_specs() -> Tuple[EnvVarSpec, ...]:
             default_display="(unset)",
             description="Comma-separated Wikimedia usernames granted admin dashboard and status access",
         ),
-        # Upstream IP intelligence provider credentials
-        EnvVarSpec(
-            name="CLOUDFLARE_RADAR_TOKEN",
-            tier="provider",
-            category="Upstream IP Intelligence Providers",
-            sensitive=True,
-            description="Cloudflare Radar API Bearer token",
-        ),
-        EnvVarSpec(
-            name="ABUSEIPDB_API_KEY",
-            tier="provider",
-            category="Upstream IP Intelligence Providers",
-            sensitive=True,
-            description="AbuseIPDB v2 API key",
-        ),
-        EnvVarSpec(
-            name="IPDATA_API_KEY",
-            tier="provider",
-            category="Upstream IP Intelligence Providers",
-            sensitive=True,
-            description="IPData API key",
-        ),
-        EnvVarSpec(
-            name="IPREGISTRY_API_KEY",
-            tier="provider",
-            category="Upstream IP Intelligence Providers",
-            sensitive=True,
-            description="IPRegistry API key",
-        ),
-        EnvVarSpec(
-            name="IP2LOCATION_API_KEY",
-            tier="provider",
-            category="Upstream IP Intelligence Providers",
-            sensitive=True,
-            description="IP2Location.io API key",
-        ),
-        EnvVarSpec(
-            name="GETIPINTEL_CONTACT_EMAIL",
-            tier="provider",
-            category="Upstream IP Intelligence Providers",
-            sensitive=True,
-            description="Contact email address required by GetIPIntel API",
-        ),
-        EnvVarSpec(
-            name="PROXYCHECK_API_KEY",
-            tier="provider",
-            category="Upstream IP Intelligence Providers",
-            sensitive=True,
-            description="Proxycheck.io API key",
-        ),
-        EnvVarSpec(
-            name="IPHUB_API_KEY",
-            tier="provider",
-            category="Upstream IP Intelligence Providers",
-            sensitive=True,
-            description="IPHub API key",
-        ),
-        EnvVarSpec(
-            name="IPHUNTER_API_KEY",
-            tier="provider",
-            category="Upstream IP Intelligence Providers",
-            sensitive=True,
-            description="IPHunter API key",
-        ),
-        # Optional runtime, path overrides, and frontend build metadata
-        EnvVarSpec(
-            name="DJANGO_DEBUG",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="False",
-            description="Enable Django debug mode (local development only)",
-        ),
-        EnvVarSpec(
-            name="DJANGO_SECURE_HSTS_SECONDS",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="31536000",
-            description="HSTS max-age in seconds when DJANGO_DEBUG is False",
-        ),
-        EnvVarSpec(
-            name="PORT",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="8000",
-            description="Gunicorn HTTP bind port",
-        ),
-        EnvVarSpec(
-            name="WEB_CONCURRENCY",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="2",
-            description="Gunicorn UvicornWorker worker count",
-        ),
-        EnvVarSpec(
-            name="REDIS_KEY_PREFIX",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="proxycheck_dev_",
-            description="Django cache key prefix in Redis",
-        ),
-        EnvVarSpec(
-            name="ENABLE_TEST_AUTH",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="(disabled)",
-            description="Set to 1 alongside DJANGO_DEBUG=True to enable test role switching",
-        ),
-        EnvVarSpec(
-            name="WIKIMEDIA_OAUTH_URL",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="https://meta.wikimedia.org/w/rest.php/oauth2",
-            description="Wikimedia OAuth 2.0 base endpoint",
-        ),
-        EnvVarSpec(
-            name="GADGET_TOKEN_TTL_SECONDS",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="3600",
-            description="Signed userscript gadget token lifetime in seconds",
-        ),
-        EnvVarSpec(
-            name="RESTRICT_TO_ALLOWED_WIKI_USERS",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="False",
-            description="Restrict access exclusively to usernames listed in ALLOWED_WIKI_USERS",
-        ),
-        EnvVarSpec(
-            name="MAXMIND_DB_DIR",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="(auto)",
-            description="Override directory for MaxMind GeoLite2 MMDB files",
-        ),
-        EnvVarSpec(
-            name="STOPFORUMSPAM_DB_DIR",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="(auto)",
-            description="Override directory for StopForumSpam offline files",
-        ),
-        EnvVarSpec(
-            name="STOPFORUMSPAM_TOXIC_CIDR_PATH",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="(auto)",
-            description="Override file or directory path for toxic_ip_cidr.txt",
-        ),
-        EnvVarSpec(
-            name="STOPFORUMSPAM_LISTED_90_PATH",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="(auto)",
-            description="Override path for StopForumSpam 90-day listed IP archive",
-        ),
-        EnvVarSpec(
-            name="STOPFORUMSPAM_LISTED_1_PATH",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="(auto)",
-            description="Override path for StopForumSpam 1-day listed IP archive",
-        ),
-        EnvVarSpec(
-            name="STOPFORUMSPAM_SQLITE_PATH",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="(auto)",
-            description="Override path for stopforumspam.sqlite3 index",
-        ),
-        EnvVarSpec(
-            name="CLOUD_CIDR_DB_PATH",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="(auto)",
-            description="Override path for cloud_cidrs.json or computehosts.json",
-        ),
-        EnvVarSpec(
-            name="HOSTING_ASN_RULES_PATH",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="(auto)",
-            description="Override path for hosting_asn_rules.json",
-        ),
-        EnvVarSpec(
-            name="HOSTING_ASNS",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="(built-in)",
-            description="Extra comma-separated hosting ASNs",
-        ),
-        EnvVarSpec(
-            name="HOSTING_ORG_KEYWORDS",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="(built-in)",
-            description="Extra comma-separated hosting organisation keywords",
-        ),
-        EnvVarSpec(
-            name="VITE_GITHUB_REPO",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="(unset)",
-            description="Build-time GitHub repository slug (owner/repo) shown in the UI footer",
-        ),
-        EnvVarSpec(
-            name="VITE_COMMIT_HASH",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="(git HEAD)",
-            description="Build-time commit hash override for the frontend bundle",
-        ),
-        EnvVarSpec(
-            name="VITE_COMMIT_TIMESTAMP",
-            tier="optional",
-            category="Runtime, Paths & Build Metadata",
-            default_display="(git commit time)",
-            description="Build-time UTC commit timestamp override for the frontend bundle",
-        ),
-        # Tuning and offline staleness thresholds
-        EnvVarSpec(
-            name="PROVIDER_STATIC_CACHE_TTL_SECONDS",
-            tier="tuning",
-            category="Tuning & Quota Limits",
-            default_display="86400",
-            description="Cache TTL for static commercial intelligence providers",
-        ),
-        EnvVarSpec(
-            name="PROVIDER_DYNAMIC_CACHE_TTL_SECONDS",
-            tier="tuning",
-            category="Tuning & Quota Limits",
-            default_display="7200",
-            description="Cache TTL for dynamic threat feeds",
-        ),
-        EnvVarSpec(
-            name="PROVIDER_COOLDOWN_DEFAULT_SECONDS",
-            tier="tuning",
-            category="Tuning & Quota Limits",
-            default_display="120",
-            description="Default reactive cooldown circuit-breaker duration",
-        ),
-        EnvVarSpec(
-            name="PROVIDER_COOLDOWN_MIN_SECONDS",
-            tier="tuning",
-            category="Tuning & Quota Limits",
-            default_display="60",
-            description="Minimum clamped Retry-After cooldown duration",
-        ),
-        EnvVarSpec(
-            name="PROVIDER_COOLDOWN_MAX_SECONDS",
-            tier="tuning",
-            category="Tuning & Quota Limits",
-            default_display="300",
-            description="Maximum clamped Retry-After cooldown duration",
-        ),
-        EnvVarSpec(
-            name="DNS_QUERY_TIMEOUT_SECONDS",
-            tier="tuning",
-            category="Tuning & Quota Limits",
-            default_display="2.0",
-            description="Per-attempt DNS resolver timeout",
-        ),
-        EnvVarSpec(
-            name="DNS_QUERY_LIFETIME_SECONDS",
-            tier="tuning",
-            category="Tuning & Quota Limits",
-            default_display="2.0",
-            description="Total DNS resolver query lifetime",
-        ),
-        EnvVarSpec(
-            name="OFFLINE_DB_MAXMIND_STALE_SECONDS",
-            tier="tuning",
-            category="Tuning & Quota Limits",
-            default_display=str(_DEFAULT_STALE_MAXMIND_SECONDS),
-            description="MaxMind MMDB staleness warning threshold",
-        ),
-        EnvVarSpec(
-            name="OFFLINE_DB_SFS_TOXIC_STALE_SECONDS",
-            tier="tuning",
-            category="Tuning & Quota Limits",
-            default_display=str(_DEFAULT_STALE_SFS_TOXIC_SECONDS),
-            description="StopForumSpam toxic_ip_cidr.txt staleness threshold",
-        ),
-        EnvVarSpec(
-            name="OFFLINE_DB_SFS_90_STALE_SECONDS",
-            tier="tuning",
-            category="Tuning & Quota Limits",
-            default_display=str(_DEFAULT_STALE_SFS_90_SECONDS),
-            description="StopForumSpam 90-day dump staleness threshold",
-        ),
-        EnvVarSpec(
-            name="OFFLINE_DB_SFS_1_STALE_SECONDS",
-            tier="tuning",
-            category="Tuning & Quota Limits",
-            default_display=str(_DEFAULT_STALE_SFS_1_SECONDS),
-            description="StopForumSpam 1-day dump staleness threshold",
-        ),
-        EnvVarSpec(
-            name="OFFLINE_DB_RULES_STALE_SECONDS",
-            tier="tuning",
-            category="Tuning & Quota Limits",
-            default_display=str(_DEFAULT_STALE_RULES_SECONDS),
-            description="Cloud CIDR and hosting rules staleness threshold",
-        ),
-    ]
+    )
 
+
+def _build_provider_api_env_specs() -> Tuple[EnvVarSpec, ...]:
+    """Returns commercial IP intelligence provider credential variable specs."""
+    provider_defs = (
+        ("CLOUDFLARE_RADAR_TOKEN", "Cloudflare Radar API Bearer token"),
+        ("ABUSEIPDB_API_KEY", "AbuseIPDB v2 API key"),
+        ("IPDATA_API_KEY", "IPData API key"),
+        ("IPREGISTRY_API_KEY", "IPRegistry API key"),
+        ("IP2LOCATION_API_KEY", "IP2Location.io API key"),
+        ("GETIPINTEL_CONTACT_EMAIL", "Contact email address required by GetIPIntel API"),
+        ("PROXYCHECK_API_KEY", "Proxycheck.io API key"),
+        ("IPHUB_API_KEY", "IPHub API key"),
+        ("IPHUNTER_API_KEY", "IPHunter API key"),
+    )
+    return tuple(
+        EnvVarSpec(
+            name=name,
+            tier="provider",
+            category="Upstream IP Intelligence Providers",
+            sensitive=True,
+            description=description,
+        )
+        for name, description in provider_defs
+    )
+
+
+def _build_runtime_and_path_env_specs() -> Tuple[EnvVarSpec, ...]:
+    """Returns optional runtime, offline database path, and frontend build metadata specs."""
+    runtime_defs = (
+        ("DJANGO_DEBUG", "False", "Enable Django debug mode (local development only)"),
+        ("DJANGO_SECURE_HSTS_SECONDS", "31536000", "HSTS max-age in seconds when DJANGO_DEBUG is False"),
+        ("PORT", "8000", "Gunicorn HTTP bind port"),
+        ("WEB_CONCURRENCY", "2", "Gunicorn UvicornWorker worker count"),
+        ("REDIS_KEY_PREFIX", "proxycheck_dev_", "Django cache key prefix in Redis"),
+        ("ENABLE_TEST_AUTH", "(disabled)", "Set to 1 alongside DJANGO_DEBUG=True to enable test role switching"),
+        ("WIKIMEDIA_OAUTH_URL", "https://meta.wikimedia.org/w/rest.php/oauth2", "Wikimedia OAuth 2.0 base endpoint"),
+        ("GADGET_TOKEN_TTL_SECONDS", "3600", "Signed userscript gadget token lifetime in seconds"),
+        (
+            "RESTRICT_TO_ALLOWED_WIKI_USERS",
+            "False",
+            "Restrict access exclusively to usernames listed in ALLOWED_WIKI_USERS",
+        ),
+        ("MAXMIND_DB_DIR", "(auto)", "Override directory for MaxMind GeoLite2 MMDB files"),
+        ("STOPFORUMSPAM_DB_DIR", "(auto)", "Override directory for StopForumSpam offline files"),
+        ("STOPFORUMSPAM_TOXIC_CIDR_PATH", "(auto)", "Override file or directory path for toxic_ip_cidr.txt"),
+        ("STOPFORUMSPAM_LISTED_90_PATH", "(auto)", "Override path for StopForumSpam 90-day listed IP archive"),
+        ("STOPFORUMSPAM_LISTED_1_PATH", "(auto)", "Override path for StopForumSpam 1-day listed IP archive"),
+        ("STOPFORUMSPAM_SQLITE_PATH", "(auto)", "Override path for stopforumspam.sqlite3 index"),
+        ("CLOUD_CIDR_DB_PATH", "(auto)", "Override path for cloud_cidrs.json or computehosts.json"),
+        ("HOSTING_ASN_RULES_PATH", "(auto)", "Override path for hosting_asn_rules.json"),
+        ("HOSTING_ASNS", "(built-in)", "Extra comma-separated hosting ASNs"),
+        ("HOSTING_ORG_KEYWORDS", "(built-in)", "Extra comma-separated hosting organisation keywords"),
+        ("VITE_GITHUB_REPO", "(unset)", "Build-time GitHub repository slug (owner/repo) shown in the UI footer"),
+        ("VITE_COMMIT_HASH", "(git HEAD)", "Build-time commit hash override for the frontend bundle"),
+        ("VITE_COMMIT_TIMESTAMP", "(git commit time)", "Build-time UTC commit timestamp override for the frontend bundle"),
+    )
+    return tuple(
+        EnvVarSpec(
+            name=name,
+            tier="optional",
+            category="Runtime, Paths & Build Metadata",
+            default_display=default_display,
+            description=description,
+        )
+        for name, default_display, description in runtime_defs
+    )
+
+
+def _build_tuning_and_quota_env_specs() -> Tuple[EnvVarSpec, ...]:
+    """Returns cache, resolver, staleness threshold, and per-provider quota tuning specs."""
+    tuning_defs = (
+        ("PROVIDER_STATIC_CACHE_TTL_SECONDS", "86400", "Cache TTL for static commercial intelligence providers"),
+        ("PROVIDER_DYNAMIC_CACHE_TTL_SECONDS", "7200", "Cache TTL for dynamic threat feeds"),
+        ("PROVIDER_COOLDOWN_DEFAULT_SECONDS", "120", "Default reactive cooldown circuit-breaker duration"),
+        ("PROVIDER_COOLDOWN_MIN_SECONDS", "60", "Minimum clamped Retry-After cooldown duration"),
+        ("PROVIDER_COOLDOWN_MAX_SECONDS", "300", "Maximum clamped Retry-After cooldown duration"),
+        ("DNS_QUERY_TIMEOUT_SECONDS", "2.0", "Per-attempt DNS resolver timeout"),
+        ("DNS_QUERY_LIFETIME_SECONDS", "2.0", "Total DNS resolver query lifetime"),
+        ("OFFLINE_DB_MAXMIND_STALE_SECONDS", str(_DEFAULT_STALE_MAXMIND_SECONDS), "MaxMind MMDB staleness warning threshold"),
+        (
+            "OFFLINE_DB_SFS_TOXIC_STALE_SECONDS",
+            str(_DEFAULT_STALE_SFS_TOXIC_SECONDS),
+            "StopForumSpam toxic_ip_cidr.txt staleness threshold",
+        ),
+        ("OFFLINE_DB_SFS_90_STALE_SECONDS", str(_DEFAULT_STALE_SFS_90_SECONDS), "StopForumSpam 90-day dump staleness threshold"),
+        ("OFFLINE_DB_SFS_1_STALE_SECONDS", str(_DEFAULT_STALE_SFS_1_SECONDS), "StopForumSpam 1-day dump staleness threshold"),
+        ("OFFLINE_DB_RULES_STALE_SECONDS", str(_DEFAULT_STALE_RULES_SECONDS), "Cloud CIDR and hosting rules staleness threshold"),
+    )
+    specs = [
+        EnvVarSpec(
+            name=name,
+            tier="tuning",
+            category="Tuning & Quota Limits",
+            default_display=default_display,
+            description=description,
+        )
+        for name, default_display, description in tuning_defs
+    ]
     for prefix, rpm_default, daily_default in _QUOTA_DEFAULT_PAIRS:
         specs.append(
             EnvVarSpec(
@@ -569,8 +361,17 @@ def _build_env_specs() -> Tuple[EnvVarSpec, ...]:
                 description=f"Soft daily quota guard for {prefix.lower()}",
             )
         )
-
     return tuple(specs)
+
+
+def _build_env_specs() -> Tuple[EnvVarSpec, ...]:
+    """Returns all scanned environment variable definitions in display order."""
+    return (
+        *_build_core_and_oauth_env_specs(),
+        *_build_provider_api_env_specs(),
+        *_build_runtime_and_path_env_specs(),
+        *_build_tuning_and_quota_env_specs(),
+    )
 
 
 ENV_SPECS: Tuple[EnvVarSpec, ...] = _build_env_specs()
@@ -741,6 +542,29 @@ def _run_toolforge_command(
     return completed.returncode, completed.stdout or "", completed.stderr or ""
 
 
+def _parse_envvars_json(stripped: str) -> Optional[Tuple[Dict[str, str], set[str]]]:
+    try:
+        payload = json.loads(stripped)
+    except ValueError:
+        return None
+    if isinstance(payload, dict):
+        values = {str(k): str(v) for k, v in payload.items() if _ENV_NAME_RE.match(str(k))}
+        return values, set(values.keys())
+    if isinstance(payload, list):
+        values: Dict[str, str] = {}
+        names: set[str] = set()
+        for entry in payload:
+            if isinstance(entry, dict) and entry.get("name"):
+                key = str(entry["name"]).strip()
+                names.add(key)
+                if entry.get("value") is not None:
+                    values[key] = str(entry["value"])
+            elif isinstance(entry, str) and _ENV_NAME_RE.match(entry.strip()):
+                names.add(entry.strip())
+        return values, names
+    return None
+
+
 def _parse_envvars_list_output(raw_output: str, *, with_values: bool) -> Tuple[Dict[str, str], set[str]]:
     """Parses tabular or JSON output from toolforge envvars list."""
     stripped = raw_output.strip()
@@ -748,25 +572,9 @@ def _parse_envvars_list_output(raw_output: str, *, with_values: bool) -> Tuple[D
         return {}, set()
 
     if stripped.startswith(("{", "[")):
-        try:
-            payload = json.loads(stripped)
-            if isinstance(payload, dict):
-                values = {str(k): str(v) for k, v in payload.items() if _ENV_NAME_RE.match(str(k))}
-                return values, set(values.keys())
-            if isinstance(payload, list):
-                values = {}
-                names: set[str] = set()
-                for entry in payload:
-                    if isinstance(entry, dict) and entry.get("name"):
-                        key = str(entry["name"]).strip()
-                        names.add(key)
-                        if "value" in entry and entry["value"] is not None:
-                            values[key] = str(entry["value"])
-                    elif isinstance(entry, str) and _ENV_NAME_RE.match(entry.strip()):
-                        names.add(entry.strip())
-                return values, names
-        except ValueError:
-            pass
+        parsed_json = _parse_envvars_json(stripped)
+        if parsed_json is not None:
+            return parsed_json
 
     values_out: Dict[str, str] = {}
     names_out: set[str] = set()
@@ -774,10 +582,8 @@ def _parse_envvars_list_output(raw_output: str, *, with_values: bool) -> Tuple[D
         candidate = line.strip()
         if not candidate or _SEPARATOR_LINE_RE.match(candidate):
             continue
-        if "=" in candidate and (len(candidate.split(None, 1)) == 1 or "=" in candidate.split(None, 1)[0]):
-            parts = [part.strip() for part in candidate.split("=", 1)]
-        else:
-            parts = candidate.split(None, 1)
+        first_token = candidate.split(None, 1)[0]
+        parts = [part.strip() for part in candidate.split("=", 1)] if "=" in first_token else candidate.split(None, 1)
         head = parts[0].strip().rstrip(":")
         if head.lower() in ("name", "key", "envvar", "variable") and (
             len(parts) == 1 or parts[1].strip().lower() in ("value", "values")
@@ -1494,6 +1300,28 @@ def _parse_bordered_jobs_table(raw_output: str) -> Dict[str, RegisteredJob]:
     return jobs
 
 
+def _parse_toolforge_jobs_json(stripped: str) -> Optional[Dict[str, RegisteredJob]]:
+    try:
+        payload = json.loads(stripped)
+    except ValueError:
+        return None
+    if not isinstance(payload, list):
+        return None
+    parsed: Dict[str, RegisteredJob] = {}
+    for entry in payload:
+        if isinstance(entry, dict) and entry.get("name"):
+            job_name = str(entry["name"]).strip()
+            parsed[job_name] = RegisteredJob(
+                name=job_name,
+                command=str(entry.get("command") or ""),
+                job_type=str(entry.get("type") or entry.get("job_type") or ""),
+                image=str(entry.get("image") or ""),
+                mount=str(entry.get("mount") or entry.get("mounts") or ""),
+                status=str(entry.get("status") or ""),
+            )
+    return parsed
+
+
 def _parse_toolforge_jobs_list(raw_output: str) -> Dict[str, RegisteredJob]:
     """Parses toolforge jobs list (--output long or compact) and JSON output."""
     stripped = raw_output.strip()
@@ -1501,24 +1329,9 @@ def _parse_toolforge_jobs_list(raw_output: str) -> Dict[str, RegisteredJob]:
         return {}
 
     if stripped.startswith(("{", "[")):
-        try:
-            payload = json.loads(stripped)
-            if isinstance(payload, list):
-                parsed: Dict[str, RegisteredJob] = {}
-                for entry in payload:
-                    if isinstance(entry, dict) and entry.get("name"):
-                        job_name = str(entry["name"]).strip()
-                        parsed[job_name] = RegisteredJob(
-                            name=job_name,
-                            command=str(entry.get("command") or ""),
-                            job_type=str(entry.get("type") or entry.get("job_type") or ""),
-                            image=str(entry.get("image") or ""),
-                            mount=str(entry.get("mount") or entry.get("mounts") or ""),
-                            status=str(entry.get("status") or ""),
-                        )
-                return parsed
-        except ValueError:
-            pass
+        parsed_json = _parse_toolforge_jobs_json(stripped)
+        if parsed_json is not None:
+            return parsed_json
 
     if any(line.strip().startswith("|") and line.strip().endswith("|") for line in raw_output.splitlines()):
         bordered = _parse_bordered_jobs_table(raw_output)
@@ -1530,8 +1343,7 @@ def _parse_toolforge_jobs_list(raw_output: str) -> Dict[str, RegisteredJob]:
     col_bounds: Optional[List[Tuple[int, int]]] = None
 
     for line in lines:
-        lower = line.strip().lower()
-        if lower.startswith("job name"):
+        if line.strip().lower().startswith("job name"):
             continue
         if _SEPARATOR_LINE_RE.match(line.strip()):
             spans = [m.span() for m in re.finditer(r"-+", line)]
@@ -1866,6 +1678,114 @@ class Command(BaseCommand):
         env_result.values[key] = value
         env_result.sources[key] = env_result.dotenv_path.name
 
+    def _report_missing_env_spec(
+        self,
+        spec: EnvVarSpec,
+        *,
+        tag: str,
+        has_explicit_db_dirs: bool,
+        missing_required: List[EnvVarSpec],
+        attention_recommended: List[EnvVarSpec],
+        missing_providers: List[EnvVarSpec],
+        missing_optional_all: List[EnvVarSpec],
+    ) -> None:
+        if spec.tier == "required":
+            missing_required.append(spec)
+            self.stdout.write(self.style.ERROR(f"  - {tag} {spec.name}: MISSING ({spec.description})"))
+        elif spec.tier == "recommended":
+            if spec.name == "TOOL_DATA_DIR" and has_explicit_db_dirs:
+                self.stdout.write(
+                    "  - [OPTIONAL] TOOL_DATA_DIR: NOT SET "
+                    "(not required; MAXMIND_DB_DIR and STOPFORUMSPAM_DB_DIR configured)"
+                )
+            else:
+                attention_recommended.append(spec)
+                self.stdout.write(self.style.WARNING(f"  - {tag} {spec.name}: MISSING (default: {spec.default_display})"))
+        elif spec.tier == "provider":
+            missing_providers.append(spec)
+            self.stdout.write(f"  - {tag} {spec.name}: MISSING (provider skipped)")
+        else:
+            missing_optional_all.append(spec)
+            self.stdout.write(f"  - {tag} {spec.name}: USING DEFAULT ({spec.default_display})")
+
+    def _report_configured_env_spec(
+        self,
+        spec: EnvVarSpec,
+        val: str,
+        *,
+        tag: str,
+        source_label: str,
+        mode: str,
+        tool_account: Optional[str],
+        missing_required: List[EnvVarSpec],
+        attention_recommended: List[EnvVarSpec],
+    ) -> None:
+        if spec.name == "DJANGO_SECRET_KEY" and val == INSECURE_DEV_SECRET_KEY:
+            missing_required.append(spec)
+            self.stdout.write(self.style.ERROR(f"  - {tag} {spec.name}: INSECURE DEFAULT ({source_label})"))
+            return
+
+        if spec.name == "DJANGO_SECRET_KEY":
+            is_placeholder, weak_reason = _is_weak_secret_key(val)
+            if weak_reason:
+                shown_val = format_display_value(spec, val)
+                if is_placeholder:
+                    missing_required.append(spec)
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"  - {tag} {spec.name}: WEAK / PLACEHOLDER = {shown_val} ({weak_reason}; {source_label})"
+                    )
+                )
+                return
+
+        review_reason = (
+            _is_recommended_local_fallback(spec, val, mode=mode, tool_account=tool_account)
+            if spec.tier == "recommended"
+            else None
+        )
+        shown_val = format_display_value(spec, val)
+        if review_reason:
+            attention_recommended.append(spec)
+            self.stdout.write(
+                self.style.WARNING(f"  - {tag} {spec.name}: NEEDS REVIEW = {shown_val} ({review_reason}; {source_label})")
+            )
+        else:
+            self.stdout.write(self.style.SUCCESS(f"  - {tag} {spec.name}: CONFIGURED = {shown_val} ({source_label})"))
+
+    def _print_tuning_env_section(
+        self,
+        values: Dict[str, str],
+        sources: Dict[str, str],
+        *,
+        show_all_options: bool,
+        missing_optional_all: List[EnvVarSpec],
+    ) -> None:
+        tuning_specs = [spec for spec in ENV_SPECS if spec.tier == "tuning"]
+        custom_tuning = [spec for spec in tuning_specs if values.get(spec.name, "")]
+        if show_all_options:
+            self.stdout.write("\n  Tuning & Quota Limits (Optional):")
+            for spec in tuning_specs:
+                val = values.get(spec.name, "")
+                if val:
+                    self.stdout.write(
+                        self.style.SUCCESS(
+                            f"  - [OPTIONAL] {spec.name}: CUSTOMISED = {val} ({sources.get(spec.name, '')})"
+                        )
+                    )
+                else:
+                    missing_optional_all.append(spec)
+                    self.stdout.write(f"  - [OPTIONAL] {spec.name}: USING DEFAULT ({spec.default_display})")
+            return
+
+        self.stdout.write(f"\n  Tuning & Quota Limits ({len(tuning_specs)} optional vars):")
+        if custom_tuning:
+            custom_summary = ", ".join(f"{spec.name}={values[spec.name]}" for spec in custom_tuning)
+            self.stdout.write(f"  - Customised ({len(custom_tuning)}): {custom_summary}")
+        self.stdout.write(
+            f"  - Using built-in defaults ({len(tuning_specs) - len(custom_tuning)} vars); "
+            "pass --all-options to inspect or edit individually."
+        )
+
     def _print_env_section(
         self,
         env_result: EnvLoadResult,
@@ -1895,87 +1815,39 @@ class Command(BaseCommand):
             ("optional", "Runtime, Paths & Build Metadata (Optional)"),
         ):
             self.stdout.write(f"\n  {heading}:")
-            tier_specs = [spec for spec in ENV_SPECS if spec.tier == tier]
-            for spec in tier_specs:
-                val = values.get(spec.name, "")
-                is_hidden = spec.name in hidden_keys
-                tag = (
-                    "[REQUIRED]" if tier == "required" else ("[RECOMMENDED]" if tier == "recommended" else "[OPTIONAL]")
-                )
-
-                if is_hidden:
+            tag = "[REQUIRED]" if tier == "required" else ("[RECOMMENDED]" if tier == "recommended" else "[OPTIONAL]")
+            for spec in ENV_SPECS:
+                if spec.tier != tier:
+                    continue
+                if spec.name in hidden_keys:
                     self.stdout.write(
                         self.style.SUCCESS(
                             f"  - {tag} {spec.name}: CONFIGURED (hidden by CLI, {sources.get(spec.name, '')})"
                         )
                     )
                     continue
-
+                val = values.get(spec.name, "")
                 if not val:
-                    if tier == "required":
-                        missing_required.append(spec)
-                        self.stdout.write(self.style.ERROR(f"  - {tag} {spec.name}: MISSING ({spec.description})"))
-                    elif tier == "recommended":
-                        if spec.name == "TOOL_DATA_DIR" and has_explicit_db_dirs:
-                            self.stdout.write(
-                                "  - [OPTIONAL] TOOL_DATA_DIR: NOT SET "
-                                "(not required; MAXMIND_DB_DIR and STOPFORUMSPAM_DB_DIR configured)"
-                            )
-                        else:
-                            attention_recommended.append(spec)
-                            self.stdout.write(
-                                self.style.WARNING(f"  - {tag} {spec.name}: MISSING (default: {spec.default_display})")
-                            )
-                    elif tier == "provider":
-                        missing_providers.append(spec)
-                        self.stdout.write(f"  - {tag} {spec.name}: MISSING (provider skipped)")
-                    else:
-                        missing_optional_all.append(spec)
-                        self.stdout.write(f"  - {tag} {spec.name}: USING DEFAULT ({spec.default_display})")
-                    continue
-
-                if spec.name == "DJANGO_SECRET_KEY" and val == INSECURE_DEV_SECRET_KEY:
-                    missing_required.append(spec)
-                    self.stdout.write(
-                        self.style.ERROR(
-                            f"  - {tag} {spec.name}: INSECURE DEFAULT ({sources.get(spec.name, 'configured')})"
-                        )
+                    self._report_missing_env_spec(
+                        spec,
+                        tag=tag,
+                        has_explicit_db_dirs=has_explicit_db_dirs,
+                        missing_required=missing_required,
+                        attention_recommended=attention_recommended,
+                        missing_providers=missing_providers,
+                        missing_optional_all=missing_optional_all,
                     )
                     continue
-
-                if spec.name == "DJANGO_SECRET_KEY":
-                    is_placeholder, weak_reason = _is_weak_secret_key(val)
-                    if weak_reason:
-                        shown_val = format_display_value(spec, val)
-                        source_label = sources.get(spec.name, "configured")
-                        if is_placeholder:
-                            missing_required.append(spec)
-                        self.stdout.write(
-                            self.style.WARNING(
-                                f"  - {tag} {spec.name}: WEAK / PLACEHOLDER = {shown_val} "
-                                f"({weak_reason}; {source_label})"
-                            )
-                        )
-                        continue
-
-                review_reason = (
-                    _is_recommended_local_fallback(spec, val, mode=mode, tool_account=tool_account)
-                    if tier == "recommended"
-                    else None
+                self._report_configured_env_spec(
+                    spec,
+                    val,
+                    tag=tag,
+                    source_label=sources.get(spec.name, "configured"),
+                    mode=mode,
+                    tool_account=tool_account,
+                    missing_required=missing_required,
+                    attention_recommended=attention_recommended,
                 )
-                shown_val = format_display_value(spec, val)
-                source_label = sources.get(spec.name, "configured")
-                if review_reason:
-                    attention_recommended.append(spec)
-                    self.stdout.write(
-                        self.style.WARNING(
-                            f"  - {tag} {spec.name}: NEEDS REVIEW = {shown_val} ({review_reason}; {source_label})"
-                        )
-                    )
-                else:
-                    self.stdout.write(
-                        self.style.SUCCESS(f"  - {tag} {spec.name}: CONFIGURED = {shown_val} ({source_label})")
-                    )
 
         if values.get("ENABLE_TEST_AUTH") == "1" and (
             mode == "bastion" or values.get("DJANGO_DEBUG", "").lower() not in ("1", "true", "yes")
@@ -1986,31 +1858,12 @@ class Command(BaseCommand):
                 )
             )
 
-        tuning_specs = [spec for spec in ENV_SPECS if spec.tier == "tuning"]
-        custom_tuning = [spec for spec in tuning_specs if values.get(spec.name, "")]
-        if show_all_options:
-            self.stdout.write("\n  Tuning & Quota Limits (Optional):")
-            for spec in tuning_specs:
-                val = values.get(spec.name, "")
-                if val:
-                    self.stdout.write(
-                        self.style.SUCCESS(
-                            f"  - [OPTIONAL] {spec.name}: CUSTOMISED = {val} ({sources.get(spec.name, '')})"
-                        )
-                    )
-                else:
-                    missing_optional_all.append(spec)
-                    self.stdout.write(f"  - [OPTIONAL] {spec.name}: USING DEFAULT ({spec.default_display})")
-        else:
-            self.stdout.write(f"\n  Tuning & Quota Limits ({len(tuning_specs)} optional vars):")
-            if custom_tuning:
-                custom_summary = ", ".join(f"{spec.name}={values[spec.name]}" for spec in custom_tuning)
-                self.stdout.write(f"  - Customised ({len(custom_tuning)}): {custom_summary}")
-            self.stdout.write(
-                f"  - Using built-in defaults ({len(tuning_specs) - len(custom_tuning)} vars); "
-                "pass --all-options to inspect or edit individually."
-            )
-
+        self._print_tuning_env_section(
+            values,
+            sources,
+            show_all_options=show_all_options,
+            missing_optional_all=missing_optional_all,
+        )
         return missing_required, attention_recommended, missing_providers, missing_optional_all
 
     def _run_interactive_env_prompts(
@@ -2254,6 +2107,75 @@ class Command(BaseCommand):
                     self.stdout.write(self.style.WARNING(f"    Note: {warning}"))
         return checks, None
 
+    def _collect_db_update_commands(
+        self,
+        *,
+        mode: str,
+        tool_account: Optional[str],
+        values: Dict[str, str],
+        hidden: set[str],
+        missing_or_stale_core_dbs: Sequence[Dict[str, Any]],
+    ) -> List[str]:
+        if not missing_or_stale_core_dbs:
+            return []
+        missing_sfs_dbs = [e for e in missing_or_stale_core_dbs if e["source"] == "StopForumSpam"]
+        missing_maxmind_dbs = [e for e in missing_or_stale_core_dbs if e["source"] == "MaxMind"]
+        has_maxmind_creds = bool(
+            (values.get("MAXMIND_ACCOUNT_ID") or "MAXMIND_ACCOUNT_ID" in hidden)
+            and (values.get("MAXMIND_LICENSE_KEY") or "MAXMIND_LICENSE_KEY" in hidden)
+        )
+        commands: List[str] = []
+        if mode == "bastion":
+            target_image = f"tool-{tool_account}/tool-{tool_account}:latest" if tool_account else DEFAULT_JOB_SPEC.image
+            if missing_maxmind_dbs and not has_maxmind_creds:
+                self.stdout.write(
+                    self.style.WARNING(
+                        "  - MaxMind credentials (MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY) are not configured; "
+                        "configure them first or upload GeoLite2-*.mmdb manually into ~/data."
+                    )
+                )
+            commands.append(
+                f"toolforge jobs run update-offline-dbs-init --image {target_image} "
+                '--mount=all --wait --command "python manage.py update_offline_dbs"'
+            )
+            return commands
+
+        if missing_sfs_dbs and not missing_maxmind_dbs:
+            return ["python manage.py update_offline_dbs --sources stopforumspam"]
+        if missing_maxmind_dbs and not has_maxmind_creds:
+            self.stdout.write(
+                self.style.WARNING(
+                    "  - MaxMind credentials (MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY) are not configured; "
+                    "StopForumSpam can still update via '--sources stopforumspam'."
+                )
+            )
+            if missing_sfs_dbs:
+                commands.append("python manage.py update_offline_dbs --sources stopforumspam")
+        commands.append("python manage.py update_offline_dbs")
+        return commands
+
+    def _collect_job_remediation_commands(self, missing_or_warn_jobs: Sequence[BastionJobCheck]) -> List[str]:
+        if not missing_or_warn_jobs:
+            return []
+        commands: List[str] = []
+        for job in missing_or_warn_jobs:
+            spec = job.expected
+            target_job_name = job.covered_by or spec.name
+            commands.append(
+                f'toolforge jobs run {target_job_name} --command "{spec.command}" '
+                f'--image {job.adapted_image} --schedule "{spec.schedule}" --mount={spec.mount}'
+            )
+        if any(job.expected.image != job.adapted_image for job in missing_or_warn_jobs):
+            template_img = missing_or_warn_jobs[0].expected.image
+            adapted_img = missing_or_warn_jobs[0].adapted_image
+            commands.append(
+                f"tmp_jobs=$(mktemp) && sed 's|{template_img}|{adapted_img}|g' jobs.yaml > \"$tmp_jobs\" "
+                '&& toolforge jobs load "$tmp_jobs" && rm -f "$tmp_jobs"'
+            )
+        else:
+            commands.append("toolforge jobs load jobs.yaml")
+        return commands
+
     def _print_remediation_and_summary(
         self,
         *,
@@ -2291,72 +2213,22 @@ class Command(BaseCommand):
             if d.required and d.exists and (not d.is_dir or not d.readable or (d.persistent and not d.writable))
         ]
         missing_or_stale_core_dbs = [e for e in offline_entries if not e["optional"] and e["status"] != "healthy"]
-        missing_sfs_dbs = [e for e in missing_or_stale_core_dbs if e["source"] == "StopForumSpam"]
-        missing_maxmind_dbs = [e for e in missing_or_stale_core_dbs if e["source"] == "MaxMind"]
         missing_or_warn_jobs = [j for j in job_checks if not j.registered or j.warnings]
 
         commands_to_run: List[str] = []
-
         if mode == "bastion" and updated_env_count > 0:
             commands_to_run.append("toolforge webservice buildservice restart --mount=all")
-
-        for d in missing_dirs:
-            commands_to_run.append(f"mkdir -p {d.path}")
-
-        if missing_or_stale_core_dbs:
-            has_maxmind_creds = bool(
-                (values.get("MAXMIND_ACCOUNT_ID") or "MAXMIND_ACCOUNT_ID" in hidden)
-                and (values.get("MAXMIND_LICENSE_KEY") or "MAXMIND_LICENSE_KEY" in hidden)
+        commands_to_run.extend(f"mkdir -p {d.path}" for d in missing_dirs)
+        commands_to_run.extend(
+            self._collect_db_update_commands(
+                mode=mode,
+                tool_account=tool_account,
+                values=values,
+                hidden=hidden,
+                missing_or_stale_core_dbs=missing_or_stale_core_dbs,
             )
-            if mode == "bastion":
-                target_image = (
-                    f"tool-{tool_account}/tool-{tool_account}:latest" if tool_account else DEFAULT_JOB_SPEC.image
-                )
-                if missing_maxmind_dbs and not has_maxmind_creds:
-                    self.stdout.write(
-                        self.style.WARNING(
-                            "  - MaxMind credentials (MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY) are not configured; "
-                            "configure them first or upload GeoLite2-*.mmdb manually into ~/data."
-                        )
-                    )
-                commands_to_run.append(
-                    f"toolforge jobs run update-offline-dbs-init --image {target_image} "
-                    '--mount=all --wait --command "python manage.py update_offline_dbs"'
-                )
-            else:
-                if missing_sfs_dbs and not missing_maxmind_dbs:
-                    commands_to_run.append("python manage.py update_offline_dbs --sources stopforumspam")
-                elif missing_maxmind_dbs and not has_maxmind_creds:
-                    self.stdout.write(
-                        self.style.WARNING(
-                            "  - MaxMind credentials (MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY) are not configured; "
-                            "StopForumSpam can still update via '--sources stopforumspam'."
-                        )
-                    )
-                    if missing_sfs_dbs:
-                        commands_to_run.append("python manage.py update_offline_dbs --sources stopforumspam")
-                    commands_to_run.append("python manage.py update_offline_dbs")
-                else:
-                    commands_to_run.append("python manage.py update_offline_dbs")
-
-        if missing_or_warn_jobs:
-            needs_image_adapt = any(job.expected.image != job.adapted_image for job in missing_or_warn_jobs)
-            for job in missing_or_warn_jobs:
-                spec = job.expected
-                target_job_name = job.covered_by or spec.name
-                commands_to_run.append(
-                    f'toolforge jobs run {target_job_name} --command "{spec.command}" '
-                    f'--image {job.adapted_image} --schedule "{spec.schedule}" --mount={spec.mount}'
-                )
-            if needs_image_adapt:
-                template_img = missing_or_warn_jobs[0].expected.image
-                adapted_img = missing_or_warn_jobs[0].adapted_image
-                commands_to_run.append(
-                    f"tmp_jobs=$(mktemp) && sed 's|{template_img}|{adapted_img}|g' jobs.yaml > \"$tmp_jobs\" "
-                    '&& toolforge jobs load "$tmp_jobs" && rm -f "$tmp_jobs"'
-                )
-            else:
-                commands_to_run.append("toolforge jobs load jobs.yaml")
+        )
+        commands_to_run.extend(self._collect_job_remediation_commands(missing_or_warn_jobs))
 
         if unresolved_required_env:
             self.stdout.write(

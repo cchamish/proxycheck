@@ -1,0 +1,1034 @@
+"""Tests for singleflight coalescing, provider caching, circuit breaking, and client reuse."""
+
+import asyncio
+import json
+import os
+import time
+import warnings
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import dns.exception
+import dns.name
+import dns.resolver
+import dns.reversename
+import httpx
+import redis.exceptions
+from django.test import AsyncRequestFactory, TestCase, override_settings
+
+from detector import views
+from detector.oauth import (
+    _clear_client_cookies,
+    fetch_project_user_rights,
+    fetch_user_rights_from_meta,
+    verify_centralauth_userinfo,
+)
+
+from .helpers import (
+    EMPTY_UPSTREAM_SECRETS,
+    MAXMIND_STUB,
+    TEST_UPSTREAM_SECRETS,
+    FakeAsyncRedis,
+    _BatchingFakeRedis,
+    _login_authorised,
+    _mock_response,
+    _patch_async_client,
+    _ptr_or_clean_dns_side_effect,
+)
+
+
+class ConnectionAndReaderReuseTests(TestCase):
+    """Tests event-loop-aware HTTP client reuse and lazy MaxMind reader caching."""
+
+    def setUp(self):
+        dns_patcher = patch(
+            "dns.asyncresolver.Resolver.resolve",
+            new_callable=AsyncMock,
+            side_effect=dns.resolver.NXDOMAIN(),
+        )
+        dns_patcher.start()
+        self.addCleanup(dns_patcher.stop)
+
+    def test_http_client_reused_in_same_loop_and_rebuilt_across_closed_loops(self):
+        async def _acquire_twice():
+            first = await views._get_shared_http_client()
+            second = await views._get_shared_http_client()
+            self.assertIs(first, second)
+            return first
+
+        with patch("detector.views.httpx.AsyncClient", wraps=httpx.AsyncClient) as spy_cls:
+            client_loop_one = asyncio.run(_acquire_twice())
+            self.assertEqual(spy_cls.call_count, 1)
+
+            # Running in a new event loop after the previous one closed must rebuild the client cleanly
+            client_loop_two = asyncio.run(_acquire_twice())
+            self.assertEqual(spy_cls.call_count, 2)
+            self.assertIsNot(client_loop_one, client_loop_two)
+
+    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
+    @patch("detector.views.httpx.AsyncClient")
+    def test_sequential_async_requests_do_not_raise_closed_event_loop_error(self, mock_async_client_cls, mock_mm):
+        mock_mm.return_value = dict(MAXMIND_STUB)
+
+        async def _ok_response(url, **kwargs):
+            return _mock_response(status_code=200, json_value={"status": "ok", "block": 0})
+
+        _patch_async_client(mock_async_client_cls, _ok_response)
+        _login_authorised(self)
+
+        with (
+            override_settings(**EMPTY_UPSTREAM_SECRETS),
+            patch.dict(os.environ, EMPTY_UPSTREAM_SECRETS),
+            patch("detector.views.redis_client", None),
+        ):
+            first_resp = self.client.get("/api/v1/detect?ip=8.8.8.8")
+            second_resp = self.client.get("/api/v1/detect?ip=1.1.1.1")
+
+        self.assertEqual(first_resp.status_code, 200)
+        self.assertEqual(second_resp.status_code, 200)
+
+    def test_maxmind_reader_reused_across_calls_and_gracefully_degrades_when_missing(self):
+        views._maxmind_readers.clear()
+
+        mock_country_reader = MagicMock()
+        mock_country_reader.get.return_value = {"country": {"iso_code": "US", "names": {"en": "United States"}}}
+        mock_city_reader = MagicMock()
+        mock_city_reader.get.return_value = {
+            "country": {"iso_code": "US", "names": {"en": "United States"}},
+            "subdivisions": [{"iso_code": "CA", "names": {"en": "California"}}],
+            "city": {"names": {"en": "Mountain View"}},
+            "location": {"latitude": 37.386, "longitude": -122.0838},
+        }
+        mock_asn_reader = MagicMock()
+        mock_asn_reader.get.return_value = {
+            "autonomous_system_number": 13335,
+            "autonomous_system_organization": "Cloudflare",
+        }
+
+        def _fake_open(path):
+            lowered = str(path).lower()
+            if "country" in lowered:
+                return mock_country_reader
+            if "city" in lowered:
+                return mock_city_reader
+            return mock_asn_reader
+
+        mock_maxmind_module = MagicMock()
+        mock_maxmind_module.open_database.side_effect = _fake_open
+
+        with (
+            patch("detector.views.os.path.exists", return_value=True),
+            patch.dict("sys.modules", {"maxminddb": mock_maxmind_module}),
+        ):
+            res_one = views._read_maxmind_sync("1.1.1.1")
+            res_two = views._read_maxmind_sync("8.8.8.8")
+
+        self.assertEqual(res_one["status"], "200 OK")
+        self.assertEqual(res_one["location"], "Mountain View, California, United States (37.386, -122.0838)")
+        self.assertEqual(res_one["countryCode"], "US")
+        self.assertEqual(res_two["status"], "200 OK")
+        self.assertEqual(mock_maxmind_module.open_database.call_count, 3)
+        self.assertEqual(mock_country_reader.get.call_count, 2)
+        self.assertEqual(mock_city_reader.get.call_count, 2)
+        self.assertEqual(mock_asn_reader.get.call_count, 2)
+
+        # Verify graceful fallback when local MMDB files are absent
+        with patch("detector.views.os.path.exists", return_value=False):
+            missing_res = views._read_maxmind_sync("1.1.1.1")
+        self.assertEqual(missing_res["status"], "Database Missing")
+        self.assertEqual(len(views._maxmind_readers), 0)
+
+class NonPublicIpInterceptionTests(TestCase):
+    """Tests early 200 OK interception for loopback, private, link-local, multicast and reserved IPs."""
+
+    def setUp(self):
+        _login_authorised(self)
+
+    def test_canonicalize_ip_strips_valid_ipv6_zone_ids_and_rejects_malformed_zones(self):
+        self.assertEqual(views.canonicalize_ip("fe80::1%eth0"), "fe80::1")
+        self.assertEqual(views.canonicalize_ip("  FE80:0:0:0:0:0:0:0001%ens33  "), "fe80::1")
+        self.assertEqual(views.canonicalize_ip("fe80::1%enp0s3"), "fe80::1")
+
+        for malformed in ("fe80::1%", "fe80::1%eth 0", "fe80::1%eth0%eth1", "127.0.0.1%eth0", "fe80::1%eth/0"):
+            with self.subTest(malformed=malformed):
+                self.assertIsNone(views.canonicalize_ip(malformed))
+
+    @patch("dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock)
+    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
+    @patch("detector.views.httpx.AsyncClient")
+    def test_non_public_ips_return_200_with_zero_external_or_redis_calls(
+        self, mock_async_client_cls, mock_mm, mock_dns
+    ):
+        mock_redis = MagicMock()
+        mock_redis.get = AsyncMock()
+        mock_redis.set = AsyncMock()
+
+        non_public_samples = (
+            ("127.0.0.1", "127.0.0.1"),
+            ("10.0.0.1", "10.0.0.1"),
+            ("169.254.1.1", "169.254.1.1"),
+            ("192.168.1.1", "192.168.1.1"),
+            ("224.0.0.1", "224.0.0.1"),
+            ("0.0.0.0", "0.0.0.0"),
+            ("100.64.0.1", "100.64.0.1"),
+            ("::1", "::1"),
+            ("::", "::"),
+            ("fe80::1%eth0", "fe80::1"),
+            ("FE80::1%ens33", "fe80::1"),
+            ("fc00::1", "fc00::1"),
+            ("ff02::1", "ff02::1"),
+            ("2001:db8::1", "2001:db8::1"),
+            ("::ffff:127.0.0.1", "::ffff:127.0.0.1"),
+        )
+
+        with patch("detector.views.redis_client", mock_redis):
+            for raw_ip, expected_canonical in non_public_samples:
+                with self.subTest(raw_ip=raw_ip):
+                    resp = self.client.get(f"/api/v1/detect?ip={raw_ip}")
+                    self.assertEqual(resp.status_code, 200)
+                    payload = resp.json()
+                    self.assertEqual(payload["ip"], expected_canonical)
+                    self.assertTrue(payload["isNonPublic"])
+                    self.assertTrue(payload["nonPublicCategory"])
+                    self.assertTrue(payload["nonPublicReason"])
+                    self.assertEqual(payload["results"], [])
+                    self.assertFalse(payload["isCached"])
+                    self.assertEqual(payload["cacheMeta"]["status"], "bypassed")
+
+        mock_async_client_cls.assert_not_called()
+        mock_dns.assert_not_called()
+        mock_mm.assert_not_called()
+        mock_redis.get.assert_not_called()
+        mock_redis.set.assert_not_called()
+
+    def test_malformed_zone_id_returns_400(self):
+        for bad_ip in ("fe80::1%25", "fe80::1%", "127.0.0.1%eth0"):
+            with self.subTest(bad_ip=bad_ip):
+                resp = self.client.get(f"/api/v1/detect?ip={bad_ip}")
+                self.assertEqual(resp.status_code, 400)
+                self.assertEqual(resp.json()["error"], "invalid_ip")
+
+class SingleflightCoalescingTests(TestCase):
+    """Tests singleflight coalescing of concurrent uncached IP detection requests."""
+
+    def tearDown(self):
+        views._ip_detect_inflight.clear()
+
+    async def test_five_concurrent_requests_for_uncached_ip_call_upstream_once(self):
+        provider_calls = {"count": 0}
+        dns_calls = {"count": 0}
+
+        def _make_slow_ok(name):
+            async def _impl(client, ip):
+                if name == "Proxycheck":
+                    provider_calls["count"] += 1
+                    await asyncio.sleep(0.03)
+                return {
+                    "provider": name,
+                    "status": "200 OK",
+                    "statusCode": 200,
+                    "asn": "AS15169",
+                    "isp": "Google",
+                    "organisation": "Google",
+                    "location": "United States",
+                    "usageType": "isp",
+                    "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
+                    "countryCode": "US",
+                    "rawJson": {},
+                }
+
+            return _impl
+
+        async def _fake_dns(ip):
+            dns_calls["count"] += 1
+            await asyncio.sleep(0.01)
+            return "dns.google"
+
+        mock_redis = MagicMock()
+        mock_redis.get = AsyncMock(return_value=None)
+        mock_redis.set = AsyncMock()
+        auth_headers = {"Authorization": f"Bearer {views.issue_gadget_token('SysopUser')}"}
+        factory = AsyncRequestFactory()
+        requests = [factory.get("/api/v1/detect?ip=8.8.4.4", headers=auth_headers) for _ in range(5)]
+
+        with (
+            patch("detector.views.redis_client", mock_redis),
+            patch("detector.views.query_maxmind", AsyncMock(return_value=dict(MAXMIND_STUB))),
+            patch("detector.views.query_rdns_ptr", side_effect=_fake_dns),
+            patch("detector.views.query_cloudflare_radar", side_effect=_make_slow_ok("Cloudflare Radar")),
+            patch("detector.views.query_abuseipdb", side_effect=_make_slow_ok("AbuseIPDB")),
+            patch("detector.views.query_ipdata", side_effect=_make_slow_ok("IPData")),
+            patch("detector.views.query_ipregistry", side_effect=_make_slow_ok("IPRegistry")),
+            patch("detector.views.query_ip2location", side_effect=_make_slow_ok("IP2Location")),
+            patch("detector.views.query_getipintel", side_effect=_make_slow_ok("GetIPIntel")),
+            patch("detector.views.query_proxycheck", side_effect=_make_slow_ok("Proxycheck")),
+            patch("detector.views.query_iphub", side_effect=_make_slow_ok("IPHub")),
+            patch("detector.views.query_iphunter", side_effect=_make_slow_ok("IPHunter")),
+            patch("detector.views.query_tor_onionoo", side_effect=_make_slow_ok("Tor Onionoo")),
+            patch("detector.views.query_stopforumspam", side_effect=_make_slow_ok("StopForumSpam")),
+            patch("detector.views.query_dshield", side_effect=_make_slow_ok("DShield")),
+        ):
+            mock_client = AsyncMock()
+            mock_client.is_closed = False
+            with patch("detector.views._get_shared_http_client", AsyncMock(return_value=mock_client)):
+                responses = await asyncio.gather(*(views.detect_ip(req) for req in requests))
+
+        self.assertEqual(len(responses), 5)
+        for resp in responses:
+            self.assertEqual(resp.status_code, 200)
+            payload = json.loads(resp.content)
+            self.assertEqual(payload["ip"], "8.8.4.4")
+            self.assertEqual(payload["ptrHostname"], "dns.google")
+
+        self.assertEqual(provider_calls["count"], 1)
+        self.assertEqual(dns_calls["count"], 1)
+        self.assertEqual(len(views._ip_detect_inflight), 0)
+
+    async def test_shield_protects_shared_inflight_task_when_one_waiter_cancels(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        provider_calls = {"count": 0}
+
+        def _make_gated_provider(name):
+            async def _impl(client, ip):
+                if name == "Proxycheck":
+                    provider_calls["count"] += 1
+                    started.set()
+                    await release.wait()
+                return {
+                    "provider": name,
+                    "status": "200 OK",
+                    "statusCode": 200,
+                    "asn": "AS15169",
+                    "isp": "Google",
+                    "organisation": "Google",
+                    "location": "United States",
+                    "usageType": "isp",
+                    "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
+                    "countryCode": "US",
+                    "rawJson": {},
+                }
+
+            return _impl
+
+        auth_headers = {"Authorization": f"Bearer {views.issue_gadget_token('SysopUser')}"}
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        factory = AsyncRequestFactory()
+        req_one = factory.get("/api/v1/detect?ip=8.8.4.4", headers=auth_headers)
+        req_two = factory.get("/api/v1/detect?ip=8.8.4.4", headers=auth_headers)
+
+        with (
+            patch("detector.views.redis_client", None),
+            patch("detector.views._get_shared_http_client", AsyncMock(return_value=mock_client)),
+            patch("detector.views.query_maxmind", AsyncMock(return_value=dict(MAXMIND_STUB))),
+            patch("detector.views.query_rdns_ptr", AsyncMock(return_value=None)),
+            patch("detector.views.query_cloudflare_radar", side_effect=_make_gated_provider("Cloudflare Radar")),
+            patch("detector.views.query_abuseipdb", side_effect=_make_gated_provider("AbuseIPDB")),
+            patch("detector.views.query_ipdata", side_effect=_make_gated_provider("IPData")),
+            patch("detector.views.query_ipregistry", side_effect=_make_gated_provider("IPRegistry")),
+            patch("detector.views.query_ip2location", side_effect=_make_gated_provider("IP2Location")),
+            patch("detector.views.query_getipintel", side_effect=_make_gated_provider("GetIPIntel")),
+            patch("detector.views.query_proxycheck", side_effect=_make_gated_provider("Proxycheck")),
+            patch("detector.views.query_iphub", side_effect=_make_gated_provider("IPHub")),
+            patch("detector.views.query_iphunter", side_effect=_make_gated_provider("IPHunter")),
+            patch("detector.views.query_tor_onionoo", side_effect=_make_gated_provider("Tor Onionoo")),
+            patch("detector.views.query_stopforumspam", side_effect=_make_gated_provider("StopForumSpam")),
+            patch("detector.views.query_dshield", side_effect=_make_gated_provider("DShield")),
+        ):
+            first_task = asyncio.create_task(views.detect_ip(req_one))
+            await started.wait()
+            second_task = asyncio.create_task(views.detect_ip(req_two))
+            await asyncio.sleep(0)
+
+            first_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await first_task
+
+            release.set()
+            second_resp = await second_task
+
+        self.assertEqual(second_resp.status_code, 200)
+        self.assertEqual(json.loads(second_resp.content)["ip"], "8.8.4.4")
+        self.assertEqual(provider_calls["count"], 1)
+        self.assertEqual(len(views._ip_detect_inflight), 0)
+
+    async def test_inflight_map_cleaned_up_on_unexpected_exception(self):
+        auth_headers = {"Authorization": f"Bearer {views.issue_gadget_token('SysopUser')}"}
+
+        with (
+            patch("detector.views.redis_client", None),
+            patch("detector.views._execute_detection_with_cache", AsyncMock(side_effect=RuntimeError("boom"))),
+            self.assertRaises(RuntimeError),
+        ):
+            await self.async_client.get("/api/v1/detect?ip=8.8.4.4", headers=auth_headers)
+
+        self.assertEqual(len(views._ip_detect_inflight), 0)
+
+    async def test_five_concurrent_requests_read_provider_caches_once(self):
+        cache_reads = {"count": 0}
+        detection_runs = {"count": 0}
+
+        async def _slow_cache_read(ip):
+            cache_reads["count"] += 1
+            # Yield long enough for every other request to reach the singleflight check
+            await asyncio.sleep(0.03)
+            return {}, ("dns.google", "2026-01-01T00:00:00+00:00")
+
+        async def _fake_detection(ip, *, initial_cache=None, query_mode="full"):
+            detection_runs["count"] += 1
+            self.assertEqual(initial_cache, ({}, ("dns.google", "2026-01-01T00:00:00+00:00")))
+            return {
+                "ip": ip,
+                "ptrHostname": "dns.google",
+                "queryMode": query_mode,
+                "results": [],
+                "cacheMeta": {"status": "hit"},
+            }
+
+        auth_headers = {"Authorization": f"Bearer {views.issue_gadget_token('SysopUser')}"}
+        factory = AsyncRequestFactory()
+        requests = [factory.get("/api/v1/detect?ip=8.8.4.4", headers=auth_headers) for _ in range(5)]
+
+        with (
+            patch("detector.views._read_provider_caches", side_effect=_slow_cache_read),
+            patch("detector.views._execute_detection_with_cache", side_effect=_fake_detection),
+            patch("detector.views.record_global_request_telemetry", AsyncMock()),
+        ):
+            responses = await asyncio.gather(*(views.detect_ip(req) for req in requests))
+
+        self.assertEqual(cache_reads["count"], 1)
+        self.assertEqual(detection_runs["count"], 1)
+        for resp in responses:
+            self.assertEqual(resp.status_code, 200)
+            payload = json.loads(resp.content)
+            self.assertEqual(payload["ip"], "8.8.4.4")
+            self.assertIn("durationSeconds", payload)
+        self.assertEqual(len(views._ip_detect_inflight), 0)
+
+    async def test_concurrent_waiters_receive_independent_payload_copies(self):
+        shared_payload = {"ip": "8.8.4.4", "results": [], "cacheMeta": {"status": "miss"}}
+
+        async def _slow_cache_read(ip):
+            await asyncio.sleep(0.02)
+            return {}, None
+
+        with (
+            patch("detector.views._read_provider_caches", side_effect=_slow_cache_read),
+            patch("detector.views._execute_detection_with_cache", AsyncMock(return_value=shared_payload)),
+            patch("detector.views.record_global_request_telemetry", AsyncMock()),
+        ):
+            payloads = await asyncio.gather(
+                *(views._detect_single_canonical_ip("8.8.4.4", "gadget", time.perf_counter()) for _ in range(5))
+            )
+
+        self.assertEqual(len({id(payload) for payload in payloads}), 5)
+        for payload in payloads:
+            self.assertIsNot(payload, shared_payload)
+            self.assertIn("durationSeconds", payload)
+        self.assertNotIn("durationSeconds", shared_payload)
+        self.assertEqual(len(views._ip_detect_inflight), 0)
+
+class PerProviderCacheAndCircuitBreakerTests(TestCase):
+    """Tests per-provider tiered TTL caching and HTTP 429 or 5xx cooldown circuit breaking."""
+
+    def setUp(self):
+        _login_authorised(self)
+
+    def test_retry_after_header_parsed_and_clamped_within_cooldown_bounds(self):
+        self.assertEqual(views._parse_retry_after_seconds("15"), 60)
+        self.assertEqual(views._parse_retry_after_seconds("180"), 180)
+        self.assertEqual(views._parse_retry_after_seconds("999"), 300)
+        self.assertEqual(views._parse_retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT"), 120)
+        self.assertEqual(views._parse_retry_after_seconds(None), 120)
+
+    def _ok_upstream_response(self, url, ip="8.8.8.8"):
+        if "ipregistry.co" in url:
+            return _mock_response(
+                status_code=200,
+                json_value={
+                    "company": {"name": "Google"},
+                    "connection": {"asn": 15169, "type": "isp"},
+                    "location": {"country": {"name": "United States", "code": "US"}},
+                    "security": {},
+                },
+            )
+        if "ip2location.io" in url:
+            return _mock_response(
+                status_code=200,
+                json_value={"asn": "15169", "as": "Google", "country_name": "United States", "country_code": "US"},
+            )
+        if "ipdata.co" in url:
+            return _mock_response(
+                status_code=200,
+                json_value={
+                    "asn": {"asn": "AS15169", "name": "Google", "type": "isp"},
+                    "country_name": "United States",
+                    "country_code": "US",
+                    "threat": {},
+                },
+            )
+        if "abuseipdb.com" in url:
+            return _mock_response(
+                status_code=200, json_value={"data": {"isp": "Google", "countryCode": "US", "abuseConfidenceScore": 0}}
+            )
+        if "getipintel.net" in url:
+            return _mock_response(status_code=200, json_value={"status": "success", "result": "0.0"})
+        if "proxycheck.io" in url:
+            return _mock_response(
+                status_code=200,
+                json_value={
+                    "status": "ok",
+                    ip: {"asn": "AS15169", "provider": "Google", "country": "United States", "isocode": "US"},
+                },
+            )
+        if "iphub.info" in url:
+            return _mock_response(
+                status_code=200,
+                json_value={
+                    "asn": 15169,
+                    "isp": "Google",
+                    "countryName": "United States",
+                    "countryCode": "US",
+                    "block": 0,
+                },
+            )
+        if "iphunter.info" in url:
+            return _mock_response(
+                status_code=200,
+                json_value={
+                    "status": "success",
+                    "data": {"isp": "Google", "country_name": "United States", "country_code": "US", "block": 0},
+                },
+            )
+        if "onionoo.torproject.org" in url:
+            return _mock_response(status_code=200, json_value={"relays": []})
+        if "stopforumspam.org" in url:
+            return _mock_response(
+                status_code=200, json_value={"success": 1, "ip": {"appears": 0, "frequency": 0, "confidence": 0.0}}
+            )
+        if "sans.edu" in url or "dshield" in url:
+            return _mock_response(status_code=200, json_value={"ip": {"attacks": 0, "count": 0}})
+        return _mock_response(
+            status_code=200,
+            json_value={
+                "success": True,
+                "result": {
+                    "location": {"countryName": "United States", "countryCode": "US"},
+                    "asn": {"asn": 15169, "name": "Google"},
+                },
+            },
+        )
+
+    @patch(
+        "dns.asyncresolver.Resolver.resolve",
+        new_callable=AsyncMock,
+        side_effect=_ptr_or_clean_dns_side_effect(ptr_hostname="dns.google."),
+    )
+    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
+    @patch("detector.views.httpx.AsyncClient")
+    def test_provider_429_triggers_cooldown_skip_without_overwriting_valid_caches(
+        self, mock_async_client_cls, mock_mm, _mock_dns
+    ):
+        mock_mm.return_value = dict(MAXMIND_STUB)
+
+        historical_proxycheck_1111 = json.dumps(
+            {
+                "row": {
+                    "provider": "Proxycheck",
+                    "status": "200 OK",
+                    "statusCode": 200,
+                    "asn": "AS13335",
+                    "isp": "Cloudflare",
+                    "organisation": "Cloudflare",
+                    "location": "United States",
+                    "usageType": "cdn",
+                    "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
+                    "countryCode": "US",
+                    "rawJson": {},
+                },
+                "cachedAt": "2026-11-13T07:00:00+00:00",
+            }
+        )
+        cache_store = {
+            "proxycheck:v1:prov:proxycheck:1.1.1.1": historical_proxycheck_1111,
+        }
+        written_ttls = {}
+        requested_urls = []
+
+        async def _fake_get(key):
+            return cache_store.get(key)
+
+        async def _fake_set(key, val, ex=None):
+            cache_store[key] = val
+            written_ttls[key] = ex
+
+        mock_redis = MagicMock()
+        mock_redis.get = AsyncMock(side_effect=_fake_get)
+        mock_redis.set = AsyncMock(side_effect=_fake_set)
+
+        async def _upstream_side_effect(url, **kwargs):
+            requested_urls.append(url)
+            if "proxycheck.io" in url:
+                resp = _mock_response(status_code=429, json_value={"status": "error", "message": "Rate limited"})
+                resp.headers = {"Retry-After": "180"}
+                return resp
+            return self._ok_upstream_response(url, ip="8.8.8.8")
+
+        _patch_async_client(mock_async_client_cls, _upstream_side_effect)
+
+        with (
+            override_settings(**TEST_UPSTREAM_SECRETS),
+            patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
+            patch("detector.views.redis_client", mock_redis),
+        ):
+            first_resp = self.client.get("/api/v1/detect?ip=8.8.8.8")
+
+        self.assertEqual(first_resp.status_code, 200)
+        first_payload = first_resp.json()
+        first_rows = {row["provider"]: row for row in first_payload["results"]}
+        self.assertEqual(first_rows["Proxycheck"]["statusCode"], 429)
+        self.assertIn("proxycheck:v1:cooldown:proxycheck", cache_store)
+        self.assertEqual(written_ttls["proxycheck:v1:cooldown:proxycheck"], 180)
+        self.assertNotIn("proxycheck:v1:prov:proxycheck:8.8.8.8", cache_store)
+        self.assertEqual(cache_store["proxycheck:v1:prov:proxycheck:1.1.1.1"], historical_proxycheck_1111)
+
+        for healthy_key in (
+            "cloudflare_radar",
+            "abuseipdb",
+            "ipdata",
+            "ipregistry",
+            "ip2location",
+            "iphub",
+            "iphunter",
+        ):
+            self.assertIn(f"proxycheck:v1:prov:{healthy_key}:8.8.8.8", cache_store)
+            self.assertEqual(written_ttls[f"proxycheck:v1:prov:{healthy_key}:8.8.8.8"], 86400)
+        self.assertIn("proxycheck:v1:prov:getipintel:8.8.8.8", cache_store)
+        self.assertEqual(written_ttls["proxycheck:v1:prov:getipintel:8.8.8.8"], 259200)
+        self.assertEqual(written_ttls["proxycheck:v1:prov:ptr:8.8.8.8"], 7200)
+
+        requested_urls.clear()
+        with (
+            override_settings(**TEST_UPSTREAM_SECRETS),
+            patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
+            patch("detector.views.redis_client", mock_redis),
+        ):
+            second_resp = self.client.get("/api/v1/detect?ip=9.9.9.9")
+
+        self.assertEqual(second_resp.status_code, 200)
+        self.assertFalse(any("proxycheck.io" in u for u in requested_urls))
+        second_rows = {row["provider"]: row for row in second_resp.json()["results"]}
+        self.assertTrue(second_rows["Proxycheck"].get("isCooldown"))
+        self.assertIn("429 Cooldown", second_rows["Proxycheck"]["status"])
+        self.assertIn("proxycheck:v1:prov:cloudflare_radar:9.9.9.9", cache_store)
+
+        requested_urls.clear()
+        with (
+            override_settings(**TEST_UPSTREAM_SECRETS),
+            patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
+            patch("detector.views.redis_client", mock_redis),
+        ):
+            historical_resp = self.client.get("/api/v1/detect?ip=1.1.1.1")
+
+        self.assertEqual(historical_resp.status_code, 200)
+        historical_rows = {row["provider"]: row for row in historical_resp.json()["results"]}
+        self.assertEqual(historical_rows["Proxycheck"]["status"], "200 OK")
+        self.assertEqual(historical_rows["Proxycheck"]["isp"], "Cloudflare")
+        self.assertFalse(any("proxycheck.io" in u for u in requested_urls))
+
+    @patch(
+        "dns.asyncresolver.Resolver.resolve",
+        new_callable=AsyncMock,
+        side_effect=_ptr_or_clean_dns_side_effect(ptr_hostname="dns.google."),
+    )
+    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
+    @patch("detector.views.httpx.AsyncClient")
+    def test_timeout_triggers_default_cooldown_and_respects_ttl_settings(
+        self, mock_async_client_cls, mock_mm, _mock_dns
+    ):
+        mock_mm.return_value = dict(MAXMIND_STUB)
+        cache_store = {}
+        written_ttls = {}
+
+        async def _fake_get(key):
+            return cache_store.get(key)
+
+        async def _fake_set(key, val, ex=None):
+            cache_store[key] = val
+            written_ttls[key] = ex
+
+        mock_redis = MagicMock()
+        mock_redis.get = AsyncMock(side_effect=_fake_get)
+        mock_redis.set = AsyncMock(side_effect=_fake_set)
+
+        async def _timeout_proxycheck(url, **kwargs):
+            if "proxycheck.io" in url:
+                raise httpx.ReadTimeout("timed out")
+            return self._ok_upstream_response(url, ip="8.8.8.8")
+
+        _patch_async_client(mock_async_client_cls, _timeout_proxycheck)
+
+        with (
+            override_settings(
+                **TEST_UPSTREAM_SECRETS,
+                PROVIDER_STATIC_CACHE_TTL_SECONDS=43200,
+                PROVIDER_DYNAMIC_CACHE_TTL_SECONDS=1800,
+            ),
+            patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
+            patch("detector.views.redis_client", mock_redis),
+        ):
+            resp = self.client.get("/api/v1/detect?ip=8.8.8.8")
+            self.assertEqual(views._get_provider_cache_ttl("dnsbl"), 1800)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(written_ttls.get("proxycheck:v1:cooldown:proxycheck"), 120)
+        self.assertNotIn("proxycheck:v1:prov:proxycheck:8.8.8.8", cache_store)
+        self.assertEqual(written_ttls.get("proxycheck:v1:prov:ptr:8.8.8.8"), 1800)
+        self.assertEqual(written_ttls.get("proxycheck:v1:prov:cloudflare_radar:8.8.8.8"), 43200)
+
+    def test_getipintel_stable_scores_extend_cache_ttl(self):
+        stable_low_row = views.adapt_getipintel({"status": "success", "result": "0.05"}, True, 200)
+        stable_high_row = views.adapt_getipintel({"status": "success", "result": "0.95"}, True, 200)
+        uncertain_row = views.adapt_getipintel({"status": "success", "result": "0.50"}, True, 200)
+
+        self.assertEqual(views._get_provider_cache_ttl("getipintel", stable_low_row), 259200)
+        self.assertEqual(views._get_provider_cache_ttl("getipintel", stable_high_row), 259200)
+        self.assertEqual(views._get_provider_cache_ttl("getipintel", uncertain_row), 86400)
+        self.assertEqual(views._get_provider_cache_ttl("getipintel"), 86400)
+
+        with override_settings(PROVIDER_STATIC_CACHE_TTL_SECONDS=86400, GETIPINTEL_STABLE_CACHE_TTL_SECONDS=604800):
+            self.assertEqual(views._get_provider_cache_ttl("getipintel", stable_low_row), 604800)
+            self.assertEqual(views._get_provider_cache_ttl("getipintel", uncertain_row), 86400)
+
+class HttpClientLifecycleTests(TestCase):
+    """Tests shared httpx.AsyncClient connection pool limits and safe cleanup across loops."""
+
+    async def test_shared_http_client_configures_explicit_connection_limits(self):
+        client = await views._get_shared_http_client()
+        try:
+            self.assertEqual(views._DEFAULT_HTTP_LIMITS.max_connections, 100)
+            self.assertEqual(views._DEFAULT_HTTP_LIMITS.max_keepalive_connections, 20)
+            pool_limits = client._transport._pool
+            self.assertEqual(pool_limits._max_connections, 100)
+            self.assertEqual(pool_limits._max_keepalive_connections, 20)
+        finally:
+            await views._close_http_client_safely(client)
+
+    async def test_cookieless_http_client_enforces_empty_cookie_policy_and_strips_request_cookies(self):
+        captured_cookie_headers = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            captured_cookie_headers.append(request.headers.get("cookie"))
+            return httpx.Response(
+                200,
+                headers=[("Set-Cookie", "centralauth_Session=leak; Domain=.wikipedia.org; Path=/")],
+                json={"ok": True},
+            )
+
+        client = views._build_cookieless_http_client()
+        try:
+            self.assertEqual(client.cookies.jar._policy.allowed_domains(), ())
+            client._transport = httpx.MockTransport(_handler)
+
+            await client.get("https://zh.wikipedia.org/w/api.php", headers={"Cookie": "injected=1"})
+            await client.get("https://meta.wikimedia.org/w/api.php")
+
+            self.assertEqual(len(client.cookies), 0)
+            self.assertEqual(captured_cookie_headers, [None, None])
+        finally:
+            await views._close_http_client_safely(client)
+
+    def test_clear_client_cookies_skips_empty_cookies_and_supports_mocks(self):
+        empty_client = SimpleNamespace(cookies=httpx.Cookies())
+        with patch.object(empty_client.cookies.jar, "clear", wraps=empty_client.cookies.jar.clear) as spy_jar_clear:
+            _clear_client_cookies(empty_client)
+            spy_jar_clear.assert_not_called()
+
+        populated_client = SimpleNamespace(cookies=httpx.Cookies({"GeoIP": "US"}))
+        _clear_client_cookies(populated_client)
+        self.assertEqual(len(populated_client.cookies), 0)
+
+        mock_method_client = SimpleNamespace(cookies=httpx.Cookies())
+        with patch.object(mock_method_client.cookies, "clear") as mock_clear:
+            _clear_client_cookies(mock_method_client)
+            mock_clear.assert_called_once()
+
+        magic_client = MagicMock()
+        _clear_client_cookies(magic_client)
+        magic_client.cookies.clear.assert_called_once()
+
+        with warnings.catch_warnings(record=True) as recorded_warnings:
+            warnings.simplefilter("always")
+            _clear_client_cookies(None)
+            _clear_client_cookies(SimpleNamespace(cookies=None))
+            _clear_client_cookies(AsyncMock())
+
+        runtime_warnings = [w for w in recorded_warnings if issubclass(w.category, RuntimeWarning)]
+        self.assertEqual(runtime_warnings, [])
+
+    async def test_concurrent_wikimedia_api_calls_on_cookieless_client_preserve_isolation(self):
+        captured_requests = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            captured_requests.append(
+                (str(request.url), request.headers.get("cookie"), request.headers.get("user-agent"))
+            )
+            query = str(request.url)
+            if "meta=userinfo" in query:
+                payload = {"query": {"userinfo": {"id": 42, "name": "StewardUser", "groups": ["sysop"], "rights": []}}}
+            elif "meta=globaluserinfo" in query:
+                payload = {"query": {"globaluserinfo": {"groups": ["steward"], "rights": [], "merged": []}}}
+            else:
+                payload = {"query": {"users": [{"name": "StewardUser", "rights": ["checkuser-temporary-account"]}]}}
+            return httpx.Response(
+                200,
+                headers=[("Set-Cookie", "GeoIP=US; Path=/"), ("Set-Cookie", "centralauth_Session=leak; Path=/")],
+                json=payload,
+            )
+
+        client = views._build_cookieless_http_client()
+        try:
+            client._transport = httpx.MockTransport(_handler)
+            with patch.object(client.cookies.jar, "clear", wraps=client.cookies.jar.clear) as spy_jar_clear:
+                userinfo, meta_rights, project_rights = await asyncio.gather(
+                    verify_centralauth_userinfo(client, "valid-token", wiki_domain="zh.wikipedia.org"),
+                    fetch_user_rights_from_meta(client, "StewardUser"),
+                    fetch_project_user_rights(client, "StewardUser", "zh.wikipedia.org"),
+                )
+
+            spy_jar_clear.assert_not_called()
+            self.assertEqual(len(client.cookies), 0)
+            self.assertEqual(userinfo["username"], "StewardUser")
+            self.assertEqual(meta_rights["global_groups"], ["steward"])
+            self.assertEqual(project_rights, ["checkuser-temporary-account"])
+            self.assertEqual(len(captured_requests), 3)
+            for _url, cookie_hdr, ua_hdr in captured_requests:
+                self.assertIsNone(cookie_hdr)
+                self.assertIn("ProxyCheck/1.0", ua_hdr or "")
+        finally:
+            await views._close_http_client_safely(client)
+
+class RedisBatchingAndCacheCompletenessTests(TestCase):
+    """Tests for batched Redis reads and writes and for the full cache hit check on partial source sets."""
+
+    IPV6_TARGET = "2001:4860:4860::8888"
+
+    @staticmethod
+    def _cached_row_entry(provider_name):
+        return json.dumps(
+            {
+                "row": {
+                    "provider": provider_name,
+                    "status": "200 OK",
+                    "statusCode": 200,
+                    "asn": "AS15169",
+                    "isp": "Google",
+                    "organisation": "Google",
+                    "location": "United States",
+                    "usageType": "isp",
+                    "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
+                    "countryCode": "US",
+                    "rawJson": {},
+                },
+                "cachedAt": "2026-11-13T08:00:00+00:00",
+                "sanitized": True,
+            }
+        )
+
+    async def test_mget_reads_all_keys_in_one_round_trip(self):
+        fake_redis = _BatchingFakeRedis()
+        fake_redis.strings["proxycheck:v1:prov:ipdata:8.8.8.8"] = "cached-ipdata"
+        fake_redis.strings["proxycheck:v1:prov:ptr:8.8.8.8"] = b"cached-ptr"
+        keys = [
+            "proxycheck:v1:prov:ipdata:8.8.8.8",
+            "proxycheck:v1:prov:iphub:8.8.8.8",
+            "proxycheck:v1:prov:ptr:8.8.8.8",
+        ]
+
+        with patch("detector.views.redis_client", fake_redis):
+            values = await views._safe_redis_mget(keys)
+
+        self.assertEqual(values, ["cached-ipdata", None, "cached-ptr"])
+        self.assertEqual(fake_redis.mget_calls, [keys])
+        self.assertEqual(fake_redis.get_calls, [])
+
+    async def test_mget_falls_back_to_single_reads_for_get_only_mocks(self):
+        cache_store = {"proxycheck:v1:prov:ipdata:8.8.8.8": "cached-ipdata"}
+        mock_redis = MagicMock()
+        mock_redis.get = AsyncMock(side_effect=lambda key: cache_store.get(key))
+        keys = ["proxycheck:v1:prov:ipdata:8.8.8.8", "proxycheck:v1:prov:iphub:8.8.8.8"]
+
+        with patch("detector.views.redis_client", mock_redis):
+            values = await views._safe_redis_mget(keys)
+
+        self.assertEqual(values, ["cached-ipdata", None])
+        self.assertEqual(sorted(call.args[0] for call in mock_redis.get.await_args_list), sorted(keys))
+
+    async def test_mget_falls_back_when_client_has_no_mget(self):
+        fake_redis = FakeAsyncRedis()
+        fake_redis.strings["proxycheck:v1:prov:ipdata:8.8.8.8"] = "cached-ipdata"
+
+        with patch("detector.views.redis_client", fake_redis):
+            values = await views._safe_redis_mget(
+                ["proxycheck:v1:prov:ipdata:8.8.8.8", "proxycheck:v1:prov:iphub:8.8.8.8"]
+            )
+
+        self.assertEqual(values, ["cached-ipdata", None])
+
+    async def test_mget_degrades_to_empty_values_on_connection_errors(self):
+        mock_redis = MagicMock()
+        mock_redis.mget = AsyncMock(side_effect=redis.exceptions.ConnectionError("redis offline"))
+        mock_redis.get = AsyncMock(return_value="should-not-be-read")
+        keys = ["proxycheck:v1:prov:ipdata:8.8.8.8", "proxycheck:v1:prov:iphub:8.8.8.8"]
+
+        with (
+            patch("detector.views.redis_client", mock_redis),
+            self.assertLogs("detector.views", level="WARNING") as logs,
+        ):
+            values = await views._safe_redis_mget(keys)
+
+        self.assertEqual(values, [None, None])
+        mock_redis.get.assert_not_awaited()
+        self.assertTrue(any("redis offline" in line for line in logs.output))
+
+    async def test_mget_without_client_or_keys_returns_empty_values(self):
+        with patch("detector.views.redis_client", None):
+            self.assertEqual(await views._safe_redis_mget(["a", "b"]), [None, None])
+        with patch("detector.views.redis_client", _BatchingFakeRedis()):
+            self.assertEqual(await views._safe_redis_mget([]), [])
+
+    async def test_set_many_flushes_entries_through_one_pipeline(self):
+        fake_redis = _BatchingFakeRedis()
+        entries = [
+            ("proxycheck:v1:prov:ipdata:8.8.8.8", "row-a", 3600),
+            ("proxycheck:v1:cooldown:iphub", "cooldown-b", 120),
+        ]
+
+        with patch("detector.views.redis_client", fake_redis):
+            await views._safe_redis_set_many(entries)
+
+        self.assertEqual(fake_redis.pipeline_calls, [False])
+        self.assertEqual(fake_redis.strings["proxycheck:v1:prov:ipdata:8.8.8.8"], "row-a")
+        self.assertEqual(fake_redis.strings["proxycheck:v1:cooldown:iphub"], "cooldown-b")
+        self.assertEqual(fake_redis.ttls["proxycheck:v1:prov:ipdata:8.8.8.8"], 3600)
+        self.assertEqual(fake_redis.ttls["proxycheck:v1:cooldown:iphub"], 120)
+
+    async def test_set_many_falls_back_to_single_writes_for_set_only_mocks(self):
+        mock_redis = MagicMock()
+        mock_redis.set = AsyncMock()
+        entries = [
+            ("proxycheck:v1:prov:ipdata:8.8.8.8", "row-a", 3600),
+            ("proxycheck:v1:prov:ptr:8.8.8.8", "row-b", 900),
+        ]
+
+        with patch("detector.views.redis_client", mock_redis):
+            await views._safe_redis_set_many(entries)
+
+        written = {call.args[0]: (call.args[1], call.kwargs["ex"]) for call in mock_redis.set.await_args_list}
+        self.assertEqual(
+            written,
+            {
+                "proxycheck:v1:prov:ipdata:8.8.8.8": ("row-a", 3600),
+                "proxycheck:v1:prov:ptr:8.8.8.8": ("row-b", 900),
+            },
+        )
+
+    async def test_set_many_logs_and_skips_writes_when_pipeline_fails(self):
+        failing_pipe = MagicMock()
+        failing_pipe.execute = AsyncMock(side_effect=redis.exceptions.TimeoutError("redis timed out"))
+        mock_redis = MagicMock()
+        mock_redis.pipeline = MagicMock(return_value=failing_pipe)
+        mock_redis.set = AsyncMock()
+
+        with (
+            patch("detector.views.redis_client", mock_redis),
+            self.assertLogs("detector.views", level="WARNING") as logs,
+        ):
+            await views._safe_redis_set_many([("proxycheck:v1:prov:ipdata:8.8.8.8", "row-a", 3600)])
+
+        mock_redis.set.assert_not_awaited()
+        self.assertTrue(any("redis timed out" in line for line in logs.output))
+
+    async def test_read_provider_caches_uses_single_mget(self):
+        fake_redis = _BatchingFakeRedis()
+        fake_redis.strings["proxycheck:v1:prov:ipdata:8.8.8.8"] = self._cached_row_entry("IPData")
+
+        with patch("detector.views.redis_client", fake_redis):
+            cached_providers, cached_ptr = await views._read_provider_caches("8.8.8.8")
+
+        self.assertEqual(list(cached_providers), ["ipdata"])
+        self.assertIsNone(cached_ptr)
+        self.assertEqual(len(fake_redis.mget_calls), 1)
+        self.assertEqual(len(fake_redis.mget_calls[0]), len(views._PROVIDER_SPECS) + 1)
+        self.assertEqual(fake_redis.get_calls, [])
+
+    @override_settings(**{**TEST_UPSTREAM_SECRETS, "IPHUNTER_API_KEY": ""})
+    def test_provider_cache_expectation_skips_dnsbl_on_ipv6_and_unconfigured_sources(self):
+        with patch("detector.views._has_any_local_maxmind_db", return_value=True):
+            self.assertTrue(views._is_provider_cache_expected("spamhaus_zen", True))
+            self.assertFalse(views._is_provider_cache_expected("spamhaus_zen", False))
+            self.assertFalse(views._is_provider_cache_expected("spamcop", False))
+            self.assertFalse(views._is_provider_cache_expected("iphunter", True))
+            self.assertTrue(views._is_provider_cache_expected("ipdata", False))
+            self.assertTrue(views._is_provider_cache_expected("tor_onionoo", False))
+            self.assertTrue(views._is_provider_cache_expected("maxmind", False))
+        with patch("detector.views._has_any_local_maxmind_db", return_value=False):
+            self.assertFalse(views._is_provider_cache_expected("maxmind", True))
+
+    @override_settings(**{**TEST_UPSTREAM_SECRETS, "IPHUNTER_API_KEY": ""})
+    @patch("dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock)
+    def test_ipv6_with_all_expected_sources_cached_takes_full_hit_fast_path(self, mock_dns_resolve):
+        target_ip = views.canonicalize_ip(self.IPV6_TARGET)
+        uncached_keys = {"spamhaus_zen", "spamcop", "iphunter", "maxmind"}
+        cache_store = {}
+        for provider_key, provider_name, _, _, _ in views._PROVIDER_SPECS:
+            if provider_key not in uncached_keys:
+                cache_store[views._provider_cache_key(provider_key, target_ip)] = self._cached_row_entry(provider_name)
+        cache_store[views._provider_cache_key("ptr", target_ip)] = json.dumps(
+            {"hostname": "dns.google", "status": "ok", "cachedAt": "2026-11-13T08:30:00+00:00"}
+        )
+
+        mock_redis = MagicMock()
+        mock_redis.get = AsyncMock(side_effect=lambda key: cache_store.get(key))
+        mock_redis.set = AsyncMock()
+        shared_client = AsyncMock()
+        _login_authorised(self)
+
+        with (
+            patch("detector.views.redis_client", mock_redis),
+            patch("detector.views._has_any_local_maxmind_db", return_value=False),
+            patch("detector.views.query_maxmind", AsyncMock(return_value=dict(MAXMIND_STUB))),
+            patch("detector.views._get_shared_http_client", shared_client),
+            patch("detector.views._release_inflight_task", wraps=views._release_inflight_task) as release_spy,
+        ):
+            response = self.client.get(f"/api/v1/detect?ip={self.IPV6_TARGET}")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["isCached"])
+        self.assertEqual(payload["cacheMeta"]["status"], "hit")
+        self.assertFalse(payload["cacheMeta"]["isPartial"])
+        self.assertEqual(payload["cacheMeta"]["missCount"], 0)
+        self.assertEqual(payload["cacheMeta"]["cooldownCount"], 0)
+        expected_hits = len(views._PROVIDER_SPECS) - len(uncached_keys) + 1
+        self.assertEqual(payload["cacheMeta"]["hitCount"], expected_hits)
+        self.assertEqual(payload["ptrHostname"], "dns.google")
+
+        # The fast path runs through exactly one coalesced task, which is released by both its finally block
+        # and its done callback, and it never builds the HTTP client or reads cooldowns
+        released_calls = [call.args for call in release_spy.call_args_list]
+        self.assertEqual(len(released_calls), 2)
+        self.assertEqual({task_key for task_key, _ in released_calls}, {(target_ip, "full")})
+        self.assertEqual(len({released_task for _, released_task in released_calls}), 1)
+        shared_client.assert_not_awaited()
+        mock_dns_resolve.assert_not_called()
+        read_keys = [call.args[0] for call in mock_redis.get.await_args_list]
+        self.assertFalse(any(":cooldown:" in key for key in read_keys))
+        mock_redis.set.assert_not_awaited()
+
+        statuses = {row["provider"]: row["status"] for row in payload["results"]}
+        self.assertEqual(statuses["Spamhaus ZEN"], "Skipped (IPv6)")
+        self.assertEqual(statuses["SpamCop"], "Skipped (IPv6)")
+        self.assertEqual(statuses["IPHunter"], "No API Key")
+        self.assertEqual(statuses["MaxMind"], "Database Missing")

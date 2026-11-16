@@ -371,12 +371,10 @@ _CLOUD_CIDR_SOURCES: Tuple[Tuple[str, Callable[[httpx.Client], List[str]]], ...]
 
 
 def _resolve_cloud_cidrs_target_path(explicit_path: str = "") -> Path:
-    configured = explicit_path.strip() or os.environ.get("CLOUD_CIDR_DB_PATH", "").strip()
-    if not configured:
-        setting_value = str(getattr(settings, "CLOUD_CIDR_DB_PATH", "") or "").strip()
-        default_fallback = str(Path(str(getattr(settings, "BASE_DIR", ""))).parent / "data" / CLOUD_CIDRS_FILENAME)
-        if setting_value and setting_value != default_fallback:
-            configured = setting_value
+    configured = (
+        explicit_path.strip()
+        or str(getattr(settings, "CLOUD_CIDR_DB_PATH", "") or os.environ.get("CLOUD_CIDR_DB_PATH", "")).strip()
+    )
     if configured:
         candidate = Path(os.path.expanduser(configured))
         if candidate.is_dir() or (not candidate.exists() and not candidate.suffix):

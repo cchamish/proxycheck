@@ -1366,21 +1366,3 @@ class UpdateOfflineDbsCommandTests(TestCase):
                 status_entries = {e["key"]: e for e in offline_dbs.collect_offline_databases_status()}
                 self.assertEqual(status_entries["cloud_cidrs"]["status"], "stale")
             clear_offline_intelligence_caches()
-
-    def test_resolve_cloud_cidrs_target_path_ignores_unconfigured_base_dir_fallback(self):
-        from django.conf import settings
-
-        from detector.management.commands import update_offline_dbs as update_cmd
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tool_data_dir = Path(tmpdir) / "tool_data"
-            tool_data_dir.mkdir(parents=True, exist_ok=True)
-            default_fallback = str(Path(str(settings.BASE_DIR)).parent / "data" / update_cmd.CLOUD_CIDRS_FILENAME)
-            with (
-                patch.dict(os.environ, {"TOOL_DATA_DIR": str(tool_data_dir)}, clear=False),
-                patch.object(update_cmd, "resolve_writable_data_dir", return_value=tool_data_dir / "data"),
-                override_settings(CLOUD_CIDR_DB_PATH=default_fallback),
-            ):
-                os.environ.pop("CLOUD_CIDR_DB_PATH", None)
-                resolved = update_cmd._resolve_cloud_cidrs_target_path()
-            self.assertEqual(resolved, tool_data_dir / "data" / update_cmd.CLOUD_CIDRS_FILENAME)

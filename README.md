@@ -27,7 +27,7 @@ python manage.py check_setup --env local --all-options
 
 Behaviour by environment:
 
-* **Toolforge Bastion** (`become proxycheck` or `become proxycheck-dev`): reads runtime variables via `toolforge envvars list` / `show`, writes new or updated values safely via `toolforge envvars create <KEY>` over stdin, inspects `~/data` (or `*_DB_DIR`) permissions and NFS mounts, checks offline databases, and verifies scheduled jobs against [jobs.yaml](./jobs.yaml) via `toolforge jobs list --output long`.
+* **Toolforge Bastion** (`become proxycheck` or `become proxycheck-dev`): reads runtime variables via `toolforge envvars list` / `show`, writes new or updated values safely via `toolforge envvars create <KEY>` over stdin, inspects `~/data` (or `TOOL_DATA_DIR/data`) permissions and NFS mounts, checks offline databases, and verifies scheduled jobs against [jobs.yaml](./jobs.yaml) via `toolforge jobs list --output long`.
 * **Local / Buildpack container**: reads process environment variables and `.env`, masks sensitive credentials on screen, writes updates to `.env` (ensuring `.gitignore` ignores `.env`), offers to create missing data directories, and prints copy-pasteable commands for missing offline databases.
 
 ## Local Development
@@ -49,7 +49,7 @@ Sessions and provider caches are stored in Toolforge Redis, and static frontend 
 toolforge build start "link-to-.git"
 python manage.py check_setup --env bastion
 
-# 2. Populate persistent offline databases under ~/data (or custom *_DB_DIR)
+# 2. Populate persistent offline databases under ~/data (or TOOL_DATA_DIR/data)
 toolforge jobs run update-offline-dbs-init \
   --image tool-proxycheck/tool-proxycheck:latest \
   --mount=all --wait \

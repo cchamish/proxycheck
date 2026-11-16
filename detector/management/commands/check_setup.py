@@ -44,6 +44,7 @@ from proxycheck.settings import (
     _find_mmdb_in_directory,
     _resolve_dotenv_path,
     _standard_data_directories,
+    resolve_tool_data_subdir,
 )
 
 ENV_MODES = ("auto", "bastion", "local")
@@ -217,7 +218,10 @@ def _build_core_and_oauth_env_specs() -> Tuple[EnvVarSpec, ...]:
             category="Production / Toolforge Recommended",
             sensitive=False,
             default_display="(unset)",
-            description="Toolforge tool home or persistent data root (for example /data/project/<tool>)",
+            description=(
+                "Toolforge tool home or persistent data root for .env and offline databases "
+                "(for example /data/project/<tool>)"
+            ),
         ),
         EnvVarSpec(
             name="MAXMIND_ACCOUNT_ID",
@@ -287,13 +291,10 @@ def _build_runtime_and_path_env_specs() -> Tuple[EnvVarSpec, ...]:
             "False",
             "Restrict access exclusively to usernames listed in ALLOWED_WIKI_USERS",
         ),
-        ("MAXMIND_DB_DIR", "(auto)", "Override directory for MaxMind GeoLite2 MMDB files"),
-        ("STOPFORUMSPAM_DB_DIR", "(auto)", "Override directory for StopForumSpam offline files"),
         ("STOPFORUMSPAM_TOXIC_CIDR_PATH", "(auto)", "Override file or directory path for toxic_ip_cidr.txt"),
         ("STOPFORUMSPAM_LISTED_90_PATH", "(auto)", "Override path for StopForumSpam 90-day listed IP archive"),
         ("STOPFORUMSPAM_LISTED_1_PATH", "(auto)", "Override path for StopForumSpam 1-day listed IP archive"),
         ("STOPFORUMSPAM_SQLITE_PATH", "(auto)", "Override path for stopforumspam.sqlite3 index"),
-        ("CLOUD_CIDR_DB_PATH", "(auto)", "Override path for cloud_cidrs.json or computehosts.json"),
         ("HOSTING_ASN_RULES_PATH", "(auto)", "Override path for hosting_asn_rules.json"),
         ("HOSTING_ASNS", "(built-in)", "Extra comma-separated hosting ASNs"),
         ("HOSTING_ORG_KEYWORDS", "(built-in)", "Extra comma-separated hosting organisation keywords"),
@@ -926,29 +927,12 @@ def _collect_target_directories(
         index_by_resolved[normalized] = len(entries)
         entries.append([[source_tag] if source_tag else [], fallback_label, raw_path, required, persistent])
 
-    maxmind_dir = _expand_configured_path(env_values.get("MAXMIND_DB_DIR", ""))
-    if maxmind_dir:
-        _add("MAXMIND_DB_DIR", "MaxMind DB directory", Path(maxmind_dir), required=True, persistent=True)
-
-    sfs_dir = _expand_configured_path(env_values.get("STOPFORUMSPAM_DB_DIR", ""))
-    if sfs_dir:
-        _add(
-            "STOPFORUMSPAM_DB_DIR",
-            "StopForumSpam DB directory",
-            Path(sfs_dir),
-            required=True,
-            persistent=True,
-        )
-
     tool_data_dir = _expand_configured_path(env_values.get("TOOL_DATA_DIR", ""))
     if tool_data_dir:
-        tool_root = Path(tool_data_dir)
-        legacy_www_data = tool_root / "www" / "python" / "data"
-        default_persistent = legacy_www_data if legacy_www_data.is_dir() else (tool_root / "data")
         _add(
             "TOOL_DATA_DIR",
             "Persistent data directory",
-            default_persistent,
+            resolve_tool_data_subdir(tool_data_dir),
             required=True,
             persistent=True,
         )
@@ -1139,6 +1123,26 @@ def _resolve_rule_for_env(
     return None, filenames[0]
 
 
+def _resolve_cloud_cidrs_for_env(
+    configured_dir: str,
+    standard_dirs: Sequence[Path],
+) -> Tuple[Optional[Path], str]:
+    filenames = ("cloud_cidrs.json", "computehosts.json")
+    if configured_dir:
+        base = Path(_expand_configured_path(configured_dir))
+        for fname in filenames:
+            candidate = base / fname
+            if candidate.is_file():
+                return candidate, candidate.name
+        return None, filenames[0]
+    for directory in standard_dirs:
+        for fname in filenames:
+            candidate = directory / fname
+            if candidate.is_file():
+                return candidate, candidate.name
+    return None, filenames[0]
+
+
 def collect_offline_status_for_env(
     base_dir: Path,
     env_values: Mapping[str, str],
@@ -1148,10 +1152,11 @@ def collect_offline_status_for_env(
     """Inventories offline database and rule files against a resolved environment mapping."""
     current_dt = now_dt or datetime.now(timezone.utc)
     now_ts = current_dt.timestamp()
-    standard_dirs = _standard_data_directories(base_dir, tool_data_dir=env_values.get("TOOL_DATA_DIR", ""))
-
-    maxmind_dir = env_values.get("MAXMIND_DB_DIR", "")
-    sfs_dir = env_values.get("STOPFORUMSPAM_DB_DIR", "")
+    raw_tool_data_dir = env_values.get("TOOL_DATA_DIR", "")
+    standard_dirs = _standard_data_directories(base_dir, tool_data_dir=raw_tool_data_dir)
+    configured_dir = (
+        str(resolve_tool_data_subdir(raw_tool_data_dir)) if _expand_configured_path(raw_tool_data_dir) else ""
+    )
 
     maxmind_stale = _parse_pos_int(
         env_values.get("OFFLINE_DB_MAXMIND_STALE_SECONDS", ""), _DEFAULT_STALE_MAXMIND_SECONDS
@@ -1170,25 +1175,25 @@ def collect_offline_status_for_env(
 
     sfs_toxic = _resolve_sfs_for_env(
         env_values.get("STOPFORUMSPAM_TOXIC_CIDR_PATH", ""),
-        sfs_dir,
+        configured_dir,
         (SFS_TOXIC_CIDR_FILENAME,),
         standard_dirs,
     )
     sfs_90 = _resolve_sfs_for_env(
         env_values.get("STOPFORUMSPAM_LISTED_90_PATH", ""),
-        sfs_dir,
+        configured_dir,
         SFS_LISTED_90_FILENAMES,
         standard_dirs,
     )
     sfs_1 = _resolve_sfs_for_env(
         env_values.get("STOPFORUMSPAM_LISTED_1_PATH", ""),
-        sfs_dir,
+        configured_dir,
         SFS_LISTED_1_FILENAMES,
         standard_dirs,
     )
     sfs_sqlite = _resolve_sfs_for_env(
         env_values.get("STOPFORUMSPAM_SQLITE_PATH", ""),
-        sfs_dir,
+        configured_dir,
         (SFS_SQLITE_FILENAME,),
         standard_dirs,
     )
@@ -1200,11 +1205,7 @@ def collect_offline_status_for_env(
                     sfs_sqlite = candidate
                     break
 
-    cloud_path, cloud_name = _resolve_rule_for_env(
-        env_values.get("CLOUD_CIDR_DB_PATH", ""),
-        ("cloud_cidrs.json", "computehosts.json"),
-        standard_dirs,
-    )
+    cloud_path, cloud_name = _resolve_cloud_cidrs_for_env(configured_dir, standard_dirs)
     hosting_path, hosting_name = _resolve_rule_for_env(
         env_values.get("HOSTING_ASN_RULES_PATH", ""),
         ("hosting_asn_rules.json",),
@@ -1213,9 +1214,9 @@ def collect_offline_status_for_env(
 
     return build_offline_database_entries(
         maxmind_paths={
-            "country": _resolve_mmdb_for_env(maxmind_dir, MAXMIND_COUNTRY_DB_FILENAME, standard_dirs),
-            "city": _resolve_mmdb_for_env(maxmind_dir, MAXMIND_CITY_DB_FILENAME, standard_dirs),
-            "asn": _resolve_mmdb_for_env(maxmind_dir, MAXMIND_ASN_DB_FILENAME, standard_dirs),
+            "country": _resolve_mmdb_for_env(configured_dir, MAXMIND_COUNTRY_DB_FILENAME, standard_dirs),
+            "city": _resolve_mmdb_for_env(configured_dir, MAXMIND_CITY_DB_FILENAME, standard_dirs),
+            "asn": _resolve_mmdb_for_env(configured_dir, MAXMIND_ASN_DB_FILENAME, standard_dirs),
         },
         sfs_paths={
             "toxic_cidr": sfs_toxic,
@@ -1717,7 +1718,6 @@ class Command(BaseCommand):
         spec: EnvVarSpec,
         *,
         tag: str,
-        has_explicit_db_dirs: bool,
         missing_required: List[EnvVarSpec],
         attention_recommended: List[EnvVarSpec],
         missing_providers: List[EnvVarSpec],
@@ -1727,16 +1727,8 @@ class Command(BaseCommand):
             missing_required.append(spec)
             self.stdout.write(self.style.ERROR(f"  - {tag} {spec.name}: MISSING ({spec.description})"))
         elif spec.tier == "recommended":
-            if spec.name == "TOOL_DATA_DIR" and has_explicit_db_dirs:
-                self.stdout.write(
-                    "  - [OPTIONAL] TOOL_DATA_DIR: NOT SET "
-                    "(not required; MAXMIND_DB_DIR and STOPFORUMSPAM_DB_DIR configured)"
-                )
-            else:
-                attention_recommended.append(spec)
-                self.stdout.write(
-                    self.style.WARNING(f"  - {tag} {spec.name}: MISSING (default: {spec.default_display})")
-                )
+            attention_recommended.append(spec)
+            self.stdout.write(self.style.WARNING(f"  - {tag} {spec.name}: MISSING (default: {spec.default_display})"))
         elif spec.tier == "provider":
             missing_providers.append(spec)
             self.stdout.write(f"  - {tag} {spec.name}: MISSING (provider skipped)")
@@ -1841,10 +1833,6 @@ class Command(BaseCommand):
         attention_recommended: List[EnvVarSpec] = []
         missing_providers: List[EnvVarSpec] = []
         missing_optional_all: List[EnvVarSpec] = []
-        has_explicit_db_dirs = bool(
-            (values.get("MAXMIND_DB_DIR") or "MAXMIND_DB_DIR" in hidden_keys)
-            and (values.get("STOPFORUMSPAM_DB_DIR") or "STOPFORUMSPAM_DB_DIR" in hidden_keys)
-        )
 
         for tier, heading in (
             ("required", "Required Configuration"),
@@ -1869,7 +1857,6 @@ class Command(BaseCommand):
                     self._report_missing_env_spec(
                         spec,
                         tag=tag,
-                        has_explicit_db_dirs=has_explicit_db_dirs,
                         missing_required=missing_required,
                         attention_recommended=attention_recommended,
                         missing_providers=missing_providers,

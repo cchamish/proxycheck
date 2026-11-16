@@ -26,6 +26,7 @@ from detector.offline_dbs import (
     SFS_TOXIC_CIDR_FILENAME,
     build_stopforumspam_sqlite_index,
     clear_stopforumspam_caches,
+    resolve_configured_data_dir,
     resolve_writable_data_dir,
 )
 from detector.offline_dbs import (
@@ -370,19 +371,6 @@ _CLOUD_CIDR_SOURCES: Tuple[Tuple[str, Callable[[httpx.Client], List[str]]], ...]
 )
 
 
-def _resolve_cloud_cidrs_target_path(explicit_path: str = "") -> Path:
-    configured = (
-        explicit_path.strip()
-        or str(getattr(settings, "CLOUD_CIDR_DB_PATH", "") or os.environ.get("CLOUD_CIDR_DB_PATH", "")).strip()
-    )
-    if configured:
-        candidate = Path(os.path.expanduser(configured))
-        if candidate.is_dir() or (not candidate.exists() and not candidate.suffix):
-            return candidate / CLOUD_CIDRS_FILENAME
-        return candidate
-    return resolve_writable_data_dir("", "CLOUD_CIDR_DB_PATH") / CLOUD_CIDRS_FILENAME
-
-
 def _load_existing_cloud_cidrs_by_provider(target_path: Path) -> Dict[str, List[str]]:
     if not target_path.is_file():
         return {}
@@ -444,19 +432,9 @@ class Command(BaseCommand):
             help="HTTP read timeout in seconds for archive downloads (default: 60).",
         )
         parser.add_argument(
-            "--sfs-dir",
+            "--data-dir",
             default="",
-            help="Override destination directory for StopForumSpam files.",
-        )
-        parser.add_argument(
-            "--maxmind-dir",
-            default="",
-            help="Override destination directory for MaxMind MMDB files.",
-        )
-        parser.add_argument(
-            "--cloud-cidrs-path",
-            default="",
-            help="Override destination file or directory for cloud_cidrs.json.",
+            help="Override destination directory for offline databases (defaults to TOOL_DATA_DIR/data).",
         )
 
     def _parse_sources(self, raw_sources: Iterable[str]) -> Tuple[bool, bool, bool]:
@@ -703,11 +681,11 @@ class Command(BaseCommand):
         self,
         client: httpx.Client,
         *,
-        cloud_cidrs_path: str,
+        data_dir: Path,
         force: bool,
         dry_run: bool,
     ) -> int:
-        target_path = _resolve_cloud_cidrs_target_path(cloud_cidrs_path)
+        target_path = data_dir / CLOUD_CIDRS_FILENAME
         wait_seconds = _check_mtime_cooldown(target_path, CLOUD_CIDRS_MIN_INTERVAL_SECONDS, force=force)
         if wait_seconds is not None:
             self.stdout.write(
@@ -757,6 +735,27 @@ class Command(BaseCommand):
         )
         return 0
 
+    def _resolve_and_validate_data_dir(self, explicit_data_dir: str, *, dry_run: bool) -> Path:
+        cleaned_explicit = explicit_data_dir.strip()
+        configured_data_dir = resolve_configured_data_dir()
+        data_dir = resolve_writable_data_dir(cleaned_explicit)
+
+        if not cleaned_explicit and not configured_data_dir:
+            self.stdout.write(f"TOOL_DATA_DIR is not set; using default offline data directory: {data_dir}")
+
+        if data_dir.exists() and not data_dir.is_dir():
+            raise CommandError(f"Offline database target path is not a directory: {data_dir}")
+
+        if not dry_run:
+            try:
+                data_dir.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(dir=data_dir, prefix=".write_probe_", delete=True):
+                    pass
+            except OSError as exc:
+                raise CommandError(f"Offline database directory is not writable ({data_dir}): {exc}") from exc
+
+        return data_dir
+
     def handle(self, *args, **options) -> None:
         update_sfs, update_maxmind, update_cloud_cidrs = self._parse_sources(options.get("sources") or ["all"])
         force = bool(options.get("force"))
@@ -766,9 +765,7 @@ class Command(BaseCommand):
         if timeout <= 0:
             raise CommandError("--timeout must be greater than zero.")
 
-        sfs_dir = resolve_writable_data_dir(str(options.get("sfs_dir") or ""), "STOPFORUMSPAM_DB_DIR")
-        maxmind_dir = resolve_writable_data_dir(str(options.get("maxmind_dir") or ""), "MAXMIND_DB_DIR")
-        cloud_cidrs_path = str(options.get("cloud_cidrs_path") or "")
+        data_dir = self._resolve_and_validate_data_dir(str(options.get("data_dir") or ""), dry_run=dry_run)
 
         total_errors = 0
         with httpx.Client(
@@ -779,7 +776,7 @@ class Command(BaseCommand):
             if update_sfs:
                 total_errors += self._update_stopforumspam(
                     client,
-                    sfs_dir=sfs_dir,
+                    sfs_dir=data_dir,
                     force=force,
                     dry_run=dry_run,
                     skip_listed_1=skip_listed_1,
@@ -787,14 +784,14 @@ class Command(BaseCommand):
             if update_maxmind:
                 total_errors += self._update_maxmind(
                     client,
-                    maxmind_dir=maxmind_dir,
+                    maxmind_dir=data_dir,
                     force=force,
                     dry_run=dry_run,
                 )
             if update_cloud_cidrs:
                 total_errors += self._update_cloud_cidrs(
                     client,
-                    cloud_cidrs_path=cloud_cidrs_path,
+                    data_dir=data_dir,
                     force=force,
                     dry_run=dry_run,
                 )

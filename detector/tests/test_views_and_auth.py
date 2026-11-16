@@ -1201,9 +1201,11 @@ class OfflineDatabaseStatusEndpointTests(TestCase):
         now_dt = datetime(2026, 11, 16, 12, 0, 0, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
-            sfs_toxic = root / "toxic_ip_cidr.txt"
-            sfs_90 = root / "listed_ip_90_ipv46_all.zip"
-            mm_asn = root / "GeoLite2-ASN.mmdb"
+            data_dir = root / "data"
+            data_dir.mkdir()
+            sfs_toxic = data_dir / "toxic_ip_cidr.txt"
+            sfs_90 = data_dir / "listed_ip_90_ipv46_all.zip"
+            mm_asn = data_dir / "GeoLite2-ASN.mmdb"
 
             sfs_toxic.write_text("192.0.2.0/24\n", encoding="utf-8")
             sfs_90.write_bytes(b"PK\x05\x06" + b"\x00" * 18)
@@ -1216,8 +1218,7 @@ class OfflineDatabaseStatusEndpointTests(TestCase):
             os.utime(mm_asn, (fresh_ts, fresh_ts))
 
             with override_settings(
-                STOPFORUMSPAM_DB_DIR=tmp_dir,
-                MAXMIND_DB_DIR=tmp_dir,
+                TOOL_DATA_DIR=tmp_dir,
                 OFFLINE_DB_SFS_90_STALE_SECONDS=86400,
             ):
                 entries = offline_dbs.collect_offline_databases_status(now_dt=now_dt)

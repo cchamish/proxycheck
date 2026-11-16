@@ -7,6 +7,7 @@ import getpass
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess  # noqa: S404
 import tempfile
@@ -50,6 +51,16 @@ DEFAULT_TOOLFORGE_ALLOWED_HOSTS = "localhost,127.0.0.1,.toolforge.org,.wmcloud.o
 DEFAULT_TOOLFORGE_REDIS_URL = "redis://redis.svc.tools.eqiad1.wikimedia.cloud:6379/0"
 INSECURE_DEV_SECRET_KEY = "django-insecure-dev-key"  # noqa: S105
 _SECRET_KEY_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#%^&*(-_=+)"  # noqa: S105
+_PLACEHOLDER_SECRET_PREFIXES = (
+    "your-",
+    "your_",
+    "changeme",
+    "replace-",
+    "placeholder",
+    "example-",
+    "django-insecure-",
+)
+_FAILED_JOB_STATUS_TOKENS = ("failed", "error", "crash", "backoff", "oom", "evicted", "killed")
 
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SEPARATOR_LINE_RE = re.compile(r"^[-=+|:\s]+$")
@@ -124,6 +135,18 @@ class JobSpec:
 
 
 @dataclass(frozen=True)
+class RegisteredJob:
+    """Active Toolforge job metadata parsed from toolforge jobs list or jobs show."""
+
+    name: str
+    command: str = ""
+    job_type: str = ""
+    image: str = ""
+    mount: str = ""
+    status: str = ""
+
+
+@dataclass(frozen=True)
 class BastionJobCheck:
     """Comparison outcome between jobs.yaml and active Toolforge jobs."""
 
@@ -133,6 +156,7 @@ class BastionJobCheck:
     status: str
     warnings: Tuple[str, ...]
     adapted_image: str
+    covered_by: str = ""
 
 
 def _build_env_specs() -> Tuple[EnvVarSpec, ...]:
@@ -552,13 +576,23 @@ def _build_env_specs() -> Tuple[EnvVarSpec, ...]:
 ENV_SPECS: Tuple[EnvVarSpec, ...] = _build_env_specs()
 ENV_SPEC_BY_NAME: Dict[str, EnvVarSpec] = {spec.name: spec for spec in ENV_SPECS}
 
-DEFAULT_JOB_SPEC = JobSpec(
-    name="update-offline-dbs",
-    command="python manage.py update_offline_dbs",
-    image="tool-proxycheck/tool-proxycheck:latest",
-    schedule="0 * * * *",
-    mount="all",
+DEFAULT_JOB_SPECS: Tuple[JobSpec, ...] = (
+    JobSpec(
+        name="update-sfs-db",
+        command="python manage.py update_offline_dbs --sources stopforumspam",
+        image="tool-proxycheck/tool-proxycheck:latest",
+        schedule="@hourly",
+        mount="all",
+    ),
+    JobSpec(
+        name="update-maxmind-db",
+        command="python manage.py update_offline_dbs --sources maxmind",
+        image="tool-proxycheck/tool-proxycheck:latest",
+        schedule="@daily",
+        mount="all",
+    ),
 )
+DEFAULT_JOB_SPEC = DEFAULT_JOB_SPECS[0]
 
 
 def mask_secret(value: str) -> str:
@@ -921,6 +955,17 @@ def save_envvar_local(base_dir: Path, dotenv_path: Path, key: str, value: str) -
     return gitignore_note if gitignore_note != "already ignored" else None
 
 
+def _is_weak_secret_key(value: str) -> Tuple[bool, Optional[str]]:
+    """Checks whether DJANGO_SECRET_KEY uses a placeholder pattern or insufficient length."""
+    cleaned = value.strip()
+    lowered = cleaned.lower()
+    if any(lowered.startswith(prefix) for prefix in _PLACEHOLDER_SECRET_PREFIXES):
+        return True, "appears to be a placeholder secret"
+    if len(cleaned) < 32:
+        return False, f"short secret ({len(cleaned)} chars; 50+ recommended)"
+    return False, None
+
+
 def _is_recommended_local_fallback(
     spec: EnvVarSpec,
     value: str,
@@ -1023,35 +1068,53 @@ def _collect_target_directories(
     mode: str,
 ) -> List[Tuple[str, Path, bool, bool]]:
     """Returns deduplicated (label, path, required, persistent) directory targets."""
-    targets: List[Tuple[str, Path, bool, bool]] = []
-    seen: set[Path] = set()
+    entries: List[List[Any]] = []
+    index_by_resolved: Dict[Path, int] = {}
 
-    def _add(label: str, raw_path: Path, *, required: bool, persistent: bool) -> None:
+    def _add(source_tag: str, fallback_label: str, raw_path: Path, *, required: bool, persistent: bool) -> None:
         try:
             normalized = raw_path.resolve()
         except OSError:
             normalized = raw_path
-        if normalized in seen:
+        existing_idx = index_by_resolved.get(normalized)
+        if existing_idx is not None:
+            existing = entries[existing_idx]
+            if source_tag and source_tag not in existing[0]:
+                existing[0].append(source_tag)
+            existing[3] = existing[3] or required
+            existing[4] = existing[4] or persistent
             return
-        seen.add(normalized)
-        targets.append((label, raw_path, required, persistent))
+        index_by_resolved[normalized] = len(entries)
+        entries.append([[source_tag] if source_tag else [], fallback_label, raw_path, required, persistent])
 
     maxmind_dir = _expand_configured_path(env_values.get("MAXMIND_DB_DIR", ""))
     if maxmind_dir:
-        _add("MaxMind DB directory (MAXMIND_DB_DIR)", Path(maxmind_dir), required=True, persistent=True)
+        _add("MAXMIND_DB_DIR", "MaxMind DB directory", Path(maxmind_dir), required=True, persistent=True)
 
     sfs_dir = _expand_configured_path(env_values.get("STOPFORUMSPAM_DB_DIR", ""))
     if sfs_dir:
-        _add("StopForumSpam DB directory (STOPFORUMSPAM_DB_DIR)", Path(sfs_dir), required=True, persistent=True)
+        _add(
+            "STOPFORUMSPAM_DB_DIR",
+            "StopForumSpam DB directory",
+            Path(sfs_dir),
+            required=True,
+            persistent=True,
+        )
 
     tool_data_dir = _expand_configured_path(env_values.get("TOOL_DATA_DIR", ""))
     if tool_data_dir:
         tool_root = Path(tool_data_dir)
         legacy_www_data = tool_root / "www" / "python" / "data"
         default_persistent = legacy_www_data if legacy_www_data.is_dir() else (tool_root / "data")
-        _add("Persistent data directory (TOOL_DATA_DIR)", default_persistent, required=True, persistent=True)
+        _add(
+            "TOOL_DATA_DIR",
+            "Persistent data directory",
+            default_persistent,
+            required=True,
+            persistent=True,
+        )
     elif mode == "bastion" or base_dir.parent == Path(base_dir.anchor):
-        _add("Persistent data directory (~/data)", Path.home() / "data", required=True, persistent=True)
+        _add("~/data", "Persistent data directory", Path.home() / "data", required=True, persistent=True)
     else:
         local_candidates = (
             base_dir.parent / "data",
@@ -1060,10 +1123,20 @@ def _collect_target_directories(
         )
         existing_local = next((cand for cand in local_candidates if cand.is_dir()), None)
         chosen_local = existing_local if existing_local is not None else (base_dir.parent / "data")
-        _add("Default offline data directory", chosen_local, required=True, persistent=True)
+        _add("", "Default offline data directory", chosen_local, required=True, persistent=True)
 
-    _add("Frontend build assets (dist/assets)", base_dir / "dist" / "assets", required=False, persistent=False)
-    _add("Collected static directory (staticfiles)", base_dir / "staticfiles", required=False, persistent=False)
+    _add("", "Frontend build assets (dist/assets)", base_dir / "dist" / "assets", required=False, persistent=False)
+    _add("", "Collected static directory (staticfiles)", base_dir / "staticfiles", required=False, persistent=False)
+
+    targets: List[Tuple[str, Path, bool, bool]] = []
+    for source_tags, fallback_label, raw_path, required, persistent in entries:
+        if len(source_tags) > 1:
+            label = f"Offline data directory ({', '.join(source_tags)})"
+        elif len(source_tags) == 1:
+            label = f"{fallback_label} ({source_tags[0]})"
+        else:
+            label = fallback_label
+        targets.append((label, raw_path, required, persistent))
     return targets
 
 
@@ -1416,7 +1489,7 @@ def _strip_yaml_quotes(raw_val: str) -> str:
 def parse_jobs_yaml(jobs_path: Path) -> List[JobSpec]:
     """Parses simple Toolforge jobs.yaml entries without requiring PyYAML."""
     if not jobs_path.is_file():
-        return [DEFAULT_JOB_SPEC]
+        return list(DEFAULT_JOB_SPECS)
 
     raw_items: List[Dict[str, str]] = []
     current: Optional[Dict[str, str]] = None
@@ -1450,11 +1523,60 @@ def parse_jobs_yaml(jobs_path: Path) -> List[JobSpec]:
                 mount=item.get("mount", DEFAULT_JOB_SPEC.mount).strip(),
             )
         )
-    return parsed or [DEFAULT_JOB_SPEC]
+    return parsed or list(DEFAULT_JOB_SPECS)
 
 
-def _parse_toolforge_jobs_list(raw_output: str) -> Dict[str, Tuple[str, str]]:
-    """Parses toolforge jobs list table or JSON into {job_name: (job_type, status)}."""
+def _split_bordered_row(line: str, plus_positions: Optional[List[int]]) -> List[str]:
+    if plus_positions and len(plus_positions) >= 2 and len(line) >= plus_positions[-1] + 1:
+        return [
+            line[plus_positions[idx] + 1 : plus_positions[idx + 1]].strip() for idx in range(len(plus_positions) - 1)
+        ]
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def _parse_bordered_jobs_table(raw_output: str) -> Dict[str, RegisteredJob]:
+    """Parses prettytable ASCII grid output from toolforge jobs list --output long."""
+    lines = [line.rstrip("\r\n") for line in raw_output.splitlines() if line.strip()]
+    plus_positions: Optional[List[int]] = None
+    headers: Optional[List[str]] = None
+    jobs: Dict[str, RegisteredJob] = {}
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("+") and "+" in stripped[1:] and set(stripped) <= {"+", "-", "="}:
+            candidate_positions = [idx for idx, ch in enumerate(line) if ch == "+"]
+            if len(candidate_positions) >= 2:
+                plus_positions = candidate_positions
+            continue
+        if not (stripped.startswith("|") and stripped.endswith("|")):
+            continue
+
+        cells = _split_bordered_row(line, plus_positions)
+        if headers is None:
+            headers = [cell.rstrip(":").strip().lower() for cell in cells]
+            continue
+
+        row_map: Dict[str, str] = {}
+        for idx, header in enumerate(headers):
+            if idx < len(cells):
+                row_map[header] = cells[idx]
+
+        name = row_map.get("job name") or row_map.get("name") or ""
+        if not name:
+            continue
+        jobs[name] = RegisteredJob(
+            name=name,
+            command=row_map.get("command", ""),
+            job_type=row_map.get("job type") or row_map.get("type") or "",
+            image=row_map.get("image", ""),
+            mount=row_map.get("mounts") or row_map.get("mount") or "",
+            status=row_map.get("status", ""),
+        )
+    return jobs
+
+
+def _parse_toolforge_jobs_list(raw_output: str) -> Dict[str, RegisteredJob]:
+    """Parses toolforge jobs list (--output long or compact) and JSON output."""
     stripped = raw_output.strip()
     if not stripped or "no jobs found" in stripped.lower():
         return {}
@@ -1463,19 +1585,29 @@ def _parse_toolforge_jobs_list(raw_output: str) -> Dict[str, Tuple[str, str]]:
         try:
             payload = json.loads(stripped)
             if isinstance(payload, list):
-                parsed: Dict[str, Tuple[str, str]] = {}
+                parsed: Dict[str, RegisteredJob] = {}
                 for entry in payload:
                     if isinstance(entry, dict) and entry.get("name"):
-                        parsed[str(entry["name"]).strip()] = (
-                            str(entry.get("type") or entry.get("job_type") or ""),
-                            str(entry.get("status") or ""),
+                        job_name = str(entry["name"]).strip()
+                        parsed[job_name] = RegisteredJob(
+                            name=job_name,
+                            command=str(entry.get("command") or ""),
+                            job_type=str(entry.get("type") or entry.get("job_type") or ""),
+                            image=str(entry.get("image") or ""),
+                            mount=str(entry.get("mount") or entry.get("mounts") or ""),
+                            status=str(entry.get("status") or ""),
                         )
                 return parsed
         except ValueError:
             pass
 
+    if any(line.strip().startswith("|") and line.strip().endswith("|") for line in raw_output.splitlines()):
+        bordered = _parse_bordered_jobs_table(raw_output)
+        if bordered:
+            return bordered
+
     lines = [line.rstrip("\r\n") for line in raw_output.splitlines() if line.strip()]
-    jobs: Dict[str, Tuple[str, str]] = {}
+    jobs: Dict[str, RegisteredJob] = {}
     col_bounds: Optional[List[Tuple[int, int]]] = None
 
     for line in lines:
@@ -1501,7 +1633,7 @@ def _parse_toolforge_jobs_list(raw_output: str) -> Dict[str, Tuple[str, str]]:
             status = parts[2].strip() if len(parts) > 2 else ""
 
         if name and not name.endswith(":"):
-            jobs[name] = (job_type, status)
+            jobs[name] = RegisteredJob(name=name, job_type=job_type, status=status)
     return jobs
 
 
@@ -1518,66 +1650,205 @@ def _parse_toolforge_job_show(raw_output: str) -> Dict[str, str]:
     return details
 
 
+def _extract_update_offline_sources(command: str) -> set[str]:
+    """Extracts covered update_offline_dbs sources from a job command string."""
+    if not command or "update_offline_dbs" not in command:
+        return set()
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+
+    if len(tokens) >= 3 and Path(tokens[0]).name in ("sh", "bash") and tokens[1] in ("-c", "-lc"):
+        try:
+            tokens = shlex.split(tokens[2])
+        except ValueError:
+            tokens = tokens[2].split()
+
+    cmd_idx = next((idx for idx, tok in enumerate(tokens) if tok == "update_offline_dbs"), None)
+    if cmd_idx is None:
+        return set()
+
+    source_tokens: List[str] = []
+    idx = cmd_idx + 1
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok == "--sources":
+            idx += 1
+            while idx < len(tokens) and not tokens[idx].startswith("-"):
+                source_tokens.extend(part.strip().lower() for part in tokens[idx].split(",") if part.strip())
+                idx += 1
+            continue
+        if tok.startswith("--sources="):
+            raw_val = tok.split("=", 1)[1]
+            source_tokens.extend(part.strip().lower() for part in raw_val.split(",") if part.strip())
+        idx += 1
+
+    if not source_tokens or "all" in source_tokens:
+        return {"stopforumspam", "maxmind"}
+
+    covered: set[str] = set()
+    for tok in source_tokens:
+        if tok in ("stopforumspam", "sfs"):
+            covered.add("stopforumspam")
+        elif tok == "maxmind":
+            covered.add("maxmind")
+    return covered
+
+
+def _schedule_matches_expected(expected_schedule: str, actual_job_type: str) -> bool:
+    """Checks scheduled job type against expected cron expressions or @hourly/@daily aliases."""
+    lowered_type = actual_job_type.strip().lower()
+    if "scheduled" not in lowered_type:
+        return False
+    if ":" in lowered_type:
+        actual_cron = " ".join(lowered_type.split(":", 1)[1].split())
+    else:
+        actual_cron = " ".join(lowered_type.split())
+
+    norm_expected = " ".join(expected_schedule.strip().lower().split())
+    if not norm_expected:
+        return True
+    if norm_expected == actual_cron:
+        return True
+    if norm_expected == "@hourly":
+        return bool(re.fullmatch(r"\d{1,2}\s+\*\s+\*\s+\*\s+\*", actual_cron))
+    if norm_expected == "@daily":
+        return bool(re.fullmatch(r"\d{1,2}\s+\d{1,2}\s+\*\s+\*\s+\*", actual_cron))
+    return False
+
+
+def _validate_registered_job(
+    spec: JobSpec,
+    reg: RegisteredJob,
+    *,
+    adapted_image: str,
+    tool_account: Optional[str],
+    covered_by: str = "",
+) -> BastionJobCheck:
+    job_warnings: List[str] = []
+    covered_sources = _extract_update_offline_sources(reg.command)
+    is_combined_coverage = bool(covered_by) and len(covered_sources) > 1
+    schedule_ok = _schedule_matches_expected(spec.schedule, reg.job_type)
+    if not schedule_ok and is_combined_coverage and spec.schedule.strip().lower() == "@daily":
+        schedule_ok = _schedule_matches_expected("@hourly", reg.job_type)
+    if spec.schedule and not schedule_ok:
+        job_warnings.append(f"schedule mismatch (expected '{spec.schedule}', got '{reg.job_type or 'unknown'}')")
+
+    mounted = reg.mount.strip().lower()
+    if mounted and spec.mount.lower() not in mounted:
+        job_warnings.append(f"mount is '{reg.mount}' (expected '{spec.mount}')")
+
+    if tool_account and reg.image and reg.image != adapted_image:
+        job_warnings.append(f"image is '{reg.image}' (expected '{adapted_image}')")
+
+    if reg.command and not covered_by and "update_offline_dbs" not in reg.command:
+        job_warnings.append(f"command is '{reg.command}' (expected '{spec.command}')")
+
+    lowered_status = reg.status.lower()
+    if any(token in lowered_status for token in _FAILED_JOB_STATUS_TOKENS):
+        job_warnings.append(f"unhealthy job status '{reg.status}'")
+
+    return BastionJobCheck(
+        expected=spec,
+        registered=True,
+        job_type=reg.job_type,
+        status=reg.status or "Registered",
+        warnings=tuple(job_warnings),
+        adapted_image=adapted_image,
+        covered_by=covered_by,
+    )
+
+
 def _check_bastion_jobs(
     toolforge_bin: str,
     base_dir: Path,
     tool_account: Optional[str],
 ) -> Tuple[List[BastionJobCheck], Optional[str]]:
-    """Checks expected scheduled jobs against toolforge jobs list and jobs show."""
+    """Checks expected scheduled jobs against toolforge jobs list --output long and jobs show."""
     expected_jobs = parse_jobs_yaml(base_dir / "jobs.yaml")
-    rc, stdout, stderr = _run_toolforge_command(toolforge_bin, ("jobs", "list"))
+    used_long_output = True
+    rc, stdout, stderr = _run_toolforge_command(toolforge_bin, ("jobs", "list", "--output", "long"))
+    if rc != 0:
+        used_long_output = False
+        rc, stdout, stderr = _run_toolforge_command(toolforge_bin, ("jobs", "list"))
     if rc != 0:
         detail = (stderr or stdout).strip()
         return [], f"Unable to query toolforge jobs list: {detail or f'exit code {rc}'}"
 
     active_jobs = _parse_toolforge_jobs_list(stdout)
+
+    # Populate full details via jobs show only when --output long was unavailable.
+    if not used_long_output:
+        expected_names = {spec.name for spec in expected_jobs}
+        for job_name, reg in list(active_jobs.items()):
+            if job_name not in expected_names and "update" not in job_name and "db" not in job_name:
+                continue
+            if reg.command and reg.image and reg.mount:
+                continue
+            rc_show, show_stdout, _ = _run_toolforge_command(toolforge_bin, ("jobs", "show", job_name))
+            if rc_show == 0:
+                details = _parse_toolforge_job_show(show_stdout)
+                active_jobs[job_name] = RegisteredJob(
+                    name=job_name,
+                    command=details.get("command", reg.command),
+                    job_type=reg.job_type or details.get("job type") or details.get("type") or "",
+                    image=details.get("image", reg.image),
+                    mount=details.get("mounts") or details.get("mount") or reg.mount,
+                    status=reg.status or details.get("status", ""),
+                )
+
     results: List[BastionJobCheck] = []
     for spec in expected_jobs:
         adapted_image = f"tool-{tool_account}/tool-{tool_account}:latest" if tool_account else spec.image
-        if spec.name not in active_jobs:
-            warnings: List[str] = []
-            if tool_account and spec.image != adapted_image:
-                warnings.append(
-                    f"jobs.yaml specifies template image '{spec.image}', whereas active account '{tool_account}' "
-                    f"requires '{adapted_image}'"
-                )
+        if spec.name in active_jobs:
             results.append(
-                BastionJobCheck(
-                    expected=spec,
-                    registered=False,
-                    job_type="",
-                    status="Missing",
-                    warnings=tuple(warnings),
+                _validate_registered_job(
+                    spec,
+                    active_jobs[spec.name],
                     adapted_image=adapted_image,
+                    tool_account=tool_account,
                 )
             )
             continue
 
-        job_type, job_status = active_jobs[spec.name]
-        job_warnings: List[str] = []
-        if spec.schedule and spec.schedule not in job_type:
-            job_warnings.append(f"schedule mismatch (expected '{spec.schedule}', got '{job_type or 'unknown'}')")
+        needed_sources = _extract_update_offline_sources(spec.command)
+        covering_job: Optional[RegisteredJob] = None
+        if needed_sources:
+            candidates = [
+                reg for reg in active_jobs.values() if needed_sources <= _extract_update_offline_sources(reg.command)
+            ]
+            if candidates:
+                covering_job = next(
+                    (cand for cand in candidates if "scheduled" in cand.job_type.lower()),
+                    candidates[0],
+                )
 
-        rc_show, show_stdout, _ = _run_toolforge_command(toolforge_bin, ("jobs", "show", spec.name))
-        if rc_show == 0:
-            details = _parse_toolforge_job_show(show_stdout)
-            mounted = details.get("mount", "").lower()
-            if mounted and spec.mount.lower() not in mounted:
-                job_warnings.append(f"mount is '{mounted}' (expected '{spec.mount}')")
-            shown_image = details.get("image", "")
-            if tool_account and shown_image and shown_image != adapted_image:
-                job_warnings.append(f"image is '{shown_image}' (expected '{adapted_image}')")
-            shown_cmd = details.get("command", "")
-            if shown_cmd and spec.command not in shown_cmd:
-                job_warnings.append(f"command is '{shown_cmd}' (expected '{spec.command}')")
+        if covering_job is not None:
+            results.append(
+                _validate_registered_job(
+                    spec,
+                    covering_job,
+                    adapted_image=adapted_image,
+                    tool_account=tool_account,
+                    covered_by=covering_job.name,
+                )
+            )
+            continue
 
+        warnings: List[str] = []
+        if tool_account and spec.image != adapted_image:
+            warnings.append(
+                f"jobs.yaml specifies template image '{spec.image}', whereas active account '{tool_account}' "
+                f"requires '{adapted_image}'"
+            )
         results.append(
             BastionJobCheck(
                 expected=spec,
-                registered=True,
-                job_type=job_type,
-                status=job_status or "Registered",
-                warnings=tuple(job_warnings),
+                registered=False,
+                job_type="",
+                status="Missing",
+                warnings=tuple(warnings),
                 adapted_image=adapted_image,
             )
         )
@@ -1693,6 +1964,10 @@ class Command(BaseCommand):
         attention_recommended: List[EnvVarSpec] = []
         missing_providers: List[EnvVarSpec] = []
         missing_optional_all: List[EnvVarSpec] = []
+        has_explicit_db_dirs = bool(
+            (values.get("MAXMIND_DB_DIR") or "MAXMIND_DB_DIR" in hidden_keys)
+            and (values.get("STOPFORUMSPAM_DB_DIR") or "STOPFORUMSPAM_DB_DIR" in hidden_keys)
+        )
 
         for tier, heading in (
             ("required", "Required Configuration"),
@@ -1722,10 +1997,16 @@ class Command(BaseCommand):
                         missing_required.append(spec)
                         self.stdout.write(self.style.ERROR(f"  - {tag} {spec.name}: MISSING ({spec.description})"))
                     elif tier == "recommended":
-                        attention_recommended.append(spec)
-                        self.stdout.write(
-                            self.style.WARNING(f"  - {tag} {spec.name}: MISSING (default: {spec.default_display})")
-                        )
+                        if spec.name == "TOOL_DATA_DIR" and has_explicit_db_dirs:
+                            self.stdout.write(
+                                "  - [OPTIONAL] TOOL_DATA_DIR: NOT SET "
+                                "(not required; MAXMIND_DB_DIR and STOPFORUMSPAM_DB_DIR configured)"
+                            )
+                        else:
+                            attention_recommended.append(spec)
+                            self.stdout.write(
+                                self.style.WARNING(f"  - {tag} {spec.name}: MISSING (default: {spec.default_display})")
+                            )
                     elif tier == "provider":
                         missing_providers.append(spec)
                         self.stdout.write(f"  - {tag} {spec.name}: MISSING (provider skipped)")
@@ -1742,6 +2023,21 @@ class Command(BaseCommand):
                         )
                     )
                     continue
+
+                if spec.name == "DJANGO_SECRET_KEY":
+                    is_placeholder, weak_reason = _is_weak_secret_key(val)
+                    if weak_reason:
+                        shown_val = format_display_value(spec, val)
+                        source_label = sources.get(spec.name, "configured")
+                        if is_placeholder:
+                            missing_required.append(spec)
+                        self.stdout.write(
+                            self.style.WARNING(
+                                f"  - {tag} {spec.name}: WEAK / PLACEHOLDER = {shown_val} "
+                                f"({weak_reason}; {source_label})"
+                            )
+                        )
+                        continue
 
                 review_reason = (
                     _is_recommended_local_fallback(spec, val, mode=mode, tool_account=tool_account)
@@ -1899,6 +2195,13 @@ class Command(BaseCommand):
             )
             tag = "[REQUIRED]" if required else "[OPTIONAL]"
             if not status.exists:
+                if not persistent and mode == "bastion":
+                    self.stdout.write(
+                        f"  - [INFO] {label}: NOT ON BASTION NFS "
+                        "(built inside Toolforge Build Service image during 'toolforge build start')"
+                    )
+                    statuses.append(status)
+                    continue
                 msg = f"  - {tag} {label}: MISSING -> {path} ({status.mount_summary})"
                 self.stdout.write(self.style.ERROR(msg) if required else self.style.WARNING(msg))
                 if persistent and not no_input and self._prompt_yes_no(f"    Create directory '{path}'? [y/N]: "):
@@ -2014,15 +2317,17 @@ class Command(BaseCommand):
                 )
             elif check.warnings:
                 detail = "; ".join(check.warnings)
+                coverage_note = f", covered by '{check.covered_by}'" if check.covered_by else ""
                 self.stdout.write(
                     self.style.WARNING(
-                        f"  - [REQUIRED] {spec.name}: REGISTERED WITH WARNINGS ({check.status}; {detail})"
+                        f"  - [REQUIRED] {spec.name}: REGISTERED WITH WARNINGS ({check.status}{coverage_note}; {detail})"
                     )
                 )
             else:
+                coverage_note = f", covered by '{check.covered_by}'" if check.covered_by else ""
                 self.stdout.write(
                     self.style.SUCCESS(
-                        f"  - [REQUIRED] {spec.name}: OK ({check.job_type or spec.schedule}; {check.status})"
+                        f"  - [REQUIRED] {spec.name}: OK ({check.job_type or spec.schedule}; {check.status}{coverage_note})"
                     )
                 )
             for warning in check.warnings:
@@ -2054,7 +2359,10 @@ class Command(BaseCommand):
             and spec.name not in hidden
             and (
                 not values.get(spec.name)
-                or (spec.name == "DJANGO_SECRET_KEY" and values[spec.name] == INSECURE_DEV_SECRET_KEY)
+                or (
+                    spec.name == "DJANGO_SECRET_KEY"
+                    and (values[spec.name] == INSECURE_DEV_SECRET_KEY or _is_weak_secret_key(values[spec.name])[0])
+                )
             )
         ]
         missing_dirs = [d for d in dir_statuses if d.required and not d.exists]
@@ -2112,19 +2420,24 @@ class Command(BaseCommand):
                 else:
                     commands_to_run.append("python manage.py update_offline_dbs")
 
-        for job in missing_or_warn_jobs:
-            spec = job.expected
-            if spec.image == job.adapted_image:
-                commands_to_run.append("toolforge jobs load jobs.yaml")
-            else:
+        if missing_or_warn_jobs:
+            needs_image_adapt = any(job.expected.image != job.adapted_image for job in missing_or_warn_jobs)
+            for job in missing_or_warn_jobs:
+                spec = job.expected
+                target_job_name = job.covered_by or spec.name
                 commands_to_run.append(
-                    f'toolforge jobs run {spec.name} --command "{spec.command}" '
+                    f'toolforge jobs run {target_job_name} --command "{spec.command}" '
                     f'--image {job.adapted_image} --schedule "{spec.schedule}" --mount={spec.mount}'
                 )
+            if needs_image_adapt:
+                template_img = missing_or_warn_jobs[0].expected.image
+                adapted_img = missing_or_warn_jobs[0].adapted_image
                 commands_to_run.append(
-                    f"tmp_jobs=$(mktemp) && sed 's|{spec.image}|{job.adapted_image}|g' jobs.yaml > \"$tmp_jobs\" "
+                    f"tmp_jobs=$(mktemp) && sed 's|{template_img}|{adapted_img}|g' jobs.yaml > \"$tmp_jobs\" "
                     '&& toolforge jobs load "$tmp_jobs" && rm -f "$tmp_jobs"'
                 )
+            else:
+                commands_to_run.append("toolforge jobs load jobs.yaml")
 
         if unresolved_required_env:
             self.stdout.write(

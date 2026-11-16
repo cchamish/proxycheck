@@ -10344,10 +10344,15 @@ class CheckSetupCommandTests(SimpleTestCase):
             project_root.mkdir()
             (project_root / "jobs.yaml").write_text(
                 "---\n"
-                "- name: update-offline-dbs\n"
-                "  command: python manage.py update_offline_dbs\n"
+                "- name: update-sfs-db\n"
+                "  command: python manage.py update_offline_dbs --sources stopforumspam\n"
                 "  image: tool-proxycheck/tool-proxycheck:latest\n"
-                '  schedule: "0 * * * *"\n'
+                '  schedule: "@hourly"\n'
+                "  mount: all\n"
+                "- name: update-maxmind-db\n"
+                "  command: python manage.py update_offline_dbs --sources maxmind\n"
+                "  image: tool-proxycheck/tool-proxycheck:latest\n"
+                '  schedule: "@daily"\n'
                 "  mount: all\n",
                 encoding="utf-8",
             )
@@ -10369,7 +10374,7 @@ class CheckSetupCommandTests(SimpleTestCase):
                         ),
                         stderr="",
                     )
-                if cmd[1:] == ["jobs", "list"]:
+                if cmd[1:] == ["jobs", "list", "--output", "long"]:
                     return subprocess.CompletedProcess(cmd, 0, stdout="No jobs found.\n", stderr="")
                 if cmd[1:3] == ["envvars", "create"]:
                     return subprocess.CompletedProcess(cmd, 0, stdout=f"name value\n{cmd[3]} ***\n", stderr="")
@@ -10445,6 +10450,9 @@ class CheckSetupCommandTests(SimpleTestCase):
 
             self.assertIn("tool-proxycheck-dev/tool-proxycheck-dev:latest", output)
             self.assertIn("toolforge webservice buildservice restart --mount=all", output)
+            self.assertIn('--schedule "@hourly"', output)
+            self.assertIn('--schedule "@daily"', output)
+            self.assertEqual(output.count("tmp_jobs=$(mktemp)"), 1)
 
     def test_bastion_fallback_envvars_show_matching_jobs_and_nfs_mount_detection(self):
         import io
@@ -10460,10 +10468,15 @@ class CheckSetupCommandTests(SimpleTestCase):
             project_root.mkdir()
             (project_root / "jobs.yaml").write_text(
                 "---\n"
-                "- name: update-offline-dbs\n"
-                "  command: python manage.py update_offline_dbs\n"
+                "- name: update-sfs-db\n"
+                "  command: python manage.py update_offline_dbs --sources stopforumspam\n"
                 "  image: tool-proxycheck/tool-proxycheck:latest\n"
-                '  schedule: "0 * * * *"\n'
+                '  schedule: "@hourly"\n'
+                "  mount: all\n"
+                "- name: update-maxmind-db\n"
+                "  command: python manage.py update_offline_dbs --sources maxmind\n"
+                "  image: tool-proxycheck/tool-proxycheck:latest\n"
+                '  schedule: "@daily"\n'
                 "  mount: all\n",
                 encoding="utf-8",
             )
@@ -10490,6 +10503,8 @@ class CheckSetupCommandTests(SimpleTestCase):
                     if key == "DJANGO_SECRET_KEY":
                         return subprocess.CompletedProcess(cmd, 0, stdout="********\n", stderr="")
                     return subprocess.CompletedProcess(cmd, 0, stdout=f"{key} value-{key}-12345\n", stderr="")
+                if cmd[1:] == ["jobs", "list", "--output", "long"]:
+                    return subprocess.CompletedProcess(cmd, 2, stdout="", stderr="unknown option --output")
                 if cmd[1:] == ["jobs", "list"]:
                     return subprocess.CompletedProcess(
                         cmd,
@@ -10533,7 +10548,8 @@ class CheckSetupCommandTests(SimpleTestCase):
 
             output = stdout.getvalue()
             self.assertIn("DJANGO_SECRET_KEY: CONFIGURED (hidden by CLI", output)
-            self.assertIn("update-offline-dbs: OK", output)
+            self.assertIn("update-sfs-db: OK", output)
+            self.assertIn("covered by 'update-offline-dbs'", output)
             self.assertIn("Toolforge scheduled jobs match jobs.yaml.", output)
 
     def test_manage_py_check_setup_starts_without_secret_key(self):
@@ -10601,27 +10617,16 @@ class CheckSetupCommandTests(SimpleTestCase):
                         ),
                         stderr="",
                     )
-                if cmd[1:] == ["jobs", "list"]:
+                if cmd[1:] == ["jobs", "list", "--output", "long"]:
                     return subprocess.CompletedProcess(
                         cmd,
                         0,
                         stdout=(
-                            "Job name:              Job type:              Status:\n"
-                            "---------------------- ---------------------- -------------------\n"
-                            "update-offline-dbs     scheduled: 0 * * * *   Running\n"
-                        ),
-                        stderr="",
-                    )
-                if cmd[1:] == ["jobs", "show", "update-offline-dbs"]:
-                    return subprocess.CompletedProcess(
-                        cmd,
-                        0,
-                        stdout=(
-                            "Job name: update-offline-dbs\n"
-                            "Command: python manage.py update_offline_dbs\n"
-                            "Image: tool-proxycheck/tool-proxycheck:latest\n"
-                            "Schedule: 0 * * * *\n"
-                            "Mount: none\n"
+                            "+--------------------+---------------------------------------+-----------------------+----------------------------------------+---------+---------+\n"
+                            "|     Job name:      |               Command:                |       Job type:       |                 Image:                 | Mounts: | Status: |\n"
+                            "+--------------------+---------------------------------------+-----------------------+----------------------------------------+---------+---------+\n"
+                            "| update-offline-dbs | python manage.py update_offline_dbs   | scheduled: 0 * * * *  | tool-proxycheck/tool-proxycheck:latest |  none   | Running |\n"
+                            "+--------------------+---------------------------------------+-----------------------+----------------------------------------+---------+---------+\n"
                         ),
                         stderr="",
                     )
@@ -10651,3 +10656,83 @@ class CheckSetupCommandTests(SimpleTestCase):
             self.assertIn("GeoLite2-City.mmdb): HEALTHY", output)
             self.assertIn("mount is 'none' (expected 'all')", output)
             self.assertIn("image is 'tool-proxycheck/tool-proxycheck:latest'", output)
+
+    def test_bastion_long_prettytable_dual_jobs_shared_dirs_and_placeholder_secret(self):
+        import io
+        import subprocess
+
+        from django.core.management import call_command
+
+        from detector.management.commands import check_setup
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            project_root = workspace / "proxycheck"
+            project_root.mkdir()
+            (project_root / "jobs.yaml").write_text(
+                "---\n"
+                "- name: update-sfs-db\n"
+                "  command: python manage.py update_offline_dbs --sources stopforumspam\n"
+                "  image: tool-proxycheck/tool-proxycheck:latest\n"
+                '  schedule: "@hourly"\n'
+                "  mount: all\n"
+                "- name: update-maxmind-db\n"
+                "  command: python manage.py update_offline_dbs --sources maxmind\n"
+                "  image: tool-proxycheck/tool-proxycheck:latest\n"
+                '  schedule: "@daily"\n'
+                "  mount: all\n",
+                encoding="utf-8",
+            )
+            data_dir = workspace / "data"
+            data_dir.mkdir()
+
+            def _fake_run(cmd, *, input=None, text=None, capture_output=None, timeout=None, check=None):
+                if cmd[1:] == ["envvars", "list", "--show-values"]:
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        stdout=(
+                            "name                         value\n"
+                            "DJANGO_SECRET_KEY            your-placeholder-secret\n"
+                            "WIKIMEDIA_CLIENT_ID          client-id\n"
+                            "WIKIMEDIA_CLIENT_SECRET      client-secret-000001\n"
+                            f"MAXMIND_DB_DIR               {data_dir}\n"
+                            f"STOPFORUMSPAM_DB_DIR         {data_dir}\n"
+                        ),
+                        stderr="",
+                    )
+                if cmd[1:] == ["jobs", "list", "--output", "long"]:
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        stdout=(
+                            "+-------------------+---------------------------------------------------------------------+-----------------------+------------------------------------------------+---------+--------------------+\n"
+                            "|     Job name:     |                              Command:                               |       Job type:       |                     Image:                     | Mounts: |      Status:       |\n"
+                            "+-------------------+---------------------------------------------------------------------+-----------------------+------------------------------------------------+---------+--------------------+\n"
+                            "| update-maxmind-db |    sh -c 'python manage.py update_offline_dbs --sources maxmind'    | scheduled: 22 5 * * * | tool-proxycheck-dev/tool-proxycheck-dev:latest |   all   |  Pending for 46m   |\n"
+                            "|   update-sfs-db   | sh -c 'python manage.py update_offline_dbs --sources stopforumspam' | scheduled: 22 * * * * | tool-proxycheck-dev/tool-proxycheck-dev:latest |   all   | Pending for 46m15s |\n"
+                            "+-------------------+---------------------------------------------------------------------+-----------------------+------------------------------------------------+---------+--------------------+\n"
+                        ),
+                        stderr="",
+                    )
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            stdout = io.StringIO()
+            with (
+                override_settings(BASE_DIR=project_root),
+                patch.dict(os.environ, {"USER": "tools.proxycheck-dev", "HOME": str(workspace)}, clear=True),
+                patch("pathlib.Path.home", return_value=workspace),
+                patch.object(check_setup.shutil, "which", return_value="/usr/bin/toolforge"),
+                patch.object(check_setup.subprocess, "run", side_effect=_fake_run),
+            ):
+                call_command("check_setup", no_input=True, env_mode="bastion", stdout=stdout, stderr=io.StringIO())
+
+            output = stdout.getvalue()
+            self.assertIn("DJANGO_SECRET_KEY: WEAK / PLACEHOLDER", output)
+            self.assertIn("not required; MAXMIND_DB_DIR and STOPFORUMSPAM_DB_DIR configured", output)
+            self.assertIn("Offline data directory (MAXMIND_DB_DIR, STOPFORUMSPAM_DB_DIR, ~/data): OK", output)
+            self.assertIn("NOT ON BASTION NFS", output)
+            self.assertIn("update-sfs-db: OK (scheduled: 22 * * * *; Pending for 46m15s)", output)
+            self.assertIn("update-maxmind-db: OK (scheduled: 22 5 * * *; Pending for 46m)", output)
+            self.assertIn("Toolforge scheduled jobs match jobs.yaml.", output)
+            self.assertNotIn("toolforge jobs load", output)

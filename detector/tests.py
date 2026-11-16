@@ -7997,9 +7997,23 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         self.assertEqual(guarded_row["status"], "Local Quota Guard (2/2 req/min)")
         self.assertEqual(guarded_row["statusCode"], 429)
         self.assertTrue(guarded_row["isQuotaGuarded"])
+        self.assertTrue(guarded_row["isQuotaGuard"])
         self.assertEqual(guarded_row["rawJson"]["status"], "quota_guarded")
         self.assertEqual(guarded_row["rawJson"]["window"], "rpm")
         self.assertEqual(third_rows["Proxycheck"]["status"], "200 OK")
+
+        from_guarded_key = views._build_cooldown_provider_row(
+            "GetIPIntel",
+            {"statusCode": 429, "isQuotaGuarded": True, "reason": "RPM limit"},
+        )
+        self.assertTrue(from_guarded_key["isQuotaGuarded"])
+        self.assertTrue(from_guarded_key["isQuotaGuard"])
+        normal_cooldown = views._build_cooldown_provider_row(
+            "GetIPIntel",
+            {"statusCode": 503, "reason": "Upstream 503"},
+        )
+        self.assertNotIn("isQuotaGuarded", normal_cooldown)
+        self.assertNotIn("isQuotaGuard", normal_cooldown)
 
         min_keys = [key for key in fake_redis.strings if key.startswith("proxycheck:v1:quota:getipintel:min:")]
         self.assertEqual(len(min_keys), 1)

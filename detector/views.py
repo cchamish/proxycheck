@@ -2333,7 +2333,7 @@ def _build_cooldown_provider_row(provider_name: str, cooldown_info: Dict[str, An
     status_code = raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool) else 503
     reason = str(cooldown_info.get("reason") or "Upstream rate limited or degraded")
     custom_label = cooldown_info.get("statusLabel")
-    is_quota_guard = bool(cooldown_info.get("isQuotaGuard"))
+    is_quota_guard = bool(cooldown_info.get("isQuotaGuard") or cooldown_info.get("isQuotaGuarded"))
     if isinstance(custom_label, str) and custom_label.strip():
         status_label = custom_label.strip()
     else:
@@ -2366,6 +2366,7 @@ def _build_cooldown_provider_row(provider_name: str, cooldown_info: Dict[str, An
     }
     if is_quota_guard:
         row["isQuotaGuarded"] = True
+        row["isQuotaGuard"] = True
     return row
 
 

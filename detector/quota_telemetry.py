@@ -4,6 +4,7 @@ Proactive multi-window API quota guard and strictly anonymised Redis telemetry.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -16,6 +17,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from django.conf import settings
 
 from .oauth import is_allowlisted_wiki_user
+from .offline_dbs import collect_offline_databases_status
 
 logger = logging.getLogger(__name__)
 
@@ -891,6 +893,14 @@ async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict
     total_requests = max(cache_total, auth_total)
     hit_rate_percent = round((cache_hit / cache_total) * 100.0, 1) if cache_total > 0 else 0.0
 
+    offline_databases = await asyncio.to_thread(collect_offline_databases_status, now_dt=current_dt)
+    has_maxmind_db = any(
+        entry.get("key", "").startswith("maxmind_") and entry.get("exists") for entry in offline_databases
+    )
+    has_sfs_db = any(
+        entry.get("key", "").startswith("stopforumspam_") and entry.get("exists") for entry in offline_databases
+    )
+
     providers_out: List[Dict[str, Any]] = []
     total_quota_blocks_today = 0
     active_cooldown_count = 0
@@ -918,7 +928,13 @@ async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict
         minute_exhausted = rpm_limit > 0 and minute_used >= rpm_limit
         daily_exhausted = daily_limit > 0 and daily_used >= daily_limit
 
-        if not configured:
+        if provider_key == "maxmind" and not has_maxmind_db:
+            status_key = "db_missing"
+            status_label = "Database Missing"
+        elif provider_key == "stopforumspam" and not has_sfs_db:
+            status_key = "db_missing"
+            status_label = "Offline DB Missing"
+        elif not configured:
             status_key = "no_api_key"
             status_label = "No API Key"
         elif cooldown_ttl > 0:
@@ -984,4 +1000,5 @@ async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict
             "activeQuotaGuardCount": active_quota_guard_count,
         },
         "providers": providers_out,
+        "offlineDatabases": offline_databases,
     }

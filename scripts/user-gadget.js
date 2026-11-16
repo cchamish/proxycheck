@@ -1481,34 +1481,110 @@
               }).filter(Boolean)
             : [];
 
+        var rows = Array.isArray(data.results) ? data.results : [];
+        var getipintelRow = null;
+        var stopforumspamRow = null;
+        var hasQuotaGuardedProvider = false;
+        var hasCooldownProvider = false;
+        for (var i = 0; i < rows.length; i++) {
+            var rowItem = rows[i];
+            if (!rowItem || typeof rowItem !== 'object') {
+                continue;
+            }
+            if (rowItem.provider === 'GetIPIntel') {
+                getipintelRow = rowItem;
+            } else if (rowItem.provider === 'StopForumSpam') {
+                stopforumspamRow = rowItem;
+            }
+            if (rowItem.isQuotaGuarded) {
+                hasQuotaGuardedProvider = true;
+            } else if (rowItem.isCooldown) {
+                hasCooldownProvider = true;
+            }
+        }
+
+        var isSfsBlacklisted = Boolean(
+            stopforumspamRow && (stopforumspamRow.blacklisted || stopforumspamRow.toxicCidr)
+        );
+        var isSfsListed = Boolean(
+            stopforumspamRow &&
+            (stopforumspamRow.appears || (stopforumspamRow.frequency && Number(stopforumspamRow.frequency) > 0))
+        );
+        var isPartialLight = Boolean(
+            data.isPartialMode || String(data.queryMode || '').trim().toLowerCase() === 'light'
+        );
+        var isGetIpIntelDeferred = Boolean(
+            getipintelRow && (getipintelRow.isDeferred || getipintelRow.status === 'Deferred (Light Mode)')
+        );
+        var hasHighOrMediumSignals = Boolean(
+            isTor ||
+            isMajorityProxyVpn ||
+            arbitrationTier === 'destructive' ||
+            hasCloudProvider ||
+            ptrIsHighRisk ||
+            arbitrationTier === 'warning' ||
+            broadcastIp ||
+            isSfsBlacklisted ||
+            isSfsListed
+        );
+        var isLightDeferredClean = Boolean(
+            !hasPrediction &&
+            !hasHighOrMediumSignals &&
+            !hasQuotaGuardedProvider &&
+            !hasCooldownProvider &&
+            (isPartialLight || isGetIpIntelDeferred)
+        );
+
         var riskTier = 'low';
         if (isNonPublic) {
             riskTier = 'nonpublic';
         } else if ((hasPrediction && prediction > 80) || isTor || isMajorityProxyVpn ||
-            arbitrationTier === 'destructive') {
+            arbitrationTier === 'destructive' || isSfsBlacklisted) {
             riskTier = 'high';
         } else if ((hasPrediction && prediction >= 30) || broadcastIp ||
-            arbitrationTier === 'warning' || ptrIsHighRisk || hasCloudProvider) {
+            arbitrationTier === 'warning' || ptrIsHighRisk || hasCloudProvider || isSfsListed) {
             riskTier = 'medium';
         }
 
         var predictionText = hasPrediction
             ? String(Number(prediction.toFixed(2)))
             : '';
-        var predictionTooltip = hasPrediction
-            ? predictionText + '%'
-            : 'Unavailable' + (data.predictionLabel ? ' (' + data.predictionLabel + ')' : '');
+        var predictionTooltip = '';
+        if (hasPrediction) {
+            predictionTooltip = predictionText + '%';
+        } else if (hasQuotaGuardedProvider) {
+            predictionTooltip = 'Quota Guard Active' +
+                (getipintelRow && getipintelRow.status ? ' (' + getipintelRow.status + ')' : '');
+        } else if (hasCooldownProvider) {
+            predictionTooltip = 'Provider Cooldown' +
+                (getipintelRow && getipintelRow.status ? ' (' + getipintelRow.status + ')' : '');
+        } else if (isPartialLight || isGetIpIntelDeferred) {
+            predictionTooltip = 'Light Mode (commercial sources deferred; click for full check)';
+        } else {
+            predictionTooltip = 'Unavailable' + (data.predictionLabel ? ' (' + data.predictionLabel + ')' : '');
+        }
+
         var badgePrimaryLabel = 'N/A';
         if (isMajorityProxyVpn || arbitrationTier === 'destructive') {
             badgePrimaryLabel = /datacenter|hosting/i.test(arbitrationVerdict)
                 ? 'HOSTING'
                 : 'PROXY';
+        } else if (isSfsBlacklisted) {
+            badgePrimaryLabel = 'BLACKLIST';
         } else if (hasCloudProvider) {
             badgePrimaryLabel = 'CLOUD';
         } else if (ptrIsHighRisk) {
             badgePrimaryLabel = 'PTR-RISK';
+        } else if (isSfsListed) {
+            badgePrimaryLabel = 'SPAM';
         } else if (arbitrationTier === 'warning') {
             badgePrimaryLabel = 'REVIEW';
+        } else if (hasQuotaGuardedProvider) {
+            badgePrimaryLabel = 'QUOTA';
+        } else if (hasCooldownProvider) {
+            badgePrimaryLabel = 'COOLDOWN';
+        } else if (isLightDeferredClean) {
+            badgePrimaryLabel = 'LITE';
         }
 
         return {
@@ -1524,6 +1600,11 @@
             arbitrationTier: arbitrationTier,
             ptrIsHighRisk: ptrIsHighRisk,
             hasCloudProvider: hasCloudProvider,
+            isSfsBlacklisted: isSfsBlacklisted,
+            isSfsListed: isSfsListed,
+            hasQuotaGuardedProvider: hasQuotaGuardedProvider,
+            hasCooldownProvider: hasCooldownProvider,
+            isLightDeferredClean: isLightDeferredClean,
             torLabel: torLabel,
             torFlags: torFlags,
             torSummary: torSummary,
@@ -2132,6 +2213,17 @@
             '  border: 1px solid var(--proxycheck-low-border);',
             '  font-weight: normal;',
             '}',
+            'a.proxycheck-ip-badge.proxycheck-badge-lite, a.proxycheck-ip-badge.proxycheck-badge-lite:visited {',
+            '  background-color: var(--proxycheck-low-bg);',
+            '  color: var(--proxycheck-subtle-color) !important;',
+            '  border: 1px solid var(--proxycheck-low-border);',
+            '  opacity: 0.9;',
+            '}',
+            'a.proxycheck-ip-badge.proxycheck-badge-quota, a.proxycheck-ip-badge.proxycheck-badge-quota:visited {',
+            '  background-color: var(--proxycheck-medium-bg);',
+            '  color: var(--proxycheck-medium-color) !important;',
+            '  border: 1px dashed var(--proxycheck-medium-border);',
+            '}',
             'a.proxycheck-ip-badge.proxycheck-ip-badge-error, a.proxycheck-ip-badge.proxycheck-ip-badge-error:visited {',
             '  background-color: var(--proxycheck-low-bg);',
             '  color: var(--proxycheck-muted-color) !important;',
@@ -2346,9 +2438,22 @@
         return FALLBACK_COOL_PALETTES[index];
     }
 
-    function createSourceBadge(provider) {
+    function formatOfflineDbDateShort(isoString) {
+        if (typeof isoString !== 'string' || !isoString.trim()) {
+            return '';
+        }
+        var parsedMs = Date.parse(isoString.trim());
+        if (isNaN(parsedMs)) {
+            return isoString.trim();
+        }
+        return new Date(parsedMs).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+    }
+
+    function createSourceBadge(provider, providerUpdatedAtMap) {
         var palette = getProviderBadgePalette(provider);
-        return $('<span>', {
+        var updatedIso = providerUpdatedAtMap && providerUpdatedAtMap[provider];
+        var formattedDate = updatedIso ? formatOfflineDbDateShort(updatedIso) : '';
+        var attrs = {
             'class': 'proxycheck-source-tag',
             style: '--proxycheck-tag-bg: ' + palette.bg + '; ' +
                 '--proxycheck-tag-border: ' + palette.border + '; ' +
@@ -2357,12 +2462,22 @@
                 '--proxycheck-tag-dark-border: ' + palette.darkBorder + '; ' +
                 '--proxycheck-tag-dark-color: ' + palette.darkColor + ';',
             text: provider
-        });
+        };
+        if (formattedDate) {
+            attrs.title = 'Offline DB updated: ' + formattedDate;
+        }
+        return $('<span>', attrs);
     }
 
     function buildResultDetailsPanel(data, risk) {
         ensureUserscriptStyles();
         var rows = getProviderRows(data);
+        var providerUpdatedAtMap = {};
+        rows.forEach(function (row) {
+            if (row && row.provider && typeof row.offlineDbUpdatedAt === 'string' && row.offlineDbUpdatedAt.trim()) {
+                providerUpdatedAtMap[row.provider] = row.offlineDbUpdatedAt.trim();
+            }
+        });
         var riskEntries = collectRiskEntries(data, rows, risk).concat(collectSpurEntriesFromDom());
         var sections = [
             { label: 'Prediction', entries: collectPredictionEntries(data, risk), isRisk: false, emptyText: 'Unavailable', copyWithSource: true },
@@ -2410,7 +2525,7 @@
 
                     if (entry.showProviders && entry.providers.length > 0) {
                         entry.providers.forEach(function (provider) {
-                            $body.append(createSourceBadge(provider));
+                            $body.append(createSourceBadge(provider, providerUpdatedAtMap));
                         });
                     }
 
@@ -2550,6 +2665,30 @@
         }
         titleLines.push('Broadcast IP: ' + (risk.broadcastIp ? 'At-risk' : 'No'));
         titleLines.push('Tor Node: ' + (risk.isTor ? torDesc : 'No'));
+        var rowsForTitle = Array.isArray(data.results) ? data.results : [];
+        var dbBaselines = [];
+        for (var i = 0; i < rowsForTitle.length; i++) {
+            var rowObj = rowsForTitle[i];
+            if (rowObj && rowObj.provider === 'StopForumSpam' && rowObj.status === '200 OK') {
+                if (rowObj.blacklisted) {
+                    titleLines.push(
+                        'StopForumSpam: Blacklisted Toxic CIDR' +
+                        (rowObj.toxicCidr ? ' (' + rowObj.toxicCidr + ')' : '')
+                    );
+                } else if (rowObj.appears) {
+                    titleLines.push('StopForumSpam: Reported (' + (rowObj.frequency || 0) + 'x)');
+                }
+            }
+            if (rowObj && rowObj.provider && typeof rowObj.offlineDbUpdatedAt === 'string' && rowObj.offlineDbUpdatedAt) {
+                var formattedBaseline = formatOfflineDbDateShort(rowObj.offlineDbUpdatedAt);
+                if (formattedBaseline) {
+                    dbBaselines.push(rowObj.provider + ' ' + formattedBaseline);
+                }
+            }
+        }
+        if (dbBaselines.length > 0) {
+            titleLines.push('Offline DB Baseline: ' + dbBaselines.join(', '));
+        }
         return titleLines.join('\n');
     }
 
@@ -2588,7 +2727,15 @@
             ? '[' + risk.nonPublicBadgeCode + ']'
             : '[' + (risk.hasPrediction ? risk.predictionText + '%' : risk.badgePrimaryLabel) +
                 broadcastLabel + torBadgeSuffix + ']';
-        badge.className = BADGE_CLASS + ' proxycheck-tier-' + risk.riskTier;
+        var stateClass = '';
+        if (!risk.isNonPublic && !risk.hasPrediction) {
+            if (risk.badgePrimaryLabel === 'QUOTA' || risk.badgePrimaryLabel === 'COOLDOWN') {
+                stateClass = ' proxycheck-badge-quota';
+            } else if (risk.badgePrimaryLabel === 'LITE') {
+                stateClass = ' proxycheck-badge-lite';
+            }
+        }
+        badge.className = BADGE_CLASS + ' proxycheck-tier-' + risk.riskTier + stateClass;
 
         applyBaseBadgeStyle(badge);
         badge.style.fontWeight = risk.riskTier === 'low' ? '' : 'bold';

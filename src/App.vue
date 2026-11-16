@@ -347,6 +347,87 @@
             </tbody>
           </table>
         </div>
+
+        <section
+          v-if="offlineDatabases.length > 0 || isOfflineDbLoading || offlineDbError"
+          class="offline-dbs-panel"
+          aria-label="Offline Databases Status"
+        >
+          <div class="offline-dbs-header">
+            <div class="offline-dbs-title-group">
+              <h2 class="offline-dbs-title">Offline Databases Status</h2>
+              <div v-if="offlineSourceSummaries.length > 0" class="offline-dbs-summary-pills">
+                <span
+                  v-for="summary in offlineSourceSummaries"
+                  :key="summary.source"
+                  class="cdx-badge"
+                  :class="getOfflineSummaryBadgeClass(summary.status)"
+                  :title="summary.latestIso ? `${summary.source}: ${formatOfflineDbTimestamp(summary.latestIso, nowTimestampMs, summary.ageSeconds)}` : `${summary.source}: Missing`"
+                >
+                  {{ summary.source }} ({{ summary.presentCount }}/{{ summary.totalCount }})
+                  &middot;
+                  {{ summary.latestIso ? formatOfflineDbTimestamp(summary.latestIso, nowTimestampMs, summary.ageSeconds) : 'Missing' }}
+                </span>
+              </div>
+            </div>
+            <div class="offline-dbs-actions">
+              <cdx-button
+                action="default"
+                weight="quiet"
+                size="small"
+                @click="isOfflineDbExpanded = !isOfflineDbExpanded"
+              >
+                {{ isOfflineDbExpanded ? 'Hide files' : 'Show files' }}
+              </cdx-button>
+              <cdx-button
+                action="progressive"
+                weight="normal"
+                size="small"
+                :disabled="isOfflineDbLoading"
+                @click="fetchOfflineDatabaseStatus"
+              >
+                {{ isOfflineDbLoading ? 'Refreshing...' : 'Refresh status' }}
+              </cdx-button>
+            </div>
+          </div>
+
+          <p v-if="offlineDbError" class="offline-dbs-error">
+            {{ offlineDbError }}
+          </p>
+
+          <div v-if="isOfflineDbExpanded && offlineDatabases.length > 0" class="offline-dbs-table-wrapper">
+            <table class="ground-truth-table offline-db-table">
+              <thead>
+                <tr>
+                  <th scope="col">SOURCE</th>
+                  <th scope="col">DATABASE FILE</th>
+                  <th scope="col">STATUS</th>
+                  <th scope="col">SIZE</th>
+                  <th scope="col">LAST UPDATED (MTIME)</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="db in offlineDatabases" :key="db.key">
+                  <td class="col-provider">
+                    <span class="provider-name">{{ db.name }}</span>
+                  </td>
+                  <td class="col-asn">
+                    <code class="asn-tag">{{ db.filename }}</code>
+                  </td>
+                  <td>
+                    <span class="cdx-badge" :class="getOfflineEntryBadgeClass(db)">
+                      {{ db.statusLabel }}
+                    </span>
+                  </td>
+                  <td class="offline-db-size">{{ formatByteSize(db.sizeBytes) }}</td>
+                  <td class="offline-db-mtime">
+                    {{ formatOfflineDbTimestamp(db.lastModifiedIso, nowTimestampMs, db.ageSeconds) }}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
       </div>
     </main>
 
@@ -438,6 +519,9 @@ import {
   resolveRepoBaseUrl,
   formatCommitVersionLabel,
   resolveProviderUpdatedLabel,
+  formatOfflineDbTimestamp,
+  formatByteSize,
+  summarizeOfflineDatabases,
   buildDiagnosticMetrics,
   formatDiagnosticSummary,
   measureInitialLoadDurationSeconds,
@@ -445,6 +529,7 @@ import {
   type DiagnosticMetrics,
   type DetectionCoordinatorState,
   type DetectionResponse,
+  type OfflineDatabaseEntry,
   type ProviderRawResult,
 } from './utils/ip-detector-logic';
 
@@ -531,6 +616,12 @@ const isDashboardOpen = ref(false);
 const isAboutOpen = ref(false);
 const isAdminUser = computed(() => isAuthorisedAdminUser(user.value));
 
+const offlineDatabases = ref<OfflineDatabaseEntry[]>([]);
+const isOfflineDbLoading = ref(false);
+const offlineDbError = ref('');
+const isOfflineDbExpanded = ref(true);
+const offlineSourceSummaries = computed(() => summarizeOfflineDatabases(offlineDatabases.value));
+
 const {
   user,
   isLoading,
@@ -605,8 +696,12 @@ type ProviderDisplayRow = Omit<Partial<ProviderRawResult>, 'port'> & {
 
 const nowTimestampMs = ref(Date.now());
 
-watch(detectionData, () => {
+watch(detectionData, (nextData) => {
   nowTimestampMs.value = Date.now();
+  if (nextData && Array.isArray(nextData.offlineDatabases)) {
+    offlineDatabases.value = nextData.offlineDatabases;
+    offlineDbError.value = '';
+  }
 });
 
 function getProviderUpdatedLabel(row: ProviderDisplayRow | null | undefined): string | null {
@@ -659,19 +754,61 @@ function getProviderMetaItems(row: ProviderDisplayRow | null | undefined): strin
   if (lastSeenValue) {
     items.push(`Last seen: ${lastSeenValue}`);
   }
+  if (row.offlineDbUpdatedAt) {
+    items.push(`Offline DB: ${formatOfflineDbTimestamp(row.offlineDbUpdatedAt, nowTimestampMs.value)}`);
+  }
   return items;
 }
 
 function getStatusBadgeClass(status?: string | null): string {
   if (!status) return 'badge-neutral';
   if (status === '200 OK') return 'badge-success';
-  if (status === 'No API Key' || status === 'Database Missing' || status === 'Skipped (IPv6)') {
+  if (
+    status === 'No API Key' ||
+    status === 'Database Missing' ||
+    status === 'Offline DB Missing' ||
+    status === 'Skipped (IPv6)'
+  ) {
     return 'badge-neutral';
   }
   if (status.includes('429') || status.includes('Cooldown') || status.includes('Quota Guard')) {
     return 'badge-warning';
   }
   return 'badge-destructive';
+}
+
+function getOfflineSummaryBadgeClass(status: 'healthy' | 'stale' | 'missing'): string {
+  if (status === 'healthy') return 'badge-success';
+  if (status === 'stale') return 'badge-warning';
+  return 'badge-destructive';
+}
+
+function getOfflineEntryBadgeClass(entry: OfflineDatabaseEntry): string {
+  if (entry.status === 'healthy') return 'badge-success';
+  if (entry.status === 'stale') return 'badge-warning';
+  return entry.optional ? 'badge-neutral' : 'badge-destructive';
+}
+
+async function fetchOfflineDatabaseStatus(): Promise<void> {
+  isOfflineDbLoading.value = true;
+  offlineDbError.value = '';
+  try {
+    const res = await fetch('/api/v1/status/', { cache: 'no-store' });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const payload = await res.json();
+    if (Array.isArray(payload?.offlineDatabases)) {
+      offlineDatabases.value = payload.offlineDatabases;
+    }
+  } catch (err) {
+    console.warn('Offline database status query failed:', err);
+    if (offlineDatabases.value.length === 0) {
+      offlineDbError.value = 'Unable to load offline database timestamps right now.';
+    }
+  } finally {
+    isOfflineDbLoading.value = false;
+  }
 }
 
 function getPredictionScoreTierClass(data: DetectionResponse | null | undefined): string {
@@ -822,6 +959,9 @@ onMounted(async () => {
     inputIp.value = initialIp;
   }
   await fetchUserStatus();
+  if (user.value.isLoggedIn && user.value.hasAccess) {
+    fetchOfflineDatabaseStatus();
+  }
   if (initialIp && user.value.isLoggedIn && user.value.hasAccess) {
     executeDetection(initialIp);
   }

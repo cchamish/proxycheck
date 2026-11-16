@@ -720,25 +720,34 @@ def match_hosting_asn_or_org(asn: Any, org_name: Optional[str]) -> Optional[Dict
 
 
 def clear_offline_intelligence_caches() -> None:
-    """Clears in-memory cloud CIDR and hosting ASN rule caches."""
+    """Clears in-memory cloud CIDR, hosting ASN rule, and StopForumSpam offline caches."""
     global _cloud_cidr_cache_key, _cloud_cidr_cache_index, _hosting_rules_cache_key, _hosting_rules_cache_data
+    from .offline_dbs import clear_stopforumspam_caches
+
     with _offline_cache_lock:
         _cloud_cidr_cache_key = None
         _cloud_cidr_cache_index = None
         _hosting_rules_cache_key = None
         _hosting_rules_cache_data = None
+    clear_stopforumspam_caches()
 
 
 def are_offline_intelligence_caches_warm() -> bool:
-    """Returns True when offline cloud CIDR and hosting ASN rule caches are populated in memory."""
+    """Returns True when offline cloud CIDR, hosting ASN rule, and StopForumSpam caches are populated."""
+    from .offline_dbs import are_stopforumspam_caches_warm
+
     with _offline_cache_lock:
-        return _cloud_cidr_cache_index is not None and _hosting_rules_cache_data is not None
+        rules_warm = _cloud_cidr_cache_index is not None and _hosting_rules_cache_data is not None
+    return rules_warm and are_stopforumspam_caches_warm()
 
 
 def warm_offline_intelligence_caches() -> None:
-    """Preloads offline cloud CIDR and hosting ASN rules in the caller thread."""
+    """Preloads offline cloud CIDR, hosting ASN rules, and StopForumSpam offline indexes in the caller thread."""
+    from .offline_dbs import warm_stopforumspam_caches
+
     _get_cloud_cidr_index()
     _get_hosting_rules()
+    warm_stopforumspam_caches()
 
 
 def _extract_carrier_name(carrier_val: Any) -> Optional[str]:
@@ -1490,7 +1499,7 @@ def adapt_maxmind(
     if prefix_length is not None and (prefix_length <= 0 or prefix_length > 128):
         prefix_length = None
 
-    internal_keys = ("_mmdb_prefix_len", "_ip")
+    internal_keys = ("_mmdb_prefix_len", "_ip", "_offline_db_updated_at")
     clean_raw_json = (
         {k: v for k, v in raw_data.items() if k not in internal_keys}
         if any(k in raw_data for k in internal_keys)
@@ -1519,6 +1528,9 @@ def adapt_maxmind(
         adapted_row["cloudPrefixLength"] = cloud_match["prefixLength"]
     if hosting_match is not None:
         adapted_row["hostingProvider"] = hosting_match["provider"]
+    offline_updated = raw_data.get("_offline_db_updated_at")
+    if isinstance(offline_updated, str) and offline_updated.strip():
+        adapted_row["offlineDbUpdatedAt"] = offline_updated.strip()
     return adapted_row
 
 
@@ -2399,8 +2411,33 @@ def adapt_tor_onionoo(
     }
 
 
-def adapt_stopforumspam(raw_data: Optional[Dict[str, Any]], status_code: int = 200) -> Dict[str, Any]:
-    """Normalizes StopForumSpam JSON IP reputation responses."""
+def adapt_stopforumspam(
+    raw_data: Optional[Dict[str, Any]],
+    status_code: int = 200,
+    *,
+    has_db: bool = True,
+) -> Dict[str, Any]:
+    """Normalizes local or API-shaped StopForumSpam IP reputation responses."""
+    if not has_db:
+        return {
+            "provider": "StopForumSpam",
+            "status": "Offline DB Missing",
+            "statusCode": None,
+            "asn": "-",
+            "isp": "-",
+            "organisation": "-",
+            "location": "-",
+            "usageType": "Offline DB Missing",
+            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
+            "appears": False,
+            "blacklisted": False,
+            "toxicCidr": None,
+            "frequency": None,
+            "confidence": None,
+            "lastSeen": None,
+            "rawJson": {"status": "unconfigured", "message": "StopForumSpam offline database files not found"},
+        }
+
     raw_data, status_code = _guard_payload(raw_data, status_code)
     has_ip_block = isinstance(raw_data, dict) and isinstance(raw_data.get("ip"), dict)
     success_flag = raw_data.get("success") if isinstance(raw_data, dict) else None
@@ -2425,6 +2462,8 @@ def adapt_stopforumspam(raw_data: Optional[Dict[str, Any]], status_code: int = 2
             "usageType": "-",
             "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
             "appears": False,
+            "blacklisted": False,
+            "toxicCidr": None,
             "frequency": None,
             "confidence": None,
             "lastSeen": None,
@@ -2432,8 +2471,14 @@ def adapt_stopforumspam(raw_data: Optional[Dict[str, Any]], status_code: int = 2
         }
 
     ip_block = raw_data.get("ip") if isinstance(raw_data.get("ip"), dict) else {}
+    raw_toxic = ip_block.get("toxicCidr") or ip_block.get("toxic_cidr")
+    toxic_cidr = raw_toxic.strip() if isinstance(raw_toxic, str) and raw_toxic.strip() else None
+    blacklisted = bool(ip_block.get("blacklisted")) or toxic_cidr is not None
+
     raw_appears = ip_block.get("appears")
-    appears = raw_appears if isinstance(raw_appears, bool) else (_safe_int(raw_appears, default=0) or 0) > 0
+    appears = blacklisted or (
+        raw_appears if isinstance(raw_appears, bool) else (_safe_int(raw_appears, default=0) or 0) > 0
+    )
 
     frequency = max(0, _safe_int(ip_block.get("frequency"), default=0) or 0)
 
@@ -2446,8 +2491,11 @@ def adapt_stopforumspam(raw_data: Optional[Dict[str, Any]], status_code: int = 2
                 confidence = round(max(0.0, min(100.0, conf_num)), 2)
         except TypeError, ValueError:
             confidence = None
-    if confidence is None and not appears:
-        confidence = 0.0
+    if confidence is None:
+        if blacklisted:
+            confidence = 100.0
+        elif not appears:
+            confidence = 0.0
 
     last_seen = _normalize_timestamp_or_text(
         ip_block.get("lastseen") or ip_block.get("last_seen") or ip_block.get("lastSeen")
@@ -2462,14 +2510,24 @@ def adapt_stopforumspam(raw_data: Optional[Dict[str, Any]], status_code: int = 2
     else:
         asn_str = "-"
 
-    if appears:
-        flags = [{"label": f"Forum Spam ({frequency}x)", "isHighRisk": True}]
+    flags: List[Dict[str, Any]] = []
+    if blacklisted:
+        toxic_label = f"Blacklisted Toxic CIDR ({toxic_cidr})" if toxic_cidr else "Blacklisted Toxic CIDR"
+        flags.append({"label": toxic_label, "isHighRisk": True})
+    if appears and (frequency > 0 or not blacklisted):
+        flags.append({"label": f"Forum Spam ({frequency}x)", "isHighRisk": True})
+
+    if blacklisted and frequency > 0:
+        usage_type = "Blacklisted Toxic CIDR / Forum Spam Reported"
+    elif blacklisted:
+        usage_type = "Blacklisted Toxic CIDR"
+    elif appears:
         usage_type = "Forum Spam Reported"
     else:
         flags = [{"label": "No Flags", "isHighRisk": False}]
         usage_type = "Clean (Not Listed)"
 
-    return {
+    row: Dict[str, Any] = {
         "provider": "StopForumSpam",
         "status": "200 OK",
         "statusCode": 200,
@@ -2480,11 +2538,17 @@ def adapt_stopforumspam(raw_data: Optional[Dict[str, Any]], status_code: int = 2
         "usageType": usage_type,
         "securityFlags": flags,
         "appears": appears,
+        "blacklisted": blacklisted,
+        "toxicCidr": toxic_cidr,
         "frequency": frequency,
         "confidence": confidence,
         "lastSeen": last_seen,
         "rawJson": raw_data,
     }
+    offline_updated = raw_data.get("offlineDbUpdatedAt") or ip_block.get("offlineDbUpdatedAt")
+    if isinstance(offline_updated, str) and offline_updated.strip():
+        row["offlineDbUpdatedAt"] = offline_updated.strip()
+    return row
 
 
 def _extract_dshield_threatfeeds(raw_feeds: Any) -> Tuple[List[str], Optional[str]]:

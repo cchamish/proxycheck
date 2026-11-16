@@ -19,7 +19,7 @@
     var TARGET_SELECTOR = 'a.ext-checkuser-tempaccount-reveal-ip-anchor';
     var BADGE_CLASS = 'proxycheck-ip-badge';
     var STYLE_ELEMENT_ID = 'proxycheck-userscript-styles';
-    var INTERNAL_NODE_SELECTOR = '#proxycheck-pageinfo, #proxycheck_result, #proxycheck-userscript-styles, .proxycheck-ip-badge, .proxycheck-details-panel, .proxycheck-light-upgrade-notice';
+    var INTERNAL_NODE_SELECTOR = '#proxycheck-pageinfo, #proxycheck_result, #proxycheck-userscript-styles, .proxycheck-ip-badge, .proxycheck-details-panel, .proxycheck-light-upgrade-notice, .proxycheck-degraded-retry-notice, .proxycheck-retry-full-btn';
     var IPINFO_PANEL_SELECTOR = '.ext-ipinfo-panel-layout';
     var OBSERVER_THROTTLE_MS = 100;
     var IPINFO_FALLBACK_DELAY_MS = 400;
@@ -36,14 +36,27 @@
     var TOKEN_REFRESH_WAIT_TIMEOUT_MS = 4000;
     var RESULT_CACHE_STORAGE_KEY = 'proxycheck-ip-result-cache-v1';
     var RESULT_CACHE_TTL_MS = 30 * 60 * 1000;
+    var DEGRADED_CACHE_TTL_MS = 60 * 1000;
+    var CONTRIB_FULL_TRIGGER_DELAY_MS = 500;
     var RESULT_CACHE_MAX_ENTRIES = 200;
 
     var IPV4_PATTERN = /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
     var IPV6_PATTERN = /^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))$/;
+    var COMMERCIAL_PROVIDERS = {
+        'AbuseIPDB': true,
+        'IPData': true,
+        'IPRegistry': true,
+        'IP2Location': true,
+        'GetIPIntel': true,
+        'Proxycheck': true,
+        'IPHub': true,
+        'IPHunter': true
+    };
 
     var ipPromiseCache = new Map();
     var ipFullPromiseCache = new Map();
     var latestResultByIp = new Map();
+    var fullResultMetaByIp = new Map();
     var renderedBadgeEntriesByIp = new Map();
     var persistedCacheRaw = null;
     var persistedCacheStore = null;
@@ -80,6 +93,8 @@
     var activeLoadingInterval = null;
     var ipContributionsObserverTimer = null;
     var ipContributionsFallbackTimer = null;
+    var ipContributionsDelayTimer = null;
+    var ipContributionsVisibilityHandler = null;
     var pendingContributionsPageCheck = false;
     var pendingSpurRefresh = false;
     var activeRequestCount = 0;
@@ -122,10 +137,26 @@
         }
     }
 
+    function clearContributionsSchedule() {
+        if (ipContributionsDelayTimer !== null) {
+            window.clearTimeout(ipContributionsDelayTimer);
+            ipContributionsDelayTimer = null;
+        }
+        if (
+            ipContributionsVisibilityHandler &&
+            typeof document !== 'undefined' &&
+            typeof document.removeEventListener === 'function'
+        ) {
+            document.removeEventListener('visibilitychange', ipContributionsVisibilityHandler);
+            ipContributionsVisibilityHandler = null;
+        }
+    }
+
     function blockAccess() {
         accessBlocked = true;
         clearLoadingInterval();
         clearTokenRefreshWait();
+        clearContributionsSchedule();
         if (ipContributionsObserverTimer !== null) {
             window.clearTimeout(ipContributionsObserverTimer);
             ipContributionsObserverTimer = null;
@@ -526,13 +557,54 @@
         return parsed;
     }
 
+    function isRowQuotaGuarded(row) {
+        return Boolean(row && typeof row === 'object' && (row.isQuotaGuarded || row.isQuotaGuard));
+    }
+
+    function hasDegradedQuotaOrCooldown(data) {
+        if (!data || typeof data !== 'object' || !Array.isArray(data.results)) {
+            return false;
+        }
+        for (var i = 0; i < data.results.length; i++) {
+            var row = data.results[i];
+            if (!row || typeof row !== 'object') {
+                continue;
+            }
+            if (isRowQuotaGuarded(row)) {
+                return true;
+            }
+            if (
+                row.isCooldown &&
+                (!row.provider || Object.prototype.hasOwnProperty.call(COMMERCIAL_PROVIDERS, row.provider))
+            ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function getResultEntryTtlMs(entry) {
+        if (
+            entry &&
+            typeof entry.ttlMs === 'number' &&
+            isFinite(entry.ttlMs) &&
+            entry.ttlMs > 0
+        ) {
+            return Math.min(entry.ttlMs, RESULT_CACHE_TTL_MS);
+        }
+        if (entry && entry.data && hasDegradedQuotaOrCooldown(entry.data)) {
+            return DEGRADED_CACHE_TTL_MS;
+        }
+        return RESULT_CACHE_TTL_MS;
+    }
+
     function isResultEntryValid(entry, now) {
         return Boolean(
             entry &&
             typeof entry === 'object' &&
             typeof entry.ts === 'number' &&
             isFinite(entry.ts) &&
-            (now - entry.ts < RESULT_CACHE_TTL_MS) &&
+            (now - entry.ts < getResultEntryTtlMs(entry)) &&
             entry.data &&
             typeof entry.data === 'object'
         );
@@ -651,6 +723,26 @@
         );
     }
 
+    function recordFullResultMeta(cacheKey, data, timestampMs) {
+        if (!cacheKey || !data || typeof data !== 'object' || isPartialLightResult(data)) {
+            return;
+        }
+        var resolvedTs = typeof timestampMs === 'number' && isFinite(timestampMs) ? timestampMs : Date.now();
+        var ttlMs = hasDegradedQuotaOrCooldown(data) ? DEGRADED_CACHE_TTL_MS : RESULT_CACHE_TTL_MS;
+        fullResultMetaByIp.set(cacheKey, { ts: resolvedTs, ttlMs: ttlMs });
+    }
+
+    function isMemoryFullResultFresh(cacheKey, data) {
+        if (!cacheKey || !data || typeof data !== 'object' || isPartialLightResult(data)) {
+            return false;
+        }
+        var meta = fullResultMetaByIp.get(cacheKey);
+        if (!meta) {
+            return !hasDegradedQuotaOrCooldown(data);
+        }
+        return (Date.now() - meta.ts) < meta.ttlMs;
+    }
+
     function recordLatestIpResult(cacheKey, data) {
         if (!cacheKey || !data || typeof data !== 'object') {
             return;
@@ -662,7 +754,7 @@
         latestResultByIp.set(cacheKey, data);
     }
 
-    function readPersistedIpResult(cacheKey) {
+    function readPersistedIpResultEntry(cacheKey) {
         if (!cacheKey || typeof cacheKey !== 'string') {
             return null;
         }
@@ -681,7 +773,46 @@
             return null;
         }
 
-        return entry.data;
+        return entry;
+    }
+
+    function readPersistedIpResult(cacheKey) {
+        var entry = readPersistedIpResultEntry(cacheKey);
+        return entry ? entry.data : null;
+    }
+
+    function removePersistedIpResult(cacheKey) {
+        if (!cacheKey || typeof cacheKey !== 'string') {
+            return;
+        }
+        var backend = getResultStorageBackend();
+        var store = readPersistedResultStore(backend);
+        if (!store || !Object.prototype.hasOwnProperty.call(store.entries, cacheKey)) {
+            return;
+        }
+        var nextEntries = cloneEntriesExcluding(store.entries, cacheKey);
+        pruneExpiredResultEntries(nextEntries, Date.now());
+        writePersistedResultStore(backend, { entries: nextEntries }, null);
+    }
+
+    function invalidateIpResultCache(ip) {
+        var cacheKey = canonicalizeIpKey(ip);
+        var rawLower = typeof ip === 'string' ? ip.trim().toLowerCase() : '';
+        var keys = [];
+        if (cacheKey) {
+            keys.push(cacheKey);
+        }
+        if (rawLower && rawLower !== cacheKey) {
+            keys.push(rawLower);
+        }
+        for (var i = 0; i < keys.length; i++) {
+            var key = keys[i];
+            ipPromiseCache.delete(key);
+            ipFullPromiseCache.delete(key);
+            latestResultByIp.delete(key);
+            fullResultMetaByIp.delete(key);
+            removePersistedIpResult(key);
+        }
     }
 
     function writePersistedIpResult(cacheKey, data) {
@@ -710,10 +841,12 @@
             return;
         }
         var nextEntries = cloneEntriesExcluding(existingStore && existingStore.entries, cacheKey);
+        var isDegraded = hasDegradedQuotaOrCooldown(compactData);
 
         pruneExpiredResultEntries(nextEntries, now);
         nextEntries[cacheKey] = {
             ts: now,
+            ttlMs: isDegraded ? DEGRADED_CACHE_TTL_MS : RESULT_CACHE_TTL_MS,
             data: compactData
         };
         evictOldestResultEntries(nextEntries, RESULT_CACHE_MAX_ENTRIES, cacheKey);
@@ -1323,8 +1456,12 @@
         });
     }
 
-    function syncResolvedIpAliases(cacheKey, data, promise, includeFullCache) {
+    function syncResolvedIpAliases(cacheKey, data, promise, includeFullCache, recordedTs) {
+        var resolvedTs = typeof recordedTs === 'number' && isFinite(recordedTs) ? recordedTs : Date.now();
         recordLatestIpResult(cacheKey, data);
+        if (includeFullCache) {
+            recordFullResultMeta(cacheKey, data, resolvedTs);
+        }
         writePersistedIpResult(cacheKey, data);
         if (typeof data.ip !== 'string') {
             return;
@@ -1334,6 +1471,9 @@
             return;
         }
         recordLatestIpResult(resolvedKey, data);
+        if (includeFullCache) {
+            recordFullResultMeta(resolvedKey, data, resolvedTs);
+        }
         writePersistedIpResult(resolvedKey, data);
         if (!ipPromiseCache.has(resolvedKey) || includeFullCache) {
             ipPromiseCache.set(resolvedKey, promise);
@@ -1341,6 +1481,27 @@
         if (includeFullCache && !ipFullPromiseCache.has(resolvedKey)) {
             ipFullPromiseCache.set(resolvedKey, promise);
         }
+    }
+
+    function pruneExpiredFullMemoryCache(cacheKey) {
+        if (!ipFullPromiseCache.has(cacheKey)) {
+            return false;
+        }
+        var cachedLatest = latestResultByIp.get(cacheKey);
+        if (
+            cachedLatest &&
+            fullResultMetaByIp.has(cacheKey) &&
+            !isMemoryFullResultFresh(cacheKey, cachedLatest)
+        ) {
+            var expiredPromise = ipFullPromiseCache.get(cacheKey);
+            ipFullPromiseCache.delete(cacheKey);
+            fullResultMetaByIp.delete(cacheKey);
+            if (ipPromiseCache.get(cacheKey) === expiredPromise) {
+                ipPromiseCache.delete(cacheKey);
+            }
+            return true;
+        }
+        return false;
     }
 
     function fetchIpIntelligence(ip, mode) {
@@ -1354,21 +1515,27 @@
 
         var resolvedMode = normalizeQueryMode(mode);
         if (resolvedMode === 'full') {
+            pruneExpiredFullMemoryCache(cacheKey);
             if (ipFullPromiseCache.has(cacheKey)) {
                 return ipFullPromiseCache.get(cacheKey);
             }
 
             var cachedLatestFull = latestResultByIp.get(cacheKey);
-            if (cachedLatestFull && !isPartialLightResult(cachedLatestFull)) {
+            if (
+                cachedLatestFull &&
+                !isPartialLightResult(cachedLatestFull) &&
+                isMemoryFullResultFresh(cacheKey, cachedLatestFull)
+            ) {
                 var promotedPromise = Promise.resolve(cachedLatestFull);
                 ipFullPromiseCache.set(cacheKey, promotedPromise);
                 return promotedPromise;
             }
 
-            var persistedFullData = readPersistedIpResult(cacheKey);
-            if (persistedFullData && !isPartialLightResult(persistedFullData)) {
-                recordLatestIpResult(cacheKey, persistedFullData);
-                var cachedFullPromise = Promise.resolve(persistedFullData);
+            var persistedFullEntry = readPersistedIpResultEntry(cacheKey);
+            if (persistedFullEntry && persistedFullEntry.data && !isPartialLightResult(persistedFullEntry.data)) {
+                recordLatestIpResult(cacheKey, persistedFullEntry.data);
+                recordFullResultMeta(cacheKey, persistedFullEntry.data, persistedFullEntry.ts);
+                var cachedFullPromise = Promise.resolve(persistedFullEntry.data);
                 ipFullPromiseCache.set(cacheKey, cachedFullPromise);
                 ipPromiseCache.set(cacheKey, cachedFullPromise);
                 return cachedFullPromise;
@@ -1382,7 +1549,7 @@
                     return null;
                 }
                 ipPromiseCache.set(cacheKey, fullPromise);
-                syncResolvedIpAliases(cacheKey, data, fullPromise, true);
+                syncResolvedIpAliases(cacheKey, data, fullPromise, true, Date.now());
                 return data;
             }).catch(function (err) {
                 console.warn('[proxycheck] Full detection request failed for ' + ip + ':', err);
@@ -1396,6 +1563,7 @@
             return fullPromise;
         }
 
+        pruneExpiredFullMemoryCache(cacheKey);
         if (ipFullPromiseCache.has(cacheKey)) {
             return ipFullPromiseCache.get(cacheKey);
         }
@@ -1403,12 +1571,15 @@
             return ipPromiseCache.get(cacheKey);
         }
 
-        var persistedData = readPersistedIpResult(cacheKey);
-        if (persistedData) {
-            recordLatestIpResult(cacheKey, persistedData);
-            var cachedPromise = Promise.resolve(persistedData);
+        var persistedEntry = readPersistedIpResultEntry(cacheKey);
+        if (persistedEntry && persistedEntry.data) {
+            recordLatestIpResult(cacheKey, persistedEntry.data);
+            if (!isPartialLightResult(persistedEntry.data)) {
+                recordFullResultMeta(cacheKey, persistedEntry.data, persistedEntry.ts);
+            }
+            var cachedPromise = Promise.resolve(persistedEntry.data);
             ipPromiseCache.set(cacheKey, cachedPromise);
-            if (!isPartialLightResult(persistedData)) {
+            if (!isPartialLightResult(persistedEntry.data)) {
                 ipFullPromiseCache.set(cacheKey, cachedPromise);
             }
             return cachedPromise;
@@ -1425,7 +1596,7 @@
             if (isFullReady && !ipFullPromiseCache.has(cacheKey)) {
                 ipFullPromiseCache.set(cacheKey, promise);
             }
-            syncResolvedIpAliases(cacheKey, data, promise, isFullReady);
+            syncResolvedIpAliases(cacheKey, data, promise, isFullReady, Date.now());
             return data;
         }).catch(function (err) {
             console.warn('[proxycheck] Detection request failed for ' + ip + ':', err);
@@ -1486,6 +1657,9 @@
         var stopforumspamRow = null;
         var hasQuotaGuardedProvider = false;
         var hasCooldownProvider = false;
+        var validCommercialCount = 0;
+        var positiveCommercialVotes = 0;
+        var validTotalSourceCount = 0;
         for (var i = 0; i < rows.length; i++) {
             var rowItem = rows[i];
             if (!rowItem || typeof rowItem !== 'object') {
@@ -1496,10 +1670,34 @@
             } else if (rowItem.provider === 'StopForumSpam') {
                 stopforumspamRow = rowItem;
             }
-            if (rowItem.isQuotaGuarded) {
+            if (isRowQuotaGuarded(rowItem)) {
                 hasQuotaGuardedProvider = true;
             } else if (rowItem.isCooldown) {
                 hasCooldownProvider = true;
+            }
+            if (isValidProviderRow(rowItem)) {
+                validTotalSourceCount += 1;
+                if (Object.prototype.hasOwnProperty.call(COMMERCIAL_PROVIDERS, rowItem.provider)) {
+                    validCommercialCount += 1;
+                    var rowFlags = Array.isArray(rowItem.securityFlags) ? rowItem.securityFlags : [];
+                    var rowHasRisk = false;
+                    for (var f = 0; f < rowFlags.length; f++) {
+                        if (rowFlags[f] && rowFlags[f].isHighRisk) {
+                            rowHasRisk = true;
+                            break;
+                        }
+                    }
+                    if (
+                        !rowHasRisk &&
+                        typeof rowItem.usageType === 'string' &&
+                        /datacenter|data center|hosting|cloud|transit|cdn/i.test(rowItem.usageType)
+                    ) {
+                        rowHasRisk = true;
+                    }
+                    if (rowHasRisk) {
+                        positiveCommercialVotes += 1;
+                    }
+                }
             }
         }
 
@@ -1534,6 +1732,19 @@
             !hasCooldownProvider &&
             (isPartialLight || isGetIpIntelDeferred)
         );
+        var hasValidNonPredictionClean = Boolean(
+            !hasPrediction &&
+            !hasHighOrMediumSignals &&
+            !isLightDeferredClean &&
+            (
+                validCommercialCount > 0 ||
+                (
+                    !hasQuotaGuardedProvider &&
+                    !hasCooldownProvider &&
+                    (validTotalSourceCount > 0 || arbitrationTier === 'success')
+                )
+            )
+        );
 
         var riskTier = 'low';
         if (isNonPublic) {
@@ -1552,14 +1763,20 @@
         var predictionTooltip = '';
         if (hasPrediction) {
             predictionTooltip = predictionText + '%';
-        } else if (hasQuotaGuardedProvider) {
-            predictionTooltip = 'Quota Guard Active' +
-                (getipintelRow && getipintelRow.status ? ' (' + getipintelRow.status + ')' : '');
-        } else if (hasCooldownProvider) {
-            predictionTooltip = 'Provider Cooldown' +
-                (getipintelRow && getipintelRow.status ? ' (' + getipintelRow.status + ')' : '');
+        } else if (isLightDeferredClean) {
+            predictionTooltip = 'Light screening passed (no local/free-tier flags). Click to run full commercial check.';
         } else if (isPartialLight || isGetIpIntelDeferred) {
             predictionTooltip = 'Light Mode (commercial sources deferred; click for full check)';
+        } else if (hasQuotaGuardedProvider) {
+            predictionTooltip = 'Quota Guard Active' +
+                (getipintelRow && getipintelRow.status ? ' (' + getipintelRow.status + ')' : '') +
+                (validCommercialCount > 0 ? '; ' + validCommercialCount + ' commercial sources OK' : '');
+        } else if (hasCooldownProvider) {
+            predictionTooltip = 'Provider Cooldown' +
+                (getipintelRow && getipintelRow.status ? ' (' + getipintelRow.status + ')' : '') +
+                (validCommercialCount > 0 ? '; ' + validCommercialCount + ' commercial sources OK' : '');
+        } else if (validCommercialCount > 0) {
+            predictionTooltip = 'Unavailable (' + positiveCommercialVotes + '/' + validCommercialCount + ' commercial sources flagged)';
         } else {
             predictionTooltip = 'Unavailable' + (data.predictionLabel ? ' (' + data.predictionLabel + ')' : '');
         }
@@ -1579,12 +1796,16 @@
             badgePrimaryLabel = 'SPAM';
         } else if (arbitrationTier === 'warning') {
             badgePrimaryLabel = 'REVIEW';
+        } else if (isLightDeferredClean) {
+            badgePrimaryLabel = 'LIGHT';
+        } else if (hasValidNonPredictionClean) {
+            badgePrimaryLabel = validCommercialCount > 0
+                ? 'OK ' + positiveCommercialVotes + '/' + validCommercialCount
+                : 'CLEAN';
         } else if (hasQuotaGuardedProvider) {
             badgePrimaryLabel = 'QUOTA';
         } else if (hasCooldownProvider) {
             badgePrimaryLabel = 'COOLDOWN';
-        } else if (isLightDeferredClean) {
-            badgePrimaryLabel = 'LITE';
         }
 
         return {
@@ -1605,6 +1826,9 @@
             hasQuotaGuardedProvider: hasQuotaGuardedProvider,
             hasCooldownProvider: hasCooldownProvider,
             isLightDeferredClean: isLightDeferredClean,
+            validCommercialCount: validCommercialCount,
+            positiveCommercialVotes: positiveCommercialVotes,
+            validTotalSourceCount: validTotalSourceCount,
             torLabel: torLabel,
             torFlags: torFlags,
             torSummary: torSummary,
@@ -1666,7 +1890,7 @@
             row &&
             typeof row === 'object' &&
             !row.isCooldown &&
-            !row.isQuotaGuarded &&
+            !isRowQuotaGuarded(row) &&
             (row.status === '200 OK' || row.statusCode === 200)
         );
     }
@@ -2345,6 +2569,34 @@
             '.proxycheck-light-upgrade-notice {',
             '  color: var(--proxycheck-subtle-color);',
             '}',
+            '.proxycheck-degraded-retry-notice {',
+            '  margin-top: 8px;',
+            '  margin-bottom: 0;',
+            '  padding: 6px 8px;',
+            '  border-radius: 3px;',
+            '  font-size: 12px;',
+            '  display: flex;',
+            '  align-items: center;',
+            '  flex-wrap: wrap;',
+            '  gap: 8px;',
+            '  background-color: var(--proxycheck-medium-bg);',
+            '  color: var(--proxycheck-medium-color);',
+            '  border: 1px solid var(--proxycheck-medium-border);',
+            '}',
+            '.proxycheck-retry-full-btn {',
+            '  cursor: pointer;',
+            '  font-size: 12px;',
+            '  font-weight: 600;',
+            '  padding: 2px 8px;',
+            '  border-radius: 3px;',
+            '  background-color: transparent;',
+            '  color: inherit;',
+            '  border: 1px solid currentColor;',
+            '}',
+            '.proxycheck-retry-full-btn:disabled {',
+            '  opacity: 0.6;',
+            '  cursor: wait;',
+            '}',
             '#proxycheck-pageinfo a, .proxycheck-details-panel a, .proxycheck-dialog-link {',
             '  color: var(--proxycheck-link-color);',
             '}',
@@ -2652,9 +2904,9 @@
         }
         var torDesc = formatTorDescription(risk);
         var cloudDesc = formatCloudDescription(data);
-        var titleLines = [
-            'Prediction: ' + risk.predictionTooltip
-        ];
+        var titleLines = risk.isLightDeferredClean
+            ? ['Light screening passed (no local/free-tier flags). Click to run full commercial check.']
+            : ['Prediction: ' + risk.predictionTooltip];
         if (typeof data.arbitrationVerdict === 'string' && data.arbitrationVerdict.trim()) {
             titleLines.push('Verdict: ' + data.arbitrationVerdict.trim());
         }
@@ -2731,7 +2983,7 @@
         if (!risk.isNonPublic && !risk.hasPrediction) {
             if (risk.badgePrimaryLabel === 'QUOTA' || risk.badgePrimaryLabel === 'COOLDOWN') {
                 stateClass = ' proxycheck-badge-quota';
-            } else if (risk.badgePrimaryLabel === 'LITE') {
+            } else if (risk.badgePrimaryLabel === 'LIGHT') {
                 stateClass = ' proxycheck-badge-lite';
             }
         }
@@ -2793,10 +3045,13 @@
         infoDialogPromise = mw.loader.using('oojs-ui-windows').then(function () {
             var targetIp = ip || (data && data.ip) || '';
             var cacheKey = canonicalizeIpKey(targetIp);
-            var initialData = (cacheKey && latestResultByIp.get(cacheKey)) || data;
-            var initialRisk = evaluateRisk(initialData);
+            var activeData = (cacheKey && latestResultByIp.get(cacheKey)) || data;
+            var initialRisk = evaluateRisk(activeData);
             var $message = $('<div>');
             var $panelContainer = $('<div>', { 'class': 'proxycheck-dialog-content' });
+            var $retryContainer = $('<div>');
+            var dialogClosed = false;
+            var retryInFlight = false;
 
             function renderDialogBody(dialogData, dialogRisk) {
                 $panelContainer.empty();
@@ -2816,8 +3071,76 @@
                 }
             }
 
-            renderDialogBody(initialData, initialRisk);
-            $message.append($panelContainer);
+            function syncDegradedRetrySection(currentData, currentRisk) {
+                $retryContainer.empty();
+                if (
+                    dialogClosed ||
+                    currentRisk.isNonPublic ||
+                    isPartialLightResult(currentData) ||
+                    !hasDegradedQuotaOrCooldown(currentData)
+                ) {
+                    return;
+                }
+
+                var $statusLabel = $('<span>').text(
+                    'Some key providers were quota-guarded or in cooldown (cached briefly for 60s). '
+                );
+                var $retryBtn = $('<button>', {
+                    type: 'button',
+                    'class': 'proxycheck-retry-full-btn',
+                    text: 'Retry Full Check'
+                });
+                $retryBtn.on('click', function (event) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (retryInFlight || dialogClosed || accessBlocked) {
+                        return;
+                    }
+                    retryInFlight = true;
+                    $retryBtn.prop('disabled', true).text('Retrying full check...');
+                    var previousData = activeData;
+                    invalidateIpResultCache(targetIp);
+
+                    fetchIpIntelligence(targetIp, 'full').then(function (retryData) {
+                        retryInFlight = false;
+                        if (!retryData || typeof retryData !== 'object') {
+                            if (cacheKey && previousData) {
+                                recordLatestIpResult(cacheKey, previousData);
+                            }
+                            if (!dialogClosed) {
+                                $statusLabel.text('Full check retry failed. ');
+                                $retryBtn.prop('disabled', false).text('Retry Full Check');
+                            }
+                            return;
+                        }
+                        activeData = retryData;
+                        refreshRenderedBadgesForIp(retryData.ip || targetIp, retryData);
+                        if (dialogClosed) {
+                            return;
+                        }
+                        var retryRisk = evaluateRisk(retryData);
+                        renderDialogBody(retryData, retryRisk);
+                        syncDegradedRetrySection(retryData, retryRisk);
+                    }).catch(function () {
+                        retryInFlight = false;
+                        if (cacheKey && previousData) {
+                            recordLatestIpResult(cacheKey, previousData);
+                        }
+                        if (!dialogClosed) {
+                            $statusLabel.text('Full check retry failed. ');
+                            $retryBtn.prop('disabled', false).text('Retry Full Check');
+                        }
+                    });
+                });
+
+                $retryContainer.append(
+                    $('<div>', { 'class': 'proxycheck-degraded-retry-notice' }).append($statusLabel, $retryBtn)
+                );
+            }
+
+            renderDialogBody(activeData, initialRisk);
+            syncDegradedRetrySection(activeData, initialRisk);
+            $message.append($panelContainer, $retryContainer);
             $message.append(
                 $('<p>', { style: 'margin-top: 8px; margin-bottom: 0;' }).append(
                     $('<a>', {
@@ -2830,9 +3153,8 @@
                 )
             );
 
-            var dialogClosed = false;
             var $upgradeNotice = null;
-            if (!initialRisk.isNonPublic && isPartialLightResult(initialData)) {
+            if (!initialRisk.isNonPublic && isPartialLightResult(activeData)) {
                 $upgradeNotice = $('<p>', {
                     'class': 'proxycheck-light-upgrade-notice',
                     style: 'margin-top: 8px; margin-bottom: 0; font-size: 12px;'
@@ -2846,12 +3168,14 @@
                         }
                         return;
                     }
+                    activeData = fullData;
                     refreshRenderedBadgesForIp(fullData.ip || targetIp, fullData);
                     if (dialogClosed) {
                         return;
                     }
                     var updatedRisk = evaluateRisk(fullData);
                     renderDialogBody(fullData, updatedRisk);
+                    syncDegradedRetrySection(fullData, updatedRisk);
                     if ($upgradeNotice) {
                         $upgradeNotice.remove();
                         $upgradeNotice = null;
@@ -2947,15 +3271,7 @@
                 if (retryBadge.parentNode) {
                     retryBadge.parentNode.removeChild(retryBadge);
                 }
-                var cacheKey = canonicalizeIpKey(ip);
-                if (cacheKey) {
-                    ipPromiseCache.delete(cacheKey);
-                    ipFullPromiseCache.delete(cacheKey);
-                    latestResultByIp.delete(cacheKey);
-                }
-                ipPromiseCache.delete(ip.toLowerCase());
-                ipFullPromiseCache.delete(ip.toLowerCase());
-                latestResultByIp.delete(ip.toLowerCase());
+                invalidateIpResultCache(ip);
                 if (anchor.dataset) {
                     delete anchor.dataset.proxycheckProcessed;
                 }
@@ -3288,6 +3604,52 @@
         return null;
     }
 
+    function isDocumentVisible() {
+        return typeof document === 'undefined' ||
+            typeof document.visibilityState !== 'string' ||
+            document.visibilityState === 'visible';
+    }
+
+    function peekCachedIpState(ip) {
+        var cacheKey = canonicalizeIpKey(ip);
+        if (!cacheKey) {
+            return null;
+        }
+        var latest = latestResultByIp.get(cacheKey);
+        if (latest && !isPartialLightResult(latest) && isMemoryFullResultFresh(cacheKey, latest)) {
+            return { data: latest, isFull: true };
+        }
+        var persistedEntry = readPersistedIpResultEntry(cacheKey);
+        if (persistedEntry && persistedEntry.data) {
+            return {
+                data: persistedEntry.data,
+                isFull: !isPartialLightResult(persistedEntry.data)
+            };
+        }
+        if (latest) {
+            return { data: latest, isFull: false };
+        }
+        return null;
+    }
+
+    function scheduleContributionsOnVisible(onVisible) {
+        if (
+            ipContributionsVisibilityHandler ||
+            typeof document === 'undefined' ||
+            typeof document.addEventListener !== 'function'
+        ) {
+            return;
+        }
+        ipContributionsVisibilityHandler = function () {
+            if (accessBlocked || !isDocumentVisible()) {
+                return;
+            }
+            clearContributionsSchedule();
+            onVisible();
+        };
+        document.addEventListener('visibilitychange', ipContributionsVisibilityHandler);
+    }
+
     function handleIPContributionsPage(allowFallback) {
         ensureUserscriptStyles();
         if (
@@ -3304,6 +3666,14 @@
         var targetIp = extractContributionsTargetIp();
         if (!isValidIp(targetIp)) {
             ipContributionsInvalidTarget = true;
+            return;
+        }
+
+        var initialCachedState = peekCachedIpState(targetIp);
+        if (!initialCachedState && !isDocumentVisible()) {
+            scheduleContributionsOnVisible(function () {
+                handleIPContributionsPage(Boolean(allowFallback));
+            });
             return;
         }
 
@@ -3363,6 +3733,21 @@
             return true;
         }
 
+        function removeUnpopulatedBanner() {
+            clearLoadingInterval();
+            if ($box && $box.length > 0 && $box[0] && $box[0].parentNode) {
+                $box[0].parentNode.removeChild($box[0]);
+            }
+            $box = null;
+            $result = null;
+        }
+
+        function registerResumeWhenVisible() {
+            scheduleContributionsOnVisible(function () {
+                handleIPContributionsPage(Boolean(allowFallback));
+            });
+        }
+
         function renderBannerFailure() {
             if (!$result || $result.length === 0) {
                 return;
@@ -3384,12 +3769,8 @@
                     return;
                 }
                 clearLoadingInterval();
-                var retryCacheKey = canonicalizeIpKey(targetIp);
-                if (retryCacheKey) {
-                    ipPromiseCache.delete(retryCacheKey);
-                    ipFullPromiseCache.delete(retryCacheKey);
-                    latestResultByIp.delete(retryCacheKey);
-                }
+                clearContributionsSchedule();
+                invalidateIpResultCache(targetIp);
                 var existingBanner = document.getElementById('proxycheck-pageinfo');
                 if (existingBanner && existingBanner.parentNode) {
                     existingBanner.parentNode.removeChild(existingBanner);
@@ -3406,6 +3787,13 @@
         ensureConsent().then(function (agreed) {
             if (!agreed || accessBlocked || document.getElementById('proxycheck-pageinfo')) {
                 ipContributionsPending = false;
+                return null;
+            }
+
+            var cachedState = peekCachedIpState(targetIp);
+            if (!cachedState && !isDocumentVisible()) {
+                ipContributionsPending = false;
+                registerResumeWhenVisible();
                 return null;
             }
 
@@ -3434,6 +3822,273 @@
             $box.append($result);
             mountBannerElement(activeTarget);
 
+            var isStatsExpanded = false;
+            var fullUpgradeRequested = false;
+
+            function renderContributionsBannerData(bannerData) {
+                var risk = evaluateRisk(bannerData);
+                var resolvedIp = bannerData.ip || targetIp;
+                var $activeBox = ($box && $box.length > 0) ? $box : $('#proxycheck-pageinfo');
+                if ($activeBox && $activeBox.length > 0 && $activeBox[0]) {
+                    var bannerTiers = ['high', 'medium', 'nonpublic', 'low'];
+                    for (var t = 0; t < bannerTiers.length; t++) {
+                        removeElementClass($activeBox[0], 'proxycheck-banner-tier-' + bannerTiers[t]);
+                    }
+                    addElementClass($activeBox[0], 'proxycheck-banner-tier-' + risk.riskTier);
+                }
+
+                var badgeClass = 'proxycheck-banner-badge proxycheck-tier-' + risk.riskTier;
+
+                if (risk.isNonPublic) {
+                    $result.empty().append(
+                        $('<span>', {
+                            'class': badgeClass,
+                            text: 'ProxyCheck [' + risk.nonPublicBadgeCode + ']'
+                        }),
+                        $('<span>').html(
+                            ' &middot; <b>Address Type:</b> ' + mw.html.escape(risk.nonPublicReason) +
+                            ' &middot; <b>Status:</b> External threat lookups skipped (non-public or reserved IP)' +
+                            ' &middot; '
+                        ),
+                        $('<a>', {
+                            href: TOOL_BASE_URL + '/?ip=' + encodeURIComponent(resolvedIp),
+                            target: '_blank',
+                            rel: 'noopener noreferrer',
+                            text: 'Full Report ↗'
+                        })
+                    );
+                    return;
+                }
+
+                var torBannerDesc = formatTorDescription(risk);
+                var cloudBannerDesc = formatCloudDescription(bannerData);
+                var verdictBannerText = typeof bannerData.arbitrationVerdict === 'string' && bannerData.arbitrationVerdict.trim()
+                    ? bannerData.arbitrationVerdict.trim()
+                    : '';
+                var ptrHostname = typeof bannerData.ptrHostname === 'string' ? bannerData.ptrHostname.trim() : '';
+                var ptrLabel = typeof bannerData.ptrLabel === 'string' ? bannerData.ptrLabel.trim() : '';
+
+                var $summary = $('<div>', { 'class': 'proxycheck-summary-line' }).append(
+                    $('<span>', {
+                        'class': badgeClass,
+                        text: 'ProxyCheck'
+                    })
+                );
+
+                function appendSummaryItem(label, valueNode) {
+                    $summary.append(
+                        document.createTextNode(' \u00b7 '),
+                        $('<b>').text(label + ': '),
+                        valueNode
+                    );
+                }
+
+                appendSummaryItem('Prediction', document.createTextNode(risk.predictionTooltip));
+                if (verdictBannerText) {
+                    appendSummaryItem('Verdict', document.createTextNode(verdictBannerText));
+                }
+                appendSummaryItem('Recommended CIDR', document.createTextNode(bannerData.recommendedCidr || 'N/A'));
+                appendSummaryItem('BGP CIDR', document.createTextNode(bannerData.mmdbCidr || 'N/A'));
+
+                if (ptrHostname || ptrLabel) {
+                    var $ptrValue = $('<span>');
+                    if (ptrHostname) {
+                        $ptrValue.append($('<code>').text(ptrHostname));
+                        if (ptrLabel) {
+                            $ptrValue.append(document.createTextNode(' '));
+                            $ptrValue.append(
+                                $('<span>', {
+                                    'class': bannerData.ptrIsHighRisk ? 'proxycheck-ptr-label-risk' : 'proxycheck-ptr-label-normal',
+                                    text: '(' + ptrLabel + ')'
+                                })
+                            );
+                        }
+                    } else {
+                        $ptrValue.text(ptrLabel);
+                    }
+                    appendSummaryItem('PTR', $ptrValue);
+                }
+
+                if (cloudBannerDesc) {
+                    appendSummaryItem('Cloud', document.createTextNode(cloudBannerDesc));
+                }
+
+                appendSummaryItem(
+                    'Broadcast IP',
+                    risk.broadcastIp
+                        ? $('<strong>', { 'class': 'proxycheck-banner-warning-text', text: 'At-risk' })
+                        : document.createTextNode('No')
+                );
+                appendSummaryItem(
+                    'Tor Node',
+                    risk.isTor
+                        ? $('<strong>', { 'class': 'proxycheck-banner-danger-text', text: torBannerDesc })
+                        : document.createTextNode('No')
+                );
+
+                var renderedSpurText = getSpurProxyText();
+                var $detailsWrapper = $('<div>', {
+                    'class': 'proxycheck-pageinfo-details',
+                    style: isStatsExpanded ? 'display: block;' : 'display: none;'
+                }).append(buildResultDetailsPanel(bannerData, risk));
+
+                refreshPageInfoSpur = function () {
+                    var latestSpurText = getSpurProxyText();
+                    if (latestSpurText === renderedSpurText) {
+                        return;
+                    }
+                    renderedSpurText = latestSpurText;
+                    $detailsWrapper.empty().append(buildResultDetailsPanel(bannerData, risk));
+                };
+
+                var $statsToggle = $('<a>', {
+                    href: '#',
+                    role: 'button',
+                    'class': 'proxycheck-stats-toggle',
+                    'aria-expanded': isStatsExpanded ? 'true' : 'false',
+                    text: isStatsExpanded ? 'Statistic ▾' : 'Statistic ▸'
+                });
+
+                $statsToggle.on('click', function (event) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    isStatsExpanded = !isStatsExpanded;
+                    $detailsWrapper.css('display', isStatsExpanded ? 'block' : 'none');
+                    $statsToggle.attr('aria-expanded', isStatsExpanded ? 'true' : 'false');
+                    $statsToggle.text(isStatsExpanded ? 'Statistic ▾' : 'Statistic ▸');
+
+                    if (isStatsExpanded && isPartialLightResult(bannerData) && !fullUpgradeRequested) {
+                        fullUpgradeRequested = true;
+                        clearContributionsSchedule();
+                        var $bannerUpgradeNotice = $('<p>', {
+                            'class': 'proxycheck-light-upgrade-notice',
+                            style: 'margin-top: 8px; margin-bottom: 0; font-size: 12px;'
+                        }).text('Loading full commercial provider intelligence...');
+                        $detailsWrapper.append($bannerUpgradeNotice);
+
+                        fetchIpIntelligence(resolvedIp, 'full').then(function (fullData) {
+                            if (!fullData || typeof fullData !== 'object') {
+                                $bannerUpgradeNotice.text('Full commercial intelligence unavailable right now.');
+                                return;
+                            }
+                            refreshRenderedBadgesForIp(fullData.ip || resolvedIp, fullData);
+                            if (!ensureBannerAttached()) {
+                                return;
+                            }
+                            renderContributionsBannerData(fullData);
+                        });
+                    }
+                });
+
+                $summary.append(
+                    document.createTextNode(' \u00b7 '),
+                    $('<a>', {
+                        href: TOOL_BASE_URL + '/?ip=' + encodeURIComponent(resolvedIp),
+                        target: '_blank',
+                        rel: 'noopener noreferrer',
+                        text: 'Full Report ↗'
+                    }),
+                    document.createTextNode(' \u00b7 '),
+                    $statsToggle
+                );
+
+                if (!isPartialLightResult(bannerData) && hasDegradedQuotaOrCooldown(bannerData)) {
+                    var $bannerRetryFull = $('<a>', {
+                        href: '#',
+                        role: 'button',
+                        'class': 'proxycheck-banner-retry-full',
+                        text: 'Retry Full Check ↻'
+                    });
+                    $bannerRetryFull.on('click', function (event) {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        if (accessBlocked) {
+                            return;
+                        }
+                        $bannerRetryFull.text('Retrying...');
+                        invalidateIpResultCache(resolvedIp);
+                        fetchIpIntelligence(resolvedIp, 'full').then(function (retryData) {
+                            if (!retryData || typeof retryData !== 'object') {
+                                $bannerRetryFull.text('Retry Full Check ↻');
+                                return;
+                            }
+                            refreshRenderedBadgesForIp(retryData.ip || resolvedIp, retryData);
+                            if (ensureBannerAttached()) {
+                                renderContributionsBannerData(retryData);
+                            }
+                        });
+                    });
+                    $summary.append(document.createTextNode(' \u00b7 '), $bannerRetryFull);
+                }
+
+                $result.empty().append($summary, $detailsWrapper);
+            }
+
+            function scheduleFullUpgradeAfterDelay() {
+                clearContributionsSchedule();
+                if (fullUpgradeRequested || accessBlocked) {
+                    return;
+                }
+                function armTimer() {
+                    if (ipContributionsDelayTimer !== null || fullUpgradeRequested || accessBlocked) {
+                        return;
+                    }
+                    ipContributionsDelayTimer = window.setTimeout(function () {
+                        ipContributionsDelayTimer = null;
+                        if (accessBlocked || fullUpgradeRequested) {
+                            return;
+                        }
+                        if (!isDocumentVisible()) {
+                            scheduleContributionsOnVisible(armTimer);
+                            return;
+                        }
+                        fullUpgradeRequested = true;
+                        fetchIpIntelligence(targetIp, 'full').then(function (fullData) {
+                            if (!fullData || typeof fullData !== 'object') {
+                                return;
+                            }
+                            refreshRenderedBadgesForIp(fullData.ip || targetIp, fullData);
+                            if (ensureBannerAttached()) {
+                                renderContributionsBannerData(fullData);
+                            }
+                        }).catch(function (err) {
+                            console.warn('[proxycheck] Contributions upgrade failed:', err);
+                        });
+                    }, CONTRIB_FULL_TRIGGER_DELAY_MS);
+                }
+                if (isDocumentVisible()) {
+                    armTimer();
+                } else {
+                    scheduleContributionsOnVisible(armTimer);
+                }
+            }
+
+            if (cachedState && cachedState.isFull) {
+                return fetchIpIntelligence(targetIp, 'full').then(function (data) {
+                    clearLoadingInterval();
+                    ipContributionsPending = false;
+                    if (!ensureBannerAttached()) {
+                        return;
+                    }
+                    if (!data) {
+                        renderBannerFailure();
+                        return;
+                    }
+                    renderContributionsBannerData(data);
+                });
+            }
+
+            if (cachedState && cachedState.data) {
+                ipContributionsPending = false;
+                if (ensureBannerAttached()) {
+                    renderContributionsBannerData(cachedState.data);
+                    if (isPartialLightResult(cachedState.data)) {
+                        scheduleFullUpgradeAfterDelay();
+                    }
+                }
+                return null;
+            }
+
             clearLoadingInterval();
             activeLoadingInterval = window.setInterval(function () {
                 if ($result.html() === '.&nbsp;&nbsp;') {
@@ -3445,199 +4100,46 @@
                 }
             }, 300);
 
-            return fetchIpIntelligence(targetIp, 'full').then(function (data) {
-                clearLoadingInterval();
-                ipContributionsPending = false;
-
-                if (!ensureBannerAttached()) {
-                    return;
-                }
-
-                if (!data) {
-                    renderBannerFailure();
-                    return;
-                }
-
-                var isStatsExpanded = false;
-
-                function renderContributionsBannerData(bannerData) {
-                    var risk = evaluateRisk(bannerData);
-                    var resolvedIp = bannerData.ip || targetIp;
-                    var $activeBox = ($box && $box.length > 0) ? $box : $('#proxycheck-pageinfo');
-                    if ($activeBox && $activeBox.length > 0 && $activeBox[0]) {
-                        var bannerTiers = ['high', 'medium', 'nonpublic', 'low'];
-                        for (var t = 0; t < bannerTiers.length; t++) {
-                            removeElementClass($activeBox[0], 'proxycheck-banner-tier-' + bannerTiers[t]);
-                        }
-                        addElementClass($activeBox[0], 'proxycheck-banner-tier-' + risk.riskTier);
-                    }
-
-                    var badgeClass = 'proxycheck-banner-badge proxycheck-tier-' + risk.riskTier;
-
-                    if (risk.isNonPublic) {
-                        $result.empty().append(
-                            $('<span>', {
-                                'class': badgeClass,
-                                text: 'ProxyCheck [' + risk.nonPublicBadgeCode + ']'
-                            }),
-                            $('<span>').html(
-                                ' &middot; <b>Address Type:</b> ' + mw.html.escape(risk.nonPublicReason) +
-                                ' &middot; <b>Status:</b> External threat lookups skipped (non-public or reserved IP)' +
-                                ' &middot; '
-                            ),
-                            $('<a>', {
-                                href: TOOL_BASE_URL + '/?ip=' + encodeURIComponent(resolvedIp),
-                                target: '_blank',
-                                rel: 'noopener noreferrer',
-                                text: 'Full Report ↗'
-                            })
-                        );
+            return new Promise(function (resolve) {
+                ipContributionsDelayTimer = window.setTimeout(function () {
+                    ipContributionsDelayTimer = null;
+                    if (accessBlocked) {
+                        clearLoadingInterval();
+                        ipContributionsPending = false;
+                        resolve(null);
                         return;
                     }
-
-                    var torBannerDesc = formatTorDescription(risk);
-                    var cloudBannerDesc = formatCloudDescription(bannerData);
-                    var verdictBannerText = typeof bannerData.arbitrationVerdict === 'string' && bannerData.arbitrationVerdict.trim()
-                        ? bannerData.arbitrationVerdict.trim()
-                        : '';
-                    var ptrHostname = typeof bannerData.ptrHostname === 'string' ? bannerData.ptrHostname.trim() : '';
-                    var ptrLabel = typeof bannerData.ptrLabel === 'string' ? bannerData.ptrLabel.trim() : '';
-
-                    var $summary = $('<div>', { 'class': 'proxycheck-summary-line' }).append(
-                        $('<span>', {
-                            'class': badgeClass,
-                            text: 'ProxyCheck'
-                        })
-                    );
-
-                    function appendSummaryItem(label, valueNode) {
-                        $summary.append(
-                            document.createTextNode(' \u00b7 '),
-                            $('<b>').text(label + ': '),
-                            valueNode
-                        );
+                    if (!isDocumentVisible()) {
+                        removeUnpopulatedBanner();
+                        ipContributionsPending = false;
+                        registerResumeWhenVisible();
+                        resolve(null);
+                        return;
                     }
-
-                    appendSummaryItem('Prediction', document.createTextNode(risk.predictionTooltip));
-                    if (verdictBannerText) {
-                        appendSummaryItem('Verdict', document.createTextNode(verdictBannerText));
-                    }
-                    appendSummaryItem('Recommended CIDR', document.createTextNode(bannerData.recommendedCidr || 'N/A'));
-                    appendSummaryItem('BGP CIDR', document.createTextNode(bannerData.mmdbCidr || 'N/A'));
-
-                    if (ptrHostname || ptrLabel) {
-                        var $ptrValue = $('<span>');
-                        if (ptrHostname) {
-                            $ptrValue.append($('<code>').text(ptrHostname));
-                            if (ptrLabel) {
-                                $ptrValue.append(document.createTextNode(' '));
-                                $ptrValue.append(
-                                    $('<span>', {
-                                        'class': bannerData.ptrIsHighRisk ? 'proxycheck-ptr-label-risk' : 'proxycheck-ptr-label-normal',
-                                        text: '(' + ptrLabel + ')'
-                                    })
-                                );
-                            }
-                        } else {
-                            $ptrValue.text(ptrLabel);
-                        }
-                        appendSummaryItem('PTR', $ptrValue);
-                    }
-
-                    if (cloudBannerDesc) {
-                        appendSummaryItem('Cloud', document.createTextNode(cloudBannerDesc));
-                    }
-
-                    appendSummaryItem(
-                        'Broadcast IP',
-                        risk.broadcastIp
-                            ? $('<strong>', { 'class': 'proxycheck-banner-warning-text', text: 'At-risk' })
-                            : document.createTextNode('No')
-                    );
-                    appendSummaryItem(
-                        'Tor Node',
-                        risk.isTor
-                            ? $('<strong>', { 'class': 'proxycheck-banner-danger-text', text: torBannerDesc })
-                            : document.createTextNode('No')
-                    );
-
-                    var renderedSpurText = getSpurProxyText();
-                    var $detailsWrapper = $('<div>', {
-                        'class': 'proxycheck-pageinfo-details',
-                        style: isStatsExpanded ? 'display: block;' : 'display: none;'
-                    }).append(buildResultDetailsPanel(bannerData, risk));
-
-                    refreshPageInfoSpur = function () {
-                        var latestSpurText = getSpurProxyText();
-                        if (latestSpurText === renderedSpurText) {
+                    fetchIpIntelligence(targetIp, 'full').then(function (data) {
+                        clearLoadingInterval();
+                        ipContributionsPending = false;
+                        if (!ensureBannerAttached()) {
+                            resolve(null);
                             return;
                         }
-                        renderedSpurText = latestSpurText;
-                        $detailsWrapper.empty().append(buildResultDetailsPanel(bannerData, risk));
-                    };
-
-                    var $statsToggle = $('<a>', {
-                        href: '#',
-                        role: 'button',
-                        'class': 'proxycheck-stats-toggle',
-                        'aria-expanded': isStatsExpanded ? 'true' : 'false',
-                        text: isStatsExpanded ? 'Statistic ▾' : 'Statistic ▸'
-                    });
-
-                    var fullUpgradeRequested = false;
-                    $statsToggle.on('click', function (event) {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        isStatsExpanded = !isStatsExpanded;
-                        $detailsWrapper.css('display', isStatsExpanded ? 'block' : 'none');
-                        $statsToggle.attr('aria-expanded', isStatsExpanded ? 'true' : 'false');
-                        $statsToggle.text(isStatsExpanded ? 'Statistic ▾' : 'Statistic ▸');
-
-                        if (isStatsExpanded && isPartialLightResult(bannerData) && !fullUpgradeRequested) {
-                            fullUpgradeRequested = true;
-                            var $bannerUpgradeNotice = $('<p>', {
-                                'class': 'proxycheck-light-upgrade-notice',
-                                style: 'margin-top: 8px; margin-bottom: 0; font-size: 12px;'
-                            }).text('Loading full commercial provider intelligence...');
-                            $detailsWrapper.append($bannerUpgradeNotice);
-
-                            fetchIpIntelligence(resolvedIp, 'full').then(function (fullData) {
-                                if (!fullData || typeof fullData !== 'object') {
-                                    $bannerUpgradeNotice.text('Full commercial intelligence unavailable right now.');
-                                    return;
-                                }
-                                refreshRenderedBadgesForIp(fullData.ip || resolvedIp, fullData);
-                                if (!ensureBannerAttached()) {
-                                    return;
-                                }
-                                renderContributionsBannerData(fullData);
-                            });
+                        if (!data) {
+                            renderBannerFailure();
+                            resolve(null);
+                            return;
                         }
+                        renderContributionsBannerData(data);
+                        resolve(data);
+                    }).catch(function (err) {
+                        clearLoadingInterval();
+                        ipContributionsPending = false;
+                        console.warn('[proxycheck] Failed to acquire contributions banner data:', err);
+                        if (ensureBannerAttached()) {
+                            renderBannerFailure();
+                        }
+                        resolve(null);
                     });
-
-                    $summary.append(
-                        document.createTextNode(' \u00b7 '),
-                        $('<a>', {
-                            href: TOOL_BASE_URL + '/?ip=' + encodeURIComponent(resolvedIp),
-                            target: '_blank',
-                            rel: 'noopener noreferrer',
-                            text: 'Full Report ↗'
-                        }),
-                        document.createTextNode(' \u00b7 '),
-                        $statsToggle
-                    );
-
-                    $result.empty().append($summary, $detailsWrapper);
-                }
-
-                renderContributionsBannerData(data);
-            }).catch(function (err) {
-                clearLoadingInterval();
-                ipContributionsPending = false;
-                console.warn('[proxycheck] Failed to acquire contributions banner data:', err);
-                if (ensureBannerAttached()) {
-                    renderBannerFailure();
-                }
+                }, CONTRIB_FULL_TRIGGER_DELAY_MS);
             });
         }).catch(function (err) {
             clearLoadingInterval();

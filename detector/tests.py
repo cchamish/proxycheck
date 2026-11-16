@@ -2262,7 +2262,7 @@ class DetectEndpointRoutingAndValidationTests(TestCase):
                 self.assertIn("Invalid IP address format", payload["message"])
 
     def test_toolforge_favicon_endpoints_return_200(self):
-        for path in ("/Toolforge.svg", "/favicon.svg", "/favicon.ico"):
+        for path in ("/Proxycheck.svg", "/favicon.svg", "/favicon.ico"):
             with self.subTest(path=path):
                 response = self.client.get(path)
                 self.assertEqual(response.status_code, 200)
@@ -6147,7 +6147,7 @@ class SpaRoutingTests(SimpleTestCase):
         oauth_miss = self.client.get("/oauth/unknown-step/")
         asset_miss = self.client.get("/assets/missing-bundle.js")
         auth_user = self.client.get("/api/v1/auth/user/")
-        toolforge_svg = self.client.get("/Toolforge.svg")
+        toolforge_svg = self.client.get("/Proxycheck.svg")
         favicon_svg = self.client.get("/favicon.svg")
 
         self.assertEqual(api_miss.status_code, 404)
@@ -6210,7 +6210,7 @@ class AsgiSmokeTests(SimpleTestCase):
                     client.get("/api/v1/auth/user/", headers={"X-Forwarded-Proto": "https"}),
                     client.get("/api/v1/auth/user/", headers={"X-Forwarded-Proto": "https"}),
                     client.get("/api/v1/detect?ip=8.8.8.8", headers={"X-Forwarded-Proto": "https"}),
-                    client.get("/Toolforge.svg", headers={"X-Forwarded-Proto": "https"}),
+                    client.get("/Proxycheck.svg", headers={"X-Forwarded-Proto": "https"}),
                 )
 
         with _run_uvicorn_smoke_server(application) as base_url:

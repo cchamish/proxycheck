@@ -29,8 +29,8 @@ def _read_text_if_exists(file_path: Path) -> Optional[str]:
 
 def _read_favicon_svg(base_dir: Path) -> Optional[bytes]:
     for candidate in (
-        base_dir / "dist" / "Toolforge.svg",
-        base_dir / "src" / "assets" / "Toolforge.svg",
+        base_dir / "dist" / "Proxycheck.svg",
+        base_dir / "src" / "assets" / "Proxycheck.svg",
     ):
         if candidate.is_file():
             return candidate.read_bytes()
@@ -56,7 +56,7 @@ async def spa_index(_request):
 
 
 async def serve_favicon(_request):
-    """Serves the Toolforge SVG icon asynchronously for icon endpoints without blocking ASGI."""
+    """Serves the site SVG icon asynchronously for icon endpoints without blocking ASGI."""
     svg_bytes = await asyncio.to_thread(_read_favicon_svg, Path(settings.BASE_DIR))
     if svg_bytes is None:
         return HttpResponseNotFound()
@@ -74,10 +74,8 @@ async def serve_debug_asset(_request, asset_path: str):
 
 
 urlpatterns = [
-    path("oauth/callback", detector_views.oauth_callback, name="oauth_callback_root"),
-    path("oauth/callback/", detector_views.oauth_callback),
-    path("api/oauth/callback", detector_views.oauth_callback),
-    path("api/oauth/callback/", detector_views.oauth_callback),
+    re_path(r"^oauth/callback/?$", detector_views.oauth_callback, name="oauth_callback_root"),
+    re_path(r"^api/oauth/callback/?$", detector_views.oauth_callback),
     path("api/v1/", include("detector.urls")),
 ]
 
@@ -87,11 +85,11 @@ if settings.DEBUG:
     ]
 
 urlpatterns += [
-    path("Toolforge.svg", serve_favicon),
+    path("Proxycheck.svg", serve_favicon),
     path("favicon.svg", serve_favicon),
     path("favicon.ico", serve_favicon),
     re_path(
-        r"^(?!api/|oauth/|assets/|Toolforge\.svg|favicon\.svg|favicon\.ico).*$",
+        r"^(?!api/|oauth/|assets/|Proxycheck\.svg|favicon\.svg|favicon\.ico).*$",
         spa_index,
         name="spa_index",
     ),

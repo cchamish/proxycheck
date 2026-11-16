@@ -1,5 +1,5 @@
 """
-Response adapters normalizing upstream IP intelligence payloads into a unified schema.
+Response adapters normalising upstream IP intelligence payloads into a unified schema.
 """
 
 import ipaddress
@@ -11,6 +11,8 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from .offline_dbs import PrefixCidrIndex
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,52 @@ def _guard_payload(raw_data: Any, status_code: int) -> Tuple[Optional[Dict[str, 
         "message": f"Unexpected upstream payload type: {type(raw_data).__name__}",
     }
     return error_payload, (502 if status_code == 200 else status_code)
+
+
+_ERROR_STATUS_LABELS: Dict[int, str] = {
+    401: "401 Unauthorised",
+    429: "429 Rate Limited",
+}
+
+
+def _build_error_row(
+    provider: str,
+    status_code: Optional[int] = None,
+    raw_data: Optional[Dict[str, Any]] = None,
+    *,
+    status: Optional[str] = None,
+    usage_type: str = "-",
+    security_flags: Optional[List[Dict[str, Any]]] = None,
+    raw_message: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Builds a standardised adapter error or unconfigured provider row."""
+    if status is not None:
+        resolved_status = status
+    elif status_code is None:
+        resolved_status = "No API Key"
+    else:
+        resolved_status = _ERROR_STATUS_LABELS.get(status_code, f"{status_code} Error")
+
+    resolved_flags = (
+        security_flags if security_flags is not None else [{"label": "No Flags", "isHighRisk": False}]
+    )
+    default_message = "API key not configured" if status_code is None else f"HTTP {status_code}"
+    resolved_raw_json = raw_data if raw_data else {"status": "error", "message": raw_message or default_message}
+
+    return {
+        "provider": provider,
+        "status": resolved_status,
+        "statusCode": status_code,
+        "asn": "-",
+        "isp": "-",
+        "organisation": "-",
+        "location": "-",
+        "usageType": usage_type,
+        "securityFlags": resolved_flags,
+        **(extra or {}),
+        "rawJson": resolved_raw_json,
+    }
 
 
 _HOSTING_GATEWAY_DOMAIN_MARKERS = (
@@ -327,7 +375,7 @@ def _get_django_setting(name: str, default: Any = None) -> Any:
 
         if django_settings.configured:
             return getattr(django_settings, name, default)
-    except Exception:
+    except ImportError, RuntimeError:
         return default
     return default
 
@@ -337,7 +385,7 @@ def _resolve_offline_file(setting_name: str, filenames: Tuple[str, ...]) -> Opti
     base_dir = _get_django_setting("BASE_DIR", Path(__file__).resolve().parent.parent)
     try:
         from proxycheck.settings import resolve_data_file
-    except Exception:
+    except ImportError:
         resolve_data_file = None
 
     if configured:
@@ -442,83 +490,18 @@ def _parse_cloud_cidr_payload(payload: Any, default_provider: str = "Cloud Provi
     return entries
 
 
-class _CloudCidrIndex:
+class _CloudCidrIndex(PrefixCidrIndex[str]):
     """In-memory prefix-bucketed index for fast IPv4 and IPv6 cloud CIDR matching."""
 
-    def __init__(self, entries: Iterable[Tuple[str, str]]) -> None:
-        v4_buckets: Dict[int, Dict[int, Tuple[str, str]]] = {}
-        v6_buckets: Dict[int, Dict[int, Tuple[str, str]]] = {}
-
-        for raw_cidr, provider_name in entries:
-            if not isinstance(raw_cidr, str) or not raw_cidr.strip():
-                continue
-            try:
-                net = ipaddress.ip_network(raw_cidr.strip(), strict=False)
-            except ValueError:
-                continue
-            if net.prefixlen <= 0:
-                continue
-            target_buckets = v4_buckets if net.version == 4 else v6_buckets
-            bucket = target_buckets.setdefault(net.prefixlen, {})
-            net_int = int(net.network_address)
-            if net_int not in bucket:
-                bucket[net_int] = (str(net), provider_name)
-
-        self.v4_prefixes: Tuple[Tuple[int, int, Dict[int, Tuple[str, str]]], ...] = tuple(
-            (
-                prefix_len,
-                ((1 << 32) - 1) ^ ((1 << (32 - prefix_len)) - 1),
-                v4_buckets[prefix_len],
-            )
-            for prefix_len in sorted(v4_buckets.keys(), reverse=True)
-        )
-        self.v6_prefixes: Tuple[Tuple[int, int, Dict[int, Tuple[str, str]]], ...] = tuple(
-            (
-                prefix_len,
-                ((1 << 128) - 1) ^ ((1 << (128 - prefix_len)) - 1),
-                v6_buckets[prefix_len],
-            )
-            for prefix_len in sorted(v6_buckets.keys(), reverse=True)
-        )
-
     def match(self, ip: Optional[str]) -> Optional[Dict[str, Any]]:
-        if not ip or not isinstance(ip, str):
+        hit = self.lookup(ip)
+        if hit is None:
             return None
-        cleaned = ip.strip()
-        if not cleaned:
-            return None
-        if "%" in cleaned and ":" in cleaned:
-            cleaned = cleaned.split("%", 1)[0]
-        try:
-            addr = ipaddress.ip_address(cleaned)
-        except ValueError:
-            return None
-
-        if addr.version == 6:
-            addr_int = int(addr)
-            for prefix_len, mask, bucket in self.v6_prefixes:
-                hit = bucket.get(addr_int & mask)
-                if hit is not None:
-                    return {
-                        "cidr": hit[0],
-                        "prefixLength": prefix_len,
-                        "provider": hit[1],
-                    }
-            mapped_v4 = getattr(addr, "ipv4_mapped", None)
-            if mapped_v4 is None:
-                return None
-            addr = mapped_v4
-
-        addr_int = int(addr)
-        for prefix_len, mask, bucket in self.v4_prefixes:
-            hit = bucket.get(addr_int & mask)
-            if hit is not None:
-                return {
-                    "cidr": hit[0],
-                    "prefixLength": prefix_len,
-                    "provider": hit[1],
-                }
-        return None
+        return {
+            "cidr": hit[0],
+            "prefixLength": hit[1],
+            "provider": hit[2],
+        }
 
 
 _EMPTY_CLOUD_CIDR_INDEX = _CloudCidrIndex(())
@@ -550,7 +533,7 @@ def _get_cloud_cidr_index() -> _CloudCidrIndex:
         raw_payload = json.loads(path.read_text(encoding="utf-8"))
         entries = _parse_cloud_cidr_payload(raw_payload)
         index = _CloudCidrIndex(entries)
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
         logger.warning("Failed to load cloud CIDR data from %s: %s", path, exc)
         return _EMPTY_CLOUD_CIDR_INDEX
 
@@ -683,7 +666,7 @@ def _get_hosting_rules() -> Tuple[Dict[int, str], Optional[re.Pattern[str]]]:
             file_asns, file_keywords = _parse_hosting_rules_payload(raw_payload)
             asn_map.update(file_asns)
             keywords.extend(file_keywords)
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             logger.warning("Failed to load hosting ASN rules from %s: %s", path, exc)
 
     for raw_asn in configured_asns:
@@ -703,7 +686,7 @@ def _get_hosting_rules() -> Tuple[Dict[int, str], Optional[re.Pattern[str]]]:
 
 
 def match_hosting_asn_or_org(asn: Any, org_name: Optional[str]) -> Optional[Dict[str, str]]:
-    """Checks whether an ASN or organization name matches configured or built-in hosting rules."""
+    """Checks whether an ASN or organisation name matches configured or built-in hosting rules."""
     asn_map, keyword_pattern = _get_hosting_rules()
     asn_num = _normalize_asn_number(asn)
     if asn_num is not None and asn_num in asn_map:
@@ -901,38 +884,11 @@ def adapt_cloudflare_radar(
     raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_code: int = 200
 ) -> Dict[str, Any]:
     if not has_api_key:
-        return {
-            "provider": "Cloudflare Radar",
-            "status": "No API Key",
-            "statusCode": None,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [],
-            "rawJson": {"status": "error", "message": "API key not configured"},
-        }
+        return _build_error_row("Cloudflare Radar", security_flags=[])
 
     raw_data, status_code = _guard_payload(raw_data, status_code)
     if status_code != 200 or not raw_data or not raw_data.get("success", False):
-        status_text = (
-            "429 Rate Limited"
-            if status_code == 429
-            else ("401 Unauthorised" if status_code == 401 else f"{status_code} Error")
-        )
-        return {
-            "provider": "Cloudflare Radar",
-            "status": status_text,
-            "statusCode": status_code,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [],
-            "rawJson": raw_data or {"status": "error", "message": f"HTTP {status_code}"},
-        }
+        return _build_error_row("Cloudflare Radar", status_code, raw_data, security_flags=[])
 
     result_obj = raw_data.get("result")
     asn_obj = result_obj.get("asn") if isinstance(result_obj, dict) else None
@@ -959,45 +915,13 @@ def adapt_cloudflare_radar(
 
 
 def adapt_abuseipdb(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_code: int = 200) -> Dict[str, Any]:
+    extra = {"totalReports": None, "numDistinctUsers": None, "lastSeen": None}
     if not has_api_key:
-        return {
-            "provider": "AbuseIPDB",
-            "status": "No API Key",
-            "statusCode": None,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "totalReports": None,
-            "numDistinctUsers": None,
-            "lastSeen": None,
-            "rawJson": {"status": "error", "message": "API key not configured"},
-        }
+        return _build_error_row("AbuseIPDB", extra=extra)
 
     raw_data, status_code = _guard_payload(raw_data, status_code)
     if status_code != 200 or not raw_data or not isinstance(raw_data.get("data"), dict):
-        status_text = (
-            "429 Rate Limited"
-            if status_code == 429
-            else ("401 Unauthorised" if status_code == 401 else f"{status_code} Error")
-        )
-        return {
-            "provider": "AbuseIPDB",
-            "status": status_text,
-            "statusCode": status_code,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "totalReports": None,
-            "numDistinctUsers": None,
-            "lastSeen": None,
-            "rawJson": raw_data or {"status": "error", "message": f"HTTP {status_code}"},
-        }
+        return _build_error_row("AbuseIPDB", status_code, raw_data, extra=extra)
 
     data = raw_data["data"]
     flags: List[Dict[str, Any]] = []
@@ -1041,40 +965,11 @@ def adapt_abuseipdb(raw_data: Optional[Dict[str, Any]], has_api_key: bool, statu
 
 def adapt_ipdata(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_code: int = 200) -> Dict[str, Any]:
     if not has_api_key:
-        return {
-            "provider": "IPData",
-            "status": "No API Key",
-            "statusCode": None,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "carrier": None,
-            "rawJson": {"status": "error", "message": "API key not configured"},
-        }
+        return _build_error_row("IPData", extra={"carrier": None})
 
     raw_data, status_code = _guard_payload(raw_data, status_code)
     if status_code != 200 or not raw_data or "message" in raw_data:
-        status_text = (
-            "429 Rate Limited"
-            if status_code == 429
-            else ("401 Unauthorised" if status_code == 401 else f"{status_code} Error")
-        )
-        return {
-            "provider": "IPData",
-            "status": status_text,
-            "statusCode": status_code,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "carrier": None,
-            "rawJson": raw_data or {"status": "error", "message": f"HTTP {status_code}"},
-        }
+        return _build_error_row("IPData", status_code, raw_data, extra={"carrier": None})
 
     threat = raw_data.get("threat")
     if not isinstance(threat, dict):
@@ -1143,40 +1038,11 @@ def adapt_ipdata(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_c
 
 def adapt_ipregistry(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_code: int = 200) -> Dict[str, Any]:
     if not has_api_key:
-        return {
-            "provider": "IPRegistry",
-            "status": "No API Key",
-            "statusCode": None,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "isMobile": False,
-            "rawJson": {"status": "error", "message": "API key not configured"},
-        }
+        return _build_error_row("IPRegistry", extra={"isMobile": False})
 
     raw_data, status_code = _guard_payload(raw_data, status_code)
     if status_code != 200 or not raw_data or "code" in raw_data:
-        status_text = (
-            "429 Rate Limited"
-            if status_code == 429
-            else ("401 Unauthorised" if status_code == 401 else f"{status_code} Error")
-        )
-        return {
-            "provider": "IPRegistry",
-            "status": status_text,
-            "statusCode": status_code,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "isMobile": False,
-            "rawJson": raw_data or {"status": "error", "message": f"HTTP {status_code}"},
-        }
+        return _build_error_row("IPRegistry", status_code, raw_data, extra={"isMobile": False})
 
     security = raw_data.get("security")
     if not isinstance(security, dict):
@@ -1248,42 +1114,19 @@ def adapt_ipregistry(raw_data: Optional[Dict[str, Any]], has_api_key: bool, stat
 
 def adapt_ip2location(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_code: int = 200) -> Dict[str, Any]:
     if not has_api_key:
-        return {
-            "provider": "IP2Location",
-            "status": "No API Key",
-            "statusCode": None,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "mobileBrand": None,
-            "rawJson": {"status": "error", "message": "API key not configured"},
-        }
+        return _build_error_row("IP2Location", extra={"mobileBrand": None})
 
     raw_data, status_code = _guard_payload(raw_data, status_code)
     if status_code != 200 or not raw_data or "error" in raw_data:
         err_obj = raw_data.get("error", {}) if isinstance(raw_data, dict) else {}
         err_msg = err_obj.get("error_message") if isinstance(err_obj, dict) else None
-        status_text = (
-            "429 Rate Limited"
-            if status_code == 429
-            else ("401 Unauthorised" if status_code == 401 else f"{status_code} Error")
+        return _build_error_row(
+            "IP2Location",
+            status_code,
+            raw_data,
+            raw_message=err_msg,
+            extra={"mobileBrand": None},
         )
-        return {
-            "provider": "IP2Location",
-            "status": status_text,
-            "statusCode": status_code,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "mobileBrand": None,
-            "rawJson": raw_data or {"status": "error", "message": err_msg or f"HTTP {status_code}"},
-        }
 
     proxy_obj = raw_data.get("proxy")
     if not isinstance(proxy_obj, dict):
@@ -1390,35 +1233,17 @@ def adapt_maxmind(
     *,
     ip: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Normalizes combined GeoLite2 and GeoIP2 Country, City, and ASN MMDB records."""
+    """Normalises combined GeoLite2 and GeoIP2 Country, City, and ASN MMDB records."""
     if not has_db:
-        return {
-            "provider": "MaxMind",
-            "status": "Database Missing",
-            "statusCode": None,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "rawJson": {"status": "error", "message": "Local MMDB files not found"},
-        }
+        return _build_error_row(
+            "MaxMind",
+            status="Database Missing",
+            raw_message="Local MMDB files not found",
+        )
 
     raw_data, status_code = _guard_payload(raw_data, status_code)
     if status_code != 200 or not raw_data:
-        return {
-            "provider": "MaxMind",
-            "status": f"{status_code} Error",
-            "statusCode": status_code,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "rawJson": raw_data or {"status": "error", "message": f"HTTP {status_code}"},
-        }
+        return _build_error_row("MaxMind", status_code, raw_data)
 
     asn_val = raw_data.get("autonomous_system_number") or raw_data.get("asn")
     asn_str = f"AS{asn_val}" if asn_val and not str(asn_val).startswith("AS") else (str(asn_val) if asn_val else "-")
@@ -1537,42 +1362,24 @@ def adapt_maxmind(
 def adapt_getipintel(
     raw_data: Optional[Dict[str, Any]], has_contact_email: bool, status_code: int = 200
 ) -> Dict[str, Any]:
-    """Normalizes GetIPIntel probability scores from a unit float to a percentage."""
+    """Normalises GetIPIntel probability scores from a unit float to a percentage."""
     if not has_contact_email:
-        return {
-            "provider": "GetIPIntel",
-            "status": "No API Key",
-            "statusCode": None,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "ML Prediction",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "chance": None,
-            "rawJson": {"status": "error", "message": "GETIPINTEL_CONTACT_EMAIL not configured"},
-        }
+        return _build_error_row(
+            "GetIPIntel",
+            usage_type="ML Prediction",
+            raw_message="GETIPINTEL_CONTACT_EMAIL not configured",
+            extra={"chance": None},
+        )
 
     raw_data, status_code = _guard_payload(raw_data, status_code)
     if status_code != 200 or not raw_data:
-        status_text = (
-            "429 Rate Limited"
-            if status_code == 429
-            else ("401 Unauthorised" if status_code == 401 else f"{status_code} Error")
+        return _build_error_row(
+            "GetIPIntel",
+            status_code,
+            raw_data,
+            usage_type="ML Prediction",
+            extra={"chance": None},
         )
-        return {
-            "provider": "GetIPIntel",
-            "status": status_text,
-            "statusCode": status_code,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "ML Prediction",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "chance": None,
-            "rawJson": raw_data or {"status": "error", "message": f"HTTP {status_code}"},
-        }
 
     try:
         raw_result = float(raw_data.get("result", -1))
@@ -1620,7 +1427,7 @@ def adapt_getipintel(
 
 
 def _normalize_timestamp_or_text(value: Any) -> Optional[str]:
-    """Converts a positive Unix timestamp or non-empty date string to normalized text."""
+    """Converts a positive Unix timestamp or non-empty date string to normalised text."""
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
@@ -1649,44 +1456,18 @@ def _extract_proxycheck_port(value: Any) -> Optional[int]:
 def adapt_proxycheck(
     raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_code: int = 200, ip: str = ""
 ) -> Dict[str, Any]:
-    """Normalizes Proxycheck v2 and v3 responses, handling both IP-keyed and flat payloads."""
+    """Normalises Proxycheck v2 and v3 responses, handling both IP-keyed and flat payloads."""
+    extra = {"port": None, "lastSeen": None}
     if not has_api_key:
-        return {
-            "provider": "Proxycheck",
-            "status": "No API Key",
-            "statusCode": None,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "port": None,
-            "lastSeen": None,
-            "rawJson": {"status": "error", "message": "PROXYCHECK_API_KEY not configured"},
-        }
+        return _build_error_row(
+            "Proxycheck",
+            raw_message="PROXYCHECK_API_KEY not configured",
+            extra=extra,
+        )
 
     raw_data, status_code = _guard_payload(raw_data, status_code)
     if status_code != 200 or not raw_data or str(raw_data.get("status", "")).lower() in ("error", "denied"):
-        status_text = (
-            "429 Rate Limited"
-            if status_code == 429
-            else ("401 Unauthorised" if status_code == 401 else f"{status_code} Error")
-        )
-        return {
-            "provider": "Proxycheck",
-            "status": status_text,
-            "statusCode": status_code,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "port": None,
-            "lastSeen": None,
-            "rawJson": raw_data or {"status": "error", "message": f"HTTP {status_code}"},
-        }
+        return _build_error_row("Proxycheck", status_code, raw_data, extra=extra)
 
     # Proxycheck v2 and v3 responses nest data under the queried IP key or at the top level
     ip_obj = raw_data.get(ip) if (ip and isinstance(raw_data.get(ip), dict)) else None
@@ -1815,21 +1596,13 @@ def adapt_proxycheck(
 
 
 def adapt_iphub(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_code: int = 200) -> Dict[str, Any]:
-    """Normalizes IPHub v2 block classification responses."""
+    """Normalises IPHub v2 block classification responses."""
     if not has_api_key:
-        return {
-            "provider": "IPHub",
-            "status": "No API Key",
-            "statusCode": None,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "block": None,
-            "rawJson": {"status": "error", "message": "IPHUB_API_KEY not configured"},
-        }
+        return _build_error_row(
+            "IPHub",
+            raw_message="IPHUB_API_KEY not configured",
+            extra={"block": None},
+        )
 
     raw_data, status_code = _guard_payload(raw_data, status_code)
     block_val = _safe_int(raw_data.get("block"), default=None) if raw_data else None
@@ -1839,24 +1612,7 @@ def adapt_iphub(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_co
         status_code = 502
 
     if status_code != 200 or not raw_data or "block" not in raw_data:
-        status_text = (
-            "429 Rate Limited"
-            if status_code == 429
-            else ("401 Unauthorised" if status_code == 401 else f"{status_code} Error")
-        )
-        return {
-            "provider": "IPHub",
-            "status": status_text,
-            "statusCode": status_code,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "block": None,
-            "rawJson": raw_data or {"status": "error", "message": f"HTTP {status_code}"},
-        }
+        return _build_error_row("IPHub", status_code, raw_data, extra={"block": None})
 
     flags: List[Dict[str, Any]] = []
     if block_val == 1:
@@ -1891,21 +1647,13 @@ def adapt_iphub(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_co
 
 
 def adapt_iphunter(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_code: int = 200) -> Dict[str, Any]:
-    """Normalizes IPHunter v1 responses."""
+    """Normalises IPHunter v1 responses."""
     if not has_api_key:
-        return {
-            "provider": "IPHunter",
-            "status": "No API Key",
-            "statusCode": None,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "block": None,
-            "rawJson": {"status": "error", "message": "IPHUNTER_API_KEY not configured"},
-        }
+        return _build_error_row(
+            "IPHunter",
+            raw_message="IPHUNTER_API_KEY not configured",
+            extra={"block": None},
+        )
 
     raw_data, status_code = _guard_payload(raw_data, status_code)
     data: Dict[str, Any] = {}
@@ -1923,24 +1671,7 @@ def adapt_iphunter(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status
             status_code = 502
 
     if status_code != 200 or not raw_data or str(raw_data.get("status", "")).lower() == "error":
-        status_text = (
-            "429 Rate Limited"
-            if status_code == 429
-            else ("401 Unauthorised" if status_code == 401 else f"{status_code} Error")
-        )
-        return {
-            "provider": "IPHunter",
-            "status": status_text,
-            "statusCode": status_code,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "block": None,
-            "rawJson": raw_data or {"status": "error", "message": f"HTTP {status_code}"},
-        }
+        return _build_error_row("IPHunter", status_code, raw_data, extra={"block": None})
 
     flags: List[Dict[str, Any]] = []
     if block_val == 1:
@@ -2078,7 +1809,7 @@ def _build_clean_dnsbl_row(provider_name: str, raw_data: Dict[str, Any]) -> Dict
 
 
 def adapt_spamhaus_zen(raw_data: Optional[Dict[str, Any]], status_code: int = 200) -> Dict[str, Any]:
-    """Normalizes Spamhaus ZEN DNSBL A-record responses including SBL, CSS, XBL, PBL and policy blocks."""
+    """Normalises Spamhaus ZEN DNSBL A-record responses including SBL, CSS, XBL, PBL and policy blocks."""
     early_row, payload = _adapt_dnsbl_precheck("Spamhaus ZEN", raw_data, status_code)
     if early_row is not None:
         return early_row
@@ -2161,7 +1892,7 @@ def adapt_spamhaus_zen(raw_data: Optional[Dict[str, Any]], status_code: int = 20
 
 
 def adapt_spamcop(raw_data: Optional[Dict[str, Any]], status_code: int = 200) -> Dict[str, Any]:
-    """Normalizes SpamCop DNSBL A-record responses."""
+    """Normalises SpamCop DNSBL A-record responses."""
     early_row, payload = _adapt_dnsbl_precheck("SpamCop", raw_data, status_code)
     if early_row is not None:
         return early_row
@@ -2244,7 +1975,7 @@ def adapt_tor_onionoo(
     ip: str = "",
 ) -> Dict[str, Any]:
     """
-    Normalizes Tor Project Onionoo summary responses and verifies exact IP membership
+    Normalises Tor Project Onionoo summary responses and verifies exact IP membership
     across OR address (`a` or `or_addresses`) and `exit_addresses` lists.
     """
     raw_data, status_code = _guard_payload(raw_data, status_code)
@@ -2252,29 +1983,19 @@ def adapt_tor_onionoo(
     if status_code != 200 or not raw_data or not isinstance(relays, list):
         if status_code == 200:
             status_code = 502
-        status_text = (
-            "429 Rate Limited"
-            if status_code == 429
-            else ("401 Unauthorised" if status_code == 401 else f"{status_code} Error")
+        return _build_error_row(
+            "Tor Onionoo",
+            status_code,
+            raw_data,
+            extra={
+                "isTor": False,
+                "torIsExit": False,
+                "torRunning": False,
+                "torFlags": [],
+                "torLabel": None,
+                "torSummary": None,
+            },
         )
-        return {
-            "provider": "Tor Onionoo",
-            "status": status_text,
-            "statusCode": status_code,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "isTor": False,
-            "torIsExit": False,
-            "torRunning": False,
-            "torFlags": [],
-            "torLabel": None,
-            "torSummary": None,
-            "rawJson": raw_data or {"status": "error", "message": f"HTTP {status_code}"},
-        }
 
     target_ip = _extract_canonical_ip_from_onionoo_entry(ip)
     active_flags: List[str] = []
@@ -2417,26 +2138,23 @@ def adapt_stopforumspam(
     *,
     has_db: bool = True,
 ) -> Dict[str, Any]:
-    """Normalizes local or API-shaped StopForumSpam IP reputation responses."""
+    """Normalises local or API-shaped StopForumSpam IP reputation responses."""
+    extra = {
+        "appears": False,
+        "blacklisted": False,
+        "toxicCidr": None,
+        "frequency": None,
+        "confidence": None,
+        "lastSeen": None,
+    }
     if not has_db:
-        return {
-            "provider": "StopForumSpam",
-            "status": "Offline DB Missing",
-            "statusCode": None,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "Offline DB Missing",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "appears": False,
-            "blacklisted": False,
-            "toxicCidr": None,
-            "frequency": None,
-            "confidence": None,
-            "lastSeen": None,
-            "rawJson": {"status": "unconfigured", "message": "StopForumSpam offline database files not found"},
-        }
+        return _build_error_row(
+            "StopForumSpam",
+            status="Offline DB Missing",
+            usage_type="Offline DB Missing",
+            raw_data={"status": "unconfigured", "message": "StopForumSpam offline database files not found"},
+            extra=extra,
+        )
 
     raw_data, status_code = _guard_payload(raw_data, status_code)
     has_ip_block = isinstance(raw_data, dict) and isinstance(raw_data.get("ip"), dict)
@@ -2446,29 +2164,7 @@ def adapt_stopforumspam(
     if status_code != 200 or not raw_data or is_explicit_api_error or (success_flag is None and not has_ip_block):
         if status_code == 200:
             status_code = 400 if is_explicit_api_error else 502
-        status_text = (
-            "429 Rate Limited"
-            if status_code == 429
-            else ("401 Unauthorised" if status_code == 401 else f"{status_code} Error")
-        )
-        return {
-            "provider": "StopForumSpam",
-            "status": status_text,
-            "statusCode": status_code,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "appears": False,
-            "blacklisted": False,
-            "toxicCidr": None,
-            "frequency": None,
-            "confidence": None,
-            "lastSeen": None,
-            "rawJson": raw_data or {"status": "error", "message": f"HTTP {status_code}"},
-        }
+        return _build_error_row("StopForumSpam", status_code, raw_data, extra=extra)
 
     ip_block = raw_data.get("ip") if isinstance(raw_data.get("ip"), dict) else {}
     raw_toxic = ip_block.get("toxicCidr") or ip_block.get("toxic_cidr")
@@ -2591,7 +2287,7 @@ def _extract_dshield_threatfeeds(raw_feeds: Any) -> Tuple[List[str], Optional[st
 
 
 def adapt_dshield(raw_data: Optional[Dict[str, Any]], status_code: int = 200) -> Dict[str, Any]:
-    """Normalizes DShield and SANS ISC IP threat intelligence responses."""
+    """Normalises DShield and SANS ISC IP threat intelligence responses."""
     raw_data, status_code = _guard_payload(raw_data, status_code)
 
     ip_block: Optional[Dict[str, Any]] = None
@@ -2604,28 +2300,18 @@ def adapt_dshield(raw_data: Optional[Dict[str, Any]], status_code: int = 200) ->
     if status_code != 200 or not raw_data or "error" in raw_data or ip_block is None:
         if status_code == 200:
             status_code = 502
-        status_text = (
-            "429 Rate Limited"
-            if status_code == 429
-            else ("401 Unauthorised" if status_code == 401 else f"{status_code} Error")
+        return _build_error_row(
+            "DShield",
+            status_code,
+            raw_data,
+            extra={
+                "attacks": None,
+                "count": None,
+                "threatfeeds": [],
+                "maxDate": None,
+                "lastSeen": None,
+            },
         )
-        return {
-            "provider": "DShield",
-            "status": status_text,
-            "statusCode": status_code,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "attacks": None,
-            "count": None,
-            "threatfeeds": [],
-            "maxDate": None,
-            "lastSeen": None,
-            "rawJson": raw_data or {"status": "error", "message": f"HTTP {status_code}"},
-        }
 
     attacks = max(0, _safe_int(ip_block.get("attacks"), default=0) or 0)
     count = max(0, _safe_int(ip_block.get("count"), default=0) or 0)

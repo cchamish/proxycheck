@@ -682,10 +682,12 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         from detector import offline_dbs
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            toxic_file = Path(tmp_dir) / "toxic_ip_cidr.txt"
+            data_dir = Path(tmp_dir) / "data"
+            data_dir.mkdir()
+            toxic_file = data_dir / "toxic_ip_cidr.txt"
             toxic_file.write_text("198.51.100.0/24\n", encoding="utf-8")
             offline_dbs.clear_stopforumspam_caches()
-            with override_settings(STOPFORUMSPAM_DB_DIR=tmp_dir):
+            with override_settings(TOOL_DATA_DIR=tmp_dir):
                 hit_row = asyncio.run(views.query_stopforumspam(None, "198.51.100.5"))
                 clean_row = asyncio.run(views.query_stopforumspam(None, "203.0.113.5"))
             offline_dbs.clear_stopforumspam_caches()
@@ -699,7 +701,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
 
         with tempfile.TemporaryDirectory() as empty_dir:
             offline_dbs.clear_stopforumspam_caches()
-            with override_settings(STOPFORUMSPAM_DB_DIR=empty_dir):
+            with override_settings(TOOL_DATA_DIR=empty_dir):
                 missing_row = asyncio.run(views.query_stopforumspam(None, "198.51.100.5"))
             offline_dbs.clear_stopforumspam_caches()
         self.assertEqual(missing_row["status"], "Offline DB Missing")
@@ -973,14 +975,16 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         from detector import offline_dbs
 
         with tempfile.TemporaryDirectory() as sfs_tmp_dir:
-            (Path(sfs_tmp_dir) / "listed_ip_90_ipv46_all.txt").write_text(
+            sfs_data_dir = Path(sfs_tmp_dir) / "data"
+            sfs_data_dir.mkdir()
+            (sfs_data_dir / "listed_ip_90_ipv46_all.txt").write_text(
                 '"185.220.101.4","25","2026-11-12 09:00:00"\n',
                 encoding="utf-8",
             )
             offline_dbs.clear_stopforumspam_caches()
 
             with (
-                override_settings(**{**TEST_UPSTREAM_SECRETS, "STOPFORUMSPAM_DB_DIR": sfs_tmp_dir}),
+                override_settings(**{**TEST_UPSTREAM_SECRETS, "TOOL_DATA_DIR": sfs_tmp_dir}),
                 patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
                 patch("detector.views.redis_client", mock_redis),
             ):
@@ -1008,7 +1012,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
 
             tor_active_mode["enabled"] = True
             with (
-                override_settings(**{**TEST_UPSTREAM_SECRETS, "STOPFORUMSPAM_DB_DIR": sfs_tmp_dir}),
+                override_settings(**{**TEST_UPSTREAM_SECRETS, "TOOL_DATA_DIR": sfs_tmp_dir}),
                 patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
                 patch("detector.views.redis_client", mock_redis),
             ):

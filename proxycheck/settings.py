@@ -341,25 +341,51 @@ def _expand_configured_path(raw_path: str) -> str:
     return os.path.expanduser(os.path.expandvars(cleaned))
 
 
+def _configured_tool_data_dir(explicit_tool_data_dir: Optional[str] = None) -> str:
+    """Returns the configured TOOL_DATA_DIR from an explicit override, Django settings, or environment."""
+    if explicit_tool_data_dir is not None:
+        return _expand_configured_path(explicit_tool_data_dir)
+    try:
+        from django.conf import settings as django_settings
+
+        if django_settings.configured:
+            setting_val = getattr(django_settings, "TOOL_DATA_DIR", "")
+            if isinstance(setting_val, str) and setting_val.strip():
+                return _expand_configured_path(setting_val)
+    except ImportError, RuntimeError:
+        pass
+    return _expand_configured_path(os.environ.get("TOOL_DATA_DIR", ""))
+
+
+def resolve_tool_data_subdir(tool_data_dir: str) -> Path:
+    """Resolves the persistent offline data subdirectory beneath a configured TOOL_DATA_DIR root."""
+    tool_root = Path(_expand_configured_path(tool_data_dir))
+    legacy_www_data = tool_root / "www" / "python" / "data"
+    if legacy_www_data.is_dir():
+        return legacy_www_data
+    return tool_root / "data"
+
+
 def _standard_data_directories(base_dir: Path | str, *, tool_data_dir: Optional[str] = None) -> list[Path]:
     """Returns local workspace and Toolforge data directories in lookup priority order."""
+    resolved_tool_dir = _configured_tool_data_dir(tool_data_dir)
+    if resolved_tool_dir:
+        expanded_tool_dir = Path(resolved_tool_dir)
+        return [
+            expanded_tool_dir / "www" / "python" / "data",
+            expanded_tool_dir / "data",
+        ]
+
     base_path = Path(str(base_dir))
-    directories = [
+    home_dir = Path.home()
+    return [
         base_path.parent / "data",
         base_path.parent,
         base_path / "data",
         base_path,
+        home_dir / "www" / "python" / "data",
+        home_dir / "data",
     ]
-    raw_tool_dir = os.environ.get("TOOL_DATA_DIR", "") if tool_data_dir is None else tool_data_dir
-    resolved_tool_dir = _expand_configured_path(raw_tool_dir)
-    if resolved_tool_dir:
-        expanded_tool_dir = Path(resolved_tool_dir)
-        directories.append(expanded_tool_dir / "www" / "python" / "data")
-        directories.append(expanded_tool_dir / "data")
-    home_dir = Path.home()
-    directories.append(home_dir / "www" / "python" / "data")
-    directories.append(home_dir / "data")
-    return directories
 
 
 def _find_mmdb_in_directory(directory: Path, filename: str) -> Optional[Path]:
@@ -417,7 +443,11 @@ def resolve_mmdb_file(
             return str(matched)
         return str(configured / filename)
 
-    fallback = default_missing if default_missing is not None else str(Path(str(base_dir)).parent / "data" / filename)
+    resolved_tool_dir = _configured_tool_data_dir()
+    default_dir = (
+        resolve_tool_data_subdir(resolved_tool_dir) if resolved_tool_dir else (Path(str(base_dir)).parent / "data")
+    )
+    fallback = default_missing if default_missing is not None else str(default_dir / filename)
     resolved_direct = resolve_data_file(
         "",
         filename,
@@ -447,13 +477,12 @@ def _resolve_optional_data_path(env_var_name: str, filenames: str | tuple[str, .
     return str(BASE_DIR.parent / "data" / candidate_names[0])
 
 
+TOOL_DATA_DIR = os.environ.get("TOOL_DATA_DIR", "").strip()
 MAXMIND_COUNTRY_DB_FILENAME = "GeoLite2-Country.mmdb"
 MAXMIND_CITY_DB_FILENAME = "GeoLite2-City.mmdb"
 MAXMIND_ASN_DB_FILENAME = "GeoLite2-ASN.mmdb"
-MAXMIND_DB_DIR = os.environ.get("MAXMIND_DB_DIR", "").strip()
 MAXMIND_ACCOUNT_ID = os.environ.get("MAXMIND_ACCOUNT_ID", "").strip()
 MAXMIND_LICENSE_KEY = os.environ.get("MAXMIND_LICENSE_KEY", "").strip()
-STOPFORUMSPAM_DB_DIR = os.environ.get("STOPFORUMSPAM_DB_DIR", "").strip()
 STOPFORUMSPAM_TOXIC_CIDR_PATH = os.environ.get("STOPFORUMSPAM_TOXIC_CIDR_PATH", "").strip()
 STOPFORUMSPAM_LISTED_90_PATH = os.environ.get("STOPFORUMSPAM_LISTED_90_PATH", "").strip()
 STOPFORUMSPAM_LISTED_1_PATH = os.environ.get("STOPFORUMSPAM_LISTED_1_PATH", "").strip()
@@ -463,7 +492,6 @@ OFFLINE_DB_SFS_TOXIC_STALE_SECONDS = _parse_positive_int_env("OFFLINE_DB_SFS_TOX
 OFFLINE_DB_SFS_90_STALE_SECONDS = _parse_positive_int_env("OFFLINE_DB_SFS_90_STALE_SECONDS", 2 * 86400)
 OFFLINE_DB_SFS_1_STALE_SECONDS = _parse_positive_int_env("OFFLINE_DB_SFS_1_STALE_SECONDS", 6 * 3600)
 OFFLINE_DB_RULES_STALE_SECONDS = _parse_positive_int_env("OFFLINE_DB_RULES_STALE_SECONDS", 90 * 86400)
-CLOUD_CIDR_DB_PATH = _resolve_optional_data_path("CLOUD_CIDR_DB_PATH", ("cloud_cidrs.json", "computehosts.json"))
 HOSTING_ASN_RULES_PATH = _resolve_optional_data_path("HOSTING_ASN_RULES_PATH", "hosting_asn_rules.json")
 HOSTING_ASNS = _parse_csv_env("HOSTING_ASNS")
 HOSTING_ORG_KEYWORDS = _parse_csv_env("HOSTING_ORG_KEYWORDS")

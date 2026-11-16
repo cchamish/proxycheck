@@ -25,6 +25,7 @@ from proxycheck.settings import (
     MAXMIND_ASN_DB_FILENAME,
     MAXMIND_CITY_DB_FILENAME,
     MAXMIND_COUNTRY_DB_FILENAME,
+    resolve_tool_data_subdir,
 )
 
 logger = logging.getLogger(__name__)
@@ -194,9 +195,17 @@ def _resolve_sfs_sqlite_path(
     return _base_dir().parent / "data" / SFS_SQLITE_FILENAME
 
 
+def resolve_configured_data_dir() -> str:
+    """Returns the resolved TOOL_DATA_DIR offline data subdirectory, or empty string when unset."""
+    tool_data_dir = _expand_path(_get_setting_or_env("TOOL_DATA_DIR"))
+    if not tool_data_dir:
+        return ""
+    return str(resolve_tool_data_subdir(tool_data_dir))
+
+
 def resolve_stopforumspam_paths() -> Dict[str, Optional[Path]]:
-    """Resolves local StopForumSpam database file paths using configured overrides or standard directories."""
-    configured_dir = _get_setting_or_env("STOPFORUMSPAM_DB_DIR")
+    """Resolves local StopForumSpam database file paths using TOOL_DATA_DIR, per-file overrides, or fallbacks."""
+    configured_dir = resolve_configured_data_dir()
     toxic_cidr = _resolve_sfs_component_path(
         "STOPFORUMSPAM_TOXIC_CIDR_PATH",
         configured_dir,
@@ -221,25 +230,19 @@ def resolve_stopforumspam_paths() -> Dict[str, Optional[Path]]:
     }
 
 
-def resolve_writable_data_dir(explicit_dir: str = "", setting_dir_name: str = "") -> Path:
+def resolve_writable_data_dir(explicit_dir: str = "") -> Path:
     """Resolves the target directory for downloading and updating offline database files."""
     if explicit_dir.strip():
         return Path(_expand_path(explicit_dir))
 
-    if setting_dir_name:
-        configured = _expand_path(_get_setting_or_env(setting_dir_name))
-        if configured:
-            return Path(configured)
+    configured_dir = resolve_configured_data_dir()
+    if configured_dir:
+        return Path(configured_dir)
 
-    tool_data_dir = _expand_path(os.environ.get("TOOL_DATA_DIR", ""))
-    if tool_data_dir:
-        tool_root = Path(tool_data_dir)
-        legacy_www_data = tool_root / "www" / "python" / "data"
-        if legacy_www_data.is_dir():
-            return legacy_www_data
-        return tool_root / "data"
-
-    return _base_dir().parent / "data"
+    base_dir = _base_dir()
+    if base_dir.parent == Path(base_dir.anchor):
+        return Path.home() / "data"
+    return base_dir.parent / "data"
 
 
 def has_any_local_stopforumspam_db() -> bool:
@@ -829,16 +832,40 @@ def clear_stopforumspam_caches() -> None:
 
 
 def resolve_maxmind_paths() -> Dict[str, Path]:
-    """Resolves Country, City, and ASN MMDB paths using configured MAXMIND_DB_DIR or fallbacks."""
+    """Resolves Country, City, and ASN MMDB paths using configured TOOL_DATA_DIR or fallbacks."""
     from proxycheck.settings import resolve_mmdb_file
 
     base_dir = _base_dir()
-    configured_dir = _get_setting_or_env("MAXMIND_DB_DIR")
+    configured_dir = resolve_configured_data_dir()
     return {
         "country": Path(resolve_mmdb_file(configured_dir, MAXMIND_COUNTRY_DB_FILENAME, base_dir)),
         "city": Path(resolve_mmdb_file(configured_dir, MAXMIND_CITY_DB_FILENAME, base_dir)),
         "asn": Path(resolve_mmdb_file(configured_dir, MAXMIND_ASN_DB_FILENAME, base_dir)),
     }
+
+
+def resolve_cloud_cidr_path() -> Tuple[Optional[Path], str]:
+    """Resolves the local cloud provider CIDR file from TOOL_DATA_DIR or standard data directories."""
+    from proxycheck.settings import resolve_data_file
+
+    filenames = ("cloud_cidrs.json", "computehosts.json")
+    configured_dir = resolve_configured_data_dir()
+    if configured_dir:
+        base = Path(configured_dir)
+        for fname in filenames:
+            candidate = base / fname
+            if candidate.is_file():
+                return candidate, candidate.name
+        return None, filenames[0]
+
+    base_dir = _base_dir()
+    for fname in filenames:
+        resolved = resolve_data_file("", fname, base_dir, default_missing="")
+        if resolved:
+            candidate = Path(resolved)
+            if candidate.is_file():
+                return candidate, candidate.name
+    return None, filenames[0]
 
 
 def get_maxmind_newest_mtime_iso() -> Optional[str]:
@@ -1082,9 +1109,7 @@ def collect_offline_databases_status(*, now_dt: Optional[datetime] = None) -> Li
 
     maxmind_paths = resolve_maxmind_paths()
     sfs_paths = resolve_stopforumspam_paths()
-    cloud_cidr_path, cloud_cidr_name = _resolve_rule_file(
-        "CLOUD_CIDR_DB_PATH", ("cloud_cidrs.json", "computehosts.json")
-    )
+    cloud_cidr_path, cloud_cidr_name = resolve_cloud_cidr_path()
     hosting_rules_path, hosting_rules_name = _resolve_rule_file("HOSTING_ASN_RULES_PATH", ("hosting_asn_rules.json",))
 
     return build_offline_database_entries(

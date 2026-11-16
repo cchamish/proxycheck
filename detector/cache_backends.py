@@ -28,6 +28,7 @@ from .offline_dbs import (
     _get_positive_int_setting,
     get_maxmind_newest_mtime_iso,
     get_stopforumspam_db_version,
+    resolve_configured_data_dir,
 )
 from .quota_telemetry import REDIS_KEY_NAMESPACE
 from .sanitization import _sanitize_payload
@@ -297,9 +298,9 @@ _maxmind_any_db_cache: Optional[Tuple[Tuple[Any, ...], float, bool]] = None
 
 
 def _resolve_maxmind_db_paths() -> Dict[str, str]:
-    """Resolves Country, City, and ASN MMDB paths using configured MAXMIND_DB_DIR or fallbacks."""
+    """Resolves Country, City, and ASN MMDB paths using configured TOOL_DATA_DIR or fallbacks."""
     base_dir = getattr(settings, "BASE_DIR", os.getcwd())
-    configured_dir = str(getattr(settings, "MAXMIND_DB_DIR", "") or os.environ.get("MAXMIND_DB_DIR", "")).strip()
+    configured_dir = resolve_configured_data_dir()
     resolve_fn = _views_attr("_resolve_db_file", _resolve_db_file)
     return {key: resolve_fn(configured_dir, filename, base_dir) for key, filename in _MAXMIND_DB_SPECS}
 
@@ -333,8 +334,8 @@ def _has_local_maxmind_city_db() -> bool:
         return bool(city_path and exists_fn(city_path))
 
     base_dir = getattr(settings, "BASE_DIR", os.getcwd())
-    configured_dir = str(getattr(settings, "MAXMIND_DB_DIR", "") or os.environ.get("MAXMIND_DB_DIR", "")).strip()
-    tool_data_dir = os.environ.get("TOOL_DATA_DIR", "").strip()
+    configured_dir = resolve_configured_data_dir()
+    tool_data_dir = str(getattr(settings, "TOOL_DATA_DIR", "") or os.environ.get("TOOL_DATA_DIR", "")).strip()
     cache_key = (configured_dir, str(base_dir), tool_data_dir, exists_fn, resolve_paths_fn, resolve_file_fn)
     now_mono = _views_attr("time", time).monotonic()
     cached = _views_attr("_maxmind_city_db_cache", _maxmind_city_db_cache)
@@ -363,8 +364,8 @@ def _has_any_local_maxmind_db() -> bool:
         return any(path and exists_fn(path) for path in resolve_paths_fn().values())
 
     base_dir = getattr(settings, "BASE_DIR", os.getcwd())
-    configured_dir = str(getattr(settings, "MAXMIND_DB_DIR", "") or os.environ.get("MAXMIND_DB_DIR", "")).strip()
-    tool_data_dir = os.environ.get("TOOL_DATA_DIR", "").strip()
+    configured_dir = resolve_configured_data_dir()
+    tool_data_dir = str(getattr(settings, "TOOL_DATA_DIR", "") or os.environ.get("TOOL_DATA_DIR", "")).strip()
     cache_key = (configured_dir, str(base_dir), tool_data_dir, exists_fn, resolve_paths_fn, resolve_file_fn)
     now_mono = _views_attr("time", time).monotonic()
     cached = _views_attr("_maxmind_any_db_cache", _maxmind_any_db_cache)

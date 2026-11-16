@@ -1223,8 +1223,7 @@ class CheckSetupCommandTests(SimpleTestCase):
                             "DJANGO_SECRET_KEY            your-placeholder-secret\n"
                             "WIKIMEDIA_CLIENT_ID          client-id\n"
                             "WIKIMEDIA_CLIENT_SECRET      client-secret-000001\n"
-                            f"MAXMIND_DB_DIR               {data_dir}\n"
-                            f"STOPFORUMSPAM_DB_DIR         {data_dir}\n"
+                            f"TOOL_DATA_DIR                {workspace}\n"
                         ),
                         stderr="",
                     )
@@ -1256,8 +1255,8 @@ class CheckSetupCommandTests(SimpleTestCase):
 
             output = stdout.getvalue()
             self.assertIn("DJANGO_SECRET_KEY: WEAK / PLACEHOLDER", output)
-            self.assertIn("not required; MAXMIND_DB_DIR and STOPFORUMSPAM_DB_DIR configured", output)
-            self.assertIn("Offline data directory (MAXMIND_DB_DIR, STOPFORUMSPAM_DB_DIR, ~/data): OK", output)
+            self.assertIn("TOOL_DATA_DIR: CONFIGURED", output)
+            self.assertIn("Persistent data directory (TOOL_DATA_DIR): OK", output)
             self.assertIn("NOT ON BASTION NFS", output)
             self.assertIn("update-sfs-db: OK (scheduled: 22 * * * *; Pending for 46m15s)", output)
             self.assertIn("update-maxmind-db: OK (scheduled: 22 5 * * *; Pending for 46m)", output)

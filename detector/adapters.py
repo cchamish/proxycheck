@@ -12,7 +12,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .offline_dbs import PrefixCidrIndex, _get_file_stat_signature
+from .offline_dbs import (
+    PrefixCidrIndex,
+    _get_file_stat_signature,
+    resolve_cloud_cidr_path,
+    resolve_configured_data_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -526,9 +531,9 @@ _EMPTY_CLOUD_CIDR_INDEX = _CloudCidrIndex(())
 def _get_cloud_cidr_index() -> _CloudCidrIndex:
     global _cloud_cidr_cache_key, _cloud_cidr_cache_index
 
-    path = _resolve_offline_file("CLOUD_CIDR_DB_PATH", ("cloud_cidrs.json", "computehosts.json"))
+    path, _ = resolve_cloud_cidr_path()
     if path is None:
-        configured = str(_get_django_setting("CLOUD_CIDR_DB_PATH", "") or "").strip()
+        configured = resolve_configured_data_dir()
         missing_key = (f"__missing__:{configured}", -1)
         with _offline_cache_lock:
             _cloud_cidr_cache_key = missing_key

@@ -87,8 +87,10 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
 
     def test_cloud_cidr_matching_formats_narrowest_prefix_and_ipv6(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            computehosts_file = Path(tmpdir) / "computehosts.json"
-            computehosts_file.write_text(
+            root = Path(tmpdir)
+            list_tool = root / "list_tool"
+            (list_tool / "data").mkdir(parents=True)
+            (list_tool / "data" / "computehosts.json").write_text(
                 json.dumps(
                     [
                         {"range": "52.94.236.0/24", "provider": "aws"},
@@ -98,7 +100,7 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
                 ),
                 encoding="utf-8",
             )
-            with override_settings(CLOUD_CIDR_DB_PATH=str(computehosts_file)):
+            with override_settings(TOOL_DATA_DIR=str(list_tool)):
                 narrow_hit = match_cloud_cidr("52.94.236.70")
                 self.assertEqual(
                     narrow_hit,
@@ -117,8 +119,9 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
                 self.assertIsNone(match_cloud_cidr("8.8.8.8"))
 
             clear_offline_intelligence_caches()
-            aws_file = Path(tmpdir) / "ip-ranges.json"
-            aws_file.write_text(
+            aws_tool = root / "aws_tool"
+            (aws_tool / "data").mkdir(parents=True)
+            (aws_tool / "data" / "cloud_cidrs.json").write_text(
                 json.dumps(
                     {
                         "prefixes": [{"ip_prefix": "3.5.140.0/22", "service": "AMAZON"}],
@@ -127,34 +130,40 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
                 ),
                 encoding="utf-8",
             )
-            with override_settings(CLOUD_CIDR_DB_PATH=str(aws_file)):
+            with override_settings(TOOL_DATA_DIR=str(aws_tool)):
                 self.assertEqual(match_cloud_cidr("3.5.140.5")["provider"], "Amazon AWS")
                 self.assertEqual(match_cloud_cidr("2a05:d014:1::5")["cidr"], "2a05:d014::/40")
 
             clear_offline_intelligence_caches()
-            provider_dict_file = Path(tmpdir) / "provider_cidrs.json"
-            provider_dict_file.write_text(
+            dict_tool = root / "dict_tool"
+            (dict_tool / "data").mkdir(parents=True)
+            (dict_tool / "data" / "cloud_cidrs.json").write_text(
                 json.dumps({"gcp": ["34.64.0.0/16"], "azure": ["20.48.0.0/16"]}),
                 encoding="utf-8",
             )
-            with override_settings(CLOUD_CIDR_DB_PATH=str(provider_dict_file)):
+            with override_settings(TOOL_DATA_DIR=str(dict_tool)):
                 self.assertEqual(match_cloud_cidr("34.64.1.2")["provider"], "Google Cloud")
                 self.assertEqual(match_cloud_cidr("20.48.1.2")["provider"], "Microsoft Azure")
 
             clear_offline_intelligence_caches()
-            broken_file = Path(tmpdir) / "broken.json"
-            broken_file.write_text("{not-valid-json", encoding="utf-8")
-            with override_settings(CLOUD_CIDR_DB_PATH=str(broken_file)):
+            broken_tool = root / "broken_tool"
+            (broken_tool / "data").mkdir(parents=True)
+            (broken_tool / "data" / "cloud_cidrs.json").write_text("{not-valid-json", encoding="utf-8")
+            with override_settings(TOOL_DATA_DIR=str(broken_tool)):
                 self.assertIsNone(match_cloud_cidr("34.64.1.2"))
 
-            with override_settings(CLOUD_CIDR_DB_PATH=str(Path(tmpdir) / "missing.json")):
+            missing_tool = root / "missing_tool"
+            missing_tool.mkdir()
+            with override_settings(TOOL_DATA_DIR=str(missing_tool)):
                 self.assertIsNone(match_cloud_cidr("34.64.1.2"))
 
     def test_cloud_cidr_cache_reloads_when_file_mtime_changes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            cidr_file = Path(tmpdir) / "cloud_cidrs.json"
+            data_dir = Path(tmpdir) / "data"
+            data_dir.mkdir()
+            cidr_file = data_dir / "cloud_cidrs.json"
             cidr_file.write_text(json.dumps({"gcp": ["34.64.0.0/16"]}), encoding="utf-8")
-            with override_settings(CLOUD_CIDR_DB_PATH=str(cidr_file)):
+            with override_settings(TOOL_DATA_DIR=tmpdir):
                 self.assertIsNone(match_cloud_cidr("20.48.1.2"))
 
                 cidr_file.write_text(json.dumps({"azure": ["20.48.0.0/16"]}), encoding="utf-8")
@@ -167,13 +176,15 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
 
     def test_maxmind_geolite2_enrichment_preserves_explicit_geoip2_user_type(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            cidr_file = Path(tmpdir) / "cloud_cidrs.json"
+            data_dir = Path(tmpdir) / "data"
+            data_dir.mkdir()
+            cidr_file = data_dir / "cloud_cidrs.json"
             cidr_file.write_text(
                 json.dumps([{"range": "54.239.28.64/26", "provider": "Amazon AWS"}]),
                 encoding="utf-8",
             )
             with override_settings(
-                CLOUD_CIDR_DB_PATH=str(cidr_file),
+                TOOL_DATA_DIR=tmpdir,
                 HOSTING_ASN_RULES_PATH="",
                 HOSTING_ASNS=(),
                 HOSTING_ORG_KEYWORDS=(),
@@ -213,7 +224,9 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
 
     def test_compute_cidr_attribution_uses_cloud_prefix_rules(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            cidr_file = Path(tmpdir) / "cloud_cidrs.json"
+            data_dir = Path(tmpdir) / "data"
+            data_dir.mkdir()
+            cidr_file = data_dir / "cloud_cidrs.json"
             cidr_file.write_text(
                 json.dumps(
                     {
@@ -223,7 +236,7 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
                 ),
                 encoding="utf-8",
             )
-            with override_settings(CLOUD_CIDR_DB_PATH=str(cidr_file)):
+            with override_settings(TOOL_DATA_DIR=tmpdir):
                 narrow_v4 = compute_cidr_attribution("54.239.28.85")
                 self.assertEqual(narrow_v4["recommendedCidr"], "54.239.28.64/26")
                 self.assertEqual(narrow_v4["defaultCidr"], "54.239.28.0/24")
@@ -248,13 +261,15 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         views._maxmind_readers.clear()
         self.addCleanup(views._maxmind_readers.clear)
         with tempfile.TemporaryDirectory() as tmpdir:
-            cidr_file = Path(tmpdir) / "cloud_cidrs.json"
+            data_dir = Path(tmpdir) / "data"
+            data_dir.mkdir()
+            cidr_file = data_dir / "cloud_cidrs.json"
             cidr_file.write_text(
                 json.dumps([{"range": "54.239.28.64/26", "provider": "Amazon AWS"}]),
                 encoding="utf-8",
             )
-            country_db = Path(tmpdir) / "GeoLite2-Country.mmdb"
-            asn_db = Path(tmpdir) / "GeoLite2-ASN.mmdb"
+            country_db = data_dir / "GeoLite2-Country.mmdb"
+            asn_db = data_dir / "GeoLite2-ASN.mmdb"
             country_db.write_bytes(b"stub")
             asn_db.write_bytes(b"stub")
 
@@ -278,8 +293,7 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
 
             with (
                 override_settings(
-                    MAXMIND_DB_DIR=str(tmpdir),
-                    CLOUD_CIDR_DB_PATH=str(cidr_file),
+                    TOOL_DATA_DIR=str(tmpdir),
                     HOSTING_ASN_RULES_PATH="",
                     HOSTING_ASNS=(),
                     HOSTING_ORG_KEYWORDS=(),
@@ -314,10 +328,8 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         self,
         ip: str,
         db_records: dict[str, tuple[dict, int | None]],
-        *,
-        cidr_path: str = "",
     ) -> dict:
-        """Creates stub MMDB files in one directory and runs _read_maxmind_sync against fake readers."""
+        """Creates stub MMDB files in one TOOL_DATA_DIR/data directory and runs _read_maxmind_sync."""
         views._maxmind_readers.clear()
         self.addCleanup(views._maxmind_readers.clear)
         filename_map = {
@@ -326,9 +338,11 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
             "asn": "GeoLite2-ASN.mmdb",
         }
         with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "data"
+            data_dir.mkdir()
             readers_by_path: dict[str, MagicMock] = {}
             for role, (rec, prefix_len) in db_records.items():
-                db_path = Path(tmpdir) / filename_map[role]
+                db_path = data_dir / filename_map[role]
                 db_path.write_bytes(b"stub")
                 reader = MagicMock()
                 reader.get.return_value = rec
@@ -341,8 +355,7 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
 
             with (
                 override_settings(
-                    MAXMIND_DB_DIR=str(tmpdir),
-                    CLOUD_CIDR_DB_PATH=cidr_path,
+                    TOOL_DATA_DIR=str(tmpdir),
                     HOSTING_ASN_RULES_PATH="",
                     HOSTING_ASNS=(),
                     HOSTING_ORG_KEYWORDS=(),
@@ -463,18 +476,18 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         self.assertEqual(city_only_country_row["location"], "Sydney, New South Wales, Australia (-33.8688, 151.2093)")
         self.assertEqual(city_only_country_row["prefixLength"], 25)
 
-        # Explicit empty MAXMIND_DB_DIR does not fall back to unrelated data directories
+        # Explicit TOOL_DATA_DIR does not fall back to unrelated data directories
         with tempfile.TemporaryDirectory() as tmpdir:
-            tool_root = Path(tmpdir) / "tool"
-            fallback_data = tool_root / "www" / "python" / "data"
+            unrelated_home = Path(tmpdir) / "home"
+            fallback_data = unrelated_home / "data"
             fallback_data.mkdir(parents=True)
             (fallback_data / "GeoLite2-Country.mmdb").write_bytes(b"stub")
-            empty_dir = Path(tmpdir) / "empty_mmdb"
-            empty_dir.mkdir()
+            empty_tool = Path(tmpdir) / "empty_tool"
+            (empty_tool / "data").mkdir(parents=True)
 
             with (
-                override_settings(MAXMIND_DB_DIR=str(empty_dir)),
-                patch.dict(os.environ, {"TOOL_DATA_DIR": str(tool_root)}),
+                override_settings(TOOL_DATA_DIR=str(empty_tool)),
+                patch("pathlib.Path.home", return_value=unrelated_home),
             ):
                 missing_row = views._read_maxmind_sync("1.1.1.1")
             self.assertEqual(missing_row["status"], "Database Missing")
@@ -557,8 +570,7 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
 
             with (
                 override_settings(
-                    MAXMIND_DB_DIR=str(flat_data_dir),
-                    CLOUD_CIDR_DB_PATH="",
+                    TOOL_DATA_DIR=str(tool_root),
                     HOSTING_ASN_RULES_PATH="",
                 ),
                 patch.dict("sys.modules", {"maxminddb": fake_maxmind_module}),
@@ -615,7 +627,8 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         _login_authorised(self)
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            mmdb_dir = Path(tmpdir)
+            mmdb_dir = Path(tmpdir) / "data"
+            mmdb_dir.mkdir()
             for fname in ("GeoLite2-Country.mmdb", "GeoLite2-City.mmdb", "GeoLite2-ASN.mmdb"):
                 (mmdb_dir / fname).write_bytes(b"stub")
 
@@ -643,8 +656,7 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
 
             with (
                 override_settings(
-                    MAXMIND_DB_DIR=str(mmdb_dir),
-                    CLOUD_CIDR_DB_PATH="",
+                    TOOL_DATA_DIR=str(tmpdir),
                     HOSTING_ASN_RULES_PATH="",
                 ),
                 patch.dict("sys.modules", {"maxminddb": fake_maxmind_module}),
@@ -679,7 +691,9 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         self.addCleanup(views._maxmind_reader_stats.clear)
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            country_db = Path(tmpdir) / "GeoLite2-Country.mmdb"
+            data_dir = Path(tmpdir) / "data"
+            data_dir.mkdir()
+            country_db = data_dir / "GeoLite2-Country.mmdb"
             country_db.write_bytes(b"stub")
 
             reader = MagicMock()
@@ -689,8 +703,7 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
 
             with (
                 override_settings(
-                    MAXMIND_DB_DIR=str(tmpdir),
-                    CLOUD_CIDR_DB_PATH="",
+                    TOOL_DATA_DIR=str(tmpdir),
                     HOSTING_ASN_RULES_PATH="",
                     HOSTING_ASNS=(),
                     HOSTING_ORG_KEYWORDS=(),
@@ -729,19 +742,18 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         self.assertFalse(detector_adapters.are_offline_intelligence_caches_warm())
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            empty_mmdb_dir = Path(tmpdir) / "empty_mmdb"
-            empty_mmdb_dir.mkdir()
-            cidr_file = Path(tmpdir) / "cloud_cidrs.json"
+            data_dir = Path(tmpdir) / "data"
+            data_dir.mkdir()
+            cidr_file = data_dir / "cloud_cidrs.json"
             cidr_file.write_text(json.dumps([{"range": "54.239.28.64/26", "provider": "Amazon AWS"}]), encoding="utf-8")
-            rules_file = Path(tmpdir) / "hosting_asn_rules.json"
+            rules_file = data_dir / "hosting_asn_rules.json"
             rules_file.write_text(
                 json.dumps({"hosts": [{"name": "Example Cloud", "asn": 64510}]}),
                 encoding="utf-8",
             )
 
             with override_settings(
-                MAXMIND_DB_DIR=str(empty_mmdb_dir),
-                CLOUD_CIDR_DB_PATH=str(cidr_file),
+                TOOL_DATA_DIR=str(tmpdir),
                 HOSTING_ASN_RULES_PATH=str(rules_file),
                 HOSTING_ASNS=(),
                 HOSTING_ORG_KEYWORDS=(),
@@ -780,9 +792,11 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         initial_cache = (cached_providers, (None, "2026-11-16T00:00:00+00:00"))
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            cidr_file = Path(tmpdir) / "cloud_cidrs.json"
+            data_dir = Path(tmpdir) / "data"
+            data_dir.mkdir()
+            cidr_file = data_dir / "cloud_cidrs.json"
             cidr_file.write_text(json.dumps([{"range": "54.239.28.64/26", "provider": "Amazon AWS"}]), encoding="utf-8")
-            rules_file = Path(tmpdir) / "hosting_asn_rules.json"
+            rules_file = data_dir / "hosting_asn_rules.json"
             rules_file.write_text(json.dumps({"hosts": []}), encoding="utf-8")
 
             original_warm = detector_adapters.warm_offline_intelligence_caches
@@ -808,7 +822,7 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
 
             with (
                 override_settings(
-                    CLOUD_CIDR_DB_PATH=str(cidr_file),
+                    TOOL_DATA_DIR=str(tmpdir),
                     HOSTING_ASN_RULES_PATH=str(rules_file),
                     HOSTING_ASNS=(),
                     HOSTING_ORG_KEYWORDS=(),
@@ -860,10 +874,12 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            city_db = Path(tmpdir) / "GeoLite2-City.mmdb"
+            data_dir = Path(tmpdir) / "data"
+            data_dir.mkdir()
+            city_db = data_dir / "GeoLite2-City.mmdb"
             city_db.write_bytes(b"stub")
 
-            with override_settings(MAXMIND_DB_DIR=str(tmpdir)):
+            with override_settings(TOOL_DATA_DIR=str(tmpdir)):
                 with patch("detector.views.json.loads", wraps=json.loads) as spy_loads:
                     decoded_true = views._decode_cached_provider_entry(raw_loaded_true)
                     self.assertIsNotNone(decoded_true)
@@ -956,7 +972,8 @@ class OfflineStopForumSpamEngineTests(TestCase):
         import zipfile
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir)
+            root = Path(tmp_dir) / "data"
+            root.mkdir()
             (root / "toxic_ip_cidr.txt").write_text(
                 "# Comment line\n192.0.2.0/24\n2001:db8:dead::/48\n",
                 encoding="utf-8",
@@ -974,7 +991,7 @@ class OfflineStopForumSpamEngineTests(TestCase):
                 gz_handle.write('"2001:0db8:cafe:0000:0000:0000:0000:0001","9","2026-11-16 04:00:00"\n')
 
             with (
-                override_settings(STOPFORUMSPAM_DB_DIR=tmp_dir),
+                override_settings(TOOL_DATA_DIR=tmp_dir),
                 patch("detector.views.httpx.AsyncClient") as mock_client,
             ):
                 toxic_row = asyncio.run(views.query_stopforumspam("192.0.2.77"))
@@ -1012,7 +1029,8 @@ class OfflineStopForumSpamEngineTests(TestCase):
         from detector import offline_dbs
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir)
+            root = Path(tmp_dir) / "data"
+            root.mkdir()
             toxic_path = root / "toxic_ip_cidr.txt"
             listed_path = root / "listed_ip_90_ipv46_all.txt"
 
@@ -1032,7 +1050,7 @@ class OfflineStopForumSpamEngineTests(TestCase):
             mock_redis.set = AsyncMock(side_effect=_fake_set)
 
             with (
-                override_settings(STOPFORUMSPAM_DB_DIR=tmp_dir),
+                override_settings(TOOL_DATA_DIR=tmp_dir),
                 patch("detector.views.redis_client", mock_redis),
             ):
                 initial_lookup = offline_dbs.query_stopforumspam_offline("198.51.100.88")
@@ -1194,13 +1212,11 @@ class UpdateOfflineDbsCommandTests(TestCase):
         archives = _build_update_test_archives()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir)
-            sfs_dir = root / "sfs"
-            mm_dir = root / "mm"
-            sfs_dir.mkdir()
-            mm_dir.mkdir()
+            tool_root = Path(tmp_dir) / "tool"
+            data_dir = tool_root / "data"
+            data_dir.mkdir(parents=True)
 
-            existing_90 = sfs_dir / "listed_ip_90_ipv46_all.zip"
+            existing_90 = data_dir / "listed_ip_90_ipv46_all.zip"
             existing_90.write_bytes(archives["old_zip_bytes"])
             downloads_seen = []
 
@@ -1208,7 +1224,9 @@ class UpdateOfflineDbsCommandTests(TestCase):
             with patch.object(
                 update_cmd.httpx, "Client", return_value=_build_fake_update_http_client(archives, downloads_seen)
             ):
-                call_command("update_offline_dbs", sources=["stopforumspam"], sfs_dir=str(sfs_dir), skip_listed_1=True)
+                call_command(
+                    "update_offline_dbs", sources=["stopforumspam"], data_dir=str(data_dir), skip_listed_1=True
+                )
 
             self.assertFalse(any("listed_ip_90_ipv46_all.zip" in u for _, u in downloads_seen))
             self.assertEqual(existing_90.read_bytes(), archives["old_zip_bytes"])
@@ -1226,20 +1244,20 @@ class UpdateOfflineDbsCommandTests(TestCase):
                 call_command(
                     "update_offline_dbs",
                     sources=["stopforumspam"],
-                    sfs_dir=str(sfs_dir),
+                    data_dir=str(data_dir),
                     force=True,
                     skip_listed_1=True,
                 )
             self.assertEqual(existing_90.read_bytes(), archives["old_zip_bytes"])
 
-            # Force full valid SFS + MaxMind update with mocked maxminddb reader validation
+            # Force full valid SFS + MaxMind update into unified TOOL_DATA_DIR with mocked maxminddb reader
             downloads_seen.clear()
             fake_mm_reader = MagicMock()
             with (
                 override_settings(
                     MAXMIND_ACCOUNT_ID="123456",
                     MAXMIND_LICENSE_KEY="secret-mm-key",
-                    STOPFORUMSPAM_DB_DIR=str(sfs_dir),
+                    TOOL_DATA_DIR=str(tool_root),
                 ),
                 patch.object(
                     update_cmd.httpx,
@@ -1252,15 +1270,13 @@ class UpdateOfflineDbsCommandTests(TestCase):
                 call_command(
                     "update_offline_dbs",
                     sources=["stopforumspam", "maxmind"],
-                    sfs_dir=str(sfs_dir),
-                    maxmind_dir=str(mm_dir),
                     force=True,
                 )
 
             self.assertEqual(existing_90.read_bytes(), archives["good_zip_bytes"])
-            self.assertEqual((mm_dir / "GeoLite2-Country.mmdb").read_bytes(), archives["mmdb_bytes"])
-            self.assertTrue((sfs_dir / "stopforumspam.sqlite3").is_file())
-            with override_settings(STOPFORUMSPAM_DB_DIR=str(sfs_dir)):
+            self.assertEqual((data_dir / "GeoLite2-Country.mmdb").read_bytes(), archives["mmdb_bytes"])
+            self.assertTrue((data_dir / "stopforumspam.sqlite3").is_file())
+            with override_settings(TOOL_DATA_DIR=str(tool_root)):
                 offline_dbs.clear_stopforumspam_caches()
                 hit = offline_dbs.query_stopforumspam_offline("198.51.100.12")
                 self.assertTrue(hit["appears"])
@@ -1315,11 +1331,11 @@ class UpdateOfflineDbsCommandTests(TestCase):
         from detector.management.commands import update_offline_dbs as update_cmd
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            target_file = Path(tmp_dir) / "cloud_cidrs.json"
+            target_file = Path(tmp_dir) / "data" / "cloud_cidrs.json"
             clear_offline_intelligence_caches()
 
             with (
-                override_settings(CLOUD_CIDR_DB_PATH=str(target_file)),
+                override_settings(TOOL_DATA_DIR=str(tmp_dir)),
                 patch.object(update_cmd.httpx, "Client", return_value=self._build_cloud_cidr_mock_client()),
             ):
                 call_command("update_offline_dbs", sources=["cloud_cidrs"], force=True)
@@ -1330,7 +1346,7 @@ class UpdateOfflineDbsCommandTests(TestCase):
             self.assertEqual(written["Oracle Cloud"], ["129.146.0.0/16"])
             self.assertEqual(written["Microsoft Azure"], ["20.48.0.0/12"])
 
-            with override_settings(CLOUD_CIDR_DB_PATH=str(target_file)):
+            with override_settings(TOOL_DATA_DIR=str(tmp_dir)):
                 self.assertEqual(match_cloud_cidr("129.146.10.5")["provider"], "Oracle Cloud")
                 self.assertEqual(match_cloud_cidr("20.48.10.5")["provider"], "Microsoft Azure")
 
@@ -1366,3 +1382,54 @@ class UpdateOfflineDbsCommandTests(TestCase):
                 status_entries = {e["key"]: e for e in offline_dbs.collect_offline_databases_status()}
                 self.assertEqual(status_entries["cloud_cidrs"]["status"], "stale")
             clear_offline_intelligence_caches()
+
+    def test_unset_tool_data_dir_fallback_and_invalid_directory_validation(self):
+        import io
+
+        from django.core.management import call_command
+        from django.core.management.base import CommandError
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            project_root = workspace / "proxycheck"
+            project_root.mkdir()
+            expected_default = workspace / "data"
+
+            stdout = io.StringIO()
+            clean_env = {key: val for key, val in os.environ.items() if key != "TOOL_DATA_DIR"}
+            with (
+                override_settings(BASE_DIR=project_root, TOOL_DATA_DIR=""),
+                patch.dict(os.environ, clean_env, clear=True),
+            ):
+                call_command(
+                    "update_offline_dbs",
+                    sources=["stopforumspam"],
+                    dry_run=True,
+                    stdout=stdout,
+                )
+
+            output = stdout.getvalue()
+            self.assertIn("TOOL_DATA_DIR is not set", output)
+            self.assertIn(str(expected_default), output)
+
+            # Reject a non-directory path configured via TOOL_DATA_DIR or --data-dir
+            blocking_file = workspace / "not_a_dir"
+            blocking_file.write_text("occupied", encoding="utf-8")
+            with self.assertRaises(CommandError) as file_exc:
+                call_command(
+                    "update_offline_dbs",
+                    sources=["stopforumspam"],
+                    data_dir=str(blocking_file),
+                    dry_run=True,
+                )
+            self.assertIn("not a directory", str(file_exc.exception))
+
+            with (
+                override_settings(TOOL_DATA_DIR=str(blocking_file)),
+                self.assertRaises(CommandError) as tool_exc,
+            ):
+                call_command(
+                    "update_offline_dbs",
+                    sources=["stopforumspam"],
+                )
+            self.assertIn("not writable", str(tool_exc.exception))

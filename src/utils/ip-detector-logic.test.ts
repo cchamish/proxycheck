@@ -562,16 +562,16 @@ test('formatRelativeUpdatedLabel formats d/h/m relative age, omits zero units, a
   assert.equal(formatRelativeUpdatedLabel(new Date(nowMs - 1 * minuteMs), nowMs), 'Updated 1m ago');
   assert.equal(formatRelativeUpdatedLabel(new Date(nowMs - 59 * minuteMs), nowMs), 'Updated 59m ago');
   assert.equal(formatRelativeUpdatedLabel(new Date(nowMs - 1 * hourMs), nowMs), 'Updated 1h ago');
-  assert.equal(formatRelativeUpdatedLabel(new Date(nowMs - (1 * hourMs + 35 * minuteMs)), nowMs), 'Updated 1h 35m ago');
+  assert.equal(formatRelativeUpdatedLabel(new Date(nowMs - (1 * hourMs + 35 * minuteMs)), nowMs), 'Updated 1h35m ago');
   assert.equal(formatRelativeUpdatedLabel(new Date(nowMs - 1 * dayMs), nowMs), 'Updated 1d ago');
-  assert.equal(formatRelativeUpdatedLabel(new Date(nowMs - (1 * dayMs + 5 * minuteMs)), nowMs), 'Updated 1d 5m ago');
-  assert.equal(formatRelativeUpdatedLabel(new Date(nowMs - (2 * dayMs + 3 * hourMs)), nowMs), 'Updated 2d 3h ago');
+  assert.equal(formatRelativeUpdatedLabel(new Date(nowMs - (1 * dayMs + 5 * minuteMs)), nowMs), 'Updated 1d5m ago');
+  assert.equal(formatRelativeUpdatedLabel(new Date(nowMs - (2 * dayMs + 3 * hourMs)), nowMs), 'Updated 2d3h ago');
   assert.equal(
     formatRelativeUpdatedLabel(new Date(nowMs - (2 * dayMs + 3 * hourMs + 45 * minuteMs)), nowMs),
-    'Updated 2d 3h 45m ago'
+    'Updated 2d3h45m ago'
   );
 
-  assert.equal(formatRelativeUpdatedLabel('2026-11-14T10:15:00+00:00', nowMs), 'Updated 1h 45m ago');
+  assert.equal(formatRelativeUpdatedLabel('2026-11-14T10:15:00+00:00', nowMs), 'Updated 1h45m ago');
   assert.equal(formatRelativeUpdatedLabel('', nowMs), null);
   assert.equal(formatRelativeUpdatedLabel(null, nowMs), null);
   assert.equal(formatRelativeUpdatedLabel('invalid-timestamp', nowMs), null);
@@ -1732,7 +1732,15 @@ test('Offline database helpers format UTC mtime timestamps, byte sizes, and sour
   const fixedNow = Date.parse('2026-11-16T07:00:00Z');
   assert.equal(
     formatOfflineDbTimestamp('2026-11-16T04:00:00+00:00', fixedNow),
-    '2026-11-16 04:00 UTC (3 hours ago)'
+    '2026-11-16 04:00 UTC (3h ago)'
+  );
+  assert.equal(
+    formatOfflineDbTimestamp('2026-11-15T05:45:00+00:00', fixedNow),
+    '2026-11-15 05:45 UTC (1d1h15m ago)'
+  );
+  assert.equal(
+    formatOfflineDbTimestamp('2026-11-16T06:55:00+00:00', fixedNow),
+    '2026-11-16 06:55 UTC (5m ago)'
   );
   assert.equal(
     formatOfflineDbTimestamp('2026-11-16T06:59:45Z', fixedNow),

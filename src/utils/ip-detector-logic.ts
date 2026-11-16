@@ -380,7 +380,28 @@ const MINUTES_PER_DAY = 24 * MINUTES_PER_HOUR;
 const MILLISECONDS_PER_MINUTE = 60_000;
 
 /**
- * Formats an ISO timestamp or Date as a compact relative update label ("Updated 1d 2h 5m ago"
+ * Formats a non-negative minute count as a compact continuous duration ("1d2h5m"),
+ * omitting zero-valued units.
+ */
+function formatCompactDurationFromMinutes(totalMinutes: number): string {
+  const days = Math.floor(totalMinutes / MINUTES_PER_DAY);
+  const hours = Math.floor((totalMinutes % MINUTES_PER_DAY) / MINUTES_PER_HOUR);
+  const minutes = totalMinutes % MINUTES_PER_HOUR;
+
+  const parts = [
+    [days, 'd'],
+    [hours, 'h'],
+    [minutes, 'm'],
+  ] as const;
+
+  return parts
+    .filter(([value]) => value > 0)
+    .map(([value, suffix]) => `${value}${suffix}`)
+    .join('');
+}
+
+/**
+ * Formats an ISO timestamp or Date as a compact relative update label ("Updated 1d2h5m ago"
  * or "Updated just now" under one minute), omitting zero-valued units.
  */
 export function formatRelativeUpdatedLabel(
@@ -415,24 +436,11 @@ export function formatRelativeUpdatedLabel(
   }
 
   const totalMinutes = Math.floor(diffMs / MILLISECONDS_PER_MINUTE);
-  const days = Math.floor(totalMinutes / MINUTES_PER_DAY);
-  const hours = Math.floor((totalMinutes % MINUTES_PER_DAY) / MINUTES_PER_HOUR);
-  const minutes = totalMinutes % MINUTES_PER_HOUR;
-
-  const parts = [
-    [days, 'd'],
-    [hours, 'h'],
-    [minutes, 'm'],
-  ] as const;
-  const formattedParts = parts
-    .filter(([value]) => value > 0)
-    .map(([value, suffix]) => `${value}${suffix}`);
-
-  return `Updated ${formattedParts.join(' ')} ago`;
+  return `Updated ${formatCompactDurationFromMinutes(totalMinutes)} ago`;
 }
 
 /**
- * Formats an offline database mtime ISO timestamp with UTC date-time and human-readable relative age.
+ * Formats an offline database mtime ISO timestamp with UTC date-time and compact relative age.
  */
 export function formatOfflineDbTimestamp(
   lastModifiedIso?: string | null,
@@ -453,18 +461,8 @@ export function formatOfflineDbTimestamp(
       : (typeof ageSeconds === 'number' && Number.isFinite(ageSeconds) ? Math.max(0, Math.floor(ageSeconds)) : 0);
 
   const utcStamp = `${new Date(parsedMs).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
-
-  let relativeText = 'just now';
-  if (computedAge >= 86400) {
-    const days = Math.floor(computedAge / 86400);
-    relativeText = `${days} ${days === 1 ? 'day' : 'days'} ago`;
-  } else if (computedAge >= 3600) {
-    const hours = Math.floor(computedAge / 3600);
-    relativeText = `${hours} ${hours === 1 ? 'hour' : 'hours'} ago`;
-  } else if (computedAge >= 60) {
-    const minutes = Math.floor(computedAge / 60);
-    relativeText = `${minutes} ${minutes === 1 ? 'minute' : 'minutes'} ago`;
-  }
+  const totalMinutes = Math.floor(computedAge / 60);
+  const relativeText = totalMinutes < 1 ? 'just now' : `${formatCompactDurationFromMinutes(totalMinutes)} ago`;
   return `${utcStamp} (${relativeText})`;
 }
 

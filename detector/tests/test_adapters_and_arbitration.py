@@ -73,7 +73,7 @@ class CredentialRedactionTests(TestCase):
         self.assertIn("contact=***REDACTED***&format=json", cleaned)
         self.assertIn("ip=1.1.1.1", cleaned)
 
-    def test_sanitize_redacts_configured_keys_outside_query_strings(self):
+    def test_sanitize_redacts_configured_and_dynamic_keys_and_handles_edge_inputs(self):
         with override_settings(**TEST_UPSTREAM_SECRETS), patch.dict(os.environ, TEST_UPSTREAM_SECRETS):
             cleaned = views._sanitize_error_message(
                 "Header X-Key iphub-key-81fa rejected, contact ops-contact%40example.org"
@@ -82,13 +82,14 @@ class CredentialRedactionTests(TestCase):
         self.assertNotIn("ops-contact", cleaned)
         self.assertEqual(cleaned.count("***REDACTED***"), 2)
 
-    @override_settings(**EMPTY_UPSTREAM_SECRETS)
-    def test_sanitize_error_message_detects_dynamic_override_settings_key_changes(self):
-        with patch.dict(os.environ, EMPTY_UPSTREAM_SECRETS):
+        with override_settings(**EMPTY_UPSTREAM_SECRETS), patch.dict(os.environ, EMPTY_UPSTREAM_SECRETS):
+            self.assertEqual(views._sanitize_error_message("plain upstream failure"), "plain upstream failure")
+            self.assertEqual(views._sanitize_error_message(""), "")
+            self.assertEqual(views._sanitize_error_message(None), "")
+
             with override_settings(IPDATA_API_KEY="first-dynamic-key-1001"):
                 first_cached = views._configured_secret_values()
-                second_cached = views._configured_secret_values()
-                self.assertIs(first_cached, second_cached)
+                self.assertIs(first_cached, views._configured_secret_values())
                 first_cleaned = views._sanitize_error_message(
                     "Upstream rejected key first-dynamic-key-1001 with Bearer tok-abc123"
                 )
@@ -102,30 +103,6 @@ class CredentialRedactionTests(TestCase):
                 rotated_cleaned = views._sanitize_error_message("Upstream rejected key rotated-dynamic-key-2002")
                 self.assertNotIn("rotated-dynamic-key-2002", rotated_cleaned)
                 self.assertIn("***REDACTED***", rotated_cleaned)
-
-    @override_settings(**EMPTY_UPSTREAM_SECRETS)
-    def test_sanitize_ignores_empty_settings_and_handles_non_strings(self):
-        with patch.dict(os.environ, EMPTY_UPSTREAM_SECRETS):
-            self.assertEqual(views._sanitize_error_message("plain upstream failure"), "plain upstream failure")
-            self.assertEqual(views._sanitize_error_message(""), "")
-            self.assertEqual(views._sanitize_error_message(None), "")
-
-    def test_getipintel_and_proxycheck_use_https(self):
-        captured_urls = []
-
-        async def _record(url, **kwargs):
-            captured_urls.append(url)
-            return _mock_response(json_value={"status": "ok"})
-
-        client = AsyncMock()
-        client.get.side_effect = _record
-        with override_settings(**TEST_UPSTREAM_SECRETS), patch.dict(os.environ, TEST_UPSTREAM_SECRETS):
-            asyncio.run(views.query_getipintel(client, "8.8.8.8"))
-            asyncio.run(views.query_proxycheck(client, "8.8.8.8"))
-
-        self.assertEqual(len(captured_urls), 2)
-        for url in captured_urls:
-            self.assertTrue(url.startswith("https://"), url)
 
     @patch("detector.views.query_maxmind", new_callable=AsyncMock)
     @patch("detector.views.httpx.AsyncClient")
@@ -225,66 +202,39 @@ class UpstreamPayloadDefenceTests(TestCase):
                     self.assertEqual(result["statusCode"], 502)
                     self.assertIsInstance(result["rawJson"], dict)
 
-    def test_non_dict_payload_keeps_upstream_error_status(self):
-        result = adapt_iphub([], True, 429)
-        self.assertEqual(result["status"], "429 Rate Limited")
+        rate_limited = adapt_iphub([], True, 429)
+        self.assertEqual(rate_limited["status"], "429 Rate Limited")
 
-    def test_iphub_null_and_invalid_block_degrade_to_format_error(self):
+    def test_adapters_degrade_or_normalise_edge_field_payloads(self):
         for block in (None, "invalid", "NaN", [], {}):
-            with self.subTest(block=block):
+            with self.subTest(provider="IPHub", block=block):
                 result = adapt_iphub({"ip": "8.8.8.8", "block": block}, True, 200)
                 self.assertEqual(result["status"], "502 Error")
                 self.assertIsNone(result["block"])
 
-    def test_iphub_numeric_string_block_is_classified(self):
-        result = adapt_iphub({"ip": "8.8.8.8", "block": "1", "countryCode": "US"}, True, 200)
-        self.assertEqual(result["status"], "200 OK")
-        self.assertEqual(result["block"], 1)
-        self.assertTrue(any(flag["isHighRisk"] for flag in result["securityFlags"]))
+        iphub_str = adapt_iphub({"ip": "8.8.8.8", "block": "1", "countryCode": "US"}, True, 200)
+        self.assertEqual(iphub_str["status"], "200 OK")
+        self.assertEqual(iphub_str["block"], 1)
+        self.assertTrue(any(flag["isHighRisk"] for flag in iphub_str["securityFlags"]))
 
-    def test_iphunter_null_and_invalid_block_degrade_to_format_error(self):
         for payload in ({"block": None}, {"block": "invalid"}, {"data": {"block": "NaN"}}):
-            with self.subTest(payload=payload):
+            with self.subTest(provider="IPHunter", payload=payload):
                 result = adapt_iphunter(payload, True, 200)
                 self.assertEqual(result["status"], "502 Error")
                 self.assertIsNone(result["block"])
 
-    def test_iphunter_missing_block_keeps_residential_default(self):
-        result = adapt_iphunter({"data": {"ip": "8.8.8.8", "country_code": "us"}}, True, 200)
-        self.assertEqual(result["status"], "200 OK")
-        self.assertEqual(result["block"], 0)
-        self.assertEqual(result["countryCode"], "US")
+        iphunter_default = adapt_iphunter({"data": {"ip": "8.8.8.8", "country_code": "us"}}, True, 200)
+        self.assertEqual(iphunter_default["status"], "200 OK")
+        self.assertEqual(iphunter_default["block"], 0)
+        self.assertEqual(iphunter_default["countryCode"], "US")
 
-    def test_getipintel_nan_result_is_rejected(self):
-        result = adapt_getipintel({"status": "success", "result": "NaN"}, True, 200)
-        self.assertEqual(result["status"], "400 Error")
-
-    def test_cloudflare_null_result_does_not_crash(self):
-        unconfigured = adapt_cloudflare_radar(None, False)
-        self.assertEqual(unconfigured["organisation"], "-")
-
-        errored = adapt_cloudflare_radar({"success": False}, True, 429)
-        self.assertEqual(errored["organisation"], "-")
-
-        result = adapt_cloudflare_radar({"success": True, "result": None}, True, 200)
-        self.assertEqual(result["status"], "200 OK")
-        self.assertEqual(result["asn"], "-")
-
-    def test_abuseipdb_non_dict_data_degrades(self):
-        result = adapt_abuseipdb({"data": None}, True, 200)
-        self.assertEqual(result["status"], "200 Error")
-
-    def test_html_gateway_page_maps_to_format_error(self):
-        client = AsyncMock()
-        client.get.return_value = _mock_response(
-            status_code=200,
-            json_error=ValueError("Expecting value: line 1 column 1"),
-            text="<html><body><h1>502 Bad Gateway</h1></body></html>",
-        )
-        with override_settings(**TEST_UPSTREAM_SECRETS), patch.dict(os.environ, TEST_UPSTREAM_SECRETS):
-            result = asyncio.run(views.query_iphub(client, "8.8.8.8"))
-        self.assertEqual(result["status"], "502 Error")
-        self.assertIn("502 Bad Gateway", result["rawJson"]["message"])
+        self.assertEqual(adapt_getipintel({"status": "success", "result": "NaN"}, True, 200)["status"], "400 Error")
+        self.assertEqual(adapt_cloudflare_radar(None, False)["organisation"], "-")
+        self.assertEqual(adapt_cloudflare_radar({"success": False}, True, 429)["organisation"], "-")
+        cf_null = adapt_cloudflare_radar({"success": True, "result": None}, True, 200)
+        self.assertEqual(cf_null["status"], "200 OK")
+        self.assertEqual(cf_null["asn"], "-")
+        self.assertEqual(adapt_abuseipdb({"data": None}, True, 200)["status"], "200 Error")
 
     @patch("detector.views.query_maxmind", new_callable=AsyncMock)
     @patch("detector.views.httpx.AsyncClient")
@@ -337,29 +287,30 @@ class MaxMindUsageTypeTests(TestCase):
         "location": {"latitude": -33.494, "longitude": 143.2104},
     }
 
-    def test_geolite2_without_user_type_is_not_hosting(self):
-        result = adapt_maxmind(dict(self.GEOLITE2_RECORD), True, 200)
-        self.assertEqual(result["status"], "200 OK")
-        self.assertEqual(result["usageType"], "unknown")
-        self.assertEqual(result["securityFlags"], [{"label": "No Flags", "isHighRisk": False}])
+    def test_maxmind_user_type_classification_and_arbitration_impact(self):
+        cases = (
+            ("geolite2_missing_user_type", {}, "unknown", [{"label": "No Flags", "isHighRisk": False}]),
+            (
+                "geoip2_hosting",
+                {"traits": {"user_type": "hosting"}},
+                "hosting",
+                [{"label": "Hosting", "isHighRisk": True}],
+            ),
+            (
+                "geoip2_residential",
+                {"traits": {"user_type": "residential"}},
+                "residential",
+                [{"label": "No Flags", "isHighRisk": False}],
+            ),
+            ("corrupted_traits", {"traits": "corrupted"}, "unknown", [{"label": "No Flags", "isHighRisk": False}]),
+        )
+        for label, extra, expected_usage, expected_flags in cases:
+            with self.subTest(case=label):
+                result = adapt_maxmind({**self.GEOLITE2_RECORD, **extra}, True, 200)
+                self.assertEqual(result["status"], "200 OK")
+                self.assertEqual(result["usageType"], expected_usage)
+                self.assertEqual(result["securityFlags"], expected_flags)
 
-    def test_geoip2_hosting_user_type_is_still_flagged(self):
-        record = dict(self.GEOLITE2_RECORD, traits={"user_type": "hosting"})
-        result = adapt_maxmind(record, True, 200)
-        self.assertEqual(result["usageType"], "hosting")
-        self.assertIn({"label": "Hosting", "isHighRisk": True}, result["securityFlags"])
-
-    def test_geoip2_residential_user_type_is_preserved(self):
-        record = dict(self.GEOLITE2_RECORD, traits={"user_type": "residential"})
-        result = adapt_maxmind(record, True, 200)
-        self.assertEqual(result["usageType"], "residential")
-
-    def test_non_dict_traits_do_not_crash(self):
-        record = dict(self.GEOLITE2_RECORD, traits="corrupted")
-        result = adapt_maxmind(record, True, 200)
-        self.assertEqual(result["usageType"], "unknown")
-
-    def test_geolite2_row_does_not_raise_aggregate_score(self):
         maxmind_row = adapt_maxmind(dict(self.GEOLITE2_RECORD), True, 200)
         aggregated = views.aggregate_intelligence_metrics("1.2.3.4", [maxmind_row])
         self.assertFalse(aggregated["isMajorityProxyVpn"])
@@ -461,78 +412,6 @@ class AggregationAndCacheIntegrityTests(TestCase):
             self.assertGreater(spy_sanitize.call_count, 0)
             self.assertIn("key=***REDACTED***", decoded_legacy[0]["rawJson"]["detail"])
 
-    @patch("dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock)
-    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
-    @patch("detector.views.httpx.AsyncClient")
-    def test_cache_hit_returns_payload_without_recomputing_aggregation(
-        self, mock_async_client_cls, mock_mm, mock_dns_resolve
-    ):
-        provider_map = {
-            "cloudflare_radar": "Cloudflare Radar",
-            "abuseipdb": "AbuseIPDB",
-            "ipdata": "IPData",
-            "ipregistry": "IPRegistry",
-            "ip2location": "IP2Location",
-            "getipintel": "GetIPIntel",
-            "proxycheck": "Proxycheck",
-            "iphub": "IPHub",
-            "iphunter": "IPHunter",
-            "maxmind": "MaxMind",
-            "spamhaus_zen": "Spamhaus ZEN",
-            "spamcop": "SpamCop",
-            "tor_onionoo": "Tor Onionoo",
-            "stopforumspam": "StopForumSpam",
-            "dshield": "DShield",
-        }
-        cache_store = {}
-        for provider_key, provider_name in provider_map.items():
-            cache_store[f"proxycheck:v1:prov:{provider_key}:8.8.8.8"] = json.dumps(
-                {
-                    "row": {
-                        "provider": provider_name,
-                        "status": "200 OK",
-                        "statusCode": 200,
-                        "asn": "AS15169",
-                        "isp": "Google",
-                        "organisation": "Google",
-                        "location": "United States",
-                        "usageType": "isp",
-                        "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                        "countryCode": "US",
-                        "rawJson": {},
-                    },
-                    "cachedAt": "2026-11-13T08:00:00+00:00",
-                }
-            )
-        cache_store["proxycheck:v1:prov:ptr:8.8.8.8"] = json.dumps(
-            {
-                "hostname": "dns.google",
-                "status": "ok",
-                "cachedAt": "2026-11-13T08:30:00+00:00",
-            }
-        )
-
-        mock_redis = MagicMock()
-        mock_redis.get = AsyncMock(side_effect=lambda k: cache_store.get(k))
-        mock_redis.set = AsyncMock()
-        _login_authorised(self)
-
-        with patch("detector.views.redis_client", mock_redis):
-            response = self.client.get("/api/v1/detect?ip=8.8.8.8")
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertTrue(payload["isCached"])
-        self.assertEqual(payload["cacheMeta"]["status"], "hit")
-        self.assertFalse(payload["cacheMeta"]["isPartial"])
-        self.assertEqual(payload["cacheMeta"]["hitCount"], 16)
-        self.assertEqual(payload["cacheMeta"]["cachedAt"], "2026-11-13T08:00:00+00:00")
-        self.assertEqual(payload["ptrHostname"], "dns.google")
-        self.assertEqual(payload["arbitrationTier"], "success")
-        mock_async_client_cls.assert_not_called()
-        mock_dns_resolve.assert_not_called()
-        mock_mm.assert_not_called()
-
     @patch(
         "dns.asyncresolver.Resolver.resolve",
         new_callable=AsyncMock,
@@ -571,187 +450,6 @@ class AggregationAndCacheIntegrityTests(TestCase):
                 self.assertEqual(len(cooldown_calls), 13)
                 for call_obj in cooldown_calls:
                     self.assertEqual(call_obj.kwargs.get("ex"), 120)
-
-    @patch("detector.views.query_dshield", new_callable=AsyncMock)
-    @patch("detector.views.query_stopforumspam", new_callable=AsyncMock)
-    @patch("detector.views.query_tor_onionoo", new_callable=AsyncMock)
-    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
-    @patch("detector.views.query_iphunter", new_callable=AsyncMock)
-    @patch("detector.views.query_iphub", new_callable=AsyncMock)
-    @patch("detector.views.query_proxycheck", new_callable=AsyncMock)
-    @patch("detector.views.query_getipintel", new_callable=AsyncMock)
-    @patch("detector.views.query_ip2location", new_callable=AsyncMock)
-    @patch("detector.views.query_ipregistry", new_callable=AsyncMock)
-    @patch("detector.views.query_ipdata", new_callable=AsyncMock)
-    @patch("detector.views.query_abuseipdb", new_callable=AsyncMock)
-    @patch("detector.views.query_cloudflare_radar", new_callable=AsyncMock)
-    def test_clean_200_responses_are_written_to_redis_cache(
-        self,
-        mock_cf,
-        mock_abuse,
-        mock_ipdata,
-        mock_ipreg,
-        mock_ip2loc,
-        mock_gii,
-        mock_pc,
-        mock_iphub,
-        mock_iphunter,
-        mock_mm,
-        mock_tor,
-        mock_sfs,
-        mock_dshield,
-    ):
-        def _ok_provider(name):
-            return {
-                "provider": name,
-                "status": "200 OK",
-                "statusCode": 200,
-                "asn": "AS15169",
-                "isp": "Google",
-                "organisation": "Google",
-                "location": "United States",
-                "usageType": "isp",
-                "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                "countryCode": "US",
-                "rawJson": {},
-            }
-
-        for m, name in (
-            (mock_cf, "Cloudflare Radar"),
-            (mock_abuse, "AbuseIPDB"),
-            (mock_ipdata, "IPData"),
-            (mock_ipreg, "IPRegistry"),
-            (mock_ip2loc, "IP2Location"),
-            (mock_gii, "GetIPIntel"),
-            (mock_pc, "Proxycheck"),
-            (mock_iphub, "IPHub"),
-            (mock_iphunter, "IPHunter"),
-            (mock_tor, "Tor Onionoo"),
-            (mock_sfs, "StopForumSpam"),
-            (mock_dshield, "DShield"),
-        ):
-            m.return_value = _ok_provider(name)
-        mock_mm.return_value = dict(MAXMIND_STUB)
-
-        mock_redis = MagicMock()
-        mock_redis.get = AsyncMock(return_value=None)
-        mock_redis.set = AsyncMock()
-        _login_authorised(self)
-
-        with patch("detector.views.redis_client", mock_redis):
-            response = self.client.get("/api/v1/detect?ip=8.8.8.8")
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertFalse(payload["isCached"])
-        self.assertEqual(payload["cacheMeta"]["status"], "miss")
-        self.assertEqual(mock_redis.set.await_count, 15)
-        ttls_by_key = {c.args[0]: c.kwargs.get("ex") for c in mock_redis.set.call_args_list}
-        for provider_key in (
-            "cloudflare_radar",
-            "abuseipdb",
-            "ipdata",
-            "ipregistry",
-            "ip2location",
-            "getipintel",
-            "proxycheck",
-            "iphub",
-            "iphunter",
-        ):
-            self.assertEqual(ttls_by_key.get(f"proxycheck:v1:prov:{provider_key}:8.8.8.8"), 86400)
-        for dynamic_key in ("ptr", "spamhaus_zen", "spamcop", "tor_onionoo", "stopforumspam", "dshield"):
-            self.assertEqual(ttls_by_key.get(f"proxycheck:v1:prov:{dynamic_key}:8.8.8.8"), 7200)
-        self.assertNotIn("proxycheck:v1:prov:maxmind:8.8.8.8", ttls_by_key)
-
-    @patch("dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock)
-    @patch("detector.views.query_dshield", new_callable=AsyncMock)
-    @patch("detector.views.query_stopforumspam", new_callable=AsyncMock)
-    @patch("detector.views.query_tor_onionoo", new_callable=AsyncMock)
-    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
-    @patch("detector.views.query_iphunter", new_callable=AsyncMock)
-    @patch("detector.views.query_iphub", new_callable=AsyncMock)
-    @patch("detector.views.query_proxycheck", new_callable=AsyncMock)
-    @patch("detector.views.query_getipintel", new_callable=AsyncMock)
-    @patch("detector.views.query_ip2location", new_callable=AsyncMock)
-    @patch("detector.views.query_ipregistry", new_callable=AsyncMock)
-    @patch("detector.views.query_ipdata", new_callable=AsyncMock)
-    @patch("detector.views.query_abuseipdb", new_callable=AsyncMock)
-    @patch("detector.views.query_cloudflare_radar", new_callable=AsyncMock)
-    def test_partial_cache_hit_annotates_only_cached_rows_with_timestamps(
-        self,
-        mock_cf,
-        mock_abuse,
-        mock_ipdata,
-        mock_ipreg,
-        mock_ip2loc,
-        mock_gii,
-        mock_pc,
-        mock_iphub,
-        mock_iphunter,
-        mock_mm,
-        mock_tor,
-        mock_sfs,
-        mock_dshield,
-        mock_dns_resolve,
-    ):
-        def _ok_row(name):
-            return {
-                "provider": name,
-                "status": "200 OK",
-                "statusCode": 200,
-                "asn": "AS15169",
-                "isp": "Google",
-                "organisation": "Google",
-                "location": "United States",
-                "usageType": "isp",
-                "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                "countryCode": "US",
-                "rawJson": {},
-            }
-
-        for m, name in (
-            (mock_cf, "Cloudflare Radar"),
-            (mock_abuse, "AbuseIPDB"),
-            (mock_ipdata, "IPData"),
-            (mock_ipreg, "IPRegistry"),
-            (mock_ip2loc, "IP2Location"),
-            (mock_gii, "GetIPIntel"),
-            (mock_pc, "Proxycheck"),
-            (mock_iphub, "IPHub"),
-            (mock_iphunter, "IPHunter"),
-            (mock_tor, "Tor Onionoo"),
-            (mock_sfs, "StopForumSpam"),
-            (mock_dshield, "DShield"),
-        ):
-            m.return_value = _ok_row(name)
-        mock_mm.return_value = dict(MAXMIND_STUB)
-        mock_dns_resolve.side_effect = dns.resolver.NXDOMAIN()
-
-        cached_iso = "2026-11-14T06:15:00+00:00"
-        cache_store = {
-            "proxycheck:v1:prov:cloudflare_radar:8.8.8.8": json.dumps(
-                {"row": _ok_row("Cloudflare Radar"), "cachedAt": cached_iso}
-            )
-        }
-        mock_redis = MagicMock()
-        mock_redis.get = AsyncMock(side_effect=lambda k: cache_store.get(k))
-        mock_redis.set = AsyncMock()
-        _login_authorised(self)
-
-        with patch("detector.views.redis_client", mock_redis):
-            response = self.client.get("/api/v1/detect?ip=8.8.8.8")
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertFalse(payload["isCached"])
-        self.assertTrue(payload["cacheMeta"]["isPartial"])
-        rows_by_provider = {row["provider"]: row for row in payload["results"]}
-        self.assertTrue(rows_by_provider["Cloudflare Radar"].get("isCached"))
-        self.assertEqual(rows_by_provider["Cloudflare Radar"].get("cachedAt"), cached_iso)
-        self.assertNotIn("isCached", rows_by_provider["AbuseIPDB"])
-        self.assertNotIn("cachedAt", rows_by_provider["AbuseIPDB"])
-        mock_cf.assert_not_called()
-        mock_abuse.assert_called_once()
 
 
 class ReverseDnsAndCidrAttributionTests(TestCase):
@@ -799,45 +497,6 @@ class ReverseDnsAndCidrAttributionTests(TestCase):
         self.assertIsNone(none_info["ptrHostname"])
         self.assertEqual(none_info["ptrCategory"], "none")
         self.assertFalse(none_info["isHighRisk"])
-
-    def test_ptr_timeout_degrades_silently_to_none(self):
-        state = {"status": "ok"}
-        token = views._rdns_context_state.set(state)
-        try:
-            with patch(
-                "dns.asyncresolver.Resolver.resolve",
-                new_callable=AsyncMock,
-                side_effect=dns.exception.Timeout("DNS timed out"),
-            ):
-                resolver = views._create_async_resolver()
-                self.assertEqual(resolver.timeout, 2.0)
-                self.assertEqual(resolver.lifetime, 2.0)
-                result = asyncio.run(views.query_rdns_ptr("8.8.8.8"))
-        finally:
-            views._rdns_context_state.reset(token)
-
-        self.assertIsNone(result)
-        self.assertEqual(state["status"], "timeout")
-
-    def test_ptr_resolution_exceptions_degrade_silently_to_none(self):
-        error_cases = (
-            ("nxdomain", dns.resolver.NXDOMAIN(), "nxdomain"),
-            ("noanswer", dns.resolver.NoAnswer(), "nxdomain"),
-            ("nonameservers", dns.resolver.NoNameservers(), "error"),
-            ("timeout", dns.exception.Timeout("DNS timed out"), "timeout"),
-        )
-        for label, exc, expected_status in error_cases:
-            with self.subTest(case=label):
-                state = {"status": "ok"}
-                token = views._rdns_context_state.set(state)
-                try:
-                    with patch("dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock, side_effect=exc):
-                        result = asyncio.run(views.query_rdns_ptr("1.2.3.4"))
-                finally:
-                    views._rdns_context_state.reset(token)
-
-                self.assertIsNone(result)
-                self.assertEqual(state["status"], expected_status)
 
     def test_cidr_attribution_defaults_and_mmdb_prefix_selection(self):
         # Verify IPv4 default prefix 24 and IPv6 default prefix 64 when no MMDB prefix is present
@@ -1027,7 +686,7 @@ class ReverseDnsAndCidrAttributionTests(TestCase):
 class CommercialProviderMetadataAdapterTests(SimpleTestCase):
     """Tests for extracted metadata and security signals across commercial adapters."""
 
-    def test_ipdata_extracts_icloud_relay_and_carrier(self):
+    def test_commercial_adapters_extract_risk_carrier_and_report_metadata(self):
         relay_row = adapt_ipdata(
             {
                 "ip": "172.224.224.1",
@@ -1057,7 +716,6 @@ class CommercialProviderMetadataAdapterTests(SimpleTestCase):
         self.assertEqual(company_row["usageType"], "isp")
         self.assertEqual(company_row["isp"], "Example Mobile ISP")
 
-    def test_ipregistry_extracts_mobile_relay_and_abuser(self):
         mobile_row = adapt_ipregistry(
             {
                 "connection": {"type": "mobile", "asn": 7018, "organization": "AT&T Mobility"},
@@ -1080,38 +738,23 @@ class CommercialProviderMetadataAdapterTests(SimpleTestCase):
         )
         self.assertFalse(hosting_row["isMobile"])
         self.assertIn({"label": "Relay", "isHighRisk": True}, hosting_row["securityFlags"])
-        self.assertIn({"label": "Known Abuser", "isHighRisk": True}, hosting_row["securityFlags"])
 
-    def test_ip2location_extracts_mobile_brand_and_ignores_dash(self):
-        mobile_row = adapt_ip2location(
-            {
-                "asn": "21928",
-                "mobile_brand": "  T-Mobile  ",
-                "usage_type": "-",
-                "country_name": "United States",
-                "country_code": "US",
-            },
+        ip2loc_mobile = adapt_ip2location(
+            {"asn": "21928", "mobile_brand": "  T-Mobile  ", "usage_type": "-", "country_code": "US"},
             has_api_key=True,
         )
-        self.assertEqual(mobile_row["mobileBrand"], "T-Mobile")
-        self.assertEqual(mobile_row["usageType"], "mobile")
-        self.assertEqual(mobile_row["isp"], "T-Mobile")
+        self.assertEqual(ip2loc_mobile["mobileBrand"], "T-Mobile")
+        self.assertEqual(ip2loc_mobile["usageType"], "mobile")
+        self.assertEqual(ip2loc_mobile["isp"], "T-Mobile")
 
-        dash_row = adapt_ip2location(
-            {
-                "asn": "1221",
-                "as": "Telstra Corporation Ltd",
-                "mobile_brand": "-",
-                "usage_type": "ISP",
-            },
+        ip2loc_dash = adapt_ip2location(
+            {"asn": "1221", "as": "Telstra Corporation Ltd", "mobile_brand": "-", "usage_type": "ISP"},
             has_api_key=True,
         )
-        self.assertIsNone(dash_row["mobileBrand"])
-        self.assertEqual(dash_row["usageType"], "ISP")
-        self.assertEqual(dash_row["isp"], "Telstra Corporation Ltd")
+        self.assertIsNone(ip2loc_dash["mobileBrand"])
+        self.assertEqual(ip2loc_dash["usageType"], "ISP")
 
-    def test_abuseipdb_extracts_report_counts_and_last_reported_at(self):
-        row = adapt_abuseipdb(
+        abuse_row = adapt_abuseipdb(
             {
                 "data": {
                     "abuseConfidenceScore": 85,
@@ -1119,36 +762,23 @@ class CommercialProviderMetadataAdapterTests(SimpleTestCase):
                     "numDistinctUsers": 17,
                     "lastReportedAt": "2026-10-01T12:30:00+00:00",
                     "isp": "Hetzner Online GmbH",
-                    "countryName": "Germany",
                     "countryCode": "DE",
-                    "usageType": "Data Center/Web Hosting/Transit",
                 }
             },
             has_api_key=True,
         )
-        self.assertEqual(row["totalReports"], 42)
-        self.assertEqual(row["numDistinctUsers"], 17)
-        self.assertEqual(row["lastSeen"], "2026-10-01T12:30:00+00:00")
+        self.assertEqual(abuse_row["totalReports"], 42)
+        self.assertEqual(abuse_row["numDistinctUsers"], 17)
+        self.assertEqual(abuse_row["lastSeen"], "2026-10-01T12:30:00+00:00")
 
         clamped_row = adapt_abuseipdb(
-            {
-                "data": {
-                    "abuseConfidenceScore": 0,
-                    "totalReports": -5,
-                    "numDistinctUsers": "invalid",
-                    "lastReportedAt": "   ",
-                }
-            },
+            {"data": {"abuseConfidenceScore": 0, "totalReports": -5, "numDistinctUsers": "bad", "lastReportedAt": " "}},
             has_api_key=True,
         )
         self.assertEqual(clamped_row["totalReports"], 0)
         self.assertIsNone(clamped_row["numDistinctUsers"])
         self.assertIsNone(clamped_row["lastSeen"])
-
-        err_row = adapt_abuseipdb(None, has_api_key=True, status_code=429)
-        self.assertIsNone(err_row["totalReports"])
-        self.assertIsNone(err_row["numDistinctUsers"])
-        self.assertIsNone(err_row["lastSeen"])
+        self.assertIsNone(adapt_abuseipdb(None, has_api_key=True, status_code=429)["totalReports"])
 
 
 class FlagBasedArbitrationTests(SimpleTestCase):

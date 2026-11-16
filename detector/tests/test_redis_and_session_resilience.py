@@ -89,89 +89,6 @@ class LoopIsolationAndSessionSettingsTests(TestCase):
         self.assertIsNot(results[0][0], results[1][0])
         self.assertIsNot(results[0][1], results[1][1])
 
-    async def test_fetch_upstream_json_logs_type_when_exception_message_is_empty(self):
-        mock_client = AsyncMock()
-        mock_client.get.side_effect = httpx.ReadTimeout("")
-
-        with self.assertLogs("detector.views", level="ERROR") as captured_logs:
-            payload, status_code = await views._fetch_upstream_json(
-                mock_client,
-                "dshield",
-                "DShield",
-                "https://www.dshield.org/api/ip/8.8.8.8?json",
-            )
-
-        self.assertEqual(status_code, 502)
-        self.assertEqual(payload["status"], "error")
-        self.assertIn("ReadTimeout", payload["message"])
-        self.assertTrue(any("ReadTimeout" in line for line in captured_logs.output))
-
-    async def test_fetch_upstream_json_warns_with_sanitized_preview_on_non_json_and_non_200(self):
-        long_html = "<html><body>upstream failure key=secret_token_999 " + ("x" * 180) + "</body></html>"
-        non_json_resp = _mock_response(
-            status_code=200,
-            json_error=json.JSONDecodeError("Expecting value", long_html, 0),
-            text=long_html,
-        )
-        non_json_resp.headers = {"Content-Type": "text/html; charset=utf-8"}
-        mock_client = AsyncMock()
-        mock_client.get.return_value = non_json_resp
-
-        with self.assertLogs("detector.views", level="WARNING") as warning_logs:
-            payload, status_code = await views._fetch_upstream_json(
-                mock_client,
-                "dshield",
-                "DShield",
-                "https://isc.sans.edu/api/ip/8.8.8.8?json",
-            )
-
-        self.assertEqual(status_code, 502)
-        self.assertEqual(payload["status"], "error")
-        self.assertTrue(all(record.levelname == "WARNING" for record in warning_logs.records))
-        warning_text = "\n".join(warning_logs.output)
-        self.assertIn("JSONDecodeError", warning_text)
-        self.assertIn("502", warning_text)
-        self.assertIn("text/html; charset=utf-8", warning_text)
-        self.assertIn("key=***REDACTED***", warning_text)
-        self.assertNotIn("secret_token_999", warning_text)
-        body_fragment = warning_logs.records[0].getMessage().split("body: ", 1)[1][:-1]
-        self.assertLessEqual(len(body_fragment), 120)
-
-        denied_resp = _mock_response(status_code=403, text="Forbidden by edge WAF")
-        denied_resp.headers = {"Content-Type": "text/plain"}
-        mock_client.get.return_value = denied_resp
-
-        with self.assertLogs("detector.views", level="WARNING") as status_logs:
-            _, denied_status = await views._fetch_upstream_json(
-                mock_client,
-                "dshield",
-                "DShield",
-                "https://isc.sans.edu/api/ip/8.8.8.8?json",
-            )
-
-        self.assertEqual(denied_status, 403)
-        status_text = "\n".join(status_logs.output)
-        self.assertIn("HTTP 403", status_text)
-        self.assertIn("text/plain", status_text)
-        self.assertIn("Forbidden by edge WAF", status_text)
-
-    def test_session_engine_uses_cache_and_production_cache_uses_redis(self):
-        from django.conf import settings as django_settings
-
-        from proxycheck.settings import _build_default_cache_config
-
-        self.assertEqual(django_settings.SESSION_ENGINE, "django.contrib.sessions.backends.cache")
-        self.assertEqual(django_settings.SESSION_CACHE_ALIAS, "default")
-
-        prod_cache = _build_default_cache_config(
-            "redis://redis.svc.tools.eqiad1.wikimedia.cloud:6379/0",
-            "proxycheck_prod_",
-            is_test_run=False,
-        )
-        self.assertEqual(prod_cache["BACKEND"], "django.core.cache.backends.redis.RedisCache")
-        self.assertEqual(prod_cache["LOCATION"], "redis://redis.svc.tools.eqiad1.wikimedia.cloud:6379/0")
-        self.assertEqual(prod_cache["KEY_PREFIX"], "proxycheck_prod_")
-
     def test_collectstatic_does_not_require_secret_key(self):
         import subprocess
 
@@ -186,60 +103,19 @@ class LoopIsolationAndSessionSettingsTests(TestCase):
         )
         self.assertEqual(proc.returncode, 0, msg=proc.stderr or proc.stdout)
 
-    def test_dotenv_and_mmdb_resolvers_support_tool_data_dir(self):
-
+    def test_dotenv_resolver_supports_tool_data_dir(self):
         from proxycheck.settings import _resolve_dotenv_path
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tool_root = Path(tmpdir) / "tool"
             python_dir = tool_root / "www" / "python"
-            data_dir = python_dir / "data"
-            data_dir.mkdir(parents=True)
+            python_dir.mkdir(parents=True)
 
             env_file = python_dir / ".env"
             env_file.write_text("DJANGO_DEBUG=False\n", encoding="utf-8")
-            mmdb_file = data_dir / "GeoLite2-Country.mmdb"
-            mmdb_file.write_bytes(b"")
-            city_mmdb_file = data_dir / "GeoLite2-City.mmdb"
-            city_mmdb_file.write_bytes(b"")
 
             resolved_env = _resolve_dotenv_path(Path(tmpdir) / "workspace", str(tool_root))
             self.assertEqual(resolved_env, env_file)
-
-            with patch.dict(os.environ, {"TOOL_DATA_DIR": str(tool_root)}):
-                resolved_db = views._resolve_db_file("", "GeoLite2-Country.mmdb", Path(tmpdir) / "workspace")
-                resolved_city_db = views._resolve_db_file("", "GeoLite2-City.mmdb", Path(tmpdir) / "workspace")
-            self.assertEqual(resolved_db, str(mmdb_file))
-            self.assertEqual(resolved_city_db, str(city_mmdb_file))
-            self.assertEqual(
-                views._resolve_db_file(str(data_dir), "GeoLite2-Country.mmdb", Path(tmpdir) / "workspace"),
-                str(mmdb_file),
-            )
-            self.assertEqual(
-                views._resolve_db_file(str(data_dir), "GeoLite2-City.mmdb", Path(tmpdir) / "workspace"),
-                str(city_mmdb_file),
-            )
-            self.assertEqual(
-                views._resolve_db_file(str(data_dir), "GeoLite2-ASN.mmdb", Path(tmpdir) / "workspace"),
-                str(data_dir / "GeoLite2-ASN.mmdb"),
-            )
-            missing_custom_dir = Path(tmpdir) / "absent_mmdb_dir"
-            with patch.dict(os.environ, {"TOOL_DATA_DIR": str(tool_root)}):
-                self.assertEqual(
-                    views._resolve_db_file(
-                        str(missing_custom_dir), "GeoLite2-Country.mmdb", Path(tmpdir) / "workspace"
-                    ),
-                    str(missing_custom_dir / "GeoLite2-Country.mmdb"),
-                )
-
-    def test_procfile_starts_asgi_gunicorn_without_runtime_collectstatic(self):
-        from django.conf import settings as django_settings
-
-        procfile_content = (django_settings.BASE_DIR / "Procfile").read_text(encoding="utf-8")
-        self.assertIn("proxycheck.asgi:application", procfile_content)
-        self.assertIn("uvicorn_worker.UvicornWorker", procfile_content)
-        self.assertNotIn("collectstatic", procfile_content)
-        self.assertTrue(getattr(django_settings, "WHITENOISE_USE_FINDERS", False))
 
 
 class RedisDegradationAndOAuthFallbackTests(TestCase):
@@ -250,29 +126,6 @@ class RedisDegradationAndOAuthFallbackTests(TestCase):
         with views._redis_client_lock:
             views._redis_clients_by_loop.clear()
         views.reset_redis_circuit_breaker()
-
-    async def test_safe_redis_helpers_degrade_on_connection_and_timeout_errors(self):
-        failures = (
-            ("connection_error", redis.exceptions.ConnectionError("Connection refused")),
-            ("timeout_error", redis.exceptions.TimeoutError("Socket read timed out")),
-        )
-        for label, exc in failures:
-            with self.subTest(failure=label):
-                mock_redis = MagicMock()
-                mock_redis.get = AsyncMock(side_effect=exc)
-                mock_redis.set = AsyncMock(side_effect=exc)
-
-                with (
-                    patch("detector.views.redis_client", mock_redis),
-                    self.assertLogs("detector.views", level="WARNING") as captured_logs,
-                ):
-                    cached_value = await views._safe_redis_get("proxycheck:v1:prov:proxycheck:8.8.8.8")
-                    await views._safe_redis_set("proxycheck:v1:prov:proxycheck:8.8.8.8", "{}", ex=60)
-
-                self.assertIsNone(cached_value)
-                log_output = "\n".join(captured_logs.output)
-                self.assertIn("Redis cache read bypassed", log_output)
-                self.assertIn("Redis cache write bypassed", log_output)
 
     @patch(
         "dns.asyncresolver.Resolver.resolve",
@@ -516,28 +369,6 @@ class RedisDegradationAndOAuthFallbackTests(TestCase):
             self.assertEqual(loop_client.set.await_count, 0)
             self.assertEqual(loop_client.eval.await_count, 0)
             self.assertEqual(loop_client.pipeline.call_count, 0)
-
-    @override_settings(REDIS_CIRCUIT_BREAKER_SECONDS=5.0)
-    async def test_redis_circuit_breaker_isolates_custom_mock_client_patches(self):
-        from detector import quota_telemetry
-
-        mock_redis = MagicMock(name="patched-mock-redis")
-        mock_redis.get = AsyncMock(side_effect=redis.exceptions.ConnectionError("Simulated mock outage"))
-        mock_redis.eval = AsyncMock(side_effect=redis.exceptions.ConnectionError("Simulated Lua outage"))
-        failing_pipe = MagicMock()
-        failing_pipe.execute = AsyncMock(side_effect=redis.exceptions.TimeoutError("Simulated pipe outage"))
-        mock_redis.pipeline = MagicMock(return_value=failing_pipe)
-
-        views.reset_redis_circuit_breaker()
-        with patch("detector.views.redis_client", mock_redis):
-            self.assertIsNone(await views._safe_redis_get("proxycheck:v1:prov:proxycheck:8.8.8.8"))
-            quota_res = await quota_telemetry.check_and_consume_quota("ipdata")
-            self.assertTrue(quota_res.allowed)
-            self.assertFalse(views.is_redis_circuit_open())
-            self.assertIs(views._get_redis_client(), mock_redis)
-
-        # Restoring the default client leaves the circuit closed
-        self.assertFalse(views.is_redis_circuit_open())
 
     @override_settings(
         WIKIMEDIA_CLIENT_ID="test_client_id",

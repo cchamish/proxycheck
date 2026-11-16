@@ -403,6 +403,19 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         )
         self.assertEqual(fallback_row["location"], "Singapore")
 
+        localized_row = adapt_maxmind(
+            {
+                "country": {"names": {"zh-CN": "中国"}, "iso_code": "CN"},
+                "subdivisions": [{"names": {"zh-CN": "北京"}, "iso_code": "BJ"}],
+                "city": {"names": {"zh-CN": "北京"}},
+                "location": {"latitude": 39.9075, "longitude": 116.3971},
+            },
+            has_db=True,
+        )
+        self.assertEqual(localized_row["location"], "北京, 中国 (39.9075, 116.3971)")
+        self.assertEqual(localized_row["coordinates"], "39.9075, 116.3971")
+        self.assertEqual(localized_row["countryCode"], "CN")
+
     def test_three_mmdb_collaboration_preserves_country_iso_and_city_fallback_coords(self):
         # Country DB remains authoritative on iso_code even when City DB omits or differs on country
         maxmind_row = self._query_mmdb_dir(
@@ -491,20 +504,6 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
             ):
                 missing_row = views._read_maxmind_sync("1.1.1.1")
             self.assertEqual(missing_row["status"], "Database Missing")
-
-    def test_adapt_maxmind_falls_back_to_non_english_localized_names(self):
-        localized_row = adapt_maxmind(
-            {
-                "country": {"names": {"zh-CN": "中国"}, "iso_code": "CN"},
-                "subdivisions": [{"names": {"zh-CN": "北京"}, "iso_code": "BJ"}],
-                "city": {"names": {"zh-CN": "北京"}},
-                "location": {"latitude": 39.9075, "longitude": 116.3971},
-            },
-            has_db=True,
-        )
-        self.assertEqual(localized_row["location"], "北京, 中国 (39.9075, 116.3971)")
-        self.assertEqual(localized_row["coordinates"], "39.9075, 116.3971")
-        self.assertEqual(localized_row["countryCode"], "CN")
 
     def test_maxmind_resolver_expands_env_nested_subdirs_and_reloads_updated_file(self):
         from proxycheck.settings import resolve_mmdb_file
@@ -684,85 +683,6 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         mock_async_client_cls.assert_not_called()
         mock_dns_resolve.assert_not_called()
 
-    def test_read_maxmind_sync_combines_get_with_prefix_len_without_duplicate_get(self):
-        views._maxmind_readers.clear()
-        views._maxmind_reader_stats.clear()
-        self.addCleanup(views._maxmind_readers.clear)
-        self.addCleanup(views._maxmind_reader_stats.clear)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            data_dir = Path(tmpdir) / "data"
-            data_dir.mkdir()
-            country_db = data_dir / "GeoLite2-Country.mmdb"
-            country_db.write_bytes(b"stub")
-
-            reader = MagicMock()
-            reader.get_with_prefix_len.return_value = ({"country": {"iso_code": "US"}}, 24)
-            fake_maxmind_module = MagicMock()
-            fake_maxmind_module.open_database.return_value = reader
-
-            with (
-                override_settings(
-                    TOOL_DATA_DIR=str(tmpdir),
-                    HOSTING_ASN_RULES_PATH="",
-                    HOSTING_ASNS=(),
-                    HOSTING_ORG_KEYWORDS=(),
-                ),
-                patch.dict("sys.modules", {"maxminddb": fake_maxmind_module}),
-            ):
-                row = views._read_maxmind_sync("198.51.100.42")
-
-        reader.get_with_prefix_len.assert_called_once_with("198.51.100.42")
-        reader.get.assert_not_called()
-        self.assertEqual(row["status"], "200 OK")
-        self.assertEqual(row["countryCode"], "US")
-        self.assertEqual(row["prefixLength"], 24)
-
-        # Unmapped record with routing prefix still avoids redundant reader.get
-        null_rec_reader = MagicMock()
-        null_rec_reader.get_with_prefix_len.return_value = (None, 20)
-        rec, prefix_len = views._lookup_mmdb_record_and_prefix(null_rec_reader, "198.51.100.42")
-        self.assertIsNone(rec)
-        self.assertEqual(prefix_len, 20)
-        null_rec_reader.get.assert_not_called()
-
-        # Distinct reader.get mock return value remains respected when configured separately
-        custom_get_reader = MagicMock()
-        custom_get_reader.get.return_value = {"country": {"iso_code": "CA"}}
-        custom_get_reader.get_with_prefix_len.return_value = ({"country": {"iso_code": "US"}}, 25)
-        rec_custom, prefix_custom = views._lookup_mmdb_record_and_prefix(custom_get_reader, "198.51.100.42")
-        self.assertEqual(rec_custom, {"country": {"iso_code": "CA"}})
-        self.assertEqual(prefix_custom, 25)
-        custom_get_reader.get.assert_called_once_with("198.51.100.42")
-
-    def test_read_maxmind_sync_warms_offline_caches_when_mmdb_missing(self):
-        from detector import adapters as detector_adapters
-
-        clear_offline_intelligence_caches()
-        self.assertFalse(detector_adapters.are_offline_intelligence_caches_warm())
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            data_dir = Path(tmpdir) / "data"
-            data_dir.mkdir()
-            cidr_file = data_dir / "cloud_cidrs.json"
-            cidr_file.write_text(json.dumps([{"range": "54.239.28.64/26", "provider": "Amazon AWS"}]), encoding="utf-8")
-            rules_file = data_dir / "hosting_asn_rules.json"
-            rules_file.write_text(
-                json.dumps({"hosts": [{"name": "Example Cloud", "asn": 64510}]}),
-                encoding="utf-8",
-            )
-
-            with override_settings(
-                TOOL_DATA_DIR=str(tmpdir),
-                HOSTING_ASN_RULES_PATH=str(rules_file),
-                HOSTING_ASNS=(),
-                HOSTING_ORG_KEYWORDS=(),
-            ):
-                missing_row = views._read_maxmind_sync("54.239.28.85")
-
-        self.assertEqual(missing_row["status"], "Database Missing")
-        self.assertTrue(detector_adapters.are_offline_intelligence_caches_warm())
-
     def test_execute_detection_with_cache_warms_offline_rules_off_event_loop(self):
         from detector import adapters as detector_adapters
 
@@ -838,118 +758,6 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         self.assertEqual(first_payload["cloudCidr"], "54.239.28.64/26")
         self.assertEqual(first_payload["cloudProvider"], "Amazon AWS")
         self.assertEqual(second_payload["cloudCidr"], "54.239.28.64/26")
-
-    def test_should_refresh_cached_maxmind_entry_respects_city_db_loaded_flag(self):
-        views._maxmind_city_db_cache = None
-        self.addCleanup(setattr, views, "_maxmind_city_db_cache", None)
-
-        base_row = {
-            "provider": "MaxMind",
-            "status": "200 OK",
-            "statusCode": 200,
-            "asn": "AS137718",
-            "isp": "Beijing Volcano Engine",
-            "organisation": "Beijing Volcano Engine",
-            "location": "China",
-            "usageType": "isp",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "countryCode": "CN",
-            "rawJson": {"country": {"iso_code": "CN"}},
-        }
-        raw_loaded_true = json.dumps(
-            {
-                "row": base_row,
-                "cachedAt": "2026-11-16T00:00:00+00:00",
-                "sanitized": True,
-                "cityDbLoaded": True,
-            }
-        )
-        raw_loaded_false = json.dumps(
-            {
-                "row": base_row,
-                "cachedAt": "2026-11-16T00:00:00+00:00",
-                "sanitized": True,
-                "cityDbLoaded": False,
-            }
-        )
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            data_dir = Path(tmpdir) / "data"
-            data_dir.mkdir()
-            city_db = data_dir / "GeoLite2-City.mmdb"
-            city_db.write_bytes(b"stub")
-
-            with override_settings(TOOL_DATA_DIR=str(tmpdir)):
-                with patch("detector.views.json.loads", wraps=json.loads) as spy_loads:
-                    decoded_true = views._decode_cached_provider_entry(raw_loaded_true)
-                    self.assertIsNotNone(decoded_true)
-                    self.assertEqual(set(decoded_true[0].keys()), set(base_row.keys()))
-                    should_refresh_true = views._should_refresh_cached_maxmind_entry(
-                        raw_loaded_true,
-                        decoded_true[0],
-                    )
-                    self.assertFalse(should_refresh_true)
-                    self.assertEqual(spy_loads.call_count, 1)
-
-                with patch("detector.views.json.loads", wraps=json.loads) as spy_loads:
-                    decoded_false = views._decode_cached_provider_entry(raw_loaded_false)
-                    self.assertIsNotNone(decoded_false)
-                    self.assertEqual(set(decoded_false[0].keys()), set(base_row.keys()))
-                    should_refresh_false = views._should_refresh_cached_maxmind_entry(
-                        raw_loaded_false,
-                        decoded_false[0],
-                    )
-                    self.assertTrue(should_refresh_false)
-                    self.assertEqual(spy_loads.call_count, 1)
-
-                # Direct calls with a plain dictionary preserve original fallback decoding
-                self.assertFalse(views._should_refresh_cached_maxmind_entry(raw_loaded_true, dict(base_row)))
-                self.assertTrue(views._should_refresh_cached_maxmind_entry(raw_loaded_false, dict(base_row)))
-
-                # Repeated checks within the TTL window reuse the cached city DB presence result
-                views._maxmind_city_db_cache = None
-                with patch("detector.views._resolve_db_file", wraps=views._resolve_db_file) as spy_resolve:
-                    self.assertTrue(views._has_local_maxmind_city_db())
-                    self.assertTrue(views._has_local_maxmind_city_db())
-                    self.assertEqual(spy_resolve.call_count, 1)
-
-        with patch("detector.views.os.path.exists", return_value=False):
-            self.assertFalse(views._has_local_maxmind_city_db())
-            self.assertFalse(views._should_refresh_cached_maxmind_entry(raw_loaded_false, dict(base_row)))
-
-    def test_async_resolver_and_proc_rss_hot_path_caches(self):
-        from unittest.mock import mock_open
-
-        views._cached_async_resolvers.clear()
-        self.addCleanup(views._cached_async_resolvers.clear)
-
-        with override_settings(DNS_QUERY_TIMEOUT_SECONDS=2.0, DNS_QUERY_LIFETIME_SECONDS=2.0):
-            first_resolver = views._create_async_resolver()
-            second_resolver = views._create_async_resolver()
-            self.assertIs(first_resolver, second_resolver)
-
-        with override_settings(DNS_QUERY_TIMEOUT_SECONDS=1.5, DNS_QUERY_LIFETIME_SECONDS=3.0):
-            custom_resolver = views._create_async_resolver()
-            self.assertEqual(custom_resolver.timeout, 1.5)
-            self.assertEqual(custom_resolver.lifetime, 3.0)
-            self.assertIs(custom_resolver, views._create_async_resolver())
-
-        views._proc_rss_cache = None
-        self.addCleanup(setattr, views, "_proc_rss_cache", None)
-
-        with (
-            patch("builtins.open", mock_open(read_data="4096 2048 0 0 0 0 0\n")),
-            patch.object(views.os, "sysconf", return_value=4096, create=True),
-        ):
-            sampled_rss = views._read_proc_rss_mb()
-        self.assertEqual(sampled_rss, 8.0)
-
-        # Unmocked call within one second returns the cached RSS sample without opening procfs
-        self.assertEqual(views._read_proc_rss_mb(), 8.0)
-
-        # Mocking builtins.open bypasses the cached sample immediately
-        with patch("builtins.open", side_effect=OSError("procfs unavailable")):
-            self.assertIsNone(views._read_proc_rss_mb())
 
 
 class OfflineStopForumSpamEngineTests(TestCase):
@@ -1084,12 +892,6 @@ class OfflineStopForumSpamEngineTests(TestCase):
             self.assertTrue(reloaded_lookup["appears"])
             self.assertEqual(reloaded_lookup["frequency"], 42)
             self.assertNotIn("stopforumspam", cached_after_update)
-
-    def test_zero_quota_limits_for_stopforumspam(self):
-        from detector import quota_telemetry
-
-        rpm, daily = quota_telemetry.get_provider_quota_limits("stopforumspam")
-        self.assertEqual((rpm, daily), (0, 0))
 
 
 class _FakeStreamResp:

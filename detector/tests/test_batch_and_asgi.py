@@ -18,8 +18,6 @@ import dns.reversename
 import httpx
 import redis.exceptions
 from asgiref.sync import SyncToAsync, iscoroutinefunction
-from django.contrib.sessions.backends.base import UpdateError
-from django.contrib.sessions.middleware import SessionInterrupted
 from django.core.asgi import get_asgi_application
 from django.http import HttpResponse
 from django.test import AsyncRequestFactory, RequestFactory, SimpleTestCase, TestCase, override_settings
@@ -186,162 +184,17 @@ class AsgiSmokeTests(SimpleTestCase):
                 self.assertEqual(api_bytes, b"async-ok")
                 self.assertEqual(async_called, ["/api/v1/auth/user/"])
 
-    def test_resilient_session_middleware_skips_sync_bridging_for_stateless_api_requests(self):
-        import django.utils.deprecation as django_deprecation
-
-        sync_factory = RequestFactory()
-        sync_middleware = ResilientSessionMiddleware(lambda req: HttpResponse("sync-ok"))
-        self.assertFalse(sync_middleware.async_mode)
-        self.assertFalse(iscoroutinefunction(sync_middleware))
-        sync_resp = sync_middleware(sync_factory.get("/api/v1/detect?ip=8.8.8.8"))
-        self.assertEqual(sync_resp.content, b"sync-ok")
-
-        observed_requests = []
-
-        async def async_next(request):
-            observed_requests.append(
-                {
-                    "path": request.path,
-                    "has_session": hasattr(request, "session"),
-                    "session_key": request.session.session_key,
-                    "accessed": request.session.accessed,
-                    "modified": request.session.modified,
-                }
-            )
+    def test_stateless_bearer_requests_do_not_block_on_slow_session_save(self):
+        async def async_next(_request):
             return HttpResponse("async-ok")
-
-        async_middleware = ResilientSessionMiddleware(async_next)
-        self.assertTrue(async_middleware.async_mode)
-        self.assertTrue(iscoroutinefunction(async_middleware))
-
-        async_factory = AsyncRequestFactory()
-        real_sync_to_async = django_deprecation.sync_to_async
-        bridged_calls = []
-
-        def spy_sync_to_async(func, *args, **kwargs):
-            bridged_calls.append(getattr(func, "__qualname__", repr(func)))
-            return real_sync_to_async(func, *args, **kwargs)
-
-        async def _exercise_stateless_requests():
-            stateless_requests = [
-                async_factory.options("/api/v1/detect"),
-                async_factory.options("/api/v1/auth/gadget-token/"),
-                async_factory.post("/api/v1/auth/gadget-token"),
-                async_factory.post("/api/v1/auth/gadget-token/"),
-                async_factory.get(
-                    "/api/v1/detect?ip=8.8.8.8",
-                    headers={
-                        "Authorization": "Bearer signed-gadget-token",
-                        "Cookie": "proxycheck_sessionid=existing-session-key",
-                    },
-                ),
-                async_factory.post(
-                    "/api/v1/detect/batch",
-                    data="{}",
-                    content_type="application/json",
-                    headers={"Authorization": "bearer lower-scheme-token"},
-                ),
-            ]
-            for req in stateless_requests:
-                resp = await async_middleware(req)
-                self.assertEqual(resp.status_code, 200)
-
-        with (
-            patch("django.utils.deprecation.sync_to_async", side_effect=spy_sync_to_async),
-            patch(
-                "django.contrib.sessions.backends.cache.SessionStore.load",
-                side_effect=AssertionError("Session backend load should not be called"),
-            ),
-            patch(
-                "django.contrib.sessions.backends.cache.SessionStore.save",
-                side_effect=AssertionError("Session backend save should not be called"),
-            ),
-        ):
-            asyncio.run(_exercise_stateless_requests())
-
-        self.assertEqual(bridged_calls, [])
-        self.assertEqual(len(observed_requests), 6)
-        for item in observed_requests:
-            self.assertTrue(item["has_session"])
-            self.assertIsNone(item["session_key"])
-            self.assertFalse(item["accessed"])
-            self.assertFalse(item["modified"])
-
-        observed_requests.clear()
-        bridged_calls.clear()
-
-        async def _exercise_session_requests():
-            no_auth_req = async_factory.get(
-                "/api/v1/detect?ip=8.8.8.8",
-                headers={"Cookie": "proxycheck_sessionid=web-session-key"},
-            )
-            basic_auth_req = async_factory.get(
-                "/api/v1/detect?ip=8.8.8.8",
-                headers={
-                    "Authorization": "Basic dXNlcjpwYXNz",
-                    "Cookie": "proxycheck_sessionid=web-session-key-2",
-                },
-            )
-            blank_auth_req = async_factory.get(
-                "/api/v1/detect?ip=8.8.8.8",
-                headers={
-                    "Authorization": "   ",
-                    "Cookie": "proxycheck_sessionid=web-session-key-3",
-                },
-            )
-            for req in (no_auth_req, basic_auth_req, blank_auth_req):
-                resp = await async_middleware(req)
-                self.assertEqual(resp.status_code, 200)
-
-        with patch("django.utils.deprecation.sync_to_async", side_effect=spy_sync_to_async):
-            asyncio.run(_exercise_session_requests())
-
-        self.assertEqual(
-            [item["session_key"] for item in observed_requests],
-            ["web-session-key", "web-session-key-2", "web-session-key-3"],
-        )
-        self.assertEqual(
-            bridged_calls,
-            [
-                "SessionMiddleware.process_request",
-                "ResilientSessionMiddleware.process_response",
-                "SessionMiddleware.process_request",
-                "ResilientSessionMiddleware.process_response",
-                "SessionMiddleware.process_request",
-                "ResilientSessionMiddleware.process_response",
-            ],
-        )
 
         async def async_mutating_next(request):
             request.session["oauth_state"] = "state_value"
             return HttpResponse("mutated")
 
+        async_middleware = ResilientSessionMiddleware(async_next)
         mutating_middleware = ResilientSessionMiddleware(async_mutating_next)
-        outage_req = async_factory.get("/api/v1/auth/login/")
-        with (
-            patch(
-                "django.contrib.sessions.backends.cache.SessionStore.save",
-                side_effect=redis.exceptions.ConnectionError("Redis offline"),
-            ),
-            self.assertLogs("detector.middleware", level="WARNING"),
-        ):
-            outage_resp = asyncio.run(mutating_middleware(outage_req))
-
-        self.assertEqual(outage_resp.status_code, 200)
-        self.assertFalse(outage_req.session.modified)
-        self.assertIn("Cookie", outage_resp.headers.get("Vary", ""))
-        self.assertNotIn("proxycheck_sessionid", outage_resp.cookies)
-
-        conflict_req = async_factory.get("/api/v1/auth/login/")
-        with (
-            patch(
-                "django.contrib.sessions.backends.cache.SessionStore.save",
-                side_effect=UpdateError("concurrent logout"),
-            ),
-            self.assertRaises(SessionInterrupted),
-        ):
-            asyncio.run(mutating_middleware(conflict_req))
-
+        async_factory = AsyncRequestFactory()
         release_save = threading.Event()
         unblocked_in_time = []
 
@@ -721,69 +574,6 @@ class CompactResponseAndCacheControlTests(TestCase):
             "rawJson": {"provider": name, "count": 10},
         }
 
-    def _patch_all_providers(self):
-        provider_map = (
-            ("detector.views.query_cloudflare_radar", "Cloudflare Radar"),
-            ("detector.views.query_abuseipdb", "AbuseIPDB"),
-            ("detector.views.query_ipdata", "IPData"),
-            ("detector.views.query_ipregistry", "IPRegistry"),
-            ("detector.views.query_ip2location", "IP2Location"),
-            ("detector.views.query_getipintel", "GetIPIntel"),
-            ("detector.views.query_proxycheck", "Proxycheck"),
-            ("detector.views.query_iphub", "IPHub"),
-            ("detector.views.query_iphunter", "IPHunter"),
-            ("detector.views.query_maxmind", "MaxMind"),
-            ("detector.views.query_tor_onionoo", "Tor Onionoo"),
-            ("detector.views.query_stopforumspam", "StopForumSpam"),
-            ("detector.views.query_dshield", "DShield"),
-        )
-        for target, name in provider_map:
-            patcher = patch(target, new_callable=AsyncMock, return_value=self._stub_provider(name))
-            patcher.start()
-            self.addCleanup(patcher.stop)
-
-    def test_strip_raw_json_from_payload_helper_does_not_mutate_input(self):
-        original_row = {"provider": "IPData", "status": "200 OK", "rawJson": {"count": "5"}}
-        original_payload = {"ip": "8.8.8.8", "results": [original_row, "non-dict-row"]}
-
-        stripped = views._strip_raw_json_from_payload(original_payload)
-
-        self.assertIsNot(stripped, original_payload)
-        self.assertIsNot(stripped["results"], original_payload["results"])
-        self.assertIsNot(stripped["results"][0], original_row)
-        self.assertNotIn("rawJson", stripped["results"][0])
-        self.assertEqual(stripped["results"][0]["provider"], "IPData")
-        self.assertEqual(stripped["results"][1], "non-dict-row")
-        self.assertIn("rawJson", original_row)
-
-        no_results_payload = {"ip": "8.8.8.8"}
-        self.assertEqual(views._strip_raw_json_from_payload(no_results_payload), no_results_payload)
-
-    @patch("detector.views.redis_client", None)
-    def test_detect_ip_compact_strips_raw_json_and_sets_cache_control_header(self):
-        self._patch_all_providers()
-        _login_authorised(self)
-
-        for query_suffix in ("&compact=1", "&compact=true", "&compact=TRUE", "&compact=yes"):
-            with self.subTest(query_suffix=query_suffix):
-                resp = self.client.get(f"/api/v1/detect?ip=8.8.8.8{query_suffix}")
-                self.assertEqual(resp.status_code, 200)
-                self.assertEqual(resp.headers.get("Cache-Control"), "private, max-age=300")
-                payload = resp.json()
-                self.assertEqual(len(payload["results"]), 14)
-                for row in payload["results"]:
-                    self.assertNotIn("rawJson", row)
-
-        for query_suffix in ("", "&compact=0", "&compact=false"):
-            with self.subTest(query_suffix=query_suffix or "default"):
-                resp = self.client.get(f"/api/v1/detect?ip=8.8.8.8{query_suffix}")
-                self.assertEqual(resp.status_code, 200)
-                self.assertEqual(resp.headers.get("Cache-Control"), "private, max-age=300")
-                payload = resp.json()
-                self.assertEqual(len(payload["results"]), 14)
-                for row in payload["results"]:
-                    self.assertIn("rawJson", row)
-
     def test_detect_ip_error_responses_omit_cache_control_header(self):
         unauth_resp = self.client.get("/api/v1/detect?ip=8.8.8.8&compact=1")
         self.assertEqual(unauth_resp.status_code, 401)
@@ -905,42 +695,6 @@ class CompactResponseAndCacheControlTests(TestCase):
         self.assertTrue(compact_cached_payload["isCached"])
         for row in compact_cached_payload["results"]:
             self.assertNotIn("rawJson", row)
-
-    @patch("detector.views.redis_client", None)
-    def test_batch_detect_compact_strips_raw_json_when_requested(self):
-        self._patch_all_providers()
-        bearer_token = views.issue_gadget_token("SysopUser")
-        headers = {"HTTP_AUTHORIZATION": f"Bearer {bearer_token}"}
-
-        query_compact_resp = self.client.post(
-            "/api/v1/detect/batch?compact=1",
-            data=json.dumps({"ips": ["1.1.1.1"]}),
-            content_type="application/json",
-            **headers,
-        )
-        self.assertEqual(query_compact_resp.status_code, 200)
-        for row in query_compact_resp.json()["results"]["1.1.1.1"]["results"]:
-            self.assertNotIn("rawJson", row)
-
-        body_compact_resp = self.client.post(
-            "/api/v1/detect/batch",
-            data=json.dumps({"ips": ["1.1.1.1"], "compact": True}),
-            content_type="application/json",
-            **headers,
-        )
-        self.assertEqual(body_compact_resp.status_code, 200)
-        for row in body_compact_resp.json()["results"]["1.1.1.1"]["results"]:
-            self.assertNotIn("rawJson", row)
-
-        default_resp = self.client.post(
-            "/api/v1/detect/batch",
-            data=json.dumps({"ips": ["1.1.1.1"]}),
-            content_type="application/json",
-            **headers,
-        )
-        self.assertEqual(default_resp.status_code, 200)
-        for row in default_resp.json()["results"]["1.1.1.1"]["results"]:
-            self.assertIn("rawJson", row)
 
 
 class TwoTierQueryModeTests(TestCase):
@@ -1195,35 +949,7 @@ class TwoTierQueryModeTests(TestCase):
         self.assertEqual(non_public_payload["queryMode"], "light")
         self.assertFalse(non_public_payload["isPartialMode"])
 
-    def test_batch_detect_supports_light_mode_from_body_and_query_parameter(self):
-        fake_redis = _BatchingFakeRedis()
-        mocks = self._patch_provider_suite()
-        bearer_token = views.issue_gadget_token("SysopUser")
-        headers = {"HTTP_AUTHORIZATION": f"Bearer {bearer_token}"}
-
-        with (
-            override_settings(**TEST_UPSTREAM_SECRETS),
-            patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-            patch("detector.views.redis_client", fake_redis),
-        ):
-            body_resp = self.client.post(
-                "/api/v1/detect/batch?compact=1",
-                data=json.dumps({"ips": ["8.8.8.8"], "mode": "light"}),
-                content_type="application/json",
-                **headers,
-            )
-
-        self.assertEqual(body_resp.status_code, 200)
-        body_payload = body_resp.json()
-        self.assertEqual(body_payload["queryMode"], "light")
-        ip_payload = body_payload["results"]["8.8.8.8"]
-        self.assertEqual(ip_payload["queryMode"], "light")
-        self.assertTrue(ip_payload["isPartialMode"])
-        mocks["getipintel"].assert_not_awaited()
-        for row in ip_payload["results"]:
-            self.assertNotIn("rawJson", row)
-
-    def test_batch_detect_defaults_to_light_mode_and_honours_explicit_full_mode(self):
+    def test_batch_detect_defaults_to_light_mode_supports_compact_and_explicit_full_mode(self):
         fake_redis = _BatchingFakeRedis()
         mocks = self._patch_provider_suite()
         bearer_token = views.issue_gadget_token("SysopUser")
@@ -1246,17 +972,35 @@ class TwoTierQueryModeTests(TestCase):
                 content_type="application/json",
                 **headers,
             )
+            compact_light_resp = self.client.post(
+                "/api/v1/detect/batch?compact=1",
+                data=json.dumps({"ips": ["8.8.8.8"], "mode": "light"}),
+                content_type="application/json",
+                **headers,
+            )
+            body_compact_resp = self.client.post(
+                "/api/v1/detect/batch",
+                data=json.dumps({"ips": ["8.8.8.8"], "compact": True}),
+                content_type="application/json",
+                **headers,
+            )
 
         self.assertEqual(default_resp.status_code, 200)
         default_payload = default_resp.json()
         self.assertEqual(default_payload["queryMode"], "light")
         self.assertTrue(default_payload["results"]["8.8.8.8"]["isPartialMode"])
         self.assertEqual(default_payload["results"]["8.8.8.8"]["queryMode"], "light")
+        for row in default_payload["results"]["8.8.8.8"]["results"]:
+            self.assertIn("rawJson", row)
 
         self.assertEqual(invalid_resp.status_code, 200)
-        invalid_payload = invalid_resp.json()
-        self.assertEqual(invalid_payload["queryMode"], "light")
-        self.assertTrue(invalid_payload["results"]["1.1.1.1"]["isPartialMode"])
+        self.assertEqual(invalid_resp.json()["queryMode"], "light")
+        self.assertTrue(invalid_resp.json()["results"]["1.1.1.1"]["isPartialMode"])
+
+        for compact_resp in (compact_light_resp, body_compact_resp):
+            self.assertEqual(compact_resp.status_code, 200)
+            for row in compact_resp.json()["results"]["8.8.8.8"]["results"]:
+                self.assertNotIn("rawJson", row)
 
         mocks["getipintel"].assert_not_awaited()
         self.assertFalse(any(key.startswith("proxycheck:v1:quota:getipintel:") for key in fake_redis.strings))

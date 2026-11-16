@@ -201,6 +201,36 @@
           </tbody>
         </table>
       </div>
+
+      <div v-if="snapshot?.offlineDatabases?.length" class="dashboard-offline-section">
+        <h3 class="dashboard-subsection-title">Offline Databases Status</h3>
+        <div class="dashboard-table-wrapper">
+          <table class="dashboard-table offline-db-table">
+            <thead>
+              <tr>
+                <th scope="col">DATABASE</th>
+                <th scope="col">FILE</th>
+                <th scope="col">STATUS</th>
+                <th scope="col">SIZE</th>
+                <th scope="col">LAST UPDATED (MTIME)</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="db in snapshot.offlineDatabases" :key="db.key">
+                <td>{{ db.name }}</td>
+                <td><code class="asn-tag">{{ db.filename }}</code></td>
+                <td>
+                  <span class="cdx-badge" :class="getOfflineDbBadgeClass(db)">
+                    {{ db.statusLabel }}
+                  </span>
+                </td>
+                <td class="dashboard-col-upstream">{{ formatByteSize(db.sizeBytes) }}</td>
+                <td class="offline-db-mtime">{{ formatOfflineDbTimestamp(db.lastModifiedIso, Date.now(), db.ageSeconds) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   </cdx-dialog>
 </template>
@@ -210,8 +240,11 @@ import { computed, onUnmounted, ref, watch } from 'vue';
 import { CdxButton, CdxDialog, CdxMessage } from '@wikimedia/codex';
 import {
   computeQuotaUsagePercent,
+  formatByteSize,
+  formatOfflineDbTimestamp,
   formatUpstreamQuotaLabel,
   getQuotaProgressTone,
+  type OfflineDatabaseEntry,
   type ProviderDashboardResponse,
   type ProviderDashboardRow,
 } from '../utils/ip-detector-logic';
@@ -257,8 +290,14 @@ function formatGeneratedTimestamp(isoValue: string): string {
 
 function getProviderStatusClass(row: ProviderDashboardRow): string {
   if (row.statusKey === 'healthy') return 'badge-success';
-  if (row.statusKey === 'no_api_key') return 'badge-neutral';
+  if (row.statusKey === 'no_api_key' || row.statusKey === 'db_missing') return 'badge-neutral';
   return 'badge-warning';
+}
+
+function getOfflineDbBadgeClass(entry: OfflineDatabaseEntry): string {
+  if (entry.status === 'healthy') return 'badge-success';
+  if (entry.status === 'stale') return 'badge-warning';
+  return entry.optional ? 'badge-neutral' : 'badge-destructive';
 }
 
 async function loadDashboard(): Promise<void> {

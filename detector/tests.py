@@ -631,7 +631,7 @@ ALL_ADAPTERS = (
 )
 
 
-HTTP_PROVIDERS = tuple(name for name, _ in ALL_ADAPTERS if name not in ("MaxMind", "Tor Onionoo"))
+HTTP_PROVIDERS = tuple(name for name, _ in ALL_ADAPTERS if name not in ("MaxMind", "Tor Onionoo", "StopForumSpam"))
 
 
 def _mock_ptr_answer(*hostnames):
@@ -1212,7 +1212,7 @@ class AggregationAndCacheIntegrityTests(TestCase):
                 cooldown_calls = [
                     c for c in mock_redis.set.call_args_list if c.args[0].startswith("proxycheck:v1:cooldown:")
                 ]
-                self.assertEqual(len(cooldown_calls), 14)
+                self.assertEqual(len(cooldown_calls), 13)
                 for call_obj in cooldown_calls:
                     self.assertEqual(call_obj.kwargs.get("ex"), 120)
 
@@ -4764,18 +4764,31 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         api_err = adapt_stopforumspam({"success": 0, "error": "rate limit"}, status_code=200)
         self.assertEqual(api_err["status"], "400 Error")
 
-        captured = {}
+        from detector import offline_dbs
 
-        async def _get(url, **kwargs):
-            captured["url"] = url
-            return _mock_response(
-                status_code=200, json_value={"success": 1, "ip": {"appears": 0, "frequency": 0, "confidence": 0}}
-            )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            toxic_file = Path(tmp_dir) / "toxic_ip_cidr.txt"
+            toxic_file.write_text("198.51.100.0/24\n", encoding="utf-8")
+            offline_dbs.clear_stopforumspam_caches()
+            with override_settings(STOPFORUMSPAM_DB_DIR=tmp_dir):
+                hit_row = asyncio.run(views.query_stopforumspam(None, "198.51.100.5"))
+                clean_row = asyncio.run(views.query_stopforumspam(None, "203.0.113.5"))
+            offline_dbs.clear_stopforumspam_caches()
 
-        client = AsyncMock()
-        client.get.side_effect = _get
-        asyncio.run(views.query_stopforumspam(client, "198.51.100.5"))
-        self.assertEqual(captured["url"], "https://api.stopforumspam.org/api?ip=198.51.100.5&json")
+        self.assertEqual(hit_row["status"], "200 OK")
+        self.assertTrue(hit_row["blacklisted"])
+        self.assertTrue(hit_row["appears"])
+        self.assertEqual(hit_row["toxicCidr"], "198.51.100.0/24")
+        self.assertEqual(clean_row["status"], "200 OK")
+        self.assertFalse(clean_row["appears"])
+
+        with tempfile.TemporaryDirectory() as empty_dir:
+            offline_dbs.clear_stopforumspam_caches()
+            with override_settings(STOPFORUMSPAM_DB_DIR=empty_dir):
+                missing_row = asyncio.run(views.query_stopforumspam(None, "198.51.100.5"))
+            offline_dbs.clear_stopforumspam_caches()
+        self.assertEqual(missing_row["status"], "Offline DB Missing")
+        self.assertIsNone(missing_row["statusCode"])
 
     def test_dshield_adapter_and_query_extract_attack_and_threatfeed_metrics(self):
         listed = adapt_dshield(
@@ -4842,11 +4855,11 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
             default_capture["follow_redirects"] = kwargs.get("follow_redirects")
             default_capture["has_timeout_kwarg"] = "timeout" in kwargs
             default_capture["timeout"] = kwargs.get("timeout")
-            return _mock_response(status_code=200, json_value={"success": 1, "ip": {"appears": 0}})
+            return _mock_response(status_code=200, json_value={"relays": []})
 
         default_client = AsyncMock()
         default_client.get.side_effect = _default_get
-        asyncio.run(views.query_stopforumspam(default_client, "198.51.100.5"))
+        asyncio.run(views.query_tor_onionoo(default_client, "198.51.100.5"))
         self.assertFalse(default_capture["follow_redirects"])
         self.assertTrue(default_capture["has_timeout_kwarg"])
         self.assertEqual(default_capture["timeout"], 5.0)
@@ -5171,40 +5184,50 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         mock_redis.get = AsyncMock(side_effect=_fake_get)
         mock_redis.set = AsyncMock(side_effect=_fake_set)
 
-        with (
-            override_settings(**TEST_UPSTREAM_SECRETS),
-            patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-            patch("detector.views.redis_client", mock_redis),
-        ):
-            resp = self.client.get("/api/v1/detect?ip=185.220.101.4")
+        from detector import offline_dbs
 
-        self.assertEqual(resp.status_code, 200)
-        payload = resp.json()
-        self.assertFalse(payload["isTor"])
-        self.assertFalse(payload["is_broadcast_ip"])
-        self.assertFalse(payload["isMajorityProxyVpn"])
-        self.assertEqual(payload["arbitrationVerdict"], "Clean Residential / Direct (0/8 Sources)")
-        self.assertEqual(payload["arbitrationTier"], "success")
+        with tempfile.TemporaryDirectory() as sfs_tmp_dir:
+            (Path(sfs_tmp_dir) / "listed_ip_90_ipv46_all.txt").write_text(
+                '"185.220.101.4","25","2026-11-12 09:00:00"\n',
+                encoding="utf-8",
+            )
+            offline_dbs.clear_stopforumspam_caches()
 
-        rows = {row["provider"]: row for row in payload["results"]}
-        self.assertNotIn("Tor Onionoo", rows)
-        self.assertEqual(rows["Proxycheck"]["port"], 9050)
-        self.assertEqual(rows["Proxycheck"]["lastSeen"], "1 hour ago")
-        self.assertEqual(rows["StopForumSpam"]["frequency"], 25)
-        self.assertEqual(rows["StopForumSpam"]["lastSeen"], "2026-11-12 09:00:00")
-        self.assertEqual(rows["DShield"]["attacks"], 80)
-        self.assertEqual(rows["DShield"]["threatfeeds"], ["scanner"])
-        self.assertEqual(written_ttls.get("proxycheck:v1:prov:tor_onionoo:185.220.101.4"), 7200)
-        self.assertEqual(written_ttls.get("proxycheck:v1:prov:stopforumspam:185.220.101.4"), 7200)
-        self.assertEqual(written_ttls.get("proxycheck:v1:prov:dshield:185.220.101.4"), 7200)
+            with (
+                override_settings(**{**TEST_UPSTREAM_SECRETS, "STOPFORUMSPAM_DB_DIR": sfs_tmp_dir}),
+                patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
+                patch("detector.views.redis_client", mock_redis),
+            ):
+                resp = self.client.get("/api/v1/detect?ip=185.220.101.4")
 
-        tor_active_mode["enabled"] = True
-        with (
-            override_settings(**TEST_UPSTREAM_SECRETS),
-            patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-            patch("detector.views.redis_client", mock_redis),
-        ):
-            tor_resp = self.client.get("/api/v1/detect?ip=185.220.101.9")
+            self.assertEqual(resp.status_code, 200)
+            payload = resp.json()
+            self.assertFalse(payload["isTor"])
+            self.assertFalse(payload["is_broadcast_ip"])
+            self.assertFalse(payload["isMajorityProxyVpn"])
+            self.assertEqual(payload["arbitrationVerdict"], "Clean Residential / Direct (0/8 Sources)")
+            self.assertEqual(payload["arbitrationTier"], "success")
+
+            rows = {row["provider"]: row for row in payload["results"]}
+            self.assertNotIn("Tor Onionoo", rows)
+            self.assertEqual(rows["Proxycheck"]["port"], 9050)
+            self.assertEqual(rows["Proxycheck"]["lastSeen"], "1 hour ago")
+            self.assertEqual(rows["StopForumSpam"]["frequency"], 25)
+            self.assertEqual(rows["StopForumSpam"]["lastSeen"], "2026-11-12 09:00:00")
+            self.assertEqual(rows["DShield"]["attacks"], 80)
+            self.assertEqual(rows["DShield"]["threatfeeds"], ["scanner"])
+            self.assertEqual(written_ttls.get("proxycheck:v1:prov:tor_onionoo:185.220.101.4"), 7200)
+            self.assertEqual(written_ttls.get("proxycheck:v1:prov:stopforumspam:185.220.101.4"), 7200)
+            self.assertEqual(written_ttls.get("proxycheck:v1:prov:dshield:185.220.101.4"), 7200)
+
+            tor_active_mode["enabled"] = True
+            with (
+                override_settings(**{**TEST_UPSTREAM_SECRETS, "STOPFORUMSPAM_DB_DIR": sfs_tmp_dir}),
+                patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
+                patch("detector.views.redis_client", mock_redis),
+            ):
+                tor_resp = self.client.get("/api/v1/detect?ip=185.220.101.9")
+            offline_dbs.clear_stopforumspam_caches()
 
         self.assertEqual(tor_resp.status_code, 200)
         tor_payload = tor_resp.json()
@@ -8817,6 +8840,7 @@ class RedisBatchingAndCacheCompletenessTests(TestCase):
         with (
             patch("detector.views.redis_client", mock_redis),
             patch("detector.views._has_any_local_maxmind_db", return_value=False),
+            patch("detector.views._has_any_local_stopforumspam_db", return_value=True),
             patch("detector.views.query_maxmind", AsyncMock(return_value=dict(MAXMIND_STUB))),
             patch("detector.views._get_shared_http_client", shared_client),
             patch("detector.views._release_inflight_task", wraps=views._release_inflight_task) as release_spy,
@@ -9412,6 +9436,10 @@ class TwoTierQueryModeTests(TestCase):
         mm_db_patcher = patch("detector.views._has_any_local_maxmind_db", return_value=True)
         mm_db_patcher.start()
         self.addCleanup(mm_db_patcher.stop)
+
+        sfs_db_patcher = patch("detector.views._has_any_local_stopforumspam_db", return_value=True)
+        sfs_db_patcher.start()
+        self.addCleanup(sfs_db_patcher.stop)
         return mocks
 
     def test_light_mode_skips_uncached_commercial_sources_and_quota(self):
@@ -9442,12 +9470,19 @@ class TwoTierQueryModeTests(TestCase):
             "proxycheck",
             "iphub",
             "iphunter",
-            "stopforumspam",
         ):
             mocks[deferred_key].assert_not_awaited()
             self.assertNotIn(f"proxycheck:v1:prov:{deferred_key}:8.8.8.8", fake_redis.strings)
 
-        for active_key in ("cloudflare_radar", "maxmind", "spamhaus_zen", "spamcop", "tor_onionoo", "dshield"):
+        for active_key in (
+            "cloudflare_radar",
+            "maxmind",
+            "stopforumspam",
+            "spamhaus_zen",
+            "spamcop",
+            "tor_onionoo",
+            "dshield",
+        ):
             mocks[active_key].assert_awaited_once()
             self.assertIn(f"proxycheck:v1:prov:{active_key}:8.8.8.8", fake_redis.strings)
 
@@ -9554,7 +9589,7 @@ class TwoTierQueryModeTests(TestCase):
         mocks["getipintel"].assert_awaited_once()
         mocks["proxycheck"].assert_awaited_once()
         # Sources already populated by the light query stay served from Redis
-        for active_key in ("cloudflare_radar", "maxmind", "tor_onionoo", "dshield"):
+        for active_key in ("cloudflare_radar", "maxmind", "stopforumspam", "tor_onionoo", "dshield"):
             mocks[active_key].assert_not_awaited()
 
         self.assertIn("proxycheck:v1:prov:getipintel:8.8.8.8", fake_redis.strings)
@@ -9661,3 +9696,377 @@ class TwoTierQueryModeTests(TestCase):
         self.assertIsNone(light_payload["getipintel_chance"])
         mocks["getipintel"].assert_awaited_once()
         self.assertEqual(len(views._ip_detect_inflight), 0)
+
+
+class OfflineStopForumSpamEngineTests(TestCase):
+    """Tests local StopForumSpam lookups, mtime hot-reloading, and graceful degradation."""
+
+    def setUp(self):
+        super().setUp()
+        from detector import offline_dbs
+
+        offline_dbs.clear_stopforumspam_caches()
+
+    def tearDown(self):
+        from detector import offline_dbs
+
+        offline_dbs.clear_stopforumspam_caches()
+        super().tearDown()
+
+    def test_toxic_cidr_and_zip_gz_listed_ips_query_without_http(self):
+        import gzip
+        import zipfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "toxic_ip_cidr.txt").write_text(
+                "# Comment line\n192.0.2.0/24\n2001:db8:dead::/48\n",
+                encoding="utf-8",
+            )
+            zip_90_path = root / "listed_ip_90_ipv46_all.zip"
+            with zipfile.ZipFile(zip_90_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr(
+                    "listed_ip_90_ipv46_all.txt",
+                    '"198.51.100.42","12","2026-11-10 08:30:00"\n"192.0.2.77","3","2026-11-09 02:00:00"\n',
+                )
+
+            gz_1_path = root / "listed_ip_1_ipv46_all.txt.gz"
+            with gzip.open(gz_1_path, "wt", encoding="utf-8") as gz_handle:
+                gz_handle.write('"198.51.100.42","18","2026-11-16 05:15:00"\n')
+                gz_handle.write('"2001:0db8:cafe:0000:0000:0000:0000:0001","9","2026-11-16 04:00:00"\n')
+
+            with (
+                override_settings(STOPFORUMSPAM_DB_DIR=tmp_dir),
+                patch("detector.views.httpx.AsyncClient") as mock_client,
+            ):
+                toxic_row = asyncio.run(views.query_stopforumspam("192.0.2.77"))
+                toxic_v6_row = asyncio.run(views.query_stopforumspam("2001:db8:dead::5"))
+                merged_row = asyncio.run(views.query_stopforumspam("198.51.100.42"))
+                canonical_v6_row = asyncio.run(views.query_stopforumspam("2001:db8:cafe::1"))
+                clean_row = asyncio.run(views.query_stopforumspam("203.0.113.99"))
+
+            mock_client.assert_not_called()
+
+        self.assertEqual(toxic_row["status"], "200 OK")
+        self.assertTrue(toxic_row["blacklisted"])
+        self.assertTrue(toxic_row["appears"])
+        self.assertEqual(toxic_row["toxicCidr"], "192.0.2.0/24")
+        self.assertEqual(toxic_row["frequency"], 3)
+        self.assertTrue(toxic_row.get("offlineDbUpdatedAt"))
+
+        self.assertTrue(toxic_v6_row["blacklisted"])
+        self.assertEqual(toxic_v6_row["toxicCidr"], "2001:db8:dead::/48")
+
+        self.assertFalse(merged_row["blacklisted"])
+        self.assertTrue(merged_row["appears"])
+        self.assertEqual(merged_row["frequency"], 18)
+        self.assertEqual(merged_row["lastSeen"], "2026-11-16 05:15:00")
+        self.assertEqual(merged_row["rawJson"]["ip"]["sources"], ["listed_ip_90", "listed_ip_1"])
+
+        self.assertTrue(canonical_v6_row["appears"])
+        self.assertEqual(canonical_v6_row["frequency"], 9)
+
+        self.assertFalse(clean_row["appears"])
+        self.assertFalse(clean_row["blacklisted"])
+        self.assertEqual(clean_row["usageType"], "Clean (Not Listed)")
+
+    def test_hot_reloads_when_files_change_mtime_and_invalidates_redis_cache(self):
+        from detector import offline_dbs
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            toxic_path = root / "toxic_ip_cidr.txt"
+            listed_path = root / "listed_ip_90_ipv46_all.txt"
+
+            toxic_path.write_text("192.0.2.0/24\n", encoding="utf-8")
+            listed_path.write_text('"198.51.100.7","5","2026-11-10 00:00:00"\n', encoding="utf-8")
+
+            cache_store = {}
+
+            async def _fake_get(key):
+                return cache_store.get(key)
+
+            async def _fake_set(key, val, ex=None):
+                cache_store[key] = val
+
+            mock_redis = MagicMock()
+            mock_redis.get = AsyncMock(side_effect=_fake_get)
+            mock_redis.set = AsyncMock(side_effect=_fake_set)
+
+            with (
+                override_settings(STOPFORUMSPAM_DB_DIR=tmp_dir),
+                patch("detector.views.redis_client", mock_redis),
+            ):
+                initial_lookup = offline_dbs.query_stopforumspam_offline("198.51.100.88")
+                self.assertFalse(initial_lookup["appears"])
+
+                first_row = asyncio.run(views.query_stopforumspam("198.51.100.88"))
+                cache_key = views._provider_cache_key("stopforumspam", "198.51.100.88")
+                cache_store[cache_key] = json.dumps(
+                    {
+                        "row": first_row,
+                        "cachedAt": "2026-11-16T00:00:00+00:00",
+                        "sanitized": True,
+                        "dbVersion": offline_dbs.get_stopforumspam_db_version(),
+                    }
+                )
+
+                cached_hit, _ = asyncio.run(views._read_provider_caches("198.51.100.88"))
+                self.assertIn("stopforumspam", cached_hit)
+
+                # Advance timestamps beyond integer second boundaries so file mtime visibly changes
+                listed_path.write_text(
+                    '"198.51.100.7","5","2026-11-10 00:00:00"\n"198.51.100.88","42","2026-11-16 12:00:00"\n',
+                    encoding="utf-8",
+                )
+                future_ts = time.time() + 10.0
+                os.utime(listed_path, (future_ts, future_ts))
+
+                reloaded_lookup = offline_dbs.query_stopforumspam_offline("198.51.100.88")
+                cached_after_update, _ = asyncio.run(views._read_provider_caches("198.51.100.88"))
+
+            self.assertTrue(reloaded_lookup["appears"])
+            self.assertEqual(reloaded_lookup["frequency"], 42)
+            self.assertNotIn("stopforumspam", cached_after_update)
+
+    def test_zero_quota_limits_for_stopforumspam(self):
+        from detector import quota_telemetry
+
+        rpm, daily = quota_telemetry.get_provider_quota_limits("stopforumspam")
+        self.assertEqual((rpm, daily), (0, 0))
+
+
+class OfflineDatabaseStatusEndpointTests(TestCase):
+    """Tests inventory reporting, stale detection, and /api/v1/status endpoint exposure."""
+
+    def test_collect_offline_databases_status_reports_healthy_stale_and_missing(self):
+        from datetime import datetime, timezone
+
+        from detector import offline_dbs
+
+        now_dt = datetime(2026, 11, 16, 12, 0, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            sfs_toxic = root / "toxic_ip_cidr.txt"
+            sfs_90 = root / "listed_ip_90_ipv46_all.zip"
+            mm_asn = root / "GeoLite2-ASN.mmdb"
+
+            sfs_toxic.write_text("192.0.2.0/24\n", encoding="utf-8")
+            sfs_90.write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+            mm_asn.write_bytes(b"mmdb-stub")
+
+            fresh_ts = now_dt.timestamp() - 3600
+            stale_ts = now_dt.timestamp() - (10 * 86400)
+            os.utime(sfs_toxic, (fresh_ts, fresh_ts))
+            os.utime(sfs_90, (stale_ts, stale_ts))
+            os.utime(mm_asn, (fresh_ts, fresh_ts))
+
+            with override_settings(
+                STOPFORUMSPAM_DB_DIR=tmp_dir,
+                MAXMIND_DB_DIR=tmp_dir,
+                OFFLINE_DB_SFS_90_STALE_SECONDS=86400,
+            ):
+                entries = offline_dbs.collect_offline_databases_status(now_dt=now_dt)
+
+        by_key = {entry["key"]: entry for entry in entries}
+        self.assertEqual(by_key["stopforumspam_toxic_cidr"]["status"], "healthy")
+        self.assertEqual(by_key["stopforumspam_toxic_cidr"]["ageSeconds"], 3600)
+        self.assertTrue(by_key["stopforumspam_toxic_cidr"]["lastModifiedIso"].startswith("2026-11-16T11:00:00"))
+        self.assertEqual(by_key["stopforumspam_listed_90"]["status"], "stale")
+        self.assertEqual(by_key["maxmind_asn"]["status"], "healthy")
+        self.assertEqual(by_key["maxmind_city"]["status"], "missing")
+        self.assertFalse(by_key["maxmind_city"]["exists"])
+
+    def test_system_status_endpoint_and_compact_strip_behavior(self):
+        response = self.client.get("/api/v1/status", HTTP_ORIGIN="https://meta.wikimedia.org")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Cache-Control"], "no-store")
+        self.assertEqual(response["Access-Control-Allow-Origin"], "https://meta.wikimedia.org")
+        payload = response.json()
+        self.assertIn("generatedAt", payload)
+        self.assertIsInstance(payload.get("offlineDatabases"), list)
+        keys = {item["key"] for item in payload["offlineDatabases"]}
+        self.assertIn("maxmind_city", keys)
+        self.assertIn("stopforumspam_listed_90", keys)
+
+        post_resp = self.client.post("/api/v1/status")
+        self.assertEqual(post_resp.status_code, 405)
+
+        sample_payload = {
+            "ip": "8.8.8.8",
+            "offlineDatabases": payload["offlineDatabases"],
+            "results": [{"provider": "StopForumSpam", "rawJson": {"secret": "no"}}],
+        }
+        compact_payload = views._strip_raw_json_from_payload(sample_payload)
+        self.assertNotIn("offlineDatabases", compact_payload)
+        self.assertNotIn("rawJson", compact_payload["results"][0])
+
+
+class UpdateOfflineDbsCommandTests(TestCase):
+    """Tests rate-limit mtime guards, checksum validation, and atomic replacements."""
+
+    def test_respects_mtime_cooldown_and_allows_force_and_validates_md5(self):
+        import hashlib
+        import io
+        import tarfile
+        import zipfile
+
+        from django.core.management import call_command
+        from django.core.management.base import CommandError
+
+        from detector import offline_dbs
+        from detector.management.commands import update_offline_dbs as update_cmd
+
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("listed_ip_90_ipv46_all.txt", '"198.51.100.12","7","2026-11-16 01:00:00"\n')
+        good_zip_bytes = zip_buf.getvalue()
+        good_zip_md5 = hashlib.md5(good_zip_bytes, usedforsecurity=False).hexdigest()
+
+        zip_1_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_1_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("listed_ip_1_ipv46_all.txt", '"198.51.100.13","3","2026-11-16 02:00:00"\n')
+        good_zip_1_bytes = zip_1_buf.getvalue()
+        good_zip_1_md5 = hashlib.md5(good_zip_1_bytes, usedforsecurity=False).hexdigest()
+
+        toxic_bytes = b"192.0.2.0/24\n"
+
+        tar_buf = io.BytesIO()
+        mmdb_bytes = b"MMDB-VALID-HEADER-STUB"
+        with tarfile.open(fileobj=tar_buf, mode="w:gz") as tf:
+            info = tarfile.TarInfo(name="GeoLite2-Country_20261116/GeoLite2-Country.mmdb")
+            info.size = len(mmdb_bytes)
+            tf.addfile(info, io.BytesIO(mmdb_bytes))
+        good_tar_bytes = tar_buf.getvalue()
+        good_tar_sha = hashlib.sha256(good_tar_bytes).hexdigest()
+
+        class _FakeStreamResp:
+            def __init__(self, content: bytes, status_code: int = 200):
+                self._content = content
+                self.status_code = status_code
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise httpx.HTTPStatusError("err", request=MagicMock(), response=MagicMock())
+
+            def iter_bytes(self, chunk_size=65536):
+                yield self._content
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        class _FakeTextResp:
+            def __init__(self, text: str, status_code: int = 200):
+                self.text = text
+                self.status_code = status_code
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise httpx.HTTPStatusError("err", request=MagicMock(), response=MagicMock())
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            sfs_dir = root / "sfs"
+            mm_dir = root / "mm"
+            sfs_dir.mkdir()
+            mm_dir.mkdir()
+
+            old_zip_buf = io.BytesIO()
+            with zipfile.ZipFile(old_zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("listed_ip_90_ipv46_all.txt", '"198.51.100.1","1","2026-11-01 00:00:00"\n')
+            old_zip_bytes = old_zip_buf.getvalue()
+
+            existing_90 = sfs_dir / "listed_ip_90_ipv46_all.zip"
+            existing_90.write_bytes(old_zip_bytes)
+
+            downloads_seen = []
+
+            def _build_client(corrupt_md5: bool = False):
+                fake_client = MagicMock()
+
+                def _get(url, **kwargs):
+                    downloads_seen.append(("GET", url))
+                    if url.endswith("listed_ip_90_ipv46_all.zip.md5"):
+                        return _FakeTextResp("0" * 32 if corrupt_md5 else good_zip_md5)
+                    if url.endswith("listed_ip_1_ipv46_all.zip.md5"):
+                        return _FakeTextResp(good_zip_1_md5)
+                    if "GeoLite2-Country" in url and url.endswith(".sha256"):
+                        return _FakeTextResp(f"{good_tar_sha}  GeoLite2-Country.tar.gz\n")
+                    if "GeoLite2-City" in url and url.endswith(".sha256"):
+                        return _FakeTextResp(f"{good_tar_sha}  GeoLite2-City.tar.gz\n")
+                    if "GeoLite2-ASN" in url and url.endswith(".sha256"):
+                        return _FakeTextResp(f"{good_tar_sha}  GeoLite2-ASN.tar.gz\n")
+                    return _FakeTextResp("")
+
+                def _stream(method, url, **kwargs):
+                    downloads_seen.append(("STREAM", url))
+                    if url.endswith("toxic_ip_cidr.txt"):
+                        return _FakeStreamResp(toxic_bytes)
+                    if url.endswith("listed_ip_90_ipv46_all.zip"):
+                        return _FakeStreamResp(good_zip_bytes)
+                    if url.endswith("listed_ip_1_ipv46_all.zip"):
+                        return _FakeStreamResp(good_zip_1_bytes)
+                    return _FakeStreamResp(good_tar_bytes)
+
+                fake_client.get.side_effect = _get
+                fake_client.stream.side_effect = _stream
+                cm = MagicMock()
+                cm.__enter__.return_value = fake_client
+                cm.__exit__.return_value = False
+                return cm
+
+            # Recent mtime blocks SFS 90d download when --force is omitted
+            with patch.object(update_cmd.httpx, "Client", return_value=_build_client()):
+                call_command("update_offline_dbs", sources=["stopforumspam"], sfs_dir=str(sfs_dir), skip_listed_1=True)
+
+            self.assertFalse(any("listed_ip_90_ipv46_all.zip" in u for _, u in downloads_seen))
+            self.assertEqual(existing_90.read_bytes(), old_zip_bytes)
+
+            # MD5 mismatch must fail without corrupting existing archive on disk
+            downloads_seen.clear()
+            with (
+                patch.object(update_cmd.httpx, "Client", return_value=_build_client(corrupt_md5=True)),
+                self.assertRaises(CommandError),
+            ):
+                call_command(
+                    "update_offline_dbs",
+                    sources=["stopforumspam"],
+                    sfs_dir=str(sfs_dir),
+                    force=True,
+                    skip_listed_1=True,
+                )
+            self.assertEqual(existing_90.read_bytes(), old_zip_bytes)
+
+            # Force full valid SFS + MaxMind update with mocked maxminddb reader validation
+            downloads_seen.clear()
+            fake_mm_reader = MagicMock()
+            with (
+                override_settings(
+                    MAXMIND_ACCOUNT_ID="123456",
+                    MAXMIND_LICENSE_KEY="secret-mm-key",
+                    STOPFORUMSPAM_DB_DIR=str(sfs_dir),
+                ),
+                patch.object(update_cmd.httpx, "Client", return_value=_build_client(corrupt_md5=False)),
+                patch.object(update_cmd.maxminddb, "open_database", return_value=fake_mm_reader),
+                patch.object(update_cmd, "MAXMIND_EDITION_SPECS", (("GeoLite2-Country", "GeoLite2-Country.mmdb"),)),
+            ):
+                call_command(
+                    "update_offline_dbs",
+                    sources=["all"],
+                    sfs_dir=str(sfs_dir),
+                    maxmind_dir=str(mm_dir),
+                    force=True,
+                )
+
+            self.assertEqual(existing_90.read_bytes(), good_zip_bytes)
+            self.assertEqual((mm_dir / "GeoLite2-Country.mmdb").read_bytes(), mmdb_bytes)
+            self.assertTrue((sfs_dir / "stopforumspam.sqlite3").is_file())
+            with override_settings(STOPFORUMSPAM_DB_DIR=str(sfs_dir)):
+                offline_dbs.clear_stopforumspam_caches()
+                hit = offline_dbs.query_stopforumspam_offline("198.51.100.12")
+                self.assertTrue(hit["appears"])
+                self.assertEqual(hit["frequency"], 7)
+            offline_dbs.clear_stopforumspam_caches()

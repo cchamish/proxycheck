@@ -22,6 +22,9 @@ import {
   formatCommitVersionLabel,
   formatRelativeUpdatedLabel,
   resolveProviderUpdatedLabel,
+  formatOfflineDbTimestamp,
+  formatByteSize,
+  summarizeOfflineDatabases,
   buildDiagnosticMetrics,
   formatDiagnosticSummary,
   measureInitialLoadDurationSeconds,
@@ -1722,6 +1725,413 @@ test('Userscript skips redundant mode=full request when light scan already has f
   assert.doesNotMatch(dialogText, /Loading full commercial provider intelligence\.\.\./);
   assert.match(dialogText, /GetIPIntel/);
   harness.openedAlerts[0].resolveDialog();
+});
+
+test('Offline database helpers format UTC mtime timestamps, byte sizes, and source summaries', () => {
+  const fixedNow = Date.parse('2026-11-16T07:00:00Z');
+  assert.equal(
+    formatOfflineDbTimestamp('2026-11-16T04:00:00+00:00', fixedNow),
+    '2026-11-16 04:00 UTC (3 hours ago)'
+  );
+  assert.equal(
+    formatOfflineDbTimestamp('2026-11-16T06:59:45Z', fixedNow),
+    '2026-11-16 06:59 UTC (just now)'
+  );
+  assert.equal(formatOfflineDbTimestamp(null, fixedNow), 'Not downloaded');
+
+  assert.equal(formatByteSize(512), '512 B');
+  assert.equal(formatByteSize(2048), '2.0 KB');
+  assert.equal(formatByteSize(5 * 1024 * 1024), '5.0 MB');
+  assert.equal(formatByteSize(null), '-');
+
+  const summaries = summarizeOfflineDatabases([
+    {
+      key: 'maxmind_country',
+      source: 'MaxMind',
+      name: 'MaxMind GeoLite2 Country',
+      filename: 'GeoLite2-Country.mmdb',
+      exists: true,
+      optional: false,
+      sizeBytes: 1024,
+      lastModifiedIso: '2026-11-16T04:00:00+00:00',
+      ageSeconds: 10800,
+      staleAfterSeconds: 604800,
+      status: 'healthy',
+      statusLabel: 'Healthy',
+    },
+    {
+      key: 'stopforumspam_toxic_cidr',
+      source: 'StopForumSpam',
+      name: 'StopForumSpam Toxic CIDRs',
+      filename: 'toxic_ip_cidr.txt',
+      exists: true,
+      optional: false,
+      sizeBytes: 256,
+      lastModifiedIso: '2026-11-14T00:00:00+00:00',
+      ageSeconds: 180000,
+      staleAfterSeconds: 86400,
+      status: 'stale',
+      statusLabel: 'Stale',
+    },
+    {
+      key: 'stopforumspam_listed_90',
+      source: 'StopForumSpam',
+      name: 'StopForumSpam Listed IPs (90d)',
+      filename: 'listed_ip_90_ipv46_all.zip',
+      exists: false,
+      optional: false,
+      sizeBytes: null,
+      lastModifiedIso: null,
+      ageSeconds: null,
+      staleAfterSeconds: 172800,
+      status: 'missing',
+      statusLabel: 'Missing',
+    },
+  ]);
+
+  assert.equal(summaries.length, 2);
+  assert.equal(summaries[0].source, 'MaxMind');
+  assert.equal(summaries[0].status, 'healthy');
+  assert.equal(summaries[0].presentCount, 1);
+  assert.equal(summaries[1].source, 'StopForumSpam');
+  assert.equal(summaries[1].status, 'missing');
+});
+
+test('Web UI templates expose Offline Databases Status panel and database timestamp bindings', () => {
+  const appPath = path.resolve(import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname), '../App.vue');
+  const modalPath = path.resolve(
+    import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname),
+    '../components/ProviderDashboardModal.vue'
+  );
+  const appSource = fs.readFileSync(appPath, 'utf8');
+  const modalSource = fs.readFileSync(modalPath, 'utf8');
+
+  assert.match(appSource, /Offline Databases Status/);
+  assert.match(appSource, /\/api\/v1\/status\//);
+  assert.match(appSource, /formatOfflineDbTimestamp/);
+  assert.match(appSource, /Offline DB Missing/);
+  assert.match(modalSource, /Offline Databases Status/);
+  assert.match(modalSource, /db_missing/);
+});
+
+test('Userscript distinguishes light mode [LITE], quota guard [QUOTA], cooldown, and StopForumSpam hits', async () => {
+  const vm = await import('node:vm');
+  const gadgetPath = path.resolve(
+    import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname),
+    '../../scripts/user-gadget.js'
+  );
+  const scriptSource = fs.readFileSync(gadgetPath, 'utf8');
+
+  const testPayloads: Record<string, any> = {
+    '198.51.100.1': {
+      ip: '198.51.100.1',
+      queryMode: 'light',
+      isPartialMode: true,
+      prediction_score: 0,
+      getipintel_chance: null,
+      arbitrationVerdict: 'Direct Connection (No Commercial Threats)',
+      arbitrationTier: 'neutral',
+      isTor: false,
+      is_broadcast_ip: false,
+      results: [
+        {
+          provider: 'MaxMind',
+          status: '200 OK',
+          statusCode: 200,
+          offlineDbUpdatedAt: '2026-11-16T04:00:00+00:00',
+          securityFlags: [{ label: 'No Flags', isHighRisk: false }],
+        },
+        {
+          provider: 'StopForumSpam',
+          status: '200 OK',
+          statusCode: 200,
+          appears: false,
+          blacklisted: false,
+          offlineDbUpdatedAt: '2026-11-16T05:00:00+00:00',
+          securityFlags: [{ label: 'No Flags', isHighRisk: false }],
+        },
+        {
+          provider: 'GetIPIntel',
+          status: 'Deferred (Light Mode)',
+          statusCode: null,
+          isDeferred: true,
+          securityFlags: [{ label: 'Deferred (Light Mode)', isHighRisk: false }],
+        },
+      ],
+    },
+    '198.51.100.2': {
+      ip: '198.51.100.2',
+      queryMode: 'full',
+      isPartialMode: false,
+      prediction_score: 0,
+      getipintel_chance: null,
+      arbitrationVerdict: 'Clean Residential / Direct (0/7 Sources)',
+      arbitrationTier: 'success',
+      isTor: false,
+      is_broadcast_ip: false,
+      results: [
+        {
+          provider: 'GetIPIntel',
+          status: 'Local Quota Guard (15/15 req/min)',
+          statusCode: 429,
+          isCooldown: true,
+          isQuotaGuarded: true,
+          securityFlags: [{ label: 'Local Quota Guard', isHighRisk: false }],
+        },
+      ],
+    },
+    '198.51.100.3': {
+      ip: '198.51.100.3',
+      queryMode: 'light',
+      isPartialMode: true,
+      prediction_score: 0,
+      getipintel_chance: null,
+      arbitrationVerdict: 'Direct Connection (No Commercial Threats)',
+      arbitrationTier: 'neutral',
+      isTor: false,
+      is_broadcast_ip: false,
+      results: [
+        {
+          provider: 'StopForumSpam',
+          status: '200 OK',
+          statusCode: 200,
+          appears: true,
+          blacklisted: true,
+          toxicCidr: '198.51.100.0/24',
+          offlineDbUpdatedAt: '2026-11-16T05:00:00+00:00',
+          securityFlags: [{ label: 'Blacklisted Toxic CIDR (198.51.100.0/24)', isHighRisk: true }],
+        },
+        {
+          provider: 'GetIPIntel',
+          status: 'Deferred (Light Mode)',
+          statusCode: null,
+          isDeferred: true,
+          securityFlags: [{ label: 'Deferred (Light Mode)', isHighRisk: false }],
+        },
+      ],
+    },
+    '198.51.100.4': {
+      ip: '198.51.100.4',
+      queryMode: 'light',
+      isPartialMode: true,
+      prediction_score: 0,
+      getipintel_chance: null,
+      arbitrationVerdict: 'Direct Connection (No Commercial Threats)',
+      arbitrationTier: 'neutral',
+      isTor: false,
+      is_broadcast_ip: false,
+      results: [
+        {
+          provider: 'StopForumSpam',
+          status: '200 OK',
+          statusCode: 200,
+          appears: true,
+          blacklisted: false,
+          frequency: 9,
+          securityFlags: [{ label: 'Forum Spam (9x)', isHighRisk: true }],
+        },
+        {
+          provider: 'GetIPIntel',
+          status: 'Deferred (Light Mode)',
+          statusCode: null,
+          isDeferred: true,
+          securityFlags: [{ label: 'Deferred (Light Mode)', isHighRisk: false }],
+        },
+      ],
+    },
+    '198.51.100.5': {
+      ip: '198.51.100.5',
+      queryMode: 'full',
+      isPartialMode: false,
+      prediction_score: 0,
+      getipintel_chance: null,
+      arbitrationVerdict: 'Direct Connection (No Commercial Threats)',
+      arbitrationTier: 'neutral',
+      isTor: false,
+      is_broadcast_ip: false,
+      results: [
+        {
+          provider: 'GetIPIntel',
+          status: 'No API Key',
+          statusCode: null,
+          securityFlags: [{ label: 'No Flags', isHighRisk: false }],
+        },
+      ],
+    },
+  };
+
+  const makeMockBadge = () => ({
+    tagName: 'A',
+    style: {} as Record<string, string>,
+    className: '',
+    href: '',
+    textContent: '',
+    title: '',
+    dataset: {} as Record<string, string>,
+    classList: { contains: () => true },
+    addEventListener: () => {},
+  });
+
+  const makeMockAnchor = (ip: string) => {
+    const inserted: any[] = [];
+    const anchor: any = {
+      tagName: 'A',
+      nodeType: 1,
+      textContent: ip,
+      dataset: {} as Record<string, string>,
+      style: {} as Record<string, string>,
+      className: 'ext-checkuser-tempaccount-reveal-ip-anchor',
+      parentNode: {
+        insertBefore: (node: any) => {
+          inserted.push(node);
+          anchor.nextElementSibling = node;
+        },
+      },
+      nextSibling: null,
+      nextElementSibling: null,
+      matches: (sel: string) => sel === 'a.ext-checkuser-tempaccount-reveal-ip-anchor',
+      closest: () => null,
+      inserted,
+    };
+    return anchor;
+  };
+
+  const anchors = Object.keys(testPayloads).map(makeMockAnchor);
+  const createdBadges: any[] = [];
+  const storageMap = new Map<string, string>([
+    ['proxycheck-ip-policy-consent', '1'],
+    ['proxycheck-gadget-token', 'valid-token'],
+    ['proxycheck-gadget-token-user', 'TestSysop'],
+    ['proxycheck-gadget-token-exp', String(Date.now() + 600_000)],
+  ]);
+
+  let readyCallback: (() => void) | null = null;
+  const mwObj = {
+    config: {
+      get: (key: string) => {
+        if (key === 'wgUserName') return 'TestSysop';
+        if (key === 'wgUserIsTemp') return false;
+        if (key === 'wgServerName') return 'meta.wikimedia.org';
+        if (key === 'wgCanonicalSpecialPageName') return 'Recentchanges';
+        if (key === 'wgNamespaceNumber') return -1;
+        if (key === 'wgAction') return 'view';
+        if (key === 'wgTitle') return 'RecentChanges';
+        return null;
+      },
+    },
+    storage: {
+      get: (k: string) => storageMap.get(k) ?? null,
+      set: (k: string, v: string) => storageMap.set(k, String(v)),
+      remove: (k: string) => storageMap.delete(k),
+    },
+    hook: () => ({ add: () => {} }),
+    Api: function () {
+      return { get: () => Promise.resolve({ centralauthtoken: { centralauthtoken: 'fresh-cat-token' } }) };
+    },
+    loader: { using: () => Promise.resolve() },
+    html: { escape: (s: string) => s },
+  };
+  const jQueryStub: any = (arg: any) => {
+    if (typeof arg === 'function') {
+      readyCallback = arg;
+      return { length: 0 };
+    }
+    return {
+      ready: (cb: () => void) => cb(),
+      find: () => ({ length: 0 }),
+      length: 0,
+    };
+  };
+  const sandbox: Record<string, any> = {
+    mw: mwObj,
+    mediaWiki: mwObj,
+    $: jQueryStub,
+    jQuery: jQueryStub,
+    window: {
+      setTimeout: globalThis.setTimeout.bind(globalThis),
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
+      setInterval: globalThis.setInterval.bind(globalThis),
+      clearInterval: globalThis.clearInterval.bind(globalThis),
+      localStorage: {
+        getItem: (k: string) => storageMap.get(k) ?? null,
+        setItem: (k: string, v: string) => storageMap.set(k, String(v)),
+        removeItem: (k: string) => storageMap.delete(k),
+      },
+    },
+    localStorage: {
+      getItem: (k: string) => storageMap.get(k) ?? null,
+      setItem: (k: string, v: string) => storageMap.set(k, String(v)),
+      removeItem: (k: string) => storageMap.delete(k),
+    },
+    document: {
+      documentElement: { classList: { contains: () => false } },
+      head: { appendChild: () => {} },
+      body: {
+        nodeType: 1,
+        matches: () => false,
+        closest: () => null,
+        classList: { contains: () => false },
+        querySelectorAll: (sel: string) =>
+          sel.indexOf('ext-checkuser-tempaccount-reveal-ip-anchor') !== -1 ? anchors : [],
+      },
+      getElementById: () => null,
+      createElement: (tag: string) => {
+        if (tag === 'a') {
+          const badge = makeMockBadge();
+          createdBadges.push(badge);
+          return badge;
+        }
+        return { tagName: tag.toUpperCase(), style: {}, id: '', textContent: '', appendChild: () => {} };
+      },
+      createTextNode: (text: string) => ({ nodeType: 3, textContent: text }),
+    },
+    MutationObserver: function () {
+      return { observe: () => {}, disconnect: () => {} };
+    },
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ results: testPayloads, count: Object.keys(testPayloads).length, queryMode: 'light' }),
+    }),
+    console,
+    Promise,
+    Map,
+    Set,
+    Object,
+    Array,
+    String,
+    Number,
+    Boolean,
+    Date,
+    Math,
+    JSON,
+    encodeURIComponent,
+    isNaN,
+    RegExp,
+  };
+  sandbox.window.localStorage = sandbox.localStorage;
+
+  vm.runInNewContext(scriptSource, sandbox);
+  assert.ok(readyCallback, 'expected gadget ready handler');
+  (readyCallback as () => void)();
+  await new Promise((resolve) => setTimeout(resolve, 120));
+
+  const badgeByIp = Object.fromEntries(anchors.map((a) => [a.textContent, a.inserted[0]]));
+  assert.equal(badgeByIp['198.51.100.1'].textContent, '[LITE]');
+  assert.match(badgeByIp['198.51.100.1'].className, /proxycheck-badge-lite/);
+  assert.match(badgeByIp['198.51.100.1'].title, /MaxMind 2026-11-16 04:00 UTC/);
+
+  assert.equal(badgeByIp['198.51.100.2'].textContent, '[QUOTA]');
+  assert.match(badgeByIp['198.51.100.2'].className, /proxycheck-badge-quota/);
+  assert.match(badgeByIp['198.51.100.2'].title, /Quota Guard Active/);
+
+  assert.equal(badgeByIp['198.51.100.3'].textContent, '[BLACKLIST]');
+  assert.match(badgeByIp['198.51.100.3'].className, /proxycheck-tier-high/);
+
+  assert.equal(badgeByIp['198.51.100.4'].textContent, '[SPAM]');
+  assert.match(badgeByIp['198.51.100.4'].className, /proxycheck-tier-medium/);
+
+  assert.equal(badgeByIp['198.51.100.5'].textContent, '[N/A]');
 });
 
 

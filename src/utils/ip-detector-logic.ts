@@ -58,15 +58,49 @@ export interface ProviderRawResult {
   torLabel?: string | null;
   torSummary?: string | null;
   appears?: boolean;
+  blacklisted?: boolean;
+  toxicCidr?: string | null;
   frequency?: number;
   confidence?: number;
   attacks?: number;
   count?: number;
   threatfeeds?: string[];
   maxDate?: string | null;
+  offlineDbUpdatedAt?: string | null;
   isCached?: boolean;
   cachedAt?: string | null;
   rawJson: Record<string, unknown>;
+}
+
+export interface OfflineDatabaseEntry {
+  key: string;
+  source: string;
+  name: string;
+  filename: string;
+  exists: boolean;
+  optional: boolean;
+  sizeBytes: number | null;
+  lastModifiedIso: string | null;
+  ageSeconds: number | null;
+  staleAfterSeconds: number;
+  status: 'healthy' | 'stale' | 'missing';
+  statusLabel: string;
+}
+
+export interface OfflineDatabaseSourceSummary {
+  source: string;
+  status: 'healthy' | 'stale' | 'missing';
+  latestIso: string | null;
+  ageSeconds: number | null;
+  presentCount: number;
+  totalCount: number;
+}
+
+export interface SystemStatusResponse {
+  generatedAt: string;
+  offlineDatabases: OfflineDatabaseEntry[];
+  durationSeconds?: number;
+  memoryMb?: number | null;
 }
 
 export type PtrCategory = 'dynamic_residential' | 'hosting_or_gateway' | 'unclassified' | 'none';
@@ -117,6 +151,7 @@ export interface DetectionResponse {
   cloudCidr?: string | null;
   cloudProvider?: string | null;
   cidrNote?: string | null;
+  offlineDatabases?: OfflineDatabaseEntry[];
   results: ProviderRawResult[];
 }
 
@@ -398,6 +433,131 @@ export function formatRelativeUpdatedLabel(
 }
 
 /**
+ * Formats an offline database mtime ISO timestamp with UTC date-time and human-readable relative age.
+ */
+export function formatOfflineDbTimestamp(
+  lastModifiedIso?: string | null,
+  now: Date | number = Date.now(),
+  ageSeconds?: number | null
+): string {
+  if (!lastModifiedIso || typeof lastModifiedIso !== 'string') {
+    return 'Not downloaded';
+  }
+  const parsedMs = Date.parse(lastModifiedIso.trim());
+  if (Number.isNaN(parsedMs)) {
+    return lastModifiedIso;
+  }
+  const nowMs = now instanceof Date ? now.getTime() : Number(now);
+  const computedAge =
+    Number.isFinite(nowMs)
+      ? Math.max(0, Math.floor((nowMs - parsedMs) / 1000))
+      : (typeof ageSeconds === 'number' && Number.isFinite(ageSeconds) ? Math.max(0, Math.floor(ageSeconds)) : 0);
+
+  const utcStamp = `${new Date(parsedMs).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+
+  let relativeText = 'just now';
+  if (computedAge >= 86400) {
+    const days = Math.floor(computedAge / 86400);
+    relativeText = `${days} ${days === 1 ? 'day' : 'days'} ago`;
+  } else if (computedAge >= 3600) {
+    const hours = Math.floor(computedAge / 3600);
+    relativeText = `${hours} ${hours === 1 ? 'hour' : 'hours'} ago`;
+  } else if (computedAge >= 60) {
+    const minutes = Math.floor(computedAge / 60);
+    relativeText = `${minutes} ${minutes === 1 ? 'minute' : 'minutes'} ago`;
+  }
+  return `${utcStamp} (${relativeText})`;
+}
+
+/**
+ * Formats byte counts cleanly for local database file listings.
+ */
+export function formatByteSize(sizeBytes?: number | null): string {
+  if (typeof sizeBytes !== 'number' || !Number.isFinite(sizeBytes) || sizeBytes < 0) {
+    return '-';
+  }
+  if (sizeBytes < 1024) {
+    return `${Math.round(sizeBytes)} B`;
+  }
+  if (sizeBytes < 1024 * 1024) {
+    return `${(sizeBytes / 1024).toFixed(1)} KB`;
+  }
+  if (sizeBytes < 1024 * 1024 * 1024) {
+    return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  return `${(sizeBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+/**
+ * Aggregates individual offline database entries into per-source health summaries.
+ */
+export function summarizeOfflineDatabases(
+  entries: OfflineDatabaseEntry[] | undefined | null
+): OfflineDatabaseSourceSummary[] {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return [];
+  }
+  const bySource = new Map<string, OfflineDatabaseEntry[]>();
+  for (const item of entries) {
+    if (!item || typeof item !== 'object' || !item.source) {
+      continue;
+    }
+    const existing = bySource.get(item.source);
+    if (existing) {
+      existing.push(item);
+    } else {
+      bySource.set(item.source, [item]);
+    }
+  }
+
+  const summaries: OfflineDatabaseSourceSummary[] = [];
+  for (const [source, rows] of bySource.entries()) {
+    let presentCount = 0;
+    let hasStale = false;
+    let hasRequiredMissing = false;
+    let latestMs = -1;
+    let latestIso: string | null = null;
+    let latestAge: number | null = null;
+
+    for (const row of rows) {
+      if (row.exists) {
+        presentCount += 1;
+        if (row.status === 'stale') {
+          hasStale = true;
+        }
+        if (row.lastModifiedIso) {
+          const parsedMs = Date.parse(row.lastModifiedIso);
+          if (!Number.isNaN(parsedMs) && parsedMs > latestMs) {
+            latestMs = parsedMs;
+            latestIso = row.lastModifiedIso;
+            latestAge = row.ageSeconds ?? null;
+          }
+        }
+      } else if (!row.optional) {
+        hasRequiredMissing = true;
+      }
+    }
+
+    let summaryStatus: 'healthy' | 'stale' | 'missing' = 'healthy';
+    if (presentCount === 0 || hasRequiredMissing) {
+      summaryStatus = 'missing';
+    } else if (hasStale) {
+      summaryStatus = 'stale';
+    }
+
+    summaries.push({
+      source,
+      status: summaryStatus,
+      latestIso,
+      ageSeconds: latestAge,
+      presentCount,
+      totalCount: rows.length,
+    });
+  }
+  return summaries;
+}
+
+/**
  * Resolves the relative "Updated ... ago" label for a cached provider row, or returns null when uncached.
  */
 export function resolveProviderUpdatedLabel(
@@ -568,7 +728,7 @@ export interface ProviderDashboardRow {
   usesHttp: boolean;
   configured: boolean;
   status: string;
-  statusKey: 'healthy' | 'quota_guarded' | 'cooldown' | 'no_api_key';
+  statusKey: 'healthy' | 'quota_guarded' | 'cooldown' | 'no_api_key' | 'db_missing';
   cooldownTtlSeconds: number;
   cooldownReason?: string | null;
   minuteUsed: number;
@@ -601,6 +761,7 @@ export interface ProviderDashboardResponse {
   redisAvailable: boolean;
   global: ProviderDashboardGlobalMetrics;
   providers: ProviderDashboardRow[];
+  offlineDatabases?: OfflineDatabaseEntry[];
   durationSeconds?: number;
   memoryMb?: number | null;
 }

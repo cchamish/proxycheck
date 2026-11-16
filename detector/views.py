@@ -77,6 +77,13 @@ from .oauth import (
     normalize_and_validate_wikimedia_domain,
     verify_centralauth_userinfo,
 )
+from .offline_dbs import (
+    collect_offline_databases_status,
+    get_maxmind_newest_mtime_iso,
+    get_stopforumspam_db_version,
+    has_any_local_stopforumspam_db,
+    query_stopforumspam_offline,
+)
 from .quota_telemetry import (
     REDIS_KEY_NAMESPACE,
     build_dashboard_snapshot,
@@ -322,15 +329,14 @@ def _attach_request_diagnostics(payload: Dict[str, Any], start_time: float) -> D
 
 
 def _strip_raw_json_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Returns a shallow copy of payload without rawJson keys on provider result rows."""
+    """Returns a shallow copy of payload without rawJson keys or heavy database inventories."""
     if isinstance(payload, dict) and isinstance(payload.get("results"), list):
-        return {
-            **payload,
-            "results": [
-                {k: v for k, v in row.items() if k != "rawJson"} if isinstance(row, dict) else row
-                for row in payload["results"]
-            ],
-        }
+        stripped = {k: v for k, v in payload.items() if k != "offlineDatabases"}
+        stripped["results"] = [
+            {k: v for k, v in row.items() if k != "rawJson"} if isinstance(row, dict) else row
+            for row in payload["results"]
+        ]
+        return stripped
     return payload
 
 
@@ -507,6 +513,8 @@ _SECRET_SETTING_NAMES = (
     "PROXYCHECK_API_KEY",
     "IPHUB_API_KEY",
     "IPHUNTER_API_KEY",
+    "MAXMIND_ACCOUNT_ID",
+    "MAXMIND_LICENSE_KEY",
     "WIKIMEDIA_CLIENT_SECRET",
 )
 
@@ -998,6 +1006,9 @@ def _read_maxmind_sync(ip: str) -> Dict[str, Any]:
         )
         if resolved_prefix_len is not None:
             combined_record["_mmdb_prefix_len"] = resolved_prefix_len
+        offline_updated_at = get_maxmind_newest_mtime_iso()
+        if offline_updated_at:
+            combined_record["_offline_db_updated_at"] = offline_updated_at
 
         return adapt_maxmind(combined_record, has_db=True, status_code=200, ip=ip)
     except Exception as exc:
@@ -1625,10 +1636,41 @@ async def query_tor_onionoo(client: httpx.AsyncClient, ip: str) -> Dict[str, Any
     return adapt_tor_onionoo(payload, status_code=status_code, ip=ip)
 
 
-async def query_stopforumspam(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
-    url = f"https://api.stopforumspam.org/api?ip={ip}&json"
-    payload, status_code = await _fetch_upstream_json(client, "stopforumspam", "StopForumSpam", url, timeout=5.0)
-    return adapt_stopforumspam(payload, status_code=status_code)
+def _has_any_local_stopforumspam_db() -> bool:
+    return has_any_local_stopforumspam_db()
+
+
+def _read_stopforumspam_sync(ip: str) -> Dict[str, Any]:
+    try:
+        lookup = query_stopforumspam_offline(ip)
+    except Exception as exc:
+        safe_message = _sanitize_error_message(str(exc))
+        logger.error("Error querying StopForumSpam offline database: %s", safe_message)
+        return adapt_stopforumspam({"success": 0, "error": safe_message}, status_code=500, has_db=True)
+
+    if not lookup.get("has_db"):
+        return adapt_stopforumspam(None, has_db=False)
+
+    payload: Dict[str, Any] = {
+        "success": 1,
+        "ip": {
+            "ip": ip,
+            "appears": 1 if lookup.get("appears") else 0,
+            "frequency": int(lookup.get("frequency") or 0),
+            "lastseen": lookup.get("last_seen"),
+            "blacklisted": bool(lookup.get("blacklisted")),
+            "toxicCidr": lookup.get("toxic_cidr"),
+            "sources": lookup.get("sources") or [],
+        },
+    }
+    if lookup.get("offline_db_updated_at"):
+        payload["offlineDbUpdatedAt"] = lookup["offline_db_updated_at"]
+    return adapt_stopforumspam(payload, status_code=200, has_db=True)
+
+
+async def query_stopforumspam(ip_or_client: Any, ip: Optional[str] = None) -> Dict[str, Any]:
+    target_ip = ip if isinstance(ip, str) and ip.strip() else str(ip_or_client)
+    return await asyncio.to_thread(_read_stopforumspam_sync, target_ip)
 
 
 async def query_dshield(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
@@ -1957,8 +1999,9 @@ _ip_detect_inflight: Dict[Tuple[str, str], asyncio.Task] = {}
 _ip_detect_inflight_lock = threading.Lock()
 
 _DNSBL_PROVIDER_KEYS = frozenset({"spamhaus_zen", "spamcop"})
+_OFFLINE_PROVIDER_KEYS = frozenset({"maxmind", "stopforumspam"})
 _LIGHT_MODE_ACTIVE_PROVIDERS = frozenset(
-    {"maxmind", "tor_onionoo", "dshield", "spamhaus_zen", "spamcop", "cloudflare_radar"}
+    {"maxmind", "stopforumspam", "tor_onionoo", "dshield", "spamhaus_zen", "spamcop", "cloudflare_radar"}
 )
 
 _PROVIDER_SPECS: Tuple[Tuple[str, str, bool, bool, Callable[[Any, str], Any]], ...] = (
@@ -1975,7 +2018,7 @@ _PROVIDER_SPECS: Tuple[Tuple[str, str, bool, bool, Callable[[Any, str], Any]], .
     ("spamhaus_zen", "Spamhaus ZEN", False, True, lambda _client, ip: query_spamhaus_zen(ip)),
     ("spamcop", "SpamCop", False, True, lambda _client, ip: query_spamcop(ip)),
     ("tor_onionoo", "Tor Onionoo", True, True, lambda client, ip: query_tor_onionoo(client, ip)),
-    ("stopforumspam", "StopForumSpam", True, True, lambda client, ip: query_stopforumspam(client, ip)),
+    ("stopforumspam", "StopForumSpam", False, False, lambda client, ip: query_stopforumspam(client, ip)),
     ("dshield", "DShield", True, True, lambda client, ip: query_dshield(client, ip)),
 )
 
@@ -2101,17 +2144,21 @@ async def _safe_redis_set_many(entries: List[Tuple[str, str, int]]) -> None:
 class _DecodedProviderRow(dict):
     """Dictionary subclass carrying internal cache wrapper metadata without altering visible keys."""
 
-    __slots__ = ("_city_db_loaded", "_source_raw_value")
+    __slots__ = ("_city_db_loaded", "_db_updated_at", "_db_version", "_source_raw_value")
 
     def __init__(
         self,
         mapping: Dict[str, Any],
         *,
         city_db_loaded: bool = False,
+        db_updated_at: Optional[str] = None,
+        db_version: Optional[int] = None,
         source_raw_value: Optional[str] = None,
     ) -> None:
         super().__init__(mapping)
         self._city_db_loaded = city_db_loaded
+        self._db_updated_at = db_updated_at
+        self._db_version = db_version
         self._source_raw_value = source_raw_value
 
 
@@ -2125,17 +2172,41 @@ def _decode_cached_provider_entry(raw_value: Optional[str]) -> Optional[Tuple[Di
     if not isinstance(parsed, dict):
         return None
     city_db_loaded = parsed.get("cityDbLoaded") is True
+    raw_db_updated = parsed.get("dbUpdatedAt")
+    db_updated_at = raw_db_updated if isinstance(raw_db_updated, str) and raw_db_updated.strip() else None
+    raw_db_version = parsed.get("dbVersion")
+    db_version = (
+        int(raw_db_version) if isinstance(raw_db_version, int) and not isinstance(raw_db_version, bool) else None
+    )
     if "row" in parsed and isinstance(parsed["row"], dict):
         row = parsed["row"]
         if not parsed.get("sanitized") and isinstance(row.get("rawJson"), (dict, list)):
             row = {**row, "rawJson": _sanitize_payload(row["rawJson"])}
         cached_at = parsed.get("cachedAt")
         cached_at_str = cached_at if isinstance(cached_at, str) and cached_at else None
-        return _DecodedProviderRow(row, city_db_loaded=city_db_loaded, source_raw_value=raw_value), cached_at_str
+        return (
+            _DecodedProviderRow(
+                row,
+                city_db_loaded=city_db_loaded,
+                db_updated_at=db_updated_at,
+                db_version=db_version,
+                source_raw_value=raw_value,
+            ),
+            cached_at_str,
+        )
     if "status" in parsed and "provider" in parsed:
         if not parsed.get("sanitized") and isinstance(parsed.get("rawJson"), (dict, list)):
             parsed = {**parsed, "rawJson": _sanitize_payload(parsed["rawJson"])}
-        return _DecodedProviderRow(parsed, city_db_loaded=city_db_loaded, source_raw_value=raw_value), None
+        return (
+            _DecodedProviderRow(
+                parsed,
+                city_db_loaded=city_db_loaded,
+                db_updated_at=db_updated_at,
+                db_version=db_version,
+                source_raw_value=raw_value,
+            ),
+            None,
+        )
     return None
 
 
@@ -2173,7 +2244,7 @@ def _decode_cooldown_entry(raw_value: Optional[str]) -> Optional[Dict[str, Any]]
 def _is_unconfigured_provider_row(row: Dict[str, Any]) -> bool:
     return (
         isinstance(row, dict)
-        and row.get("status") in ("No API Key", "Database Missing", "Skipped (IPv6)")
+        and row.get("status") in ("No API Key", "Database Missing", "Offline DB Missing", "Skipped (IPv6)")
         and row.get("statusCode") is None
     )
 
@@ -2209,8 +2280,10 @@ def _is_provider_cache_expected(provider_key: str, is_ipv4: bool) -> bool:
         return False
     if not is_provider_configured(provider_key):
         return False
-    # MaxMind needs no credential but answers Database Missing, which is never cached, without local MMDB files
+    # Offline databases answer Database Missing or Offline DB Missing uncached when local files are absent
     if provider_key == "maxmind" and not _has_any_local_maxmind_db():
+        return False
+    if provider_key == "stopforumspam" and not _has_any_local_stopforumspam_db():
         return False
     return True
 
@@ -2278,7 +2351,12 @@ def _build_unhandled_provider_error_row(provider_name: str, safe_message: str) -
 
 
 def _should_refresh_cached_maxmind_entry(raw_value: Optional[str], row: Dict[str, Any]) -> bool:
-    """Invalidates pre-City cached MaxMind entries when GeoLite2-City.mmdb is present on disk."""
+    """Invalidates stale or pre-City cached MaxMind entries when local MMDB files change."""
+    cached_db_updated = getattr(row, "_db_updated_at", None)
+    if isinstance(cached_db_updated, str) and cached_db_updated:
+        current_updated = get_maxmind_newest_mtime_iso()
+        if current_updated and current_updated != cached_db_updated:
+            return True
     if not _has_local_maxmind_city_db():
         return False
     if row.get("coordinates") is not None:
@@ -2297,6 +2375,14 @@ def _should_refresh_cached_maxmind_entry(raw_value: Optional[str], row: Dict[str
     return True
 
 
+def _should_refresh_cached_stopforumspam_entry(row: Dict[str, Any]) -> bool:
+    """Invalidates cached StopForumSpam entries when local database files change mtime."""
+    cached_db_version = getattr(row, "_db_version", None)
+    if cached_db_version is None:
+        return False
+    return cached_db_version != get_stopforumspam_db_version()
+
+
 async def _read_provider_caches(
     ip: str,
 ) -> Tuple[Dict[str, Tuple[Dict[str, Any], Optional[str]]], Optional[Tuple[Optional[str], Optional[str]]]]:
@@ -2310,6 +2396,8 @@ async def _read_provider_caches(
         decoded = _decode_cached_provider_entry(raw_values[idx])
         if decoded is not None:
             if provider_key == "maxmind" and _should_refresh_cached_maxmind_entry(raw_values[idx], decoded[0]):
+                continue
+            if provider_key == "stopforumspam" and _should_refresh_cached_stopforumspam_entry(decoded[0]):
                 continue
             cached_providers[provider_key] = decoded
     cached_ptr = _decode_cached_ptr_entry(raw_values[-1])
@@ -2344,6 +2432,7 @@ def _assemble_detection_payload(
     cached_at_timestamps: List[str],
     query_mode: str = "full",
     is_partial_mode: bool = False,
+    offline_databases: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     aggregated = aggregate_intelligence_metrics(ip, clean_results, ptr_hostname=ptr_hostname)
     total_active = hit_count + miss_count + cooldown_count
@@ -2357,7 +2446,7 @@ def _assemble_detection_payload(
         cache_status = "miss"
 
     oldest_cached_at = min(cached_at_timestamps) if cached_at_timestamps else None
-    return {
+    payload: Dict[str, Any] = {
         **aggregated,
         "queryMode": _normalize_query_mode(query_mode),
         "isPartialMode": is_partial_mode,
@@ -2372,6 +2461,9 @@ def _assemble_detection_payload(
             "cachedAt": oldest_cached_at,
         },
     }
+    if offline_databases is not None:
+        payload["offlineDatabases"] = offline_databases
+    return payload
 
 
 async def _execute_detection_with_cache(
@@ -2440,7 +2532,11 @@ async def _execute_detection_with_cache(
     quota_candidates = [
         spec[0]
         for _, spec in candidate_specs
-        if spec[0] != "maxmind" and (is_ipv4 or spec[0] not in _DNSBL_PROVIDER_KEYS) and is_provider_configured(spec[0])
+        if (
+            spec[0] not in _OFFLINE_PROVIDER_KEYS
+            and (is_ipv4 or spec[0] not in _DNSBL_PROVIDER_KEYS)
+            and is_provider_configured(spec[0])
+        )
     ]
     quota_blocked_entries: Dict[str, Dict[str, Any]] = {}
     quota_consumed_keys: Set[str] = set()
@@ -2617,6 +2713,11 @@ async def _execute_detection_with_cache(
                 entry_payload: Dict[str, Any] = {"row": row, "cachedAt": now_iso, "sanitized": True}
                 if provider_key == "maxmind":
                     entry_payload["cityDbLoaded"] = _has_local_maxmind_city_db()
+                    mm_updated = get_maxmind_newest_mtime_iso()
+                    if mm_updated:
+                        entry_payload["dbUpdatedAt"] = mm_updated
+                elif provider_key == "stopforumspam":
+                    entry_payload["dbVersion"] = get_stopforumspam_db_version()
                 cache_entry = json.dumps(entry_payload)
                 redis_set_entries.append(
                     (
@@ -2710,6 +2811,8 @@ async def _execute_detection_with_cache(
     if not are_offline_intelligence_caches_warm():
         await asyncio.to_thread(warm_offline_intelligence_caches)
 
+    offline_databases = await asyncio.to_thread(collect_offline_databases_status, now_dt=now_dt)
+
     return _assemble_detection_payload(
         ip,
         clean_results,
@@ -2720,6 +2823,7 @@ async def _execute_detection_with_cache(
         cached_at_timestamps=cached_at_timestamps,
         query_mode=normalized_mode,
         is_partial_mode=bool(deferred_provider_keys),
+        offline_databases=offline_databases,
     )
 
 
@@ -3951,3 +4055,29 @@ async def switch_test_role(request):
     if not await _persist_authenticated_session(request, user_data, context="switch_test_role"):
         return JsonResponse({"error": _SESSION_UNAVAILABLE_ERROR}, status=503)
     return JsonResponse({**user_data, "isAdmin": is_admin_user(user_data)})
+
+
+async def system_status(request):
+    """Returns live file mtime metadata for all offline databases and rule sets."""
+    start_time = time.perf_counter()
+    if request.method == "OPTIONS":
+        return _apply_detect_cors_headers(request, HttpResponse(status=204))
+
+    if request.method != "GET":
+        return _apply_detect_cors_headers(
+            request,
+            JsonResponse({"error": "Method not allowed"}, status=405),
+        )
+
+    now_dt = datetime.now(timezone.utc)
+    offline_databases = await asyncio.to_thread(collect_offline_databases_status, now_dt=now_dt)
+    payload = _attach_request_diagnostics(
+        {
+            "generatedAt": now_dt.isoformat(),
+            "offlineDatabases": offline_databases,
+        },
+        start_time,
+    )
+    response = JsonResponse(payload)
+    response["Cache-Control"] = "no-store"
+    return _apply_detect_cors_headers(request, response)

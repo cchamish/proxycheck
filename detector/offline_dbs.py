@@ -19,13 +19,15 @@ import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Generic, Iterable, List, Optional, Tuple, TypeVar
+
+from proxycheck.settings import (
+    MAXMIND_ASN_DB_FILENAME,
+    MAXMIND_CITY_DB_FILENAME,
+    MAXMIND_COUNTRY_DB_FILENAME,
+)
 
 logger = logging.getLogger(__name__)
-
-MAXMIND_COUNTRY_DB_FILENAME = "GeoLite2-Country.mmdb"
-MAXMIND_CITY_DB_FILENAME = "GeoLite2-City.mmdb"
-MAXMIND_ASN_DB_FILENAME = "GeoLite2-ASN.mmdb"
 
 SFS_TOXIC_CIDR_FILENAME = "toxic_ip_cidr.txt"
 SFS_LISTED_90_FILENAMES = (
@@ -72,7 +74,7 @@ def _get_setting(name: str, default: Any = None) -> Any:
 
         if django_settings.configured:
             return getattr(django_settings, name, default)
-    except Exception:
+    except ImportError, RuntimeError:
         return default
     return default
 
@@ -114,7 +116,7 @@ def _standard_data_directories() -> List[Path]:
     return list(settings_data_dirs(_base_dir()))
 
 
-def _get_file_stat_signature(file_path: Path) -> Optional[Tuple[int, int]]:
+def _get_file_stat_signature(file_path: str | Path) -> Optional[Tuple[int, int]]:
     try:
         stat_res = os.stat(file_path)
     except OSError:
@@ -313,20 +315,21 @@ def _resolve_lookup_byte_keys(ip: str) -> Tuple[Optional[bytes], Optional[bytes]
     return primary, mapped
 
 
-class _StopForumSpamCidrIndex:
-    """In-memory prefix-bucketed index for StopForumSpam toxic CIDR lookups."""
+_T = TypeVar("_T")
 
-    def __init__(self, cidrs: Iterable[str]) -> None:
-        v4_buckets: Dict[int, Dict[int, str]] = {}
-        v6_buckets: Dict[int, Dict[int, str]] = {}
 
-        for raw_line in cidrs:
-            cleaned = raw_line.strip()
-            if not cleaned or cleaned.startswith(("#", ";")):
+class PrefixCidrIndex(Generic[_T]):
+    """In-memory prefix-bucketed index for fast IPv4 and IPv6 CIDR matching."""
+
+    def __init__(self, entries: Iterable[Tuple[str, _T]]) -> None:
+        v4_buckets: Dict[int, Dict[int, Tuple[str, _T]]] = {}
+        v6_buckets: Dict[int, Dict[int, Tuple[str, _T]]] = {}
+
+        for raw_cidr, payload in entries:
+            if not isinstance(raw_cidr, str) or not raw_cidr.strip():
                 continue
-            token = cleaned.split()[0].strip()
             try:
-                net = ipaddress.ip_network(token, strict=False)
+                net = ipaddress.ip_network(raw_cidr.strip(), strict=False)
             except ValueError:
                 continue
             if net.prefixlen <= 0:
@@ -335,26 +338,28 @@ class _StopForumSpamCidrIndex:
             bucket = target_buckets.setdefault(net.prefixlen, {})
             net_int = int(net.network_address)
             if net_int not in bucket:
-                bucket[net_int] = str(net)
+                bucket[net_int] = (str(net), payload)
 
-        self.v4_prefixes: Tuple[Tuple[int, int, Dict[int, str]], ...] = tuple(
-            (
-                prefix_len,
-                ((1 << 32) - 1) ^ ((1 << (32 - prefix_len)) - 1),
-                v4_buckets[prefix_len],
-            )
-            for prefix_len in sorted(v4_buckets.keys(), reverse=True)
+        self.v4_prefixes: Tuple[Tuple[int, int, Dict[int, Tuple[str, _T]]], ...] = self._build_prefix_table(
+            v4_buckets, 32
         )
-        self.v6_prefixes: Tuple[Tuple[int, int, Dict[int, str]], ...] = tuple(
-            (
-                prefix_len,
-                ((1 << 128) - 1) ^ ((1 << (128 - prefix_len)) - 1),
-                v6_buckets[prefix_len],
-            )
-            for prefix_len in sorted(v6_buckets.keys(), reverse=True)
+        self.v6_prefixes: Tuple[Tuple[int, int, Dict[int, Tuple[str, _T]]], ...] = self._build_prefix_table(
+            v6_buckets, 128
         )
 
-    def match(self, ip: Optional[str]) -> Optional[str]:
+    @staticmethod
+    def _build_prefix_table(
+        buckets: Dict[int, Dict[int, Tuple[str, _T]]],
+        width: int,
+    ) -> Tuple[Tuple[int, int, Dict[int, Tuple[str, _T]]], ...]:
+        full_mask = (1 << width) - 1
+        return tuple(
+            (prefix_len, full_mask ^ ((1 << (width - prefix_len)) - 1), buckets[prefix_len])
+            for prefix_len in sorted(buckets.keys(), reverse=True)
+        )
+
+    def lookup(self, ip: Optional[str]) -> Optional[Tuple[str, int, _T]]:
+        """Matches an IPv4, IPv6, or IPv4-mapped IPv6 address against the longest prefix."""
         if not ip or not isinstance(ip, str):
             return None
         cleaned = ip.strip()
@@ -369,21 +374,40 @@ class _StopForumSpamCidrIndex:
 
         if addr.version == 6:
             addr_int = int(addr)
-            for _prefix_len, mask, bucket in self.v6_prefixes:
+            for prefix_len, mask, bucket in self.v6_prefixes:
                 hit = bucket.get(addr_int & mask)
                 if hit is not None:
-                    return hit
+                    return hit[0], prefix_len, hit[1]
             mapped_v4 = getattr(addr, "ipv4_mapped", None)
             if mapped_v4 is None:
                 return None
             addr = mapped_v4
 
         addr_int = int(addr)
-        for _prefix_len, mask, bucket in self.v4_prefixes:
+        for prefix_len, mask, bucket in self.v4_prefixes:
             hit = bucket.get(addr_int & mask)
             if hit is not None:
-                return hit
+                return hit[0], prefix_len, hit[1]
         return None
+
+
+def _iter_sfs_cidr_tokens(cidrs: Iterable[str]) -> Iterable[Tuple[str, None]]:
+    for raw_line in cidrs:
+        cleaned = raw_line.strip()
+        if not cleaned or cleaned.startswith(("#", ";")):
+            continue
+        yield cleaned.split()[0].strip(), None
+
+
+class _StopForumSpamCidrIndex(PrefixCidrIndex[None]):
+    """In-memory prefix-bucketed index for StopForumSpam toxic CIDR lookups."""
+
+    def __init__(self, cidrs: Iterable[str]) -> None:
+        super().__init__(_iter_sfs_cidr_tokens(cidrs))
+
+    def match(self, ip: Optional[str]) -> Optional[str]:
+        hit = self.lookup(ip)
+        return hit[0] if hit is not None else None
 
 
 _EMPTY_SFS_CIDR_INDEX = _StopForumSpamCidrIndex(())
@@ -520,6 +544,9 @@ def _atomic_replace_with_retry(src_path: Path, dst_path: Path) -> None:
             if attempt == 5:
                 raise
             time.sleep(0.05 * (attempt + 1))
+
+
+atomic_replace_with_retry = _atomic_replace_with_retry
 
 
 def build_stopforumspam_sqlite_index(
@@ -780,7 +807,7 @@ def warm_stopforumspam_caches() -> None:
     _get_toxic_cidr_index(toxic_path)
     try:
         _ensure_stopforumspam_sqlite_index(paths)
-    except Exception as exc:
+    except (OSError, sqlite3.Error, ValueError) as exc:
         logger.warning("Failed to warm StopForumSpam SQLite index: %s", exc)
     with _sfs_cache_lock:
         _sfs_cache_warmed = True
@@ -907,24 +934,23 @@ def _build_offline_db_entry(
     }
 
 
-def collect_offline_databases_status(*, now_dt: Optional[datetime] = None) -> List[Dict[str, Any]]:
-    """Inventories all local offline databases and rules using file mtime metadata."""
-    current_dt = now_dt or datetime.now(timezone.utc)
-    now_ts = current_dt.timestamp()
-
-    maxmind_stale = _get_positive_int_setting("OFFLINE_DB_MAXMIND_STALE_SECONDS", _DEFAULT_STALE_MAXMIND_SECONDS)
-    sfs_toxic_stale = _get_positive_int_setting("OFFLINE_DB_SFS_TOXIC_STALE_SECONDS", _DEFAULT_STALE_SFS_TOXIC_SECONDS)
-    sfs_90_stale = _get_positive_int_setting("OFFLINE_DB_SFS_90_STALE_SECONDS", _DEFAULT_STALE_SFS_90_SECONDS)
-    sfs_1_stale = _get_positive_int_setting("OFFLINE_DB_SFS_1_STALE_SECONDS", _DEFAULT_STALE_SFS_1_SECONDS)
-    rules_stale = _get_positive_int_setting("OFFLINE_DB_RULES_STALE_SECONDS", _DEFAULT_STALE_RULES_SECONDS)
-
-    maxmind_paths = resolve_maxmind_paths()
-    sfs_paths = resolve_stopforumspam_paths()
-    cloud_cidr_path, cloud_cidr_name = _resolve_rule_file(
-        "CLOUD_CIDR_DB_PATH", ("cloud_cidrs.json", "computehosts.json")
-    )
-    hosting_rules_path, hosting_rules_name = _resolve_rule_file("HOSTING_ASN_RULES_PATH", ("hosting_asn_rules.json",))
-
+def build_offline_database_entries(
+    *,
+    maxmind_paths: Dict[str, Optional[Path]],
+    sfs_paths: Dict[str, Optional[Path]],
+    cloud_cidr_path: Optional[Path],
+    cloud_cidr_name: str,
+    hosting_rules_path: Optional[Path],
+    hosting_rules_name: str,
+    maxmind_stale: int,
+    sfs_toxic_stale: int,
+    sfs_90_stale: int,
+    sfs_1_stale: int,
+    rules_stale: int,
+    now_ts: float,
+    include_resolved_path: bool = False,
+) -> List[Dict[str, Any]]:
+    """Builds standardised status entries for all configured offline databases and rule files."""
     specs = (
         (
             "maxmind_country",
@@ -1018,8 +1044,9 @@ def collect_offline_databases_status(*, now_dt: Optional[datetime] = None) -> Li
         ),
     )
 
-    return [
-        _build_offline_db_entry(
+    entries: List[Dict[str, Any]] = []
+    for key, source, name, file_path, fallback_filename, optional, stale_after_seconds, missing_label in specs:
+        entry = _build_offline_db_entry(
             key=key,
             source=source,
             name=name,
@@ -1030,5 +1057,41 @@ def collect_offline_databases_status(*, now_dt: Optional[datetime] = None) -> Li
             now_ts=now_ts,
             missing_label=missing_label,
         )
-        for key, source, name, file_path, fallback_filename, optional, stale_after_seconds, missing_label in specs
-    ]
+        if include_resolved_path:
+            entry["resolvedPath"] = str(file_path) if file_path is not None else ""
+        entries.append(entry)
+    return entries
+
+
+def collect_offline_databases_status(*, now_dt: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    """Inventories all local offline databases and rules using file mtime metadata."""
+    current_dt = now_dt or datetime.now(timezone.utc)
+    now_ts = current_dt.timestamp()
+
+    maxmind_stale = _get_positive_int_setting("OFFLINE_DB_MAXMIND_STALE_SECONDS", _DEFAULT_STALE_MAXMIND_SECONDS)
+    sfs_toxic_stale = _get_positive_int_setting("OFFLINE_DB_SFS_TOXIC_STALE_SECONDS", _DEFAULT_STALE_SFS_TOXIC_SECONDS)
+    sfs_90_stale = _get_positive_int_setting("OFFLINE_DB_SFS_90_STALE_SECONDS", _DEFAULT_STALE_SFS_90_SECONDS)
+    sfs_1_stale = _get_positive_int_setting("OFFLINE_DB_SFS_1_STALE_SECONDS", _DEFAULT_STALE_SFS_1_SECONDS)
+    rules_stale = _get_positive_int_setting("OFFLINE_DB_RULES_STALE_SECONDS", _DEFAULT_STALE_RULES_SECONDS)
+
+    maxmind_paths = resolve_maxmind_paths()
+    sfs_paths = resolve_stopforumspam_paths()
+    cloud_cidr_path, cloud_cidr_name = _resolve_rule_file(
+        "CLOUD_CIDR_DB_PATH", ("cloud_cidrs.json", "computehosts.json")
+    )
+    hosting_rules_path, hosting_rules_name = _resolve_rule_file("HOSTING_ASN_RULES_PATH", ("hosting_asn_rules.json",))
+
+    return build_offline_database_entries(
+        maxmind_paths=maxmind_paths,
+        sfs_paths=sfs_paths,
+        cloud_cidr_path=cloud_cidr_path,
+        cloud_cidr_name=cloud_cidr_name,
+        hosting_rules_path=hosting_rules_path,
+        hosting_rules_name=hosting_rules_name,
+        maxmind_stale=maxmind_stale,
+        sfs_toxic_stale=sfs_toxic_stale,
+        sfs_90_stale=sfs_90_stale,
+        sfs_1_stale=sfs_1_stale,
+        rules_stale=rules_stale,
+        now_ts=now_ts,
+    )

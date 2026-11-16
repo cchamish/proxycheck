@@ -32,8 +32,8 @@ from detector.offline_dbs import (
     SFS_LISTED_90_FILENAMES,
     SFS_SQLITE_FILENAME,
     SFS_TOXIC_CIDR_FILENAME,
-    _build_offline_db_entry,
     _find_in_directory,
+    build_offline_database_entries,
 )
 from proxycheck.settings import (
     MAXMIND_ASN_DB_FILENAME,
@@ -988,9 +988,13 @@ def _is_recommended_local_fallback(
         if "127.0.0.1" in lowered or "localhost" in lowered:
             return "points to localhost Redis inside Toolforge"
 
-    if spec.name == "WIKIMEDIA_REDIRECT_URI" and tool_account == "proxycheck-dev":
-        if "proxycheck.toolforge.org" in cleaned and "proxycheck-dev.toolforge.org" not in cleaned:
-            return "points to production callback URL while active tool is proxycheck-dev"
+    if (
+        spec.name == "WIKIMEDIA_REDIRECT_URI"
+        and tool_account == "proxycheck-dev"
+        and "proxycheck.toolforge.org" in cleaned
+        and "proxycheck-dev.toolforge.org" not in cleaned
+    ):
+        return "points to production callback URL while active tool is proxycheck-dev"
 
     return None
 
@@ -1368,115 +1372,30 @@ def collect_offline_status_for_env(
         standard_dirs,
     )
 
-    specs = (
-        (
-            "maxmind_country",
-            "MaxMind",
-            "MaxMind GeoLite2 Country",
-            _resolve_mmdb_for_env(maxmind_dir, MAXMIND_COUNTRY_DB_FILENAME, standard_dirs),
-            MAXMIND_COUNTRY_DB_FILENAME,
-            False,
-            maxmind_stale,
-            None,
-        ),
-        (
-            "maxmind_city",
-            "MaxMind",
-            "MaxMind GeoLite2 City",
-            _resolve_mmdb_for_env(maxmind_dir, MAXMIND_CITY_DB_FILENAME, standard_dirs),
-            MAXMIND_CITY_DB_FILENAME,
-            False,
-            maxmind_stale,
-            None,
-        ),
-        (
-            "maxmind_asn",
-            "MaxMind",
-            "MaxMind GeoLite2 ASN",
-            _resolve_mmdb_for_env(maxmind_dir, MAXMIND_ASN_DB_FILENAME, standard_dirs),
-            MAXMIND_ASN_DB_FILENAME,
-            False,
-            maxmind_stale,
-            None,
-        ),
-        (
-            "stopforumspam_toxic_cidr",
-            "StopForumSpam",
-            "StopForumSpam Toxic CIDRs",
-            sfs_toxic,
-            SFS_TOXIC_CIDR_FILENAME,
-            False,
-            sfs_toxic_stale,
-            None,
-        ),
-        (
-            "stopforumspam_listed_90",
-            "StopForumSpam",
-            "StopForumSpam Listed IPs (90d)",
-            sfs_90,
-            SFS_LISTED_90_FILENAMES[0],
-            False,
-            sfs_90_stale,
-            None,
-        ),
-        (
-            "stopforumspam_listed_1",
-            "StopForumSpam",
-            "StopForumSpam Listed IPs (1d)",
-            sfs_1,
-            SFS_LISTED_1_FILENAMES[0],
-            True,
-            sfs_1_stale,
-            None,
-        ),
-        (
-            "stopforumspam_index",
-            "StopForumSpam",
-            "StopForumSpam Local SQLite Index",
-            sfs_sqlite,
-            SFS_SQLITE_FILENAME,
-            True,
-            sfs_90_stale,
-            None,
-        ),
-        (
-            "cloud_cidrs",
-            "Cloud CIDRs",
-            "Cloud Provider CIDRs",
-            cloud_path,
-            cloud_name,
-            True,
-            rules_stale,
-            "Built-in (Optional)",
-        ),
-        (
-            "hosting_asn_rules",
-            "Hosting Rules",
-            "Hosting ASN Rules",
-            hosting_path,
-            hosting_name,
-            True,
-            rules_stale,
-            "Built-in (Optional)",
-        ),
+    return build_offline_database_entries(
+        maxmind_paths={
+            "country": _resolve_mmdb_for_env(maxmind_dir, MAXMIND_COUNTRY_DB_FILENAME, standard_dirs),
+            "city": _resolve_mmdb_for_env(maxmind_dir, MAXMIND_CITY_DB_FILENAME, standard_dirs),
+            "asn": _resolve_mmdb_for_env(maxmind_dir, MAXMIND_ASN_DB_FILENAME, standard_dirs),
+        },
+        sfs_paths={
+            "toxic_cidr": sfs_toxic,
+            "listed_90": sfs_90,
+            "listed_1": sfs_1,
+            "sqlite_index": sfs_sqlite,
+        },
+        cloud_cidr_path=cloud_path,
+        cloud_cidr_name=cloud_name,
+        hosting_rules_path=hosting_path,
+        hosting_rules_name=hosting_name,
+        maxmind_stale=maxmind_stale,
+        sfs_toxic_stale=sfs_toxic_stale,
+        sfs_90_stale=sfs_90_stale,
+        sfs_1_stale=sfs_1_stale,
+        rules_stale=rules_stale,
+        now_ts=now_ts,
+        include_resolved_path=True,
     )
-
-    entries: List[Dict[str, Any]] = []
-    for key, source, name, file_path, fallback_filename, optional, stale_after_seconds, missing_label in specs:
-        entry = _build_offline_db_entry(
-            key=key,
-            source=source,
-            name=name,
-            file_path=file_path,
-            fallback_filename=fallback_filename,
-            optional=optional,
-            stale_after_seconds=stale_after_seconds,
-            now_ts=now_ts,
-            missing_label=missing_label,
-        )
-        entry["resolvedPath"] = str(file_path) if file_path is not None else ""
-        entries.append(entry)
-    return entries
 
 
 def _strip_yaml_quotes(raw_val: str) -> str:

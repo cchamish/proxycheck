@@ -7,6 +7,7 @@ import hashlib
 import ipaddress
 import os
 import re
+import sqlite3
 import tarfile
 import tempfile
 import time
@@ -24,6 +25,9 @@ from detector.offline_dbs import (
     build_stopforumspam_sqlite_index,
     clear_stopforumspam_caches,
     resolve_writable_data_dir,
+)
+from detector.offline_dbs import (
+    atomic_replace_with_retry as _atomic_replace,
 )
 from detector.views import USER_AGENT_HEADER
 from proxycheck.settings import (
@@ -62,18 +66,7 @@ MAXMIND_EDITION_SPECS: Tuple[Tuple[str, str], ...] = (
     ("GeoLite2-City", MAXMIND_CITY_DB_FILENAME),
     ("GeoLite2-ASN", MAXMIND_ASN_DB_FILENAME),
 )
-
-
-def _atomic_replace(src_path: Path, dst_path: Path) -> None:
-    """Replaces dst_path atomically with brief retries for transient reader locks."""
-    for attempt in range(6):
-        try:
-            os.replace(src_path, dst_path)
-            return
-        except PermissionError:
-            if attempt == 5:
-                raise
-            time.sleep(0.05 * (attempt + 1))
+_DOWNLOAD_UPDATE_ERRORS = (httpx.HTTPError, CommandError, OSError, ValueError, tarfile.TarError, zipfile.BadZipFile)
 
 
 def _file_md5_hex(file_path: Path) -> str:
@@ -408,7 +401,7 @@ class Command(BaseCommand):
                     if tmp_toxic.exists():
                         with contextlib.suppress(OSError):
                             tmp_toxic.unlink()
-            except Exception as exc:
+            except _DOWNLOAD_UPDATE_ERRORS as exc:
                 errors += 1
                 self.stderr.write(self.style.ERROR(f"Failed StopForumSpam Toxic CIDR update: {exc}"))
 
@@ -424,7 +417,7 @@ class Command(BaseCommand):
                 dry_run=dry_run,
             ):
                 updated_listed = True
-        except Exception as exc:
+        except _DOWNLOAD_UPDATE_ERRORS as exc:
             errors += 1
             self.stderr.write(self.style.ERROR(f"Failed StopForumSpam 90d update: {exc}"))
 
@@ -441,7 +434,7 @@ class Command(BaseCommand):
                     dry_run=dry_run,
                 ):
                     updated_listed = True
-            except Exception as exc:
+            except _DOWNLOAD_UPDATE_ERRORS as exc:
                 errors += 1
                 self.stderr.write(self.style.ERROR(f"Failed StopForumSpam 1d update: {exc}"))
 
@@ -459,7 +452,7 @@ class Command(BaseCommand):
                         f"Rebuilt StopForumSpam SQLite index ({sqlite_target.name}, {row_count} entries)."
                     )
                 )
-            except Exception as exc:
+            except (OSError, sqlite3.Error, ValueError, zipfile.BadZipFile) as exc:
                 errors += 1
                 self.stderr.write(self.style.ERROR(f"Failed rebuilding StopForumSpam SQLite index: {exc}"))
         return errors
@@ -526,7 +519,7 @@ class Command(BaseCommand):
                     os.chmod(tmp_mmdb, 0o644)
                 _atomic_replace(tmp_mmdb, target_path)
                 self.stdout.write(self.style.SUCCESS(f"Updated {edition} ({filename}, sha256={expected_sha[:12]}...)."))
-            except Exception as exc:
+            except _DOWNLOAD_UPDATE_ERRORS as exc:
                 errors += 1
                 self.stderr.write(self.style.ERROR(_redact_text(f"Failed {edition} update: {exc}", secrets_to_hide)))
             finally:

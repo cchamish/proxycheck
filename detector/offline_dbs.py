@@ -857,6 +857,7 @@ def _build_offline_db_entry(
     optional: bool,
     stale_after_seconds: int,
     now_ts: float,
+    missing_label: Optional[str] = None,
 ) -> Dict[str, Any]:
     filename = file_path.name if file_path is not None else fallback_filename
     stat_res = None
@@ -868,6 +869,9 @@ def _build_offline_db_entry(
             stat_res = None
 
     if stat_res is None:
+        resolved_missing_label = (
+            missing_label if missing_label is not None else ("Optional (Not Configured)" if optional else "Missing")
+        )
         return {
             "key": key,
             "source": source,
@@ -880,7 +884,7 @@ def _build_offline_db_entry(
             "ageSeconds": None,
             "staleAfterSeconds": stale_after_seconds,
             "status": "missing",
-            "statusLabel": "Optional (Not Configured)" if optional else "Missing",
+            "statusLabel": resolved_missing_label,
         }
 
     mtime_ts = float(stat_res.st_mtime)
@@ -930,6 +934,7 @@ def collect_offline_databases_status(*, now_dt: Optional[datetime] = None) -> Li
             MAXMIND_COUNTRY_DB_FILENAME,
             False,
             maxmind_stale,
+            None,
         ),
         (
             "maxmind_city",
@@ -939,6 +944,7 @@ def collect_offline_databases_status(*, now_dt: Optional[datetime] = None) -> Li
             MAXMIND_CITY_DB_FILENAME,
             False,
             maxmind_stale,
+            None,
         ),
         (
             "maxmind_asn",
@@ -948,6 +954,7 @@ def collect_offline_databases_status(*, now_dt: Optional[datetime] = None) -> Li
             MAXMIND_ASN_DB_FILENAME,
             False,
             maxmind_stale,
+            None,
         ),
         (
             "stopforumspam_toxic_cidr",
@@ -957,6 +964,7 @@ def collect_offline_databases_status(*, now_dt: Optional[datetime] = None) -> Li
             SFS_TOXIC_CIDR_FILENAME,
             False,
             sfs_toxic_stale,
+            None,
         ),
         (
             "stopforumspam_listed_90",
@@ -966,6 +974,7 @@ def collect_offline_databases_status(*, now_dt: Optional[datetime] = None) -> Li
             SFS_LISTED_90_FILENAMES[0],
             False,
             sfs_90_stale,
+            None,
         ),
         (
             "stopforumspam_listed_1",
@@ -975,6 +984,7 @@ def collect_offline_databases_status(*, now_dt: Optional[datetime] = None) -> Li
             SFS_LISTED_1_FILENAMES[0],
             True,
             sfs_1_stale,
+            None,
         ),
         (
             "stopforumspam_index",
@@ -984,8 +994,18 @@ def collect_offline_databases_status(*, now_dt: Optional[datetime] = None) -> Li
             SFS_SQLITE_FILENAME,
             True,
             sfs_90_stale,
+            None,
         ),
-        ("cloud_cidrs", "Cloud CIDRs", "Cloud Provider CIDRs", cloud_cidr_path, cloud_cidr_name, True, rules_stale),
+        (
+            "cloud_cidrs",
+            "Cloud CIDRs",
+            "Cloud Provider CIDRs",
+            cloud_cidr_path,
+            cloud_cidr_name,
+            True,
+            rules_stale,
+            "Built-in (Optional)",
+        ),
         (
             "hosting_asn_rules",
             "Hosting Rules",
@@ -994,6 +1014,7 @@ def collect_offline_databases_status(*, now_dt: Optional[datetime] = None) -> Li
             hosting_rules_name,
             True,
             rules_stale,
+            "Built-in (Optional)",
         ),
     )
 
@@ -1007,6 +1028,7 @@ def collect_offline_databases_status(*, now_dt: Optional[datetime] = None) -> Li
             optional=optional,
             stale_after_seconds=stale_after_seconds,
             now_ts=now_ts,
+            missing_label=missing_label,
         )
-        for key, source, name, file_path, fallback_filename, optional, stale_after_seconds in specs
+        for key, source, name, file_path, fallback_filename, optional, stale_after_seconds, missing_label in specs
     ]

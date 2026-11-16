@@ -9854,30 +9854,65 @@ class OfflineDatabaseStatusEndpointTests(TestCase):
         self.assertEqual(by_key["maxmind_asn"]["status"], "healthy")
         self.assertEqual(by_key["maxmind_city"]["status"], "missing")
         self.assertFalse(by_key["maxmind_city"]["exists"])
+        self.assertEqual(by_key["cloud_cidrs"]["statusLabel"], "Built-in (Optional)")
+        self.assertEqual(by_key["hosting_asn_rules"]["statusLabel"], "Built-in (Optional)")
 
-    def test_system_status_endpoint_and_compact_strip_behavior(self):
-        response = self.client.get("/api/v1/status", HTTP_ORIGIN="https://meta.wikimedia.org")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response["Cache-Control"], "no-store")
-        self.assertEqual(response["Access-Control-Allow-Origin"], "https://meta.wikimedia.org")
-        payload = response.json()
-        self.assertIn("generatedAt", payload)
-        self.assertIsInstance(payload.get("offlineDatabases"), list)
-        keys = {item["key"] for item in payload["offlineDatabases"]}
-        self.assertIn("maxmind_city", keys)
-        self.assertIn("stopforumspam_listed_90", keys)
+    def test_system_status_endpoint_requires_admin_session_and_detect_omits_inventory(self):
+        unauth_resp = self.client.get("/api/v1/status")
+        self.assertEqual(unauth_resp.status_code, 401)
 
-        post_resp = self.client.post("/api/v1/status")
-        self.assertEqual(post_resp.status_code, 405)
+        _login_authorised(self)
+        with (
+            override_settings(ALLOWED_WIKI_USERS="AllowlistedAdmin"),
+            patch.dict(os.environ, {"ALLOWED_WIKI_USERS": "AllowlistedAdmin"}),
+        ):
+            non_admin_resp = self.client.get("/api/v1/status")
+            self.assertEqual(non_admin_resp.status_code, 403)
 
-        sample_payload = {
-            "ip": "8.8.8.8",
-            "offlineDatabases": payload["offlineDatabases"],
-            "results": [{"provider": "StopForumSpam", "rawJson": {"secret": "no"}}],
+            gadget_token = views.issue_gadget_token("AllowlistedAdmin")
+            gadget_resp = self.client.get("/api/v1/status", HTTP_AUTHORIZATION=f"Bearer {gadget_token}")
+            self.assertEqual(gadget_resp.status_code, 403)
+
+        admin_session = self.client.session
+        admin_session["wikimedia_user"] = {
+            "isLoggedIn": True,
+            "username": "AllowlistedAdmin",
+            "role": "Allowlisted Wikimedia User",
+            "hasAccess": True,
+            "localGroups": [],
+            "globalGroups": [],
         }
-        compact_payload = views._strip_raw_json_from_payload(sample_payload)
-        self.assertNotIn("offlineDatabases", compact_payload)
-        self.assertNotIn("rawJson", compact_payload["results"][0])
+        admin_session.save()
+        with (
+            override_settings(ALLOWED_WIKI_USERS="AllowlistedAdmin"),
+            patch.dict(os.environ, {"ALLOWED_WIKI_USERS": "AllowlistedAdmin"}),
+        ):
+            ok_resp = self.client.get("/api/v1/status")
+            self.assertEqual(ok_resp.status_code, 200)
+            self.assertEqual(ok_resp["Cache-Control"], "no-store")
+            payload = ok_resp.json()
+            self.assertIn("generatedAt", payload)
+            self.assertIsInstance(payload.get("offlineDatabases"), list)
+            keys = {item["key"] for item in payload["offlineDatabases"]}
+            self.assertIn("maxmind_city", keys)
+            self.assertIn("stopforumspam_listed_90", keys)
+
+            post_resp = self.client.post("/api/v1/status")
+            self.assertEqual(post_resp.status_code, 405)
+
+            detect_resp = asyncio.run(
+                views._execute_detection_with_cache(
+                    "8.8.8.8",
+                    initial_cache=(
+                        {
+                            provider_key: ({"provider": name, "status": "200 OK", "statusCode": 200}, None)
+                            for provider_key, name, _, _, _ in views._PROVIDER_SPECS
+                        },
+                        ("dns.google", None),
+                    ),
+                )
+            )
+            self.assertNotIn("offlineDatabases", detect_resp)
 
 
 class UpdateOfflineDbsCommandTests(TestCase):

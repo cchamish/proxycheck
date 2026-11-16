@@ -329,14 +329,15 @@ def _attach_request_diagnostics(payload: Dict[str, Any], start_time: float) -> D
 
 
 def _strip_raw_json_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Returns a shallow copy of payload without rawJson keys or heavy database inventories."""
+    """Returns a shallow copy of payload without rawJson keys on provider result rows."""
     if isinstance(payload, dict) and isinstance(payload.get("results"), list):
-        stripped = {k: v for k, v in payload.items() if k != "offlineDatabases"}
-        stripped["results"] = [
-            {k: v for k, v in row.items() if k != "rawJson"} if isinstance(row, dict) else row
-            for row in payload["results"]
-        ]
-        return stripped
+        return {
+            **payload,
+            "results": [
+                {k: v for k, v in row.items() if k != "rawJson"} if isinstance(row, dict) else row
+                for row in payload["results"]
+            ],
+        }
     return payload
 
 
@@ -2432,7 +2433,6 @@ def _assemble_detection_payload(
     cached_at_timestamps: List[str],
     query_mode: str = "full",
     is_partial_mode: bool = False,
-    offline_databases: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     aggregated = aggregate_intelligence_metrics(ip, clean_results, ptr_hostname=ptr_hostname)
     total_active = hit_count + miss_count + cooldown_count
@@ -2446,7 +2446,7 @@ def _assemble_detection_payload(
         cache_status = "miss"
 
     oldest_cached_at = min(cached_at_timestamps) if cached_at_timestamps else None
-    payload: Dict[str, Any] = {
+    return {
         **aggregated,
         "queryMode": _normalize_query_mode(query_mode),
         "isPartialMode": is_partial_mode,
@@ -2461,9 +2461,6 @@ def _assemble_detection_payload(
             "cachedAt": oldest_cached_at,
         },
     }
-    if offline_databases is not None:
-        payload["offlineDatabases"] = offline_databases
-    return payload
 
 
 async def _execute_detection_with_cache(
@@ -2811,8 +2808,6 @@ async def _execute_detection_with_cache(
     if not are_offline_intelligence_caches_warm():
         await asyncio.to_thread(warm_offline_intelligence_caches)
 
-    offline_databases = await asyncio.to_thread(collect_offline_databases_status, now_dt=now_dt)
-
     return _assemble_detection_payload(
         ip,
         clean_results,
@@ -2823,7 +2818,6 @@ async def _execute_detection_with_cache(
         cached_at_timestamps=cached_at_timestamps,
         query_mode=normalized_mode,
         is_partial_mode=bool(deferred_provider_keys),
-        offline_databases=offline_databases,
     )
 
 
@@ -3753,12 +3747,8 @@ async def get_current_user(request):
     return JsonResponse(_attach_request_diagnostics(payload, start_time))
 
 
-async def admin_provider_dashboard(request):
-    """
-    Returns anonymised API quota usage, reactive cooldown states, and daily telemetry
-    for allowlisted administrators.
-    """
-    start_time = time.perf_counter()
+async def _authorize_admin_session_request(request, *, context: str) -> Optional[JsonResponse]:
+    """Enforces GET-only allowlisted session access without accepting gadget Bearer tokens."""
     if request.method != "GET":
         return JsonResponse({"error": "Method not allowed"}, status=405)
 
@@ -3769,7 +3759,7 @@ async def admin_provider_dashboard(request):
             status=403,
         )
 
-    session_user = await _get_session_user(request, context="admin_provider_dashboard")
+    session_user = await _get_session_user(request, context=context)
     if not isinstance(session_user, dict) or not session_user.get("isLoggedIn"):
         return JsonResponse(
             {"error": "Authentication required. Please log in with Wikimedia."},
@@ -3780,6 +3770,18 @@ async def admin_provider_dashboard(request):
             {"error": "Access denied. Allowlisted administrator privileges required."},
             status=403,
         )
+    return None
+
+
+async def admin_provider_dashboard(request):
+    """
+    Returns anonymised API quota usage, reactive cooldown states, and daily telemetry
+    for allowlisted administrators.
+    """
+    start_time = time.perf_counter()
+    denied_response = await _authorize_admin_session_request(request, context="admin_provider_dashboard")
+    if denied_response is not None:
+        return denied_response
 
     snapshot = await build_dashboard_snapshot()
     response = JsonResponse(_attach_request_diagnostics(snapshot, start_time))
@@ -4058,16 +4060,11 @@ async def switch_test_role(request):
 
 
 async def system_status(request):
-    """Returns live file mtime metadata for all offline databases and rule sets."""
+    """Returns live file mtime metadata for all offline databases to allowlisted administrators."""
     start_time = time.perf_counter()
-    if request.method == "OPTIONS":
-        return _apply_detect_cors_headers(request, HttpResponse(status=204))
-
-    if request.method != "GET":
-        return _apply_detect_cors_headers(
-            request,
-            JsonResponse({"error": "Method not allowed"}, status=405),
-        )
+    denied_response = await _authorize_admin_session_request(request, context="system_status")
+    if denied_response is not None:
+        return denied_response
 
     now_dt = datetime.now(timezone.utc)
     offline_databases = await asyncio.to_thread(collect_offline_databases_status, now_dt=now_dt)
@@ -4080,4 +4077,4 @@ async def system_status(request):
     )
     response = JsonResponse(payload)
     response["Cache-Control"] = "no-store"
-    return _apply_detect_cors_headers(request, response)
+    return response

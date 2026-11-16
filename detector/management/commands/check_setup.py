@@ -1451,7 +1451,7 @@ def _extract_update_offline_sources(command: str) -> set[str]:
         idx += 1
 
     if not source_tokens or "all" in source_tokens:
-        return {"stopforumspam", "maxmind"}
+        return {"stopforumspam", "maxmind", "cloud_cidrs"}
 
     covered: set[str] = set()
     for tok in source_tokens:
@@ -1459,6 +1459,8 @@ def _extract_update_offline_sources(command: str) -> set[str]:
             covered.add("stopforumspam")
         elif tok == "maxmind":
             covered.add("maxmind")
+        elif tok in ("cloud_cidrs", "cloud-cidrs", "cloud"):
+            covered.add("cloud_cidrs")
     return covered
 
 
@@ -1477,10 +1479,16 @@ def _schedule_matches_expected(expected_schedule: str, actual_job_type: str) -> 
         return True
     if norm_expected == actual_cron:
         return True
+    hourly_re = r"\d{1,2}\s+\*\s+\*\s+\*\s+\*"
+    daily_re = r"\d{1,2}\s+\d{1,2}\s+\*\s+\*\s+\*"
     if norm_expected == "@hourly":
-        return bool(re.fullmatch(r"\d{1,2}\s+\*\s+\*\s+\*\s+\*", actual_cron))
+        return bool(re.fullmatch(hourly_re, actual_cron))
+    if actual_cron == "@hourly":
+        return bool(re.fullmatch(hourly_re, norm_expected))
     if norm_expected == "@daily":
-        return bool(re.fullmatch(r"\d{1,2}\s+\d{1,2}\s+\*\s+\*\s+\*", actual_cron))
+        return bool(re.fullmatch(daily_re, actual_cron))
+    if actual_cron == "@daily":
+        return bool(re.fullmatch(daily_re, norm_expected))
     return False
 
 

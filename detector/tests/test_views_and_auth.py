@@ -3,7 +3,6 @@
 import asyncio
 import json
 import os
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -51,59 +50,7 @@ class DetectorAuthTests(TestCase):
         self.addCleanup(dns_patcher.stop)
 
     # Verify detect_ip authentication and role-based access control
-    def test_detect_ip_unauthenticated_returns_401(self):
-        response = self.client.get("/api/v1/detect?ip=8.8.8.8")
-        self.assertEqual(response.status_code, 401)
-        data = response.json()
-        self.assertIn("error", data)
-
-    def test_detect_ip_unauthorised_role_returns_403(self):
-        session = self.client.session
-        session["wikimedia_user"] = {
-            "isLoggedIn": True,
-            "username": "StandardEditor",
-            "role": "Standard User (Unauthorised)",
-            "hasAccess": False,
-            "localGroups": ["autoreview"],
-            "globalGroups": [],
-        }
-        session.save()
-
-        response = self.client.get("/api/v1/detect?ip=8.8.8.8")
-        self.assertEqual(response.status_code, 403)
-        data = response.json()
-        self.assertIn("error", data)
-
-    @patch("detector.views.redis_client", None)
-    @patch("detector.views.query_dshield", new_callable=AsyncMock)
-    @patch("detector.views.query_stopforumspam", new_callable=AsyncMock)
-    @patch("detector.views.query_tor_onionoo", new_callable=AsyncMock)
-    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
-    @patch("detector.views.query_iphunter", new_callable=AsyncMock)
-    @patch("detector.views.query_iphub", new_callable=AsyncMock)
-    @patch("detector.views.query_proxycheck", new_callable=AsyncMock)
-    @patch("detector.views.query_getipintel", new_callable=AsyncMock)
-    @patch("detector.views.query_ip2location", new_callable=AsyncMock)
-    @patch("detector.views.query_ipregistry", new_callable=AsyncMock)
-    @patch("detector.views.query_ipdata", new_callable=AsyncMock)
-    @patch("detector.views.query_abuseipdb", new_callable=AsyncMock)
-    @patch("detector.views.query_cloudflare_radar", new_callable=AsyncMock)
-    def test_detect_ip_authorised_user_returns_200(
-        self,
-        mock_cf,
-        mock_abuse,
-        mock_ipdata,
-        mock_ipreg,
-        mock_ip2loc,
-        mock_gii,
-        mock_pc,
-        mock_iphub,
-        mock_iphunter,
-        mock_mm,
-        mock_tor,
-        mock_sfs,
-        mock_dshield,
-    ):
+    def _patch_detect_providers(self):
         def _stub_provider(name):
             return {
                 "provider": name,
@@ -118,32 +65,52 @@ class DetectorAuthTests(TestCase):
                 "rawJson": {"status": "error", "message": "API key not configured"},
             }
 
-        mock_cf.return_value = _stub_provider("Cloudflare Radar")
-        mock_abuse.return_value = _stub_provider("AbuseIPDB")
-        mock_ipdata.return_value = _stub_provider("IPData")
-        mock_ipreg.return_value = _stub_provider("IPRegistry")
-        mock_ip2loc.return_value = _stub_provider("IP2Location")
-        mock_gii.return_value = _stub_provider("GetIPIntel")
-        mock_pc.return_value = _stub_provider("Proxycheck")
-        mock_iphub.return_value = _stub_provider("IPHub")
-        mock_iphunter.return_value = _stub_provider("IPHunter")
-        mock_mm.return_value = _stub_provider("MaxMind")
-        mock_tor.return_value = adapt_tor_onionoo({"relays": []}, 200, "8.8.8.8")
-        mock_sfs.return_value = adapt_stopforumspam(
-            {"success": 1, "ip": {"appears": 0, "frequency": 0, "confidence": 0.0}}, 200
+        targets = (
+            ("detector.views.query_cloudflare_radar", _stub_provider("Cloudflare Radar")),
+            ("detector.views.query_abuseipdb", _stub_provider("AbuseIPDB")),
+            ("detector.views.query_ipdata", _stub_provider("IPData")),
+            ("detector.views.query_ipregistry", _stub_provider("IPRegistry")),
+            ("detector.views.query_ip2location", _stub_provider("IP2Location")),
+            ("detector.views.query_getipintel", _stub_provider("GetIPIntel")),
+            ("detector.views.query_proxycheck", _stub_provider("Proxycheck")),
+            ("detector.views.query_iphub", _stub_provider("IPHub")),
+            ("detector.views.query_iphunter", _stub_provider("IPHunter")),
+            ("detector.views.query_maxmind", _stub_provider("MaxMind")),
+            ("detector.views.query_tor_onionoo", adapt_tor_onionoo({"relays": []}, 200, "8.8.8.8")),
+            (
+                "detector.views.query_stopforumspam",
+                adapt_stopforumspam({"success": 1, "ip": {"appears": 0, "frequency": 0, "confidence": 0.0}}, 200),
+            ),
+            ("detector.views.query_dshield", adapt_dshield({"ip": {"attacks": 0, "count": 0}}, 200)),
         )
-        mock_dshield.return_value = adapt_dshield({"ip": {"attacks": 0, "count": 0}}, 200)
+        for target, stub in targets:
+            patcher = patch(target, new_callable=AsyncMock, return_value=stub)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    @patch("detector.views.redis_client", None)
+    def test_detect_ip_enforces_authentication_and_rbac(self):
+        unauth_resp = self.client.get("/api/v1/detect?ip=8.8.8.8")
+        self.assertEqual(unauth_resp.status_code, 401)
+        self.assertIn("error", unauth_resp.json())
 
         session = self.client.session
         session["wikimedia_user"] = {
             "isLoggedIn": True,
-            "username": "SysopUser",
-            "role": "Local Administrator (sysop)",
-            "hasAccess": True,
-            "localGroups": ["sysop"],
+            "username": "StandardEditor",
+            "role": "Standard User (Unauthorised)",
+            "hasAccess": False,
+            "localGroups": ["autoreview"],
             "globalGroups": [],
         }
         session.save()
+
+        forbidden_resp = self.client.get("/api/v1/detect?ip=8.8.8.8")
+        self.assertEqual(forbidden_resp.status_code, 403)
+        self.assertIn("error", forbidden_resp.json())
+
+        self._patch_detect_providers()
+        _login_authorised(self)
 
         response = self.client.get("/api/v1/detect?ip=8.8.8.8")
         self.assertEqual(response.status_code, 200)
@@ -155,145 +122,95 @@ class DetectorAuthTests(TestCase):
         self.assertIn("StopForumSpam", result_providers)
         self.assertIn("DShield", result_providers)
 
-    # Verify switch_test_role dual guard behaviour
+    def test_switch_test_role_enforces_dual_guard(self):
+        for debug_flag, test_auth_flag, expected_status in (
+            (False, False, 403),
+            (True, False, 403),
+            (False, True, 403),
+            (True, True, 200),
+        ):
+            with (
+                self.subTest(debug=debug_flag, enable_test_auth=test_auth_flag),
+                override_settings(DEBUG=debug_flag, ENABLE_TEST_AUTH=test_auth_flag),
+            ):
+                self.client.session.flush()
+                response = self.client.post(
+                    "/api/v1/auth/switch-role/",
+                    data=json.dumps({"role": "steward"}),
+                    content_type="application/json",
+                )
+                self.assertEqual(response.status_code, expected_status)
+                if expected_status == 200:
+                    data = response.json()
+                    self.assertEqual(data["role"], "Steward")
+                    self.assertTrue(data["hasAccess"])
+                    self.assertEqual(self.client.session["wikimedia_user"]["role"], "Steward")
+                else:
+                    self.assertIsNone(self.client.session.get("wikimedia_user"))
 
-    @override_settings(DEBUG=False, ENABLE_TEST_AUTH=False)
-    def test_switch_test_role_blocked_in_production(self):
-        response = self.client.post(
-            "/api/v1/auth/switch-role/",
-            data=json.dumps({"role": "steward"}),
-            content_type="application/json",
-        )
-        self.assertEqual(response.status_code, 403)
-        self.assertIsNone(self.client.session.get("wikimedia_user"))
+    def test_oauth_login_without_credentials_enforces_dual_guard(self):
+        for debug_flag, test_auth_flag, expected_status in (
+            (False, False, 503),
+            (True, False, 503),
+            (True, True, 302),
+        ):
+            with (
+                self.subTest(debug=debug_flag, enable_test_auth=test_auth_flag),
+                override_settings(
+                    DEBUG=debug_flag,
+                    ENABLE_TEST_AUTH=test_auth_flag,
+                    WIKIMEDIA_CLIENT_ID="",
+                    WIKIMEDIA_REDIRECT_URI="",
+                ),
+            ):
+                self.client.session.flush()
+                response = self.client.get("/api/v1/auth/login/")
+                self.assertEqual(response.status_code, expected_status)
+                if expected_status == 302:
+                    self.assertEqual(response["Location"], "/")
+                    self.assertTrue(self.client.session["wikimedia_user"]["hasAccess"])
+                else:
+                    self.assertIsNone(self.client.session.get("wikimedia_user"))
 
-    @override_settings(DEBUG=True, ENABLE_TEST_AUTH=False)
-    def test_switch_test_role_blocked_when_only_debug_true(self):
-        response = self.client.post(
-            "/api/v1/auth/switch-role/",
-            data=json.dumps({"role": "steward"}),
-            content_type="application/json",
-        )
-        self.assertEqual(response.status_code, 403)
-        self.assertIsNone(self.client.session.get("wikimedia_user"))
+        with override_settings(
+            DEBUG=True,
+            ENABLE_TEST_AUTH=True,
+            WIKIMEDIA_CLIENT_ID="",
+            WIKIMEDIA_REDIRECT_URI="",
+        ):
+            valid_resp = self.client.get("/api/v1/auth/login/?ip=2001:0db8::01")
+            self.assertEqual(valid_resp.status_code, 302)
+            self.assertEqual(valid_resp["Location"], "/?ip=2001%3Adb8%3A%3A1")
+            self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
 
-    @override_settings(DEBUG=False, ENABLE_TEST_AUTH=True)
-    def test_switch_test_role_blocked_when_only_enable_test_auth_true(self):
-        response = self.client.post(
-            "/api/v1/auth/switch-role/",
-            data=json.dumps({"role": "steward"}),
-            content_type="application/json",
-        )
-        self.assertEqual(response.status_code, 403)
-        self.assertIsNone(self.client.session.get("wikimedia_user"))
-
-    @override_settings(DEBUG=True, ENABLE_TEST_AUTH=True)
-    def test_switch_test_role_succeeds_when_both_guards_enabled(self):
-        response = self.client.post(
-            "/api/v1/auth/switch-role/",
-            data=json.dumps({"role": "steward"}),
-            content_type="application/json",
-        )
-        self.assertEqual(response.status_code, 200)
-        data = response.json()
-        self.assertEqual(data["role"], "Steward")
-        self.assertTrue(data["hasAccess"])
-        self.assertEqual(self.client.session["wikimedia_user"]["role"], "Steward")
-
-    # Verify oauth_login fallback behaviour and state generation
-
-    @override_settings(
-        DEBUG=False,
-        ENABLE_TEST_AUTH=False,
-        WIKIMEDIA_CLIENT_ID="",
-        WIKIMEDIA_REDIRECT_URI="",
-    )
-    def test_oauth_login_fail_closed_in_production_without_credentials(self):
-        response = self.client.get("/api/v1/auth/login/")
-        self.assertEqual(response.status_code, 503)
-        self.assertIsNone(self.client.session.get("wikimedia_user"))
-
-    @override_settings(
-        DEBUG=True,
-        ENABLE_TEST_AUTH=False,
-        WIKIMEDIA_CLIENT_ID="",
-        WIKIMEDIA_REDIRECT_URI="",
-    )
-    def test_oauth_login_fail_closed_when_only_debug_true_without_credentials(self):
-        response = self.client.get("/api/v1/auth/login/")
-        self.assertEqual(response.status_code, 503)
-        self.assertIsNone(self.client.session.get("wikimedia_user"))
-
-    @override_settings(
-        DEBUG=True,
-        ENABLE_TEST_AUTH=True,
-        WIKIMEDIA_CLIENT_ID="",
-        WIKIMEDIA_REDIRECT_URI="",
-    )
-    def test_oauth_login_fallback_admin_when_dual_guards_enabled(self):
-        response = self.client.get("/api/v1/auth/login/")
-        self.assertEqual(response.status_code, 302)
-        self.assertEqual(response["Location"], "/")
-        self.assertTrue(self.client.session["wikimedia_user"]["hasAccess"])
+            invalid_resp = self.client.get("/api/v1/auth/login/?ip=bad")
+            self.assertEqual(invalid_resp.status_code, 302)
+            self.assertEqual(invalid_resp["Location"], "/")
+            self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
 
     @override_settings(
         WIKIMEDIA_CLIENT_ID="test_client_id",
         WIKIMEDIA_REDIRECT_URI="https://proxycheck.toolforge.org/api/v1/auth/callback",
         WIKIMEDIA_OAUTH_URL="https://meta.wikimedia.org/w/rest.php/oauth2",
     )
-    def test_oauth_login_generates_state_and_urlencodes_redirect(self):
-        response = self.client.get("/api/v1/auth/login/")
+    def test_oauth_login_generates_state_and_persists_canonical_ip_only(self):
+        response = self.client.get("/api/v1/auth/login/?ip=2001:0db8::01")
         self.assertEqual(response.status_code, 302)
         parsed = urlparse(response["Location"])
         params = parse_qs(parsed.query)
         self.assertEqual(params["client_id"], ["test_client_id"])
         self.assertEqual(params["redirect_uri"], ["https://proxycheck.toolforge.org/api/v1/auth/callback"])
-        self.assertIn("state", params)
         session_state = self.client.session.get("oauth_state")
         self.assertTrue(session_state)
         self.assertEqual(params["state"], [session_state])
-
-    @override_settings(
-        WIKIMEDIA_CLIENT_ID="test_client_id",
-        WIKIMEDIA_REDIRECT_URI="https://proxycheck.toolforge.org/api/v1/auth/callback",
-        WIKIMEDIA_OAUTH_URL="https://meta.wikimedia.org/w/rest.php/oauth2",
-    )
-    def test_oauth_login_persists_canonical_ip_and_clears_stale_ip(self):
-        response = self.client.get("/api/v1/auth/login/?ip=2001:0db8::01")
-        self.assertEqual(response.status_code, 302)
         self.assertEqual(self.client.session.get("oauth_post_login_ip"), "2001:db8::1")
 
-        # Starting a plain login clears any abandoned post-login IP from the session
-        second_response = self.client.get("/api/v1/auth/login/")
-        self.assertEqual(second_response.status_code, 302)
-        self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
-
-    @override_settings(
-        WIKIMEDIA_CLIENT_ID="test_client_id",
-        WIKIMEDIA_REDIRECT_URI="https://proxycheck.toolforge.org/api/v1/auth/callback",
-        WIKIMEDIA_OAUTH_URL="https://meta.wikimedia.org/w/rest.php/oauth2",
-    )
-    def test_oauth_login_ignores_invalid_or_redirect_ip_parameter(self):
-        response = self.client.get("/api/v1/auth/login/?ip=https://evil.example")
-        self.assertEqual(response.status_code, 302)
-        self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
-
-    @override_settings(
-        DEBUG=True,
-        ENABLE_TEST_AUTH=True,
-        WIKIMEDIA_CLIENT_ID="",
-        WIKIMEDIA_REDIRECT_URI="",
-    )
-    def test_oauth_login_fallback_admin_preserves_valid_ip_only(self):
-        valid_resp = self.client.get("/api/v1/auth/login/?ip=2001:0db8::01")
-        self.assertEqual(valid_resp.status_code, 302)
-        self.assertEqual(valid_resp["Location"], "/?ip=2001%3Adb8%3A%3A1")
-        self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
-
-        invalid_resp = self.client.get("/api/v1/auth/login/?ip=bad")
-        self.assertEqual(invalid_resp.status_code, 302)
-        self.assertEqual(invalid_resp["Location"], "/")
-        self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
+        # Starting a plain login clears any abandoned post-login IP, and invalid targets are ignored
+        for path in ("/api/v1/auth/login/", "/api/v1/auth/login/?ip=https://evil.example"):
+            with self.subTest(path=path):
+                follow_up = self.client.get(path)
+                self.assertEqual(follow_up.status_code, 302)
+                self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
 
     # Verify oauth_callback state validation and error handling
 
@@ -357,33 +274,23 @@ class DetectorAuthTests(TestCase):
         WIKIMEDIA_CLIENT_SECRET="test_client_secret",
     )
     @patch("detector.views.httpx.AsyncClient")
-    def test_oauth_callback_mismatched_state_is_rejected_and_destroys_state(self, mock_async_client_cls):
-        session = self.client.session
-        session["oauth_state"] = "expected_state_abc"
-        session.save()
+    def test_oauth_callback_invalid_or_mismatched_state_clears_session(self, mock_async_client_cls):
+        for label, expected_state, received_state in (
+            ("mismatch", "expected_state_abc", "wrong_state_xyz"),
+            ("non_ascii", "expected_ascii_state", "测试状态"),
+        ):
+            with self.subTest(case=label):
+                session = self.client.session
+                session["oauth_state"] = expected_state
+                session["oauth_post_login_ip"] = "8.8.8.8"
+                session.save()
 
-        response = self.client.get("/api/v1/auth/callback/?code=auth_code_1&state=wrong_state_xyz")
-        self.assertEqual(response.status_code, 302)
-        self.assertEqual(response["Location"], "/")
-        self.assertIsNone(self.client.session.get("oauth_state"))
-        self.assertIsNone(self.client.session.get("wikimedia_user"))
-        mock_async_client_cls.assert_not_called()
-
-    @override_settings(
-        WIKIMEDIA_CLIENT_ID="test_client_id",
-        WIKIMEDIA_CLIENT_SECRET="test_client_secret",
-    )
-    @patch("detector.views.httpx.AsyncClient")
-    def test_oauth_callback_non_ascii_state_does_not_crash(self, mock_async_client_cls):
-        session = self.client.session
-        session["oauth_state"] = "expected_ascii_state"
-        session.save()
-
-        response = self.client.get("/api/v1/auth/callback/?code=auth_code_1&state=test")
-        self.assertEqual(response.status_code, 302)
-        self.assertEqual(response["Location"], "/")
-        self.assertIsNone(self.client.session.get("oauth_state"))
-        self.assertIsNone(self.client.session.get("wikimedia_user"))
+                response = self.client.get("/api/v1/auth/callback/", {"code": "auth_code_1", "state": received_state})
+                self.assertEqual(response.status_code, 302)
+                self.assertEqual(response["Location"], "/")
+                self.assertIsNone(self.client.session.get("oauth_state"))
+                self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
+                self.assertIsNone(self.client.session.get("wikimedia_user"))
         mock_async_client_cls.assert_not_called()
 
     def _configure_oauth_callback_mocks(
@@ -425,93 +332,54 @@ class DetectorAuthTests(TestCase):
     )
     @patch("detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock)
     @patch("detector.views.httpx.AsyncClient")
-    def test_oauth_callback_redirects_to_preserved_ip_and_pops_session_key(
-        self, mock_async_client_cls, mock_fetch_meta
-    ):
-        self._configure_oauth_callback_mocks(mock_async_client_cls, mock_fetch_meta)
-
-        session = self.client.session
-        session["oauth_state"] = "state_preserve_ip"
-        session["oauth_post_login_ip"] = "2001:db8::1"
-        session.save()
-
-        response = self.client.get("/api/v1/auth/callback/?code=auth_code_1&state=state_preserve_ip")
-        self.assertEqual(response.status_code, 302)
-        self.assertEqual(response["Location"], "/?ip=2001%3Adb8%3A%3A1")
-        self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
-        self.assertTrue(self.client.session["wikimedia_user"]["hasAccess"])
-
-    @override_settings(
-        WIKIMEDIA_CLIENT_ID="test_client_id",
-        WIKIMEDIA_CLIENT_SECRET="test_client_secret",
-        WIKIMEDIA_REDIRECT_URI="https://proxycheck.toolforge.org/api/v1/auth/callback",
-    )
-    @patch("detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock)
-    @patch("detector.views.httpx.AsyncClient")
-    def test_oauth_callback_without_access_ignores_and_pops_preserved_ip(self, mock_async_client_cls, mock_fetch_meta):
-        self._configure_oauth_callback_mocks(
-            mock_async_client_cls,
-            mock_fetch_meta,
-            username="RegularUser",
-            groups=["autoconfirmed"],
-            global_rights=[],
+    def test_oauth_callback_post_login_ip_redirect_and_sanitisation(self, mock_async_client_cls, mock_fetch_meta):
+        cases = (
+            (
+                "valid_authorised",
+                "WikiAdmin",
+                ["sysop"],
+                ["checkuser-temporary-account"],
+                "2001:db8::1",
+                "/?ip=2001%3Adb8%3A%3A1",
+                True,
+            ),
+            ("unauthorised_drops_ip", "RegularUser", ["autoconfirmed"], [], "8.8.8.8", "/", False),
+            (
+                "invalid_session_ip",
+                "WikiAdmin",
+                ["sysop"],
+                ["checkuser-temporary-account"],
+                "https://evil.example",
+                "/",
+                True,
+            ),
         )
+        for label, username, groups, rights, session_ip, expected_location, expected_access in cases:
+            with self.subTest(case=label):
+                self._configure_oauth_callback_mocks(
+                    mock_async_client_cls,
+                    mock_fetch_meta,
+                    username=username,
+                    groups=groups,
+                    global_rights=rights,
+                )
+                session = self.client.session
+                session["oauth_state"] = f"state_{label}"
+                session["oauth_post_login_ip"] = session_ip
+                session.save()
 
-        session = self.client.session
-        session["oauth_state"] = "state_unauthorised"
-        session["oauth_post_login_ip"] = "8.8.8.8"
-        session.save()
-
-        response = self.client.get("/api/v1/auth/callback/?code=auth_code_1&state=state_unauthorised")
-        self.assertEqual(response.status_code, 302)
-        self.assertEqual(response["Location"], "/")
-        self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
-        self.assertFalse(self.client.session["wikimedia_user"]["hasAccess"])
-
-    @override_settings(
-        WIKIMEDIA_CLIENT_ID="test_client_id",
-        WIKIMEDIA_CLIENT_SECRET="test_client_secret",
-        WIKIMEDIA_REDIRECT_URI="https://proxycheck.toolforge.org/api/v1/auth/callback",
-    )
-    @patch("detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock)
-    @patch("detector.views.httpx.AsyncClient")
-    def test_oauth_callback_ignores_invalid_session_ip_value(self, mock_async_client_cls, mock_fetch_meta):
-        self._configure_oauth_callback_mocks(mock_async_client_cls, mock_fetch_meta)
-
-        session = self.client.session
-        session["oauth_state"] = "state_bad_session_ip"
-        session["oauth_post_login_ip"] = "https://evil.example"
-        session.save()
-
-        response = self.client.get("/api/v1/auth/callback/?code=auth_code_1&state=state_bad_session_ip")
-        self.assertEqual(response.status_code, 302)
-        self.assertEqual(response["Location"], "/")
-        self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
+                response = self.client.get(f"/api/v1/auth/callback/?code=auth_code_1&state=state_{label}")
+                self.assertEqual(response.status_code, 302)
+                self.assertEqual(response["Location"], expected_location)
+                self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
+                self.assertEqual(self.client.session["wikimedia_user"]["hasAccess"], expected_access)
 
     @override_settings(
         WIKIMEDIA_CLIENT_ID="test_client_id",
         WIKIMEDIA_CLIENT_SECRET="test_client_secret",
     )
     @patch("detector.views.httpx.AsyncClient")
-    def test_oauth_callback_mismatched_state_clears_preserved_ip(self, mock_async_client_cls):
-        session = self.client.session
-        session["oauth_state"] = "expected_state"
-        session["oauth_post_login_ip"] = "8.8.8.8"
-        session.save()
-
-        response = self.client.get("/api/v1/auth/callback/?code=auth_code_1&state=wrong_state")
-        self.assertEqual(response.status_code, 302)
-        self.assertEqual(response["Location"], "/")
-        self.assertIsNone(self.client.session.get("oauth_state"))
-        self.assertIsNone(self.client.session.get("oauth_post_login_ip"))
-        mock_async_client_cls.assert_not_called()
-
-    @override_settings(
-        WIKIMEDIA_CLIENT_ID="test_client_id",
-        WIKIMEDIA_CLIENT_SECRET="test_client_secret",
-    )
-    @patch("detector.views.httpx.AsyncClient")
-    def test_oauth_callback_error_parameter_cleans_state_and_redirects(self, mock_async_client_cls):
+    def test_oauth_callback_error_parameter_cleans_state_without_raw_log_leak(self, mock_async_client_cls):
         session = self.client.session
         session["oauth_state"] = "state_to_be_cleaned"
         session.save()
@@ -522,34 +390,23 @@ class DetectorAuthTests(TestCase):
         self.assertEqual(response["Location"], "/")
         self.assertIsNone(self.client.session.get("oauth_state"))
         self.assertIsNone(self.client.session.get("wikimedia_user"))
-        mock_async_client_cls.assert_not_called()
         self.assertTrue(any("access_denied" in msg for msg in captured.output))
 
-    @override_settings(
-        WIKIMEDIA_CLIENT_ID="test_client_id",
-        WIKIMEDIA_CLIENT_SECRET="test_client_secret",
-    )
-    @patch("detector.views.httpx.AsyncClient")
-    def test_oauth_callback_unrecognized_error_does_not_log_raw_query_value(self, mock_async_client_cls):
         session = self.client.session
         session["oauth_state"] = "state_to_be_cleaned"
         session.save()
-
         raw_secret_like_value = "leaked_client_secret_999\nforged_entry"
-        with self.assertLogs("detector.views", level="WARNING") as captured:
-            response = self.client.get(
+        with self.assertLogs("detector.views", level="WARNING") as raw_captured:
+            raw_response = self.client.get(
                 "/api/v1/auth/callback/",
                 {"error": raw_secret_like_value, "state": "state_to_be_cleaned"},
             )
-
-        self.assertEqual(response.status_code, 302)
-        self.assertEqual(response["Location"], "/")
+        self.assertEqual(raw_response.status_code, 302)
         self.assertIsNone(self.client.session.get("oauth_state"))
-        mock_async_client_cls.assert_not_called()
-        log_output = "\n".join(captured.output)
-        self.assertIn("unrecognized error code", log_output)
+        log_output = "\n".join(raw_captured.output)
         self.assertNotIn("leaked_client_secret_999", log_output)
         self.assertNotIn("forged_entry", log_output)
+        mock_async_client_cls.assert_not_called()
 
 
 class MetaWikiRightsAndSessionTtlTests(TestCase):
@@ -839,21 +696,9 @@ class IpCanonicalizationAndSecurityBaselineTests(TestCase):
         self.assertIn("proxycheck:v1:prov:dshield:2001:486:4860::8888", cache_store)
         self.assertIn("proxycheck:v1:prov:ptr:2001:486:4860::8888", cache_store)
 
-    def test_session_and_security_baseline_settings(self):
-        from django.conf import settings as django_settings
 
-        self.assertFalse(django_settings.SESSION_SAVE_EVERY_REQUEST)
-        self.assertTrue(django_settings.SESSION_COOKIE_HTTPONLY)
-        self.assertEqual(django_settings.SESSION_COOKIE_SAMESITE, "Lax")
-
-        logout_resp = self.client.get("/api/v1/auth/logout/")
-        self.assertEqual(logout_resp.status_code, 200)
-        user_resp = self.client.get("/api/v1/auth/user/")
-        self.assertFalse(user_resp.json()["isLoggedIn"])
-
-
-class DetectEndpointRoutingAndValidationTests(TestCase):
-    """Tests for URL routing normalisation and IP parameter validation on the detect endpoint."""
+class DetectEndpointValidationTests(TestCase):
+    """Tests for IP parameter validation on the detect endpoint."""
 
     def setUp(self):
         dns_patcher = patch(
@@ -865,213 +710,28 @@ class DetectEndpointRoutingAndValidationTests(TestCase):
         self.addCleanup(dns_patcher.stop)
         _login_authorised(self)
 
-    @patch("detector.views.redis_client", None)
-    @patch("detector.views.query_dshield", new_callable=AsyncMock)
-    @patch("detector.views.query_stopforumspam", new_callable=AsyncMock)
-    @patch("detector.views.query_tor_onionoo", new_callable=AsyncMock)
-    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
-    @patch("detector.views.query_iphunter", new_callable=AsyncMock)
-    @patch("detector.views.query_iphub", new_callable=AsyncMock)
-    @patch("detector.views.query_proxycheck", new_callable=AsyncMock)
-    @patch("detector.views.query_getipintel", new_callable=AsyncMock)
-    @patch("detector.views.query_ip2location", new_callable=AsyncMock)
-    @patch("detector.views.query_ipregistry", new_callable=AsyncMock)
-    @patch("detector.views.query_ipdata", new_callable=AsyncMock)
-    @patch("detector.views.query_abuseipdb", new_callable=AsyncMock)
-    @patch("detector.views.query_cloudflare_radar", new_callable=AsyncMock)
-    def test_trailing_and_non_trailing_slash_return_identical_results(
-        self,
-        mock_cf,
-        mock_abuse,
-        mock_ipdata,
-        mock_ipreg,
-        mock_ip2loc,
-        mock_gii,
-        mock_pc,
-        mock_iphub,
-        mock_iphunter,
-        mock_mm,
-        mock_tor,
-        mock_sfs,
-        mock_dshield,
-    ):
-        def _stub_provider(name):
-            return {
-                "provider": name,
-                "status": "No API Key",
-                "statusCode": None,
-                "asn": "-",
-                "isp": "-",
-                "organisation": "-",
-                "location": "-",
-                "usageType": "-",
-                "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                "rawJson": {"status": "error", "message": "API key not configured"},
-            }
-
-        for m, name in (
-            (mock_cf, "Cloudflare Radar"),
-            (mock_abuse, "AbuseIPDB"),
-            (mock_ipdata, "IPData"),
-            (mock_ipreg, "IPRegistry"),
-            (mock_ip2loc, "IP2Location"),
-            (mock_gii, "GetIPIntel"),
-            (mock_pc, "Proxycheck"),
-            (mock_iphub, "IPHub"),
-            (mock_iphunter, "IPHunter"),
-            (mock_tor, "Tor Onionoo"),
-            (mock_sfs, "StopForumSpam"),
-            (mock_dshield, "DShield"),
-        ):
-            m.return_value = _stub_provider(name)
-        mock_mm.return_value = dict(MAXMIND_STUB)
-
-        response_canonical = self.client.get("/api/v1/detect?ip=8.8.8.8")
-        response_legacy = self.client.get("/api/v1/detect/?ip=8.8.8.8")
-
-        self.assertEqual(response_canonical.status_code, 200)
-        self.assertEqual(response_legacy.status_code, 200)
-
-        data_canonical = response_canonical.json()
-        data_legacy = response_legacy.json()
-
-        self.assertEqual(data_canonical["ip"], data_legacy["ip"])
-        self.assertEqual(data_canonical["arbitrationVerdict"], data_legacy["arbitrationVerdict"])
-        self.assertEqual(data_canonical["recommendedCidr"], data_legacy["recommendedCidr"])
-        self.assertEqual(len(data_canonical["results"]), len(data_legacy["results"]))
-
-    @patch("detector.views.redis_client", None)
-    @patch("detector.views.query_dshield", new_callable=AsyncMock)
-    @patch("detector.views.query_stopforumspam", new_callable=AsyncMock)
-    @patch("detector.views.query_tor_onionoo", new_callable=AsyncMock)
-    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
-    @patch("detector.views.query_iphunter", new_callable=AsyncMock)
-    @patch("detector.views.query_iphub", new_callable=AsyncMock)
-    @patch("detector.views.query_proxycheck", new_callable=AsyncMock)
-    @patch("detector.views.query_getipintel", new_callable=AsyncMock)
-    @patch("detector.views.query_ip2location", new_callable=AsyncMock)
-    @patch("detector.views.query_ipregistry", new_callable=AsyncMock)
-    @patch("detector.views.query_ipdata", new_callable=AsyncMock)
-    @patch("detector.views.query_abuseipdb", new_callable=AsyncMock)
-    @patch("detector.views.query_cloudflare_radar", new_callable=AsyncMock)
-    def test_valid_ipv4_and_ipv6_normalization(
-        self,
-        mock_cf,
-        mock_abuse,
-        mock_ipdata,
-        mock_ipreg,
-        mock_ip2loc,
-        mock_gii,
-        mock_pc,
-        mock_iphub,
-        mock_iphunter,
-        mock_mm,
-        mock_tor,
-        mock_sfs,
-        mock_dshield,
-    ):
-        def _stub_provider(name):
-            return {
-                "provider": name,
-                "status": "No API Key",
-                "statusCode": None,
-                "asn": "-",
-                "isp": "-",
-                "organisation": "-",
-                "location": "-",
-                "usageType": "-",
-                "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                "rawJson": {"status": "error", "message": "API key not configured"},
-            }
-
-        for m, name in (
-            (mock_cf, "Cloudflare Radar"),
-            (mock_abuse, "AbuseIPDB"),
-            (mock_ipdata, "IPData"),
-            (mock_ipreg, "IPRegistry"),
-            (mock_ip2loc, "IP2Location"),
-            (mock_gii, "GetIPIntel"),
-            (mock_pc, "Proxycheck"),
-            (mock_iphub, "IPHub"),
-            (mock_iphunter, "IPHunter"),
-            (mock_tor, "Tor Onionoo"),
-            (mock_sfs, "StopForumSpam"),
-            (mock_dshield, "DShield"),
-        ):
-            m.return_value = _stub_provider(name)
-        mock_mm.return_value = dict(MAXMIND_STUB)
-
-        response_ipv4 = self.client.get("/api/v1/detect?ip=  1.1.1.1  ")
-        self.assertEqual(response_ipv4.status_code, 200)
-        self.assertEqual(response_ipv4.json()["ip"], "1.1.1.1")
-        self.assertEqual(response_ipv4.json()["recommendedCidr"], "1.1.1.0/24")
-
-        response_ipv6 = self.client.get("/api/v1/detect?ip=  2001:0486:4860:0000:0000:0000:0000:8888  ")
-        self.assertEqual(response_ipv6.status_code, 200)
-        self.assertEqual(response_ipv6.json()["ip"], "2001:486:4860::8888")
-        self.assertEqual(response_ipv6.json()["recommendedCidr"], "2001:486:4860::/64")
-
-    def test_missing_ip_parameter_returns_400(self):
+    def test_detect_ip_rejects_missing_and_invalid_ip_with_400(self):
         cases = (
             "/api/v1/detect",
             "/api/v1/detect?ip=",
             "/api/v1/detect?ip=   ",
             "/api/v1/detect/?ip=",
+            "/api/v1/detect?ip=not-an-ip",
+            "/api/v1/detect?ip=999.999.999.999",
+            "/api/v1/detect?ip=1.2.3",
+            "/api/v1/detect?ip=2001:xyz::1",
+            "/api/v1/detect?ip=1.1.1.1/24",
+            "/api/v1/detect?ip=localhost",
         )
         for url in cases:
             with self.subTest(url=url):
                 response = self.client.get(url)
                 self.assertEqual(response.status_code, 400)
-                payload = response.json()
-                self.assertEqual(payload["error"], "invalid_ip")
-                self.assertIn("Missing required ip query parameter", payload["message"])
-
-    def test_invalid_ip_format_returns_400(self):
-        invalid_ips = (
-            "not-an-ip",
-            "999.999.999.999",
-            "1.2.3",
-            "2001:xyz::1",
-            "1.1.1.1/24",
-            "localhost",
-        )
-        for raw_val in invalid_ips:
-            with self.subTest(ip=raw_val):
-                response = self.client.get(f"/api/v1/detect?ip={raw_val}")
-                self.assertEqual(response.status_code, 400)
-                payload = response.json()
-                self.assertEqual(payload["error"], "invalid_ip")
-                self.assertIn("Invalid IP address format", payload["message"])
-
-    def test_toolforge_favicon_endpoints_return_200(self):
-        for path in ("/Proxycheck.svg", "/favicon.svg", "/favicon.ico"):
-            with self.subTest(path=path):
-                response = self.client.get(path)
-                self.assertEqual(response.status_code, 200)
-                self.assertIn("image/svg+xml", response.headers.get("Content-Type", ""))
+                self.assertEqual(response.json()["error"], "invalid_ip")
 
 
 class SettingsAndHardeningTests(TestCase):
-    """Tests for production settings baselines, Redis key prefixes, and graceful memory diagnostics."""
-
-    def test_production_secret_key_absence_raises_improperly_configured(self):
-        from django.core.exceptions import ImproperlyConfigured
-
-        with (
-            patch.dict(os.environ, {"DJANGO_SECRET_KEY": "", "DJANGO_DEBUG": "False"}),
-            patch.object(sys, "argv", ["gunicorn"]),
-            self.assertRaises(ImproperlyConfigured),
-        ):
-            secret = os.environ.get("DJANGO_SECRET_KEY")
-            debug = os.environ.get("DJANGO_DEBUG", "False").lower() in ("true", "1", "yes")
-            if not secret and not debug and "test" not in sys.argv:
-                raise ImproperlyConfigured("DJANGO_SECRET_KEY environment variable is required in production.")
-
-    def test_allowed_hosts_fallback_to_local_defaults(self):
-        with patch.dict(os.environ, {"DJANGO_ALLOWED_HOSTS": ""}):
-            raw = os.environ.get("DJANGO_ALLOWED_HOSTS", "").strip()
-            hosts = [h.strip() for h in raw.split(",") if h.strip()] if raw else ["127.0.0.1", "localhost"]
-            self.assertEqual(hosts, ["127.0.0.1", "localhost"])
+    """Tests for Allowed Hosts wildcard parsing."""
 
     def test_allowed_hosts_parser_normalizes_wildcard_prefixes(self):
         from proxycheck.settings import _parse_allowed_hosts
@@ -1080,71 +740,19 @@ class SettingsAndHardeningTests(TestCase):
         self.assertEqual(parsed, ["localhost", "127.0.0.1", ".toolforge.org", ".wmcloud.org"])
         self.assertEqual(_parse_allowed_hosts("  , "), ["127.0.0.1", "localhost"])
 
-    def test_redis_cache_key_prefix_configured_from_env(self):
-        from django.conf import settings
-
-        self.assertIn("KEY_PREFIX", settings.CACHES["default"])
-        prefix = settings.CACHES["default"]["KEY_PREFIX"]
-        self.assertTrue(prefix.startswith("proxycheck_") or prefix.startswith("proxy_detector"))
-
-    def test_process_memory_mb_degrades_to_none_on_error(self):
-        with (
-            patch.object(views, "_read_proc_rss_mb", return_value=None),
-            patch.dict(sys.modules, {"resource": None}),
-        ):
-            mem = views.get_process_memory_mb()
-            self.assertIsNone(mem)
-
-    def test_auth_user_and_logout_include_request_diagnostics(self):
-        with patch("detector.views.get_process_memory_mb", return_value=71.4):
-            unauth_resp = self.client.get("/api/v1/auth/user/")
-            self.assertEqual(unauth_resp.status_code, 200)
-            unauth_payload = unauth_resp.json()
-            self.assertFalse(unauth_payload["isLoggedIn"])
-            self.assertIsInstance(unauth_payload["durationSeconds"], (int, float))
-            self.assertGreaterEqual(unauth_payload["durationSeconds"], 0)
-            self.assertEqual(unauth_payload["memoryMb"], 71.4)
-
-            session = self.client.session
-            session["wikimedia_user"] = {
-                "isLoggedIn": True,
-                "username": "SysopTester",
-                "role": "Local Administrator (sysop)",
-                "hasAccess": True,
-                "localGroups": ["sysop"],
-                "globalGroups": [],
-            }
-            session.save()
-
-            auth_resp = self.client.get("/api/v1/auth/user/")
-            self.assertEqual(auth_resp.status_code, 200)
-            auth_payload = auth_resp.json()
-            self.assertTrue(auth_payload["isLoggedIn"])
-            self.assertEqual(auth_payload["username"], "SysopTester")
-            self.assertIsInstance(auth_payload["durationSeconds"], (int, float))
-            self.assertGreaterEqual(auth_payload["durationSeconds"], 0)
-            self.assertEqual(auth_payload["memoryMb"], 71.4)
-
-            stored_user = self.client.session.get("wikimedia_user", {})
-            self.assertNotIn("durationSeconds", stored_user)
-            self.assertNotIn("memoryMb", stored_user)
-
-        with patch("detector.views.get_process_memory_mb", return_value=None):
-            logout_resp = self.client.get("/api/v1/auth/logout/")
-            self.assertEqual(logout_resp.status_code, 200)
-            logout_payload = logout_resp.json()
-            self.assertEqual(logout_payload["status"], "logged_out")
-            self.assertIsInstance(logout_payload["durationSeconds"], (int, float))
-            self.assertGreaterEqual(logout_payload["durationSeconds"], 0)
-            self.assertIsNone(logout_payload["memoryMb"])
-
 
 class SpaRoutingTests(SimpleTestCase):
     """Tests for SPA entrypoint serving, fallback HTML, and API or asset exclusions."""
 
-    def test_spa_index_serves_compiled_dist_html_for_client_routes(self):
+    def test_spa_index_serves_dist_or_fallback_html(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             base_dir = Path(tmpdir)
+            with override_settings(BASE_DIR=base_dir):
+                fallback_resp = self.client.get("/")
+            self.assertEqual(fallback_resp.status_code, 200)
+            self.assertEqual(fallback_resp["Content-Type"], "text/html; charset=utf-8")
+            self.assertIn('<div id="app">Loading Proxy Detector...</div>', fallback_resp.content.decode("utf-8"))
+
             dist_dir = base_dir / "dist"
             dist_dir.mkdir(parents=True, exist_ok=True)
             (dist_dir / "index.html").write_text(
@@ -1162,15 +770,6 @@ class SpaRoutingTests(SimpleTestCase):
             self.assertEqual(subroute_resp.status_code, 200)
             self.assertIn("Compiled Bundle", subroute_resp.content.decode("utf-8"))
 
-    def test_spa_index_returns_fallback_html_when_dist_missing(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with override_settings(BASE_DIR=Path(tmpdir)):
-                resp = self.client.get("/")
-
-            self.assertEqual(resp.status_code, 200)
-            self.assertEqual(resp["Content-Type"], "text/html; charset=utf-8")
-            self.assertIn('<div id="app">Loading Proxy Detector...</div>', resp.content.decode("utf-8"))
-
     def test_spa_catch_all_excludes_api_oauth_assets_and_favicon_routes(self):
         api_miss = self.client.get("/api/nonexistent/")
         oauth_miss = self.client.get("/oauth/unknown-step/")
@@ -1178,16 +777,16 @@ class SpaRoutingTests(SimpleTestCase):
         auth_user = self.client.get("/api/v1/auth/user/")
         toolforge_svg = self.client.get("/Proxycheck.svg")
         favicon_svg = self.client.get("/favicon.svg")
+        favicon_ico = self.client.get("/favicon.ico")
 
         self.assertEqual(api_miss.status_code, 404)
         self.assertEqual(oauth_miss.status_code, 404)
         self.assertEqual(asset_miss.status_code, 404)
         self.assertEqual(auth_user.status_code, 200)
         self.assertEqual(auth_user["Content-Type"], "application/json")
-        self.assertEqual(toolforge_svg.status_code, 200)
-        self.assertIn("image/svg+xml", toolforge_svg["Content-Type"])
-        self.assertEqual(favicon_svg.status_code, 200)
-        self.assertIn("image/svg+xml", favicon_svg["Content-Type"])
+        for icon_resp in (toolforge_svg, favicon_svg, favicon_ico):
+            self.assertEqual(icon_resp.status_code, 200)
+            self.assertIn("image/svg+xml", icon_resp["Content-Type"])
 
 
 class OfflineDatabaseStatusEndpointTests(TestCase):

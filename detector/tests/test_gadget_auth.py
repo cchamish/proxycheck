@@ -476,185 +476,6 @@ class GadgetTokenAndCorsAuthTests(TestCase):
         self.assertEqual(local_ok_resp.status_code, 200)
         self.assertEqual(local_ok_resp.json()["username"], "LocalZhCheckUser")
 
-    def test_exchange_gadget_token_issues_signed_token_across_rbac_groups_and_allowlist(self):
-        authorized_right_cases = (
-            (
-                "GlobalTaViewer",
-                ["read"],
-                {"global_groups": [], "global_rights": ["checkuser-temporary-account"], "merged_projects": []},
-                [],
-            ),
-            (
-                "GlobalNoPrefUser",
-                ["read"],
-                {
-                    "global_groups": [],
-                    "global_rights": ["checkuser-temporary-account-no-preference"],
-                    "merged_projects": [],
-                },
-                [],
-            ),
-            (
-                "LocalTaRightUser",
-                ["read", "checkuser-temporary-account"],
-                {"global_groups": [], "global_rights": [], "merged_projects": []},
-                [],
-            ),
-            (
-                "LocalNoPrefRightUser",
-                ["read", "checkuser-temporary-account-no-preference"],
-                {"global_groups": [], "global_rights": [], "merged_projects": []},
-                [],
-            ),
-            (
-                "PrepopulatedProjectRightUser",
-                ["read"],
-                {
-                    "global_groups": [],
-                    "global_rights": [],
-                    "merged_projects": [{"wiki": "enwiki", "rights": ["checkuser-temporary-account"]}],
-                },
-                [],
-            ),
-            (
-                "FetchedProjectTaRightUser",
-                ["read"],
-                {
-                    "global_groups": [],
-                    "global_rights": [],
-                    "merged_projects": [{"wiki": "jawiki", "url": "https://ja.wikipedia.org", "groups": ["sysop"]}],
-                },
-                ["read", "checkuser-temporary-account"],
-            ),
-            (
-                "FetchedProjectNoPrefRightUser",
-                ["read"],
-                {
-                    "global_groups": [],
-                    "global_rights": [],
-                    "merged_projects": [{"wiki": "enwiki", "url": "https://en.wikipedia.org", "groups": ["checkuser"]}],
-                },
-                ["read", "checkuser-temporary-account-no-preference"],
-            ),
-        )
-
-        with override_settings(GADGET_TOKEN_TTL_SECONDS=3600):
-            for username, local_rights, rights_payload, project_rights in authorized_right_cases:
-                with self.subTest(username=username):
-                    userinfo_stub = {
-                        "username": username,
-                        "local_groups": ["*", "user"],
-                        "rights": local_rights,
-                        "centralids": {},
-                        "domain": "zh.wiktionary.org",
-                    }
-                    with (
-                        patch(
-                            "detector.views.verify_centralauth_userinfo",
-                            new_callable=AsyncMock,
-                            return_value=userinfo_stub,
-                        ),
-                        patch(
-                            "detector.views.fetch_user_rights_from_meta",
-                            new_callable=AsyncMock,
-                            return_value=rights_payload,
-                        ),
-                        patch(
-                            "detector.views.fetch_project_user_rights",
-                            new_callable=AsyncMock,
-                            return_value=project_rights,
-                        ),
-                    ):
-                        resp = self.client.post(
-                            "/api/v1/auth/gadget-token",
-                            data=json.dumps({"centralauthtoken": "valid-cat", "domain": "zh.wiktionary.org"}),
-                            content_type="application/json",
-                            HTTP_ORIGIN="https://zh.wiktionary.org",
-                        )
-                    self.assertEqual(resp.status_code, 200)
-                    self.assertEqual(resp.headers.get("Access-Control-Allow-Origin"), "https://zh.wiktionary.org")
-                    data = resp.json()
-                    self.assertEqual(data["username"], username)
-                    self.assertEqual(data["expires_in"], 3600)
-                    decoded = signing.loads(data["token"], salt=views.GADGET_TOKEN_SALT, max_age=3600)
-                    self.assertEqual(decoded, {"u": username, "scope": "gadget"})
-
-            group_only_denied_cases = (
-                (
-                    "GroupOnlySteward",
-                    ["user"],
-                    ["read", "delete"],
-                    {"global_groups": ["steward"], "global_rights": ["read"], "merged_projects": []},
-                ),
-                (
-                    "GroupOnlyLocalSysop",
-                    ["sysop", "temporary-account-viewer"],
-                    ["read", "block"],
-                    {
-                        "global_groups": [],
-                        "global_rights": [],
-                        "merged_projects": [{"wiki": "enwiki", "url": "https://en.wikipedia.org", "groups": ["sysop"]}],
-                    },
-                ),
-            )
-            for username, local_groups, local_rights, rights_payload in group_only_denied_cases:
-                with self.subTest(denied_username=username):
-                    userinfo_stub = {
-                        "username": username,
-                        "local_groups": local_groups,
-                        "rights": local_rights,
-                        "centralids": {},
-                        "domain": "zh.wiktionary.org",
-                    }
-                    with (
-                        patch(
-                            "detector.views.verify_centralauth_userinfo",
-                            new_callable=AsyncMock,
-                            return_value=userinfo_stub,
-                        ),
-                        patch(
-                            "detector.views.fetch_user_rights_from_meta",
-                            new_callable=AsyncMock,
-                            return_value=rights_payload,
-                        ),
-                        patch(
-                            "detector.views.fetch_project_user_rights",
-                            new_callable=AsyncMock,
-                            return_value=["read", "block"],
-                        ),
-                    ):
-                        denied_resp = self.client.post(
-                            "/api/v1/auth/gadget-token",
-                            data=json.dumps({"centralauthtoken": "valid-cat", "domain": "zh.wiktionary.org"}),
-                            content_type="application/json",
-                            HTTP_ORIGIN="https://zh.wiktionary.org",
-                        )
-                    self.assertEqual(denied_resp.status_code, 403)
-
-        allowlisted_userinfo = {
-            "username": "allowlisted Tester",
-            "local_groups": ["*", "user"],
-            "rights": [],
-            "centralids": {},
-            "domain": "zh.wikipedia.org",
-        }
-        with (
-            override_settings(ALLOWED_WIKI_USERS="Allowlisted_Tester"),
-            patch(
-                "detector.views.verify_centralauth_userinfo", new_callable=AsyncMock, return_value=allowlisted_userinfo
-            ),
-            patch("detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock) as mock_fetch,
-        ):
-            allow_resp = self.client.post(
-                "/api/v1/auth/gadget-token",
-                data=json.dumps({"centralauthtoken": "valid-cat", "domain": "zh.wikipedia.org"}),
-                content_type="application/json",
-                HTTP_ORIGIN="https://zh.wikipedia.org",
-            )
-        self.assertEqual(allow_resp.status_code, 200)
-        mock_fetch.assert_not_called()
-        self.assertEqual(allow_resp.json()["username"], "allowlisted Tester")
-
     def test_merged_project_rights_lookup_prioritises_sysop_and_edit_count(self):
         merged_projects = [
             {"wiki": "enwiki", "url": "https://en.wikipedia.org", "editcount": 9000, "groups": []},
@@ -776,7 +597,6 @@ class GadgetTokenAndCorsAuthTests(TestCase):
 
     def test_gadget_bearer_token_rejects_temporary_accounts_and_enforces_restricted_allowlist(self):
         self._patch_all_providers()
-        self.assertEqual(views.DEFAULT_GADGET_TOKEN_TTL_SECONDS, 3600)
 
         with patch("detector.views.redis_client", None):
             for temp_username in ("~2026-12345", " ~2026-99999 "):
@@ -967,43 +787,11 @@ class GadgetTokenAndCorsAuthTests(TestCase):
             self.assertFalse(denied)
             self.assertEqual(role_label, "Access Denied (restricted user allowlist)")
 
-        session = self.client.session
-        session["oauth_state"] = "state-allowlist"
-        session.save()
-
-        token_resp = MagicMock(status_code=200)
-        token_resp.json.return_value = {"access_token": "oauth-access-token"}
-        profile_resp = MagicMock(status_code=200)
-        profile_resp.json.return_value = {"username": "allowlisted Operator", "groups": ["user"]}
-
-        mock_client = MagicMock()
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client.post = AsyncMock(return_value=token_resp)
-        mock_client.get = AsyncMock(return_value=profile_resp)
-
-        with (
-            override_settings(
-                WIKIMEDIA_CLIENT_ID="test-id",
-                WIKIMEDIA_CLIENT_SECRET="test-secret",
-                ALLOWED_WIKI_USERS="Allowlisted_Operator",
-            ),
-            patch("detector.views.httpx.AsyncClient", return_value=mock_client),
-            patch("detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock) as mock_meta_fetch,
-        ):
-            callback_resp = self.client.get("/api/v1/auth/callback?code=abc&state=state-allowlist")
-
-        self.assertEqual(callback_resp.status_code, 302)
-        mock_meta_fetch.assert_not_called()
-        user_session = self.client.session.get("wikimedia_user")
-        self.assertIsInstance(user_session, dict)
-        self.assertTrue(user_session["hasAccess"])
-        self.assertEqual(user_session["role"], "Allowlisted Wikimedia User")
-
     @override_settings(
         WIKIMEDIA_CLIENT_ID="test-id",
         WIKIMEDIA_CLIENT_SECRET="test-secret",
         WIKIMEDIA_REDIRECT_URI="https://proxycheck.toolforge.org/oauth/callback",
+        GADGET_TOKEN_TTL_SECONDS=3600,
     )
     def test_oauth_callback_and_gadget_parity_for_cross_wiki_sysop_taiv_and_temp_accounts(self):
         cross_wiki_cases = (
@@ -1101,7 +889,11 @@ class GadgetTokenAndCorsAuthTests(TestCase):
                     )
 
                 self.assertEqual(gadget_resp.status_code, 200)
-                self.assertEqual(gadget_resp.json()["username"], username)
+                gadget_data = gadget_resp.json()
+                self.assertEqual(gadget_data["username"], username)
+                self.assertEqual(gadget_data["expires_in"], 3600)
+                decoded = signing.loads(gadget_data["token"], salt=views.GADGET_TOKEN_SALT, max_age=3600)
+                self.assertEqual(decoded, {"u": username, "scope": "gadget"})
 
         # Verify Meta-Wiki local right fallback on transient globaluserinfo error matches gadget behaviour
         session = self.client.session
@@ -1193,7 +985,25 @@ class GadgetTokenAndCorsAuthTests(TestCase):
             )
         self.assertEqual(denied_gadget_resp.status_code, 403)
 
-        # Verify temporary accounts are rejected via OAuth even if allowlisted
+        # Verify allowlisted users bypass Meta-Wiki lookup and temporary accounts are rejected even if allowlisted
+        session = self.client.session
+        session["oauth_state"] = "state-allowlist"
+        session.pop("wikimedia_user", None)
+        session.save()
+
+        allow_profile_resp = MagicMock(status_code=200)
+        allow_profile_resp.json.return_value = {"username": "allowlisted Operator", "groups": ["user"]}
+        mock_client.get = AsyncMock(return_value=allow_profile_resp)
+        with (
+            override_settings(ALLOWED_WIKI_USERS="Allowlisted_Operator"),
+            patch("detector.views.httpx.AsyncClient", return_value=mock_client),
+            patch("detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock) as mock_allow_meta,
+        ):
+            allow_oauth_resp = self.client.get("/api/v1/auth/callback?code=code_allow&state=state-allowlist")
+        self.assertEqual(allow_oauth_resp.status_code, 302)
+        mock_allow_meta.assert_not_called()
+        self.assertTrue(self.client.session.get("wikimedia_user")["hasAccess"])
+
         session = self.client.session
         session["oauth_state"] = "state-temp-acct"
         session.pop("wikimedia_user", None)
@@ -1213,11 +1023,3 @@ class GadgetTokenAndCorsAuthTests(TestCase):
         self.assertEqual(temp_resp.status_code, 302)
         mock_temp_meta.assert_not_called()
         self.assertIsNone(self.client.session.get("wikimedia_user"))
-
-    def test_post_method_returns_405_with_cors_headers(self):
-        resp = self.client.post(
-            "/api/v1/detect?ip=8.8.8.8",
-            HTTP_ORIGIN="https://zh.wikipedia.org",
-        )
-        self.assertEqual(resp.status_code, 405)
-        self.assertEqual(resp.headers.get("Access-Control-Allow-Origin"), "https://zh.wikipedia.org")

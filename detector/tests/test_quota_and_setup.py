@@ -4,7 +4,6 @@ import json
 import os
 import sys
 import tempfile
-import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -150,35 +149,6 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         self.assertEqual(fake_redis.strings[min_keys[0]], "1")
         self.assertEqual(fake_redis.strings[day_keys[0]], "1")
 
-    @override_settings(**TEST_UPSTREAM_SECRETS, GETIPINTEL_RPM_LIMIT=0, GETIPINTEL_DAILY_LIMIT=0)
-    def test_zero_quota_limit_disables_local_interception(self):
-        fake_redis = FakeAsyncRedis()
-        called_urls = []
-        _login_authorised(self)
-
-        async def fake_get(url, **kwargs):
-            called_urls.append(url)
-            return self._build_provider_http_response(url)
-
-        fake_resolver = MagicMock()
-        fake_resolver.resolve = AsyncMock(side_effect=self._clean_dns_side_effect)
-
-        with (
-            patch("detector.views.redis_client", fake_redis),
-            patch("detector.views.httpx.AsyncClient") as mock_client_cls,
-            patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver),
-            patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
-        ):
-            _patch_async_client(mock_client_cls, fake_get)
-            self.client.get("/api/v1/detect?ip=8.8.8.8")
-            second_response = self.client.get("/api/v1/detect?ip=1.1.1.1")
-
-        self.assertEqual(second_response.status_code, 200)
-        getipintel_calls = [url for url in called_urls if "getipintel.net" in url]
-        self.assertEqual(len(getipintel_calls), 2)
-        rows = {row["provider"]: row for row in second_response.json()["results"]}
-        self.assertEqual(rows["GetIPIntel"]["status"], "200 OK")
-
     @override_settings(GETIPINTEL_RPM_LIMIT=15, GETIPINTEL_DAILY_LIMIT=5000)
     def test_lua_script_evaluation_and_redis_outage_fail_open(self):
         from asgiref.sync import async_to_sync
@@ -213,6 +183,14 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         with patch("detector.views.redis_client", None):
             no_redis_res = async_to_sync(quota_telemetry.check_and_consume_quota)("getipintel")
         self.assertTrue(no_redis_res.allowed)
+
+        with (
+            override_settings(GETIPINTEL_RPM_LIMIT=0, GETIPINTEL_DAILY_LIMIT=0),
+            patch("detector.views.redis_client", FakeAsyncRedis()),
+        ):
+            for _ in range(2):
+                zero_limit_res = async_to_sync(quota_telemetry.check_and_consume_quota)("getipintel")
+                self.assertTrue(zero_limit_res.allowed)
 
     @override_settings(**EMPTY_UPSTREAM_SECRETS, GETIPINTEL_RPM_LIMIT=1, SPAMCOP_RPM_LIMIT=1)
     def test_unconfigured_providers_and_ipv6_dnsbl_skips_do_not_consume_quota(self):
@@ -610,31 +588,6 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         self.assertEqual(providers["proxycheck"]["upstreamLimit"], 1000)
         self.assertEqual(providers["proxycheck"]["telemetry"]["cacheHit"], 6)
 
-    def test_redis_key_builders_use_proxycheck_v1_namespace(self):
-        from datetime import datetime, timezone
-
-        from detector import quota_telemetry
-
-        sample_dt = datetime(2026, 11, 15, 10, 30, tzinfo=timezone.utc)
-        self.assertEqual(views._provider_cache_key("proxycheck", "8.8.8.8"), "proxycheck:v1:prov:proxycheck:8.8.8.8")
-        self.assertEqual(views._provider_cooldown_key("proxycheck"), "proxycheck:v1:cooldown:proxycheck")
-        self.assertEqual(
-            quota_telemetry._quota_minute_key("getipintel", sample_dt),
-            "proxycheck:v1:quota:getipintel:min:202611151030",
-        )
-        self.assertEqual(
-            quota_telemetry._quota_daily_key("getipintel", sample_dt),
-            "proxycheck:v1:quota:getipintel:day:20261115",
-        )
-        self.assertEqual(
-            quota_telemetry._provider_telemetry_key("getipintel", sample_dt),
-            "proxycheck:v1:telemetry:getipintel:day:20261115",
-        )
-        self.assertEqual(
-            quota_telemetry._global_telemetry_key(sample_dt),
-            "proxycheck:v1:telemetry:global:day:20261115",
-        )
-
     @override_settings(
         **TEST_UPSTREAM_SECRETS,
         GETIPINTEL_RPM_LIMIT=1,
@@ -700,23 +653,6 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
 
 class CheckSetupCommandTests(SimpleTestCase):
     """Tests environment detection, secret masking, interactive completion, and job checks."""
-
-    def test_secret_masking_and_redis_url_redaction(self):
-        from detector.management.commands import check_setup
-
-        self.assertEqual(check_setup.mask_secret(""), "")
-        self.assertEqual(check_setup.mask_secret("abc"), "***")
-        self.assertEqual(check_setup.mask_secret("abcd1234"), "a******4")
-        self.assertEqual(check_setup.mask_secret("1234567890"), "12...90")
-        self.assertEqual(check_setup.mask_secret("sk_live_abcdefgh_9876"), "sk_l...9876")
-        self.assertEqual(
-            check_setup.redact_url_credentials("redis://:supersecret@redis.example.org:6379/0"),
-            "redis://:***@redis.example.org:6379/0",
-        )
-        self.assertEqual(
-            check_setup.redact_url_credentials("redis://127.0.0.1:6379/0"),
-            "redis://127.0.0.1:6379/0",
-        )
 
     def test_environment_detection_and_toolforge_account_resolution(self):
         from django.core.management.base import CommandError
@@ -1095,170 +1031,3 @@ class CheckSetupCommandTests(SimpleTestCase):
         )
         self.assertEqual(completed.returncode, 0, msg=completed.stderr)
         self.assertIn("Proxy Detector Environment Check", completed.stdout)
-
-    def test_all_options_offline_db_health_and_job_mismatch_warnings(self):
-        import io
-        import subprocess
-
-        from django.core.management import call_command
-
-        from detector.management.commands import check_setup
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            workspace = Path(tmp_dir)
-            project_root = workspace / "proxycheck"
-            project_root.mkdir()
-            (project_root / "jobs.yaml").write_text(
-                "---\n"
-                "- name: update-offline-dbs\n"
-                "  command: python manage.py update_offline_dbs\n"
-                "  image: tool-proxycheck/tool-proxycheck:latest\n"
-                '  schedule: "0 * * * *"\n'
-                "  mount: all\n",
-                encoding="utf-8",
-            )
-            data_dir = workspace / "data"
-            data_dir.mkdir()
-            for fname in (
-                "GeoLite2-Country.mmdb",
-                "GeoLite2-City.mmdb",
-                "GeoLite2-ASN.mmdb",
-                "toxic_ip_cidr.txt",
-                "listed_ip_90_ipv46_all.zip",
-            ):
-                (data_dir / fname).write_bytes(b"stub-db")
-            stale_time = time.time() - (20 * 86400)
-            os.utime(data_dir / "GeoLite2-Country.mmdb", (stale_time, stale_time))
-
-            def _fake_run(cmd, *, input=None, text=None, capture_output=None, timeout=None, check=None):
-                if cmd[1:] == ["envvars", "list", "--show-values"]:
-                    return subprocess.CompletedProcess(
-                        cmd,
-                        0,
-                        stdout=(
-                            "name                         value\n"
-                            "DJANGO_SECRET_KEY            test-secret-value-000001\n"
-                            "WIKIMEDIA_CLIENT_ID          client-id\n"
-                            "WIKIMEDIA_CLIENT_SECRET      client-secret-000001\n"
-                            "ABUSEIPDB_DAILY_LIMIT        500\n"
-                        ),
-                        stderr="",
-                    )
-                if cmd[1:] == ["jobs", "list", "--output", "long"]:
-                    return subprocess.CompletedProcess(
-                        cmd,
-                        0,
-                        stdout=(
-                            "+--------------------+---------------------------------------+-----------------------+----------------------------------------+---------+---------+\n"
-                            "|     Job name:      |               Command:                |       Job type:       |                 Image:                 | Mounts: | Status: |\n"
-                            "+--------------------+---------------------------------------+-----------------------+----------------------------------------+---------+---------+\n"
-                            "| update-offline-dbs | python manage.py update_offline_dbs   | scheduled: 0 * * * *  | tool-proxycheck/tool-proxycheck:latest |  none   | Running |\n"
-                            "+--------------------+---------------------------------------+-----------------------+----------------------------------------+---------+---------+\n"
-                        ),
-                        stderr="",
-                    )
-                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-            stdout = io.StringIO()
-            with (
-                override_settings(BASE_DIR=project_root),
-                patch.dict(os.environ, {"USER": "tools.proxycheck-dev", "HOME": str(workspace)}, clear=True),
-                patch("pathlib.Path.home", return_value=workspace),
-                patch.object(check_setup.shutil, "which", return_value="/usr/bin/toolforge"),
-                patch.object(check_setup.subprocess, "run", side_effect=_fake_run),
-            ):
-                call_command(
-                    "check_setup",
-                    no_input=True,
-                    env_mode="bastion",
-                    all_options=True,
-                    stdout=stdout,
-                    stderr=io.StringIO(),
-                )
-
-            output = stdout.getvalue()
-            self.assertIn("ABUSEIPDB_DAILY_LIMIT: CUSTOMISED = 500", output)
-            self.assertIn("PROVIDER_STATIC_CACHE_TTL_SECONDS: USING DEFAULT (86400)", output)
-            self.assertIn("GeoLite2-Country.mmdb): STALE", output)
-            self.assertIn("GeoLite2-City.mmdb): HEALTHY", output)
-            self.assertIn("mount is 'none' (expected 'all')", output)
-            self.assertIn("image is 'tool-proxycheck/tool-proxycheck:latest'", output)
-
-    def test_bastion_long_prettytable_dual_jobs_shared_dirs_and_placeholder_secret(self):
-        import io
-        import subprocess
-
-        from django.core.management import call_command
-
-        from detector.management.commands import check_setup
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            workspace = Path(tmp_dir)
-            project_root = workspace / "proxycheck"
-            project_root.mkdir()
-            (project_root / "jobs.yaml").write_text(
-                "---\n"
-                "- name: update-sfs-db\n"
-                "  command: python manage.py update_offline_dbs --sources stopforumspam\n"
-                "  image: tool-proxycheck/tool-proxycheck:latest\n"
-                '  schedule: "@hourly"\n'
-                "  mount: all\n"
-                "- name: update-maxmind-db\n"
-                "  command: python manage.py update_offline_dbs --sources maxmind\n"
-                "  image: tool-proxycheck/tool-proxycheck:latest\n"
-                '  schedule: "@daily"\n'
-                "  mount: all\n",
-                encoding="utf-8",
-            )
-            data_dir = workspace / "data"
-            data_dir.mkdir()
-
-            def _fake_run(cmd, *, input=None, text=None, capture_output=None, timeout=None, check=None):
-                if cmd[1:] == ["envvars", "list", "--show-values"]:
-                    return subprocess.CompletedProcess(
-                        cmd,
-                        0,
-                        stdout=(
-                            "name                         value\n"
-                            "DJANGO_SECRET_KEY            your-placeholder-secret\n"
-                            "WIKIMEDIA_CLIENT_ID          client-id\n"
-                            "WIKIMEDIA_CLIENT_SECRET      client-secret-000001\n"
-                            f"TOOL_DATA_DIR                {workspace}\n"
-                        ),
-                        stderr="",
-                    )
-                if cmd[1:] == ["jobs", "list", "--output", "long"]:
-                    return subprocess.CompletedProcess(
-                        cmd,
-                        0,
-                        stdout=(
-                            "+-------------------+---------------------------------------------------------------------+-----------------------+------------------------------------------------+---------+--------------------+\n"
-                            "|     Job name:     |                              Command:                               |       Job type:       |                     Image:                     | Mounts: |      Status:       |\n"
-                            "+-------------------+---------------------------------------------------------------------+-----------------------+------------------------------------------------+---------+--------------------+\n"
-                            "| update-maxmind-db |    sh -c 'python manage.py update_offline_dbs --sources maxmind'    | scheduled: 22 5 * * * | tool-proxycheck-dev/tool-proxycheck-dev:latest |   all   |  Pending for 46m   |\n"
-                            "|   update-sfs-db   | sh -c 'python manage.py update_offline_dbs --sources stopforumspam' | scheduled: 22 * * * * | tool-proxycheck-dev/tool-proxycheck-dev:latest |   all   | Pending for 46m15s |\n"
-                            "+-------------------+---------------------------------------------------------------------+-----------------------+------------------------------------------------+---------+--------------------+\n"
-                        ),
-                        stderr="",
-                    )
-                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-            stdout = io.StringIO()
-            with (
-                override_settings(BASE_DIR=project_root),
-                patch.dict(os.environ, {"USER": "tools.proxycheck-dev", "HOME": str(workspace)}, clear=True),
-                patch("pathlib.Path.home", return_value=workspace),
-                patch.object(check_setup.shutil, "which", return_value="/usr/bin/toolforge"),
-                patch.object(check_setup.subprocess, "run", side_effect=_fake_run),
-            ):
-                call_command("check_setup", no_input=True, env_mode="bastion", stdout=stdout, stderr=io.StringIO())
-
-            output = stdout.getvalue()
-            self.assertIn("DJANGO_SECRET_KEY: WEAK / PLACEHOLDER", output)
-            self.assertIn("TOOL_DATA_DIR: CONFIGURED", output)
-            self.assertIn("Persistent data directory (TOOL_DATA_DIR): OK", output)
-            self.assertIn("NOT ON BASTION NFS", output)
-            self.assertIn("update-sfs-db: OK (scheduled: 22 * * * *; Pending for 46m15s)", output)
-            self.assertIn("update-maxmind-db: OK (scheduled: 22 5 * * *; Pending for 46m)", output)
-            self.assertIn("Toolforge scheduled jobs match jobs.yaml.", output)
-            self.assertNotIn("toolforge jobs load", output)

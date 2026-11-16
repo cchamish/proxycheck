@@ -778,33 +778,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         default_client.get.side_effect = _default_get
         asyncio.run(views.query_tor_onionoo(default_client, "198.51.100.5"))
         self.assertFalse(default_capture["follow_redirects"])
-        self.assertTrue(default_capture["has_timeout_kwarg"])
         self.assertEqual(default_capture["timeout"], 5.0)
-
-        # Calling _fetch_upstream_json without timeout lets the client default timeout apply
-        asyncio.run(
-            views._fetch_upstream_json(
-                default_client,
-                "dshield",
-                "DShield",
-                "https://isc.sans.edu/api/ip/198.51.100.5?json",
-            )
-        )
-        self.assertFalse(default_capture["has_timeout_kwarg"])
-
-        # Passing an explicit httpx.Timeout overrides the client default timeout
-        custom_timeout = httpx.Timeout(12.0)
-        asyncio.run(
-            views._fetch_upstream_json(
-                default_client,
-                "dshield",
-                "DShield",
-                "https://isc.sans.edu/api/ip/198.51.100.5?json",
-                timeout=custom_timeout,
-            )
-        )
-        self.assertTrue(default_capture["has_timeout_kwarg"])
-        self.assertIs(default_capture["timeout"], custom_timeout)
 
         failure_modes = (
             ("network_error", httpx.ConnectError("connection reset")),

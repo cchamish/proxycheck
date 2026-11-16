@@ -27,7 +27,7 @@ python manage.py check_setup --env local --all-options
 
 Behaviour by environment:
 
-* **Toolforge Bastion** (`become proxycheck` or `become proxycheck-dev`): reads runtime variables via `toolforge envvars list` / `show`, writes new or updated values safely via `toolforge envvars create <KEY>` over stdin, inspects `~/data` (or `*_DB_DIR`) permissions and NFS mounts, checks offline databases, and verifies scheduled jobs against [jobs.yaml](./jobs.yaml) via `toolforge jobs list`.
+* **Toolforge Bastion** (`become proxycheck` or `become proxycheck-dev`): reads runtime variables via `toolforge envvars list` / `show`, writes new or updated values safely via `toolforge envvars create <KEY>` over stdin, inspects `~/data` (or `*_DB_DIR`) permissions and NFS mounts, checks offline databases, and verifies scheduled jobs against [jobs.yaml](./jobs.yaml) via `toolforge jobs list --output long`.
 * **Local / Buildpack container**: reads process environment variables and `.env`, masks sensitive credentials on screen, writes updates to `.env` (ensuring `.gitignore` ignores `.env`), offers to create missing data directories, and prints copy-pasteable commands for missing offline databases.
 
 ## Local Development
@@ -55,7 +55,7 @@ toolforge jobs run update-offline-dbs-init \
   --mount=all --wait \
   --command "python manage.py update_offline_dbs"
 
-# 3. Register the hourly scheduled database update job (see jobs.yaml)
+# 3. Register the scheduled database update jobs (@hourly StopForumSpam + @daily MaxMind; see jobs.yaml)
 toolforge jobs load jobs.yaml
 
 # 4. Start or restart the ASGI webservice with NFS mounts enabled

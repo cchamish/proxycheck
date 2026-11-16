@@ -364,7 +364,7 @@
           &middot;
           <a
             v-if="repoBaseUrl"
-            :href="`${repoBaseUrl}/commit/${commitHash}`"
+            :href="`${repoBaseUrl}/tree/${commitHash}`"
             target="_blank"
             rel="noopener noreferrer"
             class="commit-link"

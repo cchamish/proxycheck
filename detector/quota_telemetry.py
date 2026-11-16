@@ -19,6 +19,17 @@ from django.conf import settings
 from .oauth import is_allowlisted_wiki_user
 from .offline_dbs import collect_offline_databases_status
 
+try:
+    from redis.exceptions import RedisError as _RedisError
+except ImportError:
+    _RedisError = None
+
+_REDIS_ERRORS: Tuple[type[BaseException], ...] = (
+    (ConnectionError, TimeoutError, OSError, _RedisError)
+    if _RedisError is not None
+    else (ConnectionError, TimeoutError, OSError)
+)
+
 logger = logging.getLogger(__name__)
 
 MINUTE_QUOTA_TTL_SECONDS = 120
@@ -444,7 +455,7 @@ async def check_and_consume_quota(
             return lua_result
     except NotImplementedError:
         pass
-    except Exception as exc:
+    except _REDIS_ERRORS as exc:
         _mark_redis_failure(exc)
         logger.warning(f"Quota Lua check bypassed for {provider_key} due to Redis error ({type(exc).__name__})")
         return QuotaCheckResult(allowed=True, minute_limit=rpm_limit, daily_limit=daily_limit)
@@ -453,7 +464,7 @@ async def check_and_consume_quota(
         pipe_result = await _run_quota_pipeline(client, min_key, day_key, tel_key, rpm_limit, daily_limit)
         if pipe_result is not None:
             return pipe_result
-    except Exception as exc:
+    except _REDIS_ERRORS as exc:
         _mark_redis_failure(exc)
         logger.warning(f"Quota pipeline check bypassed for {provider_key} due to Redis error ({type(exc).__name__})")
 
@@ -480,7 +491,7 @@ def extract_upstream_rate_limit(
                     for key, value in raw_items:
                         if isinstance(key, str):
                             normalized_headers[key.strip().lower()] = value
-            except Exception:
+            except AttributeError, TypeError, ValueError:
                 normalized_headers = {}
 
     def _lookup_header(candidates: Tuple[str, ...]) -> Optional[int]:
@@ -650,20 +661,19 @@ async def record_provider_outcomes_batch(
                     refund_quota=refund_quota,
                     _tracked_ops=tracked_ops,
                 )
-            elif refund_quota:
-                if _queue_quota_refund_commands(
-                    pipe,
-                    provider_key,
-                    now_dt=current_dt,
-                    _tracked_ops=tracked_ops,
-                ):
-                    queued = True
+            elif refund_quota and _queue_quota_refund_commands(
+                pipe,
+                provider_key,
+                now_dt=current_dt,
+                _tracked_ops=tracked_ops,
+            ):
+                queued = True
         if not queued:
             return
         exec_call = pipe.execute()
         results = await exec_call if inspect.isawaitable(exec_call) else None
         await _clamp_negative_quota_counters(pipeline_fn, tracked_ops, results)
-    except Exception as exc:
+    except _REDIS_ERRORS as exc:
         _mark_redis_failure(exc)
         logger.warning(f"Batch telemetry write bypassed due to Redis error ({type(exc).__name__})")
 
@@ -706,7 +716,7 @@ async def record_global_request_telemetry(
         exec_call = pipe.execute()
         if inspect.isawaitable(exec_call):
             await exec_call
-    except Exception as exc:
+    except _REDIS_ERRORS as exc:
         _mark_redis_failure(exc)
         logger.warning(f"Global telemetry write bypassed due to Redis error ({type(exc).__name__})")
 
@@ -797,7 +807,7 @@ async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict
                                 cd_str,
                                 _decode_hash(raw_tel_hash),
                             )
-            except Exception as exc:
+            except _REDIS_ERRORS as exc:
                 _mark_redis_failure(exc)
                 logger.warning(f"Dashboard snapshot fell back to empty telemetry ({type(exc).__name__})")
                 redis_available = False
@@ -839,7 +849,7 @@ async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict
                 parsed_cd = json.loads(cd_raw)
                 if isinstance(parsed_cd, dict) and isinstance(parsed_cd.get("reason"), str):
                     cooldown_reason = parsed_cd["reason"]
-            except Exception:
+            except ValueError:
                 cooldown_reason = None
 
         quota_blocked = _safe_hash_int(tel_hash, "quota_blocked")

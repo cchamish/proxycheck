@@ -63,7 +63,7 @@ class InvalidCentralAuthTokenError(RuntimeError):
 
 def normalize_and_validate_wikimedia_domain(raw_domain: Any) -> Optional[str]:
     """
-    Validates and normalizes a Wikimedia project hostname without scheme, port, or path.
+    Validates and normalises a Wikimedia project hostname without scheme, port, or path.
     """
     if not isinstance(raw_domain, str):
         return None
@@ -104,7 +104,7 @@ def _clear_client_cookies(client: Any) -> None:
 
 
 def normalize_wiki_username(raw_username: Any) -> str:
-    """Normalizes a Wikimedia username with underscores replaced and initial character capitalized."""
+    """Normalises a Wikimedia username with underscores replaced and initial character capitalised."""
     if not isinstance(raw_username, str):
         return ""
     cleaned = raw_username.replace("_", " ").strip()
@@ -114,7 +114,7 @@ def normalize_wiki_username(raw_username: Any) -> str:
 
 
 def get_allowed_wiki_users() -> Set[str]:
-    """Returns normalized usernames configured in the ALLOWED_WIKI_USERS setting or environment."""
+    """Returns normalised usernames configured in the ALLOWED_WIKI_USERS setting or environment."""
     configured = getattr(settings, "ALLOWED_WIKI_USERS", None)
     if configured is None or configured == "":
         configured = os.environ.get("ALLOWED_WIKI_USERS", "")
@@ -128,7 +128,7 @@ def get_allowed_wiki_users() -> Set[str]:
 
 
 def is_allowlisted_wiki_user(username: Any) -> bool:
-    """Returns True when the normalized username is present in ALLOWED_WIKI_USERS."""
+    """Returns True when the normalised username is present in ALLOWED_WIKI_USERS."""
     normalized = normalize_wiki_username(username)
     if not normalized:
         return False
@@ -465,7 +465,7 @@ async def fetch_project_user_rights(
     _clear_client_cookies(client)
     try:
         resp = await client.get(api_url, params=params, headers=headers, timeout=10.0)
-    except Exception as exc:
+    except httpx.HTTPError as exc:
         logger.warning(f"Error querying {validated_domain} for user rights: {type(exc).__name__}")
         return []
     finally:

@@ -55,7 +55,7 @@ toolforge jobs run update-offline-dbs-init \
   --mount=all --wait \
   --command "python manage.py update_offline_dbs"
 
-# 3. Register the scheduled database update jobs (@hourly StopForumSpam + @daily MaxMind; see jobs.yaml)
+# 3. Register the scheduled database update jobs (@hourly StopForumSpam + @daily MaxMind + @daily Cloud CIDRs; see jobs.yaml)
 toolforge jobs load jobs.yaml
 
 # 4. Start or restart the ASGI webservice with NFS mounts enabled

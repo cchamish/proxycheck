@@ -23,6 +23,7 @@ from django.utils.crypto import get_random_string
 from dotenv import dotenv_values, set_key
 
 from detector.offline_dbs import (
+    _DEFAULT_STALE_CLOUD_CIDRS_SECONDS,
     _DEFAULT_STALE_MAXMIND_SECONDS,
     _DEFAULT_STALE_RULES_SECONDS,
     _DEFAULT_STALE_SFS_1_SECONDS,
@@ -298,7 +299,11 @@ def _build_runtime_and_path_env_specs() -> Tuple[EnvVarSpec, ...]:
         ("HOSTING_ORG_KEYWORDS", "(built-in)", "Extra comma-separated hosting organisation keywords"),
         ("VITE_GITHUB_REPO", "(unset)", "Build-time GitHub repository slug (owner/repo) shown in the UI footer"),
         ("VITE_COMMIT_HASH", "(git HEAD)", "Build-time commit hash override for the frontend bundle"),
-        ("VITE_COMMIT_TIMESTAMP", "(git commit time)", "Build-time UTC commit timestamp override for the frontend bundle"),
+        (
+            "VITE_COMMIT_TIMESTAMP",
+            "(git commit time)",
+            "Build-time UTC commit timestamp override for the frontend bundle",
+        ),
     )
     return tuple(
         EnvVarSpec(
@@ -322,15 +327,32 @@ def _build_tuning_and_quota_env_specs() -> Tuple[EnvVarSpec, ...]:
         ("PROVIDER_COOLDOWN_MAX_SECONDS", "300", "Maximum clamped Retry-After cooldown duration"),
         ("DNS_QUERY_TIMEOUT_SECONDS", "2.0", "Per-attempt DNS resolver timeout"),
         ("DNS_QUERY_LIFETIME_SECONDS", "2.0", "Total DNS resolver query lifetime"),
-        ("OFFLINE_DB_MAXMIND_STALE_SECONDS", str(_DEFAULT_STALE_MAXMIND_SECONDS), "MaxMind MMDB staleness warning threshold"),
+        (
+            "OFFLINE_DB_MAXMIND_STALE_SECONDS",
+            str(_DEFAULT_STALE_MAXMIND_SECONDS),
+            "MaxMind MMDB staleness warning threshold",
+        ),
         (
             "OFFLINE_DB_SFS_TOXIC_STALE_SECONDS",
             str(_DEFAULT_STALE_SFS_TOXIC_SECONDS),
             "StopForumSpam toxic_ip_cidr.txt staleness threshold",
         ),
-        ("OFFLINE_DB_SFS_90_STALE_SECONDS", str(_DEFAULT_STALE_SFS_90_SECONDS), "StopForumSpam 90-day dump staleness threshold"),
-        ("OFFLINE_DB_SFS_1_STALE_SECONDS", str(_DEFAULT_STALE_SFS_1_SECONDS), "StopForumSpam 1-day dump staleness threshold"),
-        ("OFFLINE_DB_RULES_STALE_SECONDS", str(_DEFAULT_STALE_RULES_SECONDS), "Cloud CIDR and hosting rules staleness threshold"),
+        (
+            "OFFLINE_DB_SFS_90_STALE_SECONDS",
+            str(_DEFAULT_STALE_SFS_90_SECONDS),
+            "StopForumSpam 90-day dump staleness threshold",
+        ),
+        (
+            "OFFLINE_DB_SFS_1_STALE_SECONDS",
+            str(_DEFAULT_STALE_SFS_1_SECONDS),
+            "StopForumSpam 1-day dump staleness threshold",
+        ),
+        (
+            "OFFLINE_DB_CLOUD_CIDRS_STALE_SECONDS",
+            str(_DEFAULT_STALE_CLOUD_CIDRS_SECONDS),
+            "Cloud provider CIDRs staleness threshold",
+        ),
+        ("OFFLINE_DB_RULES_STALE_SECONDS", str(_DEFAULT_STALE_RULES_SECONDS), "Hosting ASN rules staleness threshold"),
     )
     specs = [
         EnvVarSpec(
@@ -390,6 +412,13 @@ DEFAULT_JOB_SPECS: Tuple[JobSpec, ...] = (
         command="python manage.py update_offline_dbs --sources maxmind",
         image="tool-proxycheck/tool-proxycheck:latest",
         schedule="@daily",
+        mount="all",
+    ),
+    JobSpec(
+        name="update-cloud-cidrs-db",
+        command="python manage.py update_offline_dbs --sources cloud_cidrs",
+        image="tool-proxycheck/tool-proxycheck:latest",
+        schedule="0 3 * * *",
         mount="all",
     ),
 )
@@ -1133,6 +1162,10 @@ def collect_offline_status_for_env(
     )
     sfs_90_stale = _parse_pos_int(env_values.get("OFFLINE_DB_SFS_90_STALE_SECONDS", ""), _DEFAULT_STALE_SFS_90_SECONDS)
     sfs_1_stale = _parse_pos_int(env_values.get("OFFLINE_DB_SFS_1_STALE_SECONDS", ""), _DEFAULT_STALE_SFS_1_SECONDS)
+    cloud_cidrs_stale = _parse_pos_int(
+        env_values.get("OFFLINE_DB_CLOUD_CIDRS_STALE_SECONDS", ""),
+        _DEFAULT_STALE_CLOUD_CIDRS_SECONDS,
+    )
     rules_stale = _parse_pos_int(env_values.get("OFFLINE_DB_RULES_STALE_SECONDS", ""), _DEFAULT_STALE_RULES_SECONDS)
 
     sfs_toxic = _resolve_sfs_for_env(
@@ -1199,6 +1232,7 @@ def collect_offline_status_for_env(
         sfs_90_stale=sfs_90_stale,
         sfs_1_stale=sfs_1_stale,
         rules_stale=rules_stale,
+        cloud_cidrs_stale=cloud_cidrs_stale,
         now_ts=now_ts,
         include_resolved_path=True,
     )
@@ -1700,7 +1734,9 @@ class Command(BaseCommand):
                 )
             else:
                 attention_recommended.append(spec)
-                self.stdout.write(self.style.WARNING(f"  - {tag} {spec.name}: MISSING (default: {spec.default_display})"))
+                self.stdout.write(
+                    self.style.WARNING(f"  - {tag} {spec.name}: MISSING (default: {spec.default_display})")
+                )
         elif spec.tier == "provider":
             missing_providers.append(spec)
             self.stdout.write(f"  - {tag} {spec.name}: MISSING (provider skipped)")
@@ -1747,7 +1783,9 @@ class Command(BaseCommand):
         if review_reason:
             attention_recommended.append(spec)
             self.stdout.write(
-                self.style.WARNING(f"  - {tag} {spec.name}: NEEDS REVIEW = {shown_val} ({review_reason}; {source_label})")
+                self.style.WARNING(
+                    f"  - {tag} {spec.name}: NEEDS REVIEW = {shown_val} ({review_reason}; {source_label})"
+                )
             )
         else:
             self.stdout.write(self.style.SUCCESS(f"  - {tag} {spec.name}: CONFIGURED = {shown_val} ({source_label})"))

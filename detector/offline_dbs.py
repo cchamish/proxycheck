@@ -55,6 +55,7 @@ _DEFAULT_STALE_MAXMIND_SECONDS = 14 * 86400
 _DEFAULT_STALE_SFS_TOXIC_SECONDS = 7 * 86400
 _DEFAULT_STALE_SFS_90_SECONDS = 2 * 86400
 _DEFAULT_STALE_SFS_1_SECONDS = 6 * 3600
+_DEFAULT_STALE_CLOUD_CIDRS_SECONDS = 7 * 86400
 _DEFAULT_STALE_RULES_SECONDS = 90 * 86400
 
 _sfs_cache_lock = threading.Lock()
@@ -948,6 +949,7 @@ def build_offline_database_entries(
     sfs_1_stale: int,
     rules_stale: int,
     now_ts: float,
+    cloud_cidrs_stale: Optional[int] = None,
     include_resolved_path: bool = False,
 ) -> List[Dict[str, Any]]:
     """Builds standardised status entries for all configured offline databases and rule files."""
@@ -1029,7 +1031,7 @@ def build_offline_database_entries(
             cloud_cidr_path,
             cloud_cidr_name,
             True,
-            rules_stale,
+            rules_stale if cloud_cidrs_stale is None else cloud_cidrs_stale,
             "Built-in (Optional)",
         ),
         (
@@ -1072,6 +1074,10 @@ def collect_offline_databases_status(*, now_dt: Optional[datetime] = None) -> Li
     sfs_toxic_stale = _get_positive_int_setting("OFFLINE_DB_SFS_TOXIC_STALE_SECONDS", _DEFAULT_STALE_SFS_TOXIC_SECONDS)
     sfs_90_stale = _get_positive_int_setting("OFFLINE_DB_SFS_90_STALE_SECONDS", _DEFAULT_STALE_SFS_90_SECONDS)
     sfs_1_stale = _get_positive_int_setting("OFFLINE_DB_SFS_1_STALE_SECONDS", _DEFAULT_STALE_SFS_1_SECONDS)
+    cloud_cidrs_stale = _get_positive_int_setting(
+        "OFFLINE_DB_CLOUD_CIDRS_STALE_SECONDS",
+        _DEFAULT_STALE_CLOUD_CIDRS_SECONDS,
+    )
     rules_stale = _get_positive_int_setting("OFFLINE_DB_RULES_STALE_SECONDS", _DEFAULT_STALE_RULES_SECONDS)
 
     maxmind_paths = resolve_maxmind_paths()
@@ -1093,5 +1099,6 @@ def collect_offline_databases_status(*, now_dt: Optional[datetime] = None) -> Li
         sfs_90_stale=sfs_90_stale,
         sfs_1_stale=sfs_1_stale,
         rules_stale=rules_stale,
+        cloud_cidrs_stale=cloud_cidrs_stale,
         now_ts=now_ts,
     )

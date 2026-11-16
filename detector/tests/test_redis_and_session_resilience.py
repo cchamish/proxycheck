@@ -241,6 +241,7 @@ class LoopIsolationAndSessionSettingsTests(TestCase):
         self.assertNotIn("collectstatic", procfile_content)
         self.assertTrue(getattr(django_settings, "WHITENOISE_USE_FINDERS", False))
 
+
 class RedisDegradationAndOAuthFallbackTests(TestCase):
     """Tests Redis cache fault tolerance, OAuth upstream error handling, and callback route aliases."""
 

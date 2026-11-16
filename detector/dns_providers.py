@@ -484,7 +484,12 @@ async def _query_dnsbl_zone(
         resolver = _create_async_resolver()
         answer = await resolver.resolve(qname, "A")
         codes = _extract_dnsbl_a_records(answer)
-        return {"status": "listed" if codes else "clean", "query": qname, "reversedIp": reversed_ip, "codes": codes}, 200
+        return {
+            "status": "listed" if codes else "clean",
+            "query": qname,
+            "reversedIp": reversed_ip,
+            "codes": codes,
+        }, 200
     except dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.YXDOMAIN:
         return {"status": "clean", "query": qname, "reversedIp": reversed_ip, "codes": []}, 200
     except (dns.exception.Timeout, dns.resolver.LifetimeTimeout, asyncio.TimeoutError, TimeoutError) as exc:

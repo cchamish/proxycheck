@@ -281,9 +281,7 @@ async def query_iphunter(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
 
     url = f"https://www.iphunter.info:8082/v1/ip/{ip}"
     headers = {"X-Key": api_key}
-    payload, status_code = await _fetch_upstream_json(
-        client, "iphunter", "IPHunter", url, headers=headers, timeout=5.0
-    )
+    payload, status_code = await _fetch_upstream_json(client, "iphunter", "IPHunter", url, headers=headers, timeout=5.0)
     return adapt_iphunter(payload, True, status_code)
 
 
@@ -426,7 +424,13 @@ _PROVIDER_SPECS: Tuple[Tuple[str, str, bool, bool, Callable[[Any, str], Any]], .
         True,
         lambda client, ip: _views_attr("query_cloudflare_radar", query_cloudflare_radar)(client, ip),
     ),
-    ("abuseipdb", "AbuseIPDB", True, True, lambda client, ip: _views_attr("query_abuseipdb", query_abuseipdb)(client, ip)),
+    (
+        "abuseipdb",
+        "AbuseIPDB",
+        True,
+        True,
+        lambda client, ip: _views_attr("query_abuseipdb", query_abuseipdb)(client, ip),
+    ),
     ("ipdata", "IPData", True, True, lambda client, ip: _views_attr("query_ipdata", query_ipdata)(client, ip)),
     (
         "ipregistry",

@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .offline_dbs import PrefixCidrIndex
+from .offline_dbs import PrefixCidrIndex, _get_file_stat_signature
 
 logger = logging.getLogger(__name__)
 
@@ -356,12 +356,15 @@ _CLOUD_SERVICE_ALIASES: Dict[str, str] = {
     "google": "Google Cloud",
     "gcp": "Google Cloud",
     "google cloud": "Google Cloud",
+    "oracle": "Oracle Cloud",
+    "oci": "Oracle Cloud",
+    "oracle cloud": "Oracle Cloud",
     "azure": "Microsoft Azure",
     "microsoft azure": "Microsoft Azure",
 }
 
 _offline_cache_lock = threading.Lock()
-_cloud_cidr_cache_key: Optional[Tuple[str, int]] = None
+_cloud_cidr_cache_key: Optional[Tuple[str, Tuple[int, int] | int]] = None
 _cloud_cidr_cache_index: Optional["_CloudCidrIndex"] = None
 _hosting_rules_cache_key: Optional[Tuple[Any, ...]] = None
 _hosting_rules_cache_data: Optional[Tuple[Dict[int, str], Optional[re.Pattern[str]]]] = None
@@ -532,12 +535,11 @@ def _get_cloud_cidr_index() -> _CloudCidrIndex:
             _cloud_cidr_cache_index = _EMPTY_CLOUD_CIDR_INDEX
         return _EMPTY_CLOUD_CIDR_INDEX
 
-    try:
-        mtime_ns = path.stat().st_mtime_ns
-    except OSError:
+    stat_sig = _get_file_stat_signature(path)
+    if stat_sig is None:
         return _EMPTY_CLOUD_CIDR_INDEX
 
-    cache_key = (str(path), mtime_ns)
+    cache_key = (str(path), stat_sig)
     with _offline_cache_lock:
         if _cloud_cidr_cache_key == cache_key and _cloud_cidr_cache_index is not None:
             return _cloud_cidr_cache_index
@@ -627,7 +629,9 @@ def _parse_hosting_rules_payload(payload: Any) -> Tuple[Dict[int, str], List[str
     _ingest_hosting_asns_block(payload.get("asns"), asn_map, keywords)
     for hosts_key in ("hosts", "providers", "rules"):
         raw_hosts = payload.get(hosts_key)
-        entries = raw_hosts if isinstance(raw_hosts, list) else (raw_hosts.values() if isinstance(raw_hosts, dict) else ())
+        entries = (
+            raw_hosts if isinstance(raw_hosts, list) else (raw_hosts.values() if isinstance(raw_hosts, dict) else ())
+        )
         for entry in entries:
             _ingest_hosting_rule_entry(entry, asn_map, keywords)
     _ingest_hosting_keywords_block(payload, keywords)
@@ -814,7 +818,11 @@ def _select_cidr_recommendation(
     narrow_cloud = valid_cloud_prefix is not None and valid_cloud_prefix > default_prefix
     provider_label = f"{resolved_cloud_provider} " if resolved_cloud_provider else ""
 
-    if narrow_mmdb and mmdb_cidr is not None and (not narrow_cloud or (valid_mmdb_prefix or 0) >= (valid_cloud_prefix or 0)):
+    if (
+        narrow_mmdb
+        and mmdb_cidr is not None
+        and (not narrow_cloud or (valid_mmdb_prefix or 0) >= (valid_cloud_prefix or 0))
+    ):
         return mmdb_cidr, (
             f"Narrower MMDB prefix /{valid_mmdb_prefix} selected over default "
             f"/{default_prefix} to avoid collateral blocking"
@@ -866,7 +874,9 @@ def compute_cidr_attribution(
     default_cidr = str(ipaddress.ip_network(f"{addr.compressed}/{default_prefix}", strict=False))
     valid_mmdb_prefix = (
         mmdb_prefix_len
-        if not isinstance(mmdb_prefix_len, bool) and isinstance(mmdb_prefix_len, int) and 0 < mmdb_prefix_len <= addr.max_prefixlen
+        if not isinstance(mmdb_prefix_len, bool)
+        and isinstance(mmdb_prefix_len, int)
+        and 0 < mmdb_prefix_len <= addr.max_prefixlen
         else None
     )
     mmdb_cidr = (
@@ -1992,9 +2002,7 @@ def _parse_optional_bool(value: Any) -> Optional[bool]:
     return None
 
 
-def _match_onionoo_relay(
-    relay: Dict[str, Any], target_ip: Optional[str]
-) -> Tuple[bool, bool, List[str], bool]:
+def _match_onionoo_relay(relay: Dict[str, Any], target_ip: Optional[str]) -> Tuple[bool, bool, List[str], bool]:
     """Checks whether an Onionoo relay matches target_ip and returns (matched, matched_exit, flags, running)."""
     or_entries: List[Any] = []
     for list_key in ("a", "or_addresses"):
@@ -2013,7 +2021,9 @@ def _match_onionoo_relay(
         return False, False, [], False
 
     raw_flags = relay.get("flags")
-    relay_flags = [f.strip() for f in raw_flags if isinstance(f, str) and f.strip()] if isinstance(raw_flags, list) else []
+    relay_flags = (
+        [f.strip() for f in raw_flags if isinstance(f, str) and f.strip()] if isinstance(raw_flags, list) else []
+    )
 
     running_val = _parse_optional_bool(relay.get("running"))
     if running_val is None:

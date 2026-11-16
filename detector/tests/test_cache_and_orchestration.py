@@ -138,6 +138,7 @@ class ConnectionAndReaderReuseTests(TestCase):
         self.assertEqual(missing_res["status"], "Database Missing")
         self.assertEqual(len(views._maxmind_readers), 0)
 
+
 class NonPublicIpInterceptionTests(TestCase):
     """Tests early 200 OK interception for loopback, private, link-local, multicast and reserved IPs."""
 
@@ -207,6 +208,7 @@ class NonPublicIpInterceptionTests(TestCase):
                 resp = self.client.get(f"/api/v1/detect?ip={bad_ip}")
                 self.assertEqual(resp.status_code, 400)
                 self.assertEqual(resp.json()["error"], "invalid_ip")
+
 
 class SingleflightCoalescingTests(TestCase):
     """Tests singleflight coalescing of concurrent uncached IP detection requests."""
@@ -428,6 +430,7 @@ class SingleflightCoalescingTests(TestCase):
             self.assertIn("durationSeconds", payload)
         self.assertNotIn("durationSeconds", shared_payload)
         self.assertEqual(len(views._ip_detect_inflight), 0)
+
 
 class PerProviderCacheAndCircuitBreakerTests(TestCase):
     """Tests per-provider tiered TTL caching and HTTP 429 or 5xx cooldown circuit breaking."""
@@ -701,6 +704,7 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
             self.assertEqual(views._get_provider_cache_ttl("getipintel", stable_low_row), 604800)
             self.assertEqual(views._get_provider_cache_ttl("getipintel", uncertain_row), 86400)
 
+
 class HttpClientLifecycleTests(TestCase):
     """Tests shared httpx.AsyncClient connection pool limits and safe cleanup across loops."""
 
@@ -808,6 +812,7 @@ class HttpClientLifecycleTests(TestCase):
                 self.assertIn("ProxyCheck/1.0", ua_hdr or "")
         finally:
             await views._close_http_client_safely(client)
+
 
 class RedisBatchingAndCacheCompletenessTests(TestCase):
     """Tests for batched Redis reads and writes and for the full cache hit check on partial source sets."""

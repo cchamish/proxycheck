@@ -345,6 +345,7 @@ class AsyncDnsAndDnsblTests(TestCase):
         self.assertEqual(written_ttls.get("proxycheck:v1:cooldown:spamhaus_zen"), 120)
         self.assertEqual(written_ttls.get("proxycheck:v1:prov:spamcop:8.7.6.5"), 7200)
 
+
 _MIXED_OSINT_STATIC_RESPONSES = (
     (
         "stopforumspam.org",
@@ -411,7 +412,13 @@ _MIXED_OSINT_STATIC_RESPONSES = (
     ("getipintel.net", {"status": "success", "result": "0.0"}),
     (
         "iphub.info",
-        {"asn": 3320, "isp": "Example Residential ISP", "countryName": "United States", "countryCode": "US", "block": 0},
+        {
+            "asn": 3320,
+            "isp": "Example Residential ISP",
+            "countryName": "United States",
+            "countryCode": "US",
+            "block": 0,
+        },
     ),
     (
         "iphunter.info",

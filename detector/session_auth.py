@@ -552,5 +552,3 @@ def _parse_gadget_token_payload(request) -> Tuple[Optional[Tuple[str, str]], Opt
     if not wiki_domain:
         return None, JsonResponse({"error": "Invalid or unsupported Wikimedia domain."}, status=400)
     return (centralauth_token, wiki_domain), None
-
-

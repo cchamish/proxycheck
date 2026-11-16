@@ -551,6 +551,7 @@ class DetectorAuthTests(TestCase):
         self.assertNotIn("leaked_client_secret_999", log_output)
         self.assertNotIn("forged_entry", log_output)
 
+
 class MetaWikiRightsAndSessionTtlTests(TestCase):
     """Tests distinction between Meta-Wiki API failures and empty user rights, plus session TTL expiry."""
 
@@ -705,6 +706,7 @@ class MetaWikiRightsAndSessionTtlTests(TestCase):
         self.assertEqual(user_resp.status_code, 200)
         self.assertFalse(user_resp.json()["isLoggedIn"])
 
+
 class IpCanonicalizationAndSecurityBaselineTests(TestCase):
     """Tests IPv4 and IPv6 address canonicalisation for cache consistency and production security settings."""
 
@@ -848,6 +850,7 @@ class IpCanonicalizationAndSecurityBaselineTests(TestCase):
         self.assertEqual(logout_resp.status_code, 200)
         user_resp = self.client.get("/api/v1/auth/user/")
         self.assertFalse(user_resp.json()["isLoggedIn"])
+
 
 class DetectEndpointRoutingAndValidationTests(TestCase):
     """Tests for URL routing normalisation and IP parameter validation on the detect endpoint."""
@@ -1047,6 +1050,7 @@ class DetectEndpointRoutingAndValidationTests(TestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertIn("image/svg+xml", response.headers.get("Content-Type", ""))
 
+
 class SettingsAndHardeningTests(TestCase):
     """Tests for production settings baselines, Redis key prefixes, and graceful memory diagnostics."""
 
@@ -1134,6 +1138,7 @@ class SettingsAndHardeningTests(TestCase):
             self.assertGreaterEqual(logout_payload["durationSeconds"], 0)
             self.assertIsNone(logout_payload["memoryMb"])
 
+
 class SpaRoutingTests(SimpleTestCase):
     """Tests for SPA entrypoint serving, fallback HTML, and API or asset exclusions."""
 
@@ -1183,6 +1188,7 @@ class SpaRoutingTests(SimpleTestCase):
         self.assertIn("image/svg+xml", toolforge_svg["Content-Type"])
         self.assertEqual(favicon_svg.status_code, 200)
         self.assertIn("image/svg+xml", favicon_svg["Content-Type"])
+
 
 class OfflineDatabaseStatusEndpointTests(TestCase):
     """Tests inventory reporting, stale detection, and /api/v1/status endpoint exposure."""

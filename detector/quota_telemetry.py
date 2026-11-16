@@ -764,7 +764,9 @@ def _decode_redis_str(raw_value: Any) -> Optional[str]:
 
 def _decode_pipeline_provider_row(results: Any, idx: int) -> Tuple[int, int, int, Optional[str], Dict[str, str]]:
     base = 1 + (idx * 5)
-    min_val = _parse_non_negative_int(_decode_redis_str(results[base]) if isinstance(results[base], bytes) else results[base])
+    min_val = _parse_non_negative_int(
+        _decode_redis_str(results[base]) if isinstance(results[base], bytes) else results[base]
+    )
     day_val = _parse_non_negative_int(
         _decode_redis_str(results[base + 1]) if isinstance(results[base + 1], bytes) else results[base + 1]
     )

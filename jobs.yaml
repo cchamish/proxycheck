@@ -9,3 +9,8 @@
   image: tool-proxycheck/tool-proxycheck:latest
   schedule: "@daily"
   mount: all
+- name: update-cloud-cidrs-db
+  command: python manage.py update_offline_dbs --sources cloud_cidrs
+  image: tool-proxycheck/tool-proxycheck:latest
+  schedule: "0 3 * * *"
+  mount: all

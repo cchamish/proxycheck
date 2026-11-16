@@ -935,6 +935,7 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         with patch("builtins.open", side_effect=OSError("procfs unavailable")):
             self.assertIsNone(views._read_proc_rss_mb())
 
+
 class OfflineStopForumSpamEngineTests(TestCase):
     """Tests local StopForumSpam lookups, mtime hot-reloading, and graceful degradation."""
 
@@ -1071,6 +1072,7 @@ class OfflineStopForumSpamEngineTests(TestCase):
 
         rpm, daily = quota_telemetry.get_provider_quota_limits("stopforumspam")
         self.assertEqual((rpm, daily), (0, 0))
+
 
 class _FakeStreamResp:
     def __init__(self, content: bytes, status_code: int = 200):
@@ -1249,7 +1251,7 @@ class UpdateOfflineDbsCommandTests(TestCase):
             ):
                 call_command(
                     "update_offline_dbs",
-                    sources=["all"],
+                    sources=["stopforumspam", "maxmind"],
                     sfs_dir=str(sfs_dir),
                     maxmind_dir=str(mm_dir),
                     force=True,
@@ -1264,3 +1266,103 @@ class UpdateOfflineDbsCommandTests(TestCase):
                 self.assertTrue(hit["appears"])
                 self.assertEqual(hit["frequency"], 7)
             offline_dbs.clear_stopforumspam_caches()
+
+    def _build_cloud_cidr_mock_client(self, *, fail_providers=()):
+        azure_json_url = "https://download.microsoft.com/download/7/1/D/71D86715-5596-4529-9B13-DA13A5DE5B63/ServiceTags_Public_20261117.json"
+        payload_by_url = {
+            "ip-ranges.amazonaws.com": json.dumps(
+                {
+                    "prefixes": [{"ip_prefix": "3.5.140.0/22"}, {"ip_prefix": "invalid-cidr"}],
+                    "ipv6_prefixes": [{"ipv6_prefix": "2a05:d014::/40"}],
+                }
+            ),
+            "gstatic.com": json.dumps({"prefixes": [{"ipv4Prefix": "34.64.0.0/10"}, {"ipv6Prefix": "2600:1900::/28"}]}),
+            "docs.oracle.com": json.dumps(
+                {"regions": [{"region": "us-ashburn-1", "cidrs": [{"cidr": "129.146.0.0/16"}]}]}
+            ),
+            "details.aspx?id=56519": f'<html><a href="{azure_json_url}">Download</a></html>',
+            "ServiceTags_Public_": json.dumps(
+                {"values": [{"name": "AzureCloud", "properties": {"addressPrefixes": ["20.48.0.0/12"]}}]}
+            ),
+        }
+
+        def _get(url, **kwargs):
+            for provider_key, url_part in (
+                ("aws", "ip-ranges.amazonaws.com"),
+                ("gcp", "gstatic.com"),
+                ("oci", "docs.oracle.com"),
+                ("azure", "details.aspx?id=56519"),
+                ("azure", "ServiceTags_Public_"),
+            ):
+                if url_part in url and provider_key in fail_providers:
+                    raise httpx.ConnectTimeout("Upstream timed out")
+            for fragment, body in payload_by_url.items():
+                if fragment in url:
+                    return _FakeTextResp(body)
+            return _FakeTextResp("{}", status_code=404)
+
+        fake_client = MagicMock()
+        fake_client.get.side_effect = _get
+        cm = MagicMock()
+        cm.__enter__.return_value = fake_client
+        cm.__exit__.return_value = False
+        return cm
+
+    def test_cloud_cidrs_update_parses_all_providers_degrades_gracefully_and_hot_reloads(self):
+        from django.core.management import call_command
+
+        from detector import offline_dbs
+        from detector.management.commands import update_offline_dbs as update_cmd
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target_file = Path(tmp_dir) / "cloud_cidrs.json"
+            clear_offline_intelligence_caches()
+
+            with (
+                override_settings(CLOUD_CIDR_DB_PATH=str(target_file)),
+                patch.object(update_cmd.httpx, "Client", return_value=self._build_cloud_cidr_mock_client()),
+            ):
+                call_command("update_offline_dbs", sources=["cloud_cidrs"], force=True)
+
+            written = json.loads(target_file.read_text(encoding="utf-8"))
+            self.assertEqual(written["Amazon AWS"], ["2a05:d014::/40", "3.5.140.0/22"])
+            self.assertEqual(written["Google Cloud"], ["2600:1900::/28", "34.64.0.0/10"])
+            self.assertEqual(written["Oracle Cloud"], ["129.146.0.0/16"])
+            self.assertEqual(written["Microsoft Azure"], ["20.48.0.0/12"])
+
+            with override_settings(CLOUD_CIDR_DB_PATH=str(target_file)):
+                self.assertEqual(match_cloud_cidr("129.146.10.5")["provider"], "Oracle Cloud")
+                self.assertEqual(match_cloud_cidr("20.48.10.5")["provider"], "Microsoft Azure")
+
+                # Partial failure: OCI and Azure fail, so their historical CIDRs must be preserved
+                target_file.write_text(
+                    json.dumps(
+                        {
+                            "Amazon AWS": ["3.5.140.0/22"],
+                            "Oracle Cloud": ["129.146.0.0/16", "130.35.0.0/16"],
+                            "Microsoft Azure": ["20.48.0.0/12"],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                # Ensure hot-reload detects both mtime and size changes
+                self.assertEqual(match_cloud_cidr("130.35.1.1")["provider"], "Oracle Cloud")
+
+                with patch.object(
+                    update_cmd.httpx,
+                    "Client",
+                    return_value=self._build_cloud_cidr_mock_client(fail_providers=("oci", "azure")),
+                ):
+                    call_command("update_offline_dbs", sources=["cloud_cidrs"], force=True)
+
+                degraded = json.loads(target_file.read_text(encoding="utf-8"))
+                self.assertEqual(degraded["Oracle Cloud"], ["129.146.0.0/16", "130.35.0.0/16"])
+                self.assertEqual(degraded["Microsoft Azure"], ["20.48.0.0/12"])
+                self.assertEqual(match_cloud_cidr("34.64.5.5")["provider"], "Google Cloud")
+
+                # Verify 7-day staleness threshold in offline_dbs status monitoring
+                stale_ts = time.time() - (8 * 86400)
+                os.utime(target_file, (stale_ts, stale_ts))
+                status_entries = {e["key"]: e for e in offline_dbs.collect_offline_databases_status()}
+                self.assertEqual(status_entries["cloud_cidrs"]["status"], "stale")
+            clear_offline_intelligence_caches()

@@ -127,6 +127,7 @@ def _patch_async_client(mock_async_client_cls, get_side_effect):
     mock_async_client_cls.return_value = mock_client
     return mock_client
 
+
 @contextlib.contextmanager
 def _run_uvicorn_smoke_server(asgi_app):
     """Starts an ephemeral local Uvicorn server and guarantees shutdown on exit."""
@@ -157,6 +158,7 @@ def _run_uvicorn_smoke_server(asgi_app):
     finally:
         server.should_exit = True
         thread.join(timeout=5.0)
+
 
 class _FakeRedisPipeline:
     """Queued command pipeline mirroring redis.asyncio pipeline execution."""
@@ -208,6 +210,7 @@ class _FakeRedisPipeline:
             results.append(await getattr(self._store, name)(*args, **kwargs))
         self._ops.clear()
         return results
+
 
 class FakeAsyncRedis:
     """In-memory async Redis double supporting quota buckets, hashes, TTLs, and pipelines."""
@@ -271,6 +274,7 @@ class FakeAsyncRedis:
     def pipeline(self, transaction=True):
         return _FakeRedisPipeline(self)
 
+
 class _BatchingFakeRedis(FakeAsyncRedis):
     """In-memory Redis double that records single reads, batch reads and pipeline flushes."""
 
@@ -295,7 +299,11 @@ class _BatchingFakeRedis(FakeAsyncRedis):
 
 def build_provider_http_response(url, ip="8.8.8.8"):
     static_payloads = (
-        ("cloudflare.com", {"success": True, "result": {"ip": {"asn": "15169", "asnName": "Google LLC", "asnLocation": "US"}}}, None),
+        (
+            "cloudflare.com",
+            {"success": True, "result": {"ip": {"asn": "15169", "asnName": "Google LLC", "asnLocation": "US"}}},
+            None,
+        ),
         (
             "abuseipdb.com",
             {"data": {"isp": "Google LLC", "countryCode": "US", "usageType": "Data Center", "abuseConfidenceScore": 0}},
@@ -303,23 +311,50 @@ def build_provider_http_response(url, ip="8.8.8.8"):
         ),
         (
             "ipdata.co",
-            {"asn": {"asn": "AS15169", "name": "Google LLC"}, "country_name": "United States", "country_code": "US", "threat": {}, "count": "142"},
+            {
+                "asn": {"asn": "AS15169", "name": "Google LLC"},
+                "country_name": "United States",
+                "country_code": "US",
+                "threat": {},
+                "count": "142",
+            },
             None,
         ),
         (
             "ipregistry.co",
-            {"company": {"name": "Google LLC"}, "connection": {"asn": 15169, "type": "isp"}, "location": {"country": {"name": "United States", "code": "US"}}, "security": {}},
+            {
+                "company": {"name": "Google LLC"},
+                "connection": {"asn": 15169, "type": "isp"},
+                "location": {"country": {"name": "United States", "code": "US"}},
+                "security": {},
+            },
             {"RateLimit-Remaining": "4950"},
         ),
         (
             "ip2location.io",
-            {"asn": "15169", "as": "Google LLC", "country_name": "United States", "country_code": "US", "usage_type": "DCH", "is_proxy": False},
+            {
+                "asn": "15169",
+                "as": "Google LLC",
+                "country_name": "United States",
+                "country_code": "US",
+                "usage_type": "DCH",
+                "is_proxy": False,
+            },
             None,
         ),
         ("getipintel.net", {"status": "success", "result": "0.02"}, None),
         (
             "proxycheck.io",
-            {"status": "ok", ip: {"asn": "AS15169", "provider": "Google LLC", "country": "United States", "isocode": "US", "proxy": "no"}},
+            {
+                "status": "ok",
+                ip: {
+                    "asn": "AS15169",
+                    "provider": "Google LLC",
+                    "country": "United States",
+                    "isocode": "US",
+                    "proxy": "no",
+                },
+            },
             None,
         ),
         (
@@ -329,12 +364,19 @@ def build_provider_http_response(url, ip="8.8.8.8"):
         ),
         (
             "iphunter.info",
-            {"status": "success", "data": {"isp": "Google LLC", "country_name": "United States", "country_code": "US", "block": 0}},
+            {
+                "status": "success",
+                "data": {"isp": "Google LLC", "country_name": "United States", "country_code": "US", "block": 0},
+            },
             None,
         ),
         ("onionoo.torproject.org", {"relays": []}, None),
         ("stopforumspam.org", {"success": 1, "ip": {"appears": 0, "frequency": 0, "confidence": 0.0}}, None),
-        ("sans.edu", {"ip": {"count": 0, "attacks": 0, "as": "15169", "asname": "Google LLC", "ascountry": "US"}}, None),
+        (
+            "sans.edu",
+            {"ip": {"count": 0, "attacks": 0, "as": "15169", "asname": "Google LLC", "ascountry": "US"}},
+            None,
+        ),
         ("dshield", {"ip": {"count": 0, "attacks": 0, "as": "15169", "asname": "Google LLC", "ascountry": "US"}}, None),
     )
     for fragment, payload, headers in static_payloads:
@@ -352,4 +394,3 @@ def clean_dns_side_effect(qname, rdtype):
         answer.__str__ = lambda self: "dns.google."
         return [answer]
     raise dns.resolver.NXDOMAIN()
-

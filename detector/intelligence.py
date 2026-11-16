@@ -35,7 +35,9 @@ def _set_views_attr(name: str, value: Any) -> None:
 
 def _is_builtin_open_mocked() -> bool:
     views_mod = sys.modules.get("detector.views")
-    views_open = views_mod.__dict__.get("open", _DEFAULT_BUILTIN_OPEN) if views_mod is not None else _DEFAULT_BUILTIN_OPEN
+    views_open = (
+        views_mod.__dict__.get("open", _DEFAULT_BUILTIN_OPEN) if views_mod is not None else _DEFAULT_BUILTIN_OPEN
+    )
     return (
         builtins.open is not _DEFAULT_BUILTIN_OPEN
         or globals().get("open", _DEFAULT_BUILTIN_OPEN) is not _DEFAULT_BUILTIN_OPEN
@@ -495,7 +497,9 @@ def _resolve_arbitration_verdict(acc: _ArbitrationAccumulator, tor: _TorOverview
             else "Confirmed Proxy / VPN"
         )
         verdict, tier, is_majority = f"{prefix} ({votes}/{total} Sources)", "destructive", True
-    elif is_isolated_hosting_outlier or (acc.behavioral_threat_votes == 0 and acc.hosting_source_count == 1 and votes <= 1):
+    elif is_isolated_hosting_outlier or (
+        acc.behavioral_threat_votes == 0 and acc.hosting_source_count == 1 and votes <= 1
+    ):
         verdict, tier, is_majority = "Clean Residential (1 Minor Attribute Dispute)", "success", False
     elif votes > 0:
         if acc.has_anonymizer_flag:
@@ -514,7 +518,9 @@ def _resolve_arbitration_verdict(acc: _ArbitrationAccumulator, tor: _TorOverview
     return verdict, tier, is_majority
 
 
-def _extract_maxmind_cidr_hints(comparison_results: List[Dict[str, Any]]) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+def _extract_maxmind_cidr_hints(
+    comparison_results: List[Dict[str, Any]],
+) -> Tuple[Optional[int], Optional[str], Optional[str]]:
     mmdb_prefix_len: Optional[int] = None
     cloud_cidr: Optional[str] = None
     cloud_provider: Optional[str] = None

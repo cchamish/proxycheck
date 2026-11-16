@@ -332,7 +332,10 @@ def _build_telemetry_entry(
     is_timeout_outcome = bool(
         (event and event.get("isTimeout"))
         or status_code == 504
-        or (miss_triggered_exception and isinstance(raw_res, (httpx.TimeoutException, asyncio.TimeoutError, TimeoutError)))
+        or (
+            miss_triggered_exception
+            and isinstance(raw_res, (httpx.TimeoutException, asyncio.TimeoutError, TimeoutError))
+        )
     )
     if _is_provider_result_cacheable(row):
         outcome_name: Optional[str] = "ok"
@@ -380,7 +383,11 @@ def _build_cache_or_cooldown_write(
                 entry_payload["dbUpdatedAt"] = mm_updated
         elif provider_key == "stopforumspam":
             entry_payload["dbVersion"] = get_stopforumspam_db_version()
-        return _provider_cache_key(provider_key, ip), json.dumps(entry_payload), _get_provider_cache_ttl(provider_key, row)
+        return (
+            _provider_cache_key(provider_key, ip),
+            json.dumps(entry_payload),
+            _get_provider_cache_ttl(provider_key, row),
+        )
 
     if not supports_cooldown:
         return None
@@ -505,7 +512,15 @@ def _collect_detection_outcomes(
         if write_entry is not None:
             redis_set_entries.append(write_entry)
 
-    return clean_results, redis_set_entries, telemetry_entries, hit_count, miss_count, cooldown_count, cached_at_timestamps
+    return (
+        clean_results,
+        redis_set_entries,
+        telemetry_entries,
+        hit_count,
+        miss_count,
+        cooldown_count,
+        cached_at_timestamps,
+    )
 
 
 def _resolve_ptr_outcome(
@@ -553,7 +568,9 @@ async def _execute_detection_with_cache(
     # Sources that are skipped for this address or lack configuration answer statically, so they need
     # neither a cooldown lookup nor the shared HTTP client
     cache_expected_keys = frozenset(
-        provider_key for provider_key, _, _, _, _ in _PROVIDER_SPECS if _is_provider_cache_expected(provider_key, is_ipv4)
+        provider_key
+        for provider_key, _, _, _, _ in _PROVIDER_SPECS
+        if _is_provider_cache_expected(provider_key, is_ipv4)
     )
     deferred_provider_keys = frozenset(
         provider_key
@@ -583,7 +600,9 @@ async def _execute_detection_with_cache(
         for idx, spec in enumerate(_PROVIDER_SPECS)
         if spec[0] not in cached_providers and spec[0] not in deferred_provider_keys and spec[0] not in cooldown_entries
     ]
-    quota_blocked_entries, quota_consumed_keys = await _evaluate_quota_candidates(active_redis, candidate_specs, is_ipv4)
+    quota_blocked_entries, quota_consumed_keys = await _evaluate_quota_candidates(
+        active_redis, candidate_specs, is_ipv4
+    )
     specs_to_execute = [(idx, spec) for idx, spec in candidate_specs if spec[0] not in quota_blocked_entries]
     executed_provider_results, ptr_raw, upstream_events, rdns_state = await _dispatch_upstream_queries(
         ip,
@@ -760,9 +779,7 @@ async def _detect_single_canonical_ip(
                 finally:
                     release_fn((target_ip, target_mode), own_task)
 
-            created_task = current_loop.create_task(
-                _run_coalesced_detection(target_ip=ip, target_mode=normalized_mode)
-            )
+            created_task = current_loop.create_task(_run_coalesced_detection(target_ip=ip, target_mode=normalized_mode))
 
             def _finalize_inflight(done_task: asyncio.Task, task_key: Tuple[str, str] = inflight_key) -> None:
                 release_fn(task_key, done_task)

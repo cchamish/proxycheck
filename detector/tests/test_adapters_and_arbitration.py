@@ -190,6 +190,7 @@ class CredentialRedactionTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertNotIn("secret123", response.content.decode("utf-8"))
 
+
 class UpstreamPayloadDefenceTests(TestCase):
     """Tests that malformed upstream bodies degrade to error rows instead of crashing adapters."""
 
@@ -325,6 +326,7 @@ class UpstreamPayloadDefenceTests(TestCase):
                 for provider in expected_format_errors:
                     self.assertEqual(rows[provider]["status"], "502 Error", provider)
 
+
 class MaxMindUsageTypeTests(TestCase):
     """Tests that GeoLite2 records without traits.user_type are not reported as hosting."""
 
@@ -363,6 +365,7 @@ class MaxMindUsageTypeTests(TestCase):
         self.assertFalse(aggregated["isMajorityProxyVpn"])
         self.assertEqual(aggregated["arbitrationTier"], "neutral")
         self.assertNotIn("Hosting", aggregated["arbitrationVerdict"])
+
 
 class AggregationAndCacheIntegrityTests(TestCase):
     """Tests pure aggregation semantics and protection against caching transient upstream failures."""
@@ -750,6 +753,7 @@ class AggregationAndCacheIntegrityTests(TestCase):
         mock_cf.assert_not_called()
         mock_abuse.assert_called_once()
 
+
 class ReverseDnsAndCidrAttributionTests(TestCase):
     """Tests reverse DNS PTR resolution, hostname classification, CIDR range attribution, and cache guards."""
 
@@ -1019,6 +1023,7 @@ class ReverseDnsAndCidrAttributionTests(TestCase):
         self.assertEqual(written_ttls.get("proxycheck:v1:prov:ptr:8.8.8.8"), 7200)
         self.assertEqual(mock_cf.call_count, 1)
 
+
 class CommercialProviderMetadataAdapterTests(SimpleTestCase):
     """Tests for extracted metadata and security signals across commercial adapters."""
 
@@ -1144,6 +1149,7 @@ class CommercialProviderMetadataAdapterTests(SimpleTestCase):
         self.assertIsNone(err_row["totalReports"])
         self.assertIsNone(err_row["numDistinctUsers"])
         self.assertIsNone(err_row["lastSeen"])
+
 
 class FlagBasedArbitrationTests(SimpleTestCase):
     """Tests for flag and Proxycheck risk arbitrage."""

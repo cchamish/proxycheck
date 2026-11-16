@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import ipaddress
+import json
 import os
 import re
 import sqlite3
@@ -13,12 +14,13 @@ import tempfile
 import time
 import zipfile
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import httpx
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
+from detector.adapters import _parse_cloud_cidr_payload, clear_offline_intelligence_caches
 from detector.offline_dbs import (
     SFS_SQLITE_FILENAME,
     SFS_TOXIC_CIDR_FILENAME,
@@ -56,6 +58,16 @@ SFS_TOXIC_MIN_INTERVAL_SECONDS = 12 * 3600 - 300
 SFS_90_MIN_INTERVAL_SECONDS = 12 * 3600 - 300
 SFS_1_MIN_INTERVAL_SECONDS = 3600 - 120
 MAXMIND_MIN_INTERVAL_SECONDS = 24 * 3600 - 300
+CLOUD_CIDRS_MIN_INTERVAL_SECONDS = 24 * 3600 - 300
+
+CLOUD_CIDRS_FILENAME = "cloud_cidrs.json"
+AWS_IP_RANGES_URL = "https://ip-ranges.amazonaws.com/ip-ranges.json"
+GCP_IP_RANGES_URL = "https://www.gstatic.com/ipranges/cloud.json"
+OCI_IP_RANGES_URL = "https://docs.oracle.com/en-us/iaas/tools/public_ip_ranges.json"
+AZURE_DOWNLOAD_PAGE_URL = "https://www.microsoft.com/en-us/download/details.aspx?id=56519"
+_AZURE_SERVICETAGS_URL_RE = re.compile(
+    r"https://download\.microsoft\.com/download/[^\"'\s<>]+/ServiceTags_Public_\d+\.json"
+)
 
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 _HEX_32_RE = re.compile(r"\b([0-9a-fA-F]{32})\b")
@@ -253,15 +265,162 @@ def _extract_mmdb_from_tar_gz(tar_path: Path, edition_name: str, target_dir: Pat
         raise
 
 
+def _normalize_cidr_list(raw_cidrs: Iterable[Any]) -> List[str]:
+    """Validates, normalises, and deduplicates raw CIDR strings in deterministic order."""
+    seen: set[str] = set()
+    for raw in raw_cidrs:
+        if not isinstance(raw, str):
+            continue
+        cleaned = raw.strip()
+        if not cleaned:
+            continue
+        try:
+            net = ipaddress.ip_network(cleaned, strict=False)
+        except ValueError:
+            continue
+        seen.add(str(net))
+    return sorted(seen)
+
+
+def _parse_aws_cloud_cidrs(payload: Any) -> List[str]:
+    if not isinstance(payload, dict):
+        raise CommandError("AWS IP ranges payload was not a JSON object.")
+    raw: List[Any] = []
+    for key, field in (("prefixes", "ip_prefix"), ("ipv6_prefixes", "ipv6_prefix")):
+        items = payload.get(key)
+        if isinstance(items, list):
+            raw.extend(entry.get(field) for entry in items if isinstance(entry, dict))
+    return _normalize_cidr_list(raw)
+
+
+def _parse_gcp_cloud_cidrs(payload: Any) -> List[str]:
+    if not isinstance(payload, dict):
+        raise CommandError("GCP IP ranges payload was not a JSON object.")
+    prefixes = payload.get("prefixes")
+    if not isinstance(prefixes, list):
+        raise CommandError("GCP IP ranges payload missing prefixes list.")
+    raw: List[Any] = []
+    for entry in prefixes:
+        if isinstance(entry, dict):
+            raw.append(entry.get("ipv4Prefix"))
+            raw.append(entry.get("ipv6Prefix"))
+    return _normalize_cidr_list(raw)
+
+
+def _parse_oci_cloud_cidrs(payload: Any) -> List[str]:
+    if not isinstance(payload, dict):
+        raise CommandError("OCI IP ranges payload was not a JSON object.")
+    regions = payload.get("regions")
+    if not isinstance(regions, list):
+        raise CommandError("OCI IP ranges payload missing regions list.")
+    raw: List[Any] = []
+    for region in regions:
+        if not isinstance(region, dict):
+            continue
+        cidrs = region.get("cidrs")
+        if isinstance(cidrs, list):
+            raw.extend(item.get("cidr") for item in cidrs if isinstance(item, dict))
+    return _normalize_cidr_list(raw)
+
+
+def _extract_azure_servicetags_url(html_text: str) -> str:
+    match = _AZURE_SERVICETAGS_URL_RE.search(html_text or "")
+    if match is None:
+        raise CommandError("Could not locate ServiceTags_Public JSON download URL on Microsoft download page.")
+    return match.group(0)
+
+
+def _parse_azure_cloud_cidrs(payload: Any) -> List[str]:
+    if not isinstance(payload, dict):
+        raise CommandError("Azure ServiceTags payload was not a JSON object.")
+    values = payload.get("values")
+    if not isinstance(values, list):
+        raise CommandError("Azure ServiceTags payload missing values list.")
+    raw: List[Any] = []
+    for entry in values:
+        if not isinstance(entry, dict):
+            continue
+        props = entry.get("properties")
+        if isinstance(props, dict) and isinstance(props.get("addressPrefixes"), list):
+            raw.extend(props["addressPrefixes"])
+    return _normalize_cidr_list(raw)
+
+
+def _fetch_json_payload(client: httpx.Client, url: str) -> Any:
+    resp = client.get(url)
+    resp.raise_for_status()
+    json_fn = getattr(resp, "json", None)
+    if callable(json_fn):
+        return json_fn()
+    return json.loads(resp.text)
+
+
+def _fetch_azure_cloud_cidrs(client: httpx.Client) -> List[str]:
+    page_resp = client.get(AZURE_DOWNLOAD_PAGE_URL)
+    page_resp.raise_for_status()
+    json_url = _extract_azure_servicetags_url(page_resp.text)
+    return _parse_azure_cloud_cidrs(_fetch_json_payload(client, json_url))
+
+
+_CLOUD_CIDR_SOURCES: Tuple[Tuple[str, Callable[[httpx.Client], List[str]]], ...] = (
+    ("Amazon AWS", lambda client: _parse_aws_cloud_cidrs(_fetch_json_payload(client, AWS_IP_RANGES_URL))),
+    ("Google Cloud", lambda client: _parse_gcp_cloud_cidrs(_fetch_json_payload(client, GCP_IP_RANGES_URL))),
+    ("Oracle Cloud", lambda client: _parse_oci_cloud_cidrs(_fetch_json_payload(client, OCI_IP_RANGES_URL))),
+    ("Microsoft Azure", _fetch_azure_cloud_cidrs),
+)
+
+
+def _resolve_cloud_cidrs_target_path(explicit_path: str = "") -> Path:
+    configured = (
+        explicit_path.strip()
+        or str(getattr(settings, "CLOUD_CIDR_DB_PATH", "") or os.environ.get("CLOUD_CIDR_DB_PATH", "")).strip()
+    )
+    if configured:
+        candidate = Path(os.path.expanduser(configured))
+        if candidate.is_dir() or (not candidate.exists() and not candidate.suffix):
+            return candidate / CLOUD_CIDRS_FILENAME
+        return candidate
+    return resolve_writable_data_dir("", "CLOUD_CIDR_DB_PATH") / CLOUD_CIDRS_FILENAME
+
+
+def _load_existing_cloud_cidrs_by_provider(target_path: Path) -> Dict[str, List[str]]:
+    if not target_path.is_file():
+        return {}
+    try:
+        payload = json.loads(target_path.read_text(encoding="utf-8"))
+    except OSError, ValueError:
+        return {}
+    grouped: Dict[str, List[str]] = {}
+    for raw_cidr, provider_name in _parse_cloud_cidr_payload(payload):
+        grouped.setdefault(provider_name, []).append(raw_cidr)
+    return {provider: _normalize_cidr_list(cidrs) for provider, cidrs in grouped.items()}
+
+
+def _write_json_atomically(payload: Dict[str, List[str]], target_path: Path) -> None:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target_path.name}.tmp.", dir=str(target_path.parent))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        with contextlib.suppress(OSError):
+            os.chmod(tmp_path, 0o644)
+        _atomic_replace(tmp_path, target_path)
+    finally:
+        if tmp_path.exists():
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
+
+
 class Command(BaseCommand):
-    help = "Downloads and atomically replaces local StopForumSpam and MaxMind offline databases."
+    help = "Downloads and atomically replaces local StopForumSpam, MaxMind, and cloud CIDR offline databases."
 
     def add_arguments(self, parser) -> None:
         parser.add_argument(
             "--sources",
             nargs="+",
             default=["all"],
-            help="Sources to update: all, stopforumspam, maxmind (space or comma separated).",
+            help="Sources to update: all, stopforumspam, maxmind, cloud_cidrs (space or comma separated).",
         )
         parser.add_argument(
             "--force",
@@ -294,8 +453,13 @@ class Command(BaseCommand):
             default="",
             help="Override destination directory for MaxMind MMDB files.",
         )
+        parser.add_argument(
+            "--cloud-cidrs-path",
+            default="",
+            help="Override destination file or directory for cloud_cidrs.json.",
+        )
 
-    def _parse_sources(self, raw_sources: Iterable[str]) -> Tuple[bool, bool]:
+    def _parse_sources(self, raw_sources: Iterable[str]) -> Tuple[bool, bool, bool]:
         tokens: List[str] = []
         for entry in raw_sources:
             for part in str(entry).split(","):
@@ -303,11 +467,16 @@ class Command(BaseCommand):
                 if cleaned:
                     tokens.append(cleaned)
         if not tokens or "all" in tokens:
-            return True, True
-        unknown = [tok for tok in tokens if tok not in ("stopforumspam", "sfs", "maxmind", "all")]
+            return True, True, True
+        valid_tokens = {"stopforumspam", "sfs", "maxmind", "cloud_cidrs", "cloud-cidrs", "cloud", "all"}
+        unknown = [tok for tok in tokens if tok not in valid_tokens]
         if unknown:
             raise CommandError(f"Unknown --sources value: {', '.join(unknown)}")
-        return ("stopforumspam" in tokens or "sfs" in tokens), ("maxmind" in tokens)
+        return (
+            "stopforumspam" in tokens or "sfs" in tokens,
+            "maxmind" in tokens,
+            any(tok in tokens for tok in ("cloud_cidrs", "cloud-cidrs", "cloud")),
+        )
 
     def _download_sfs_zip(
         self,
@@ -530,8 +699,66 @@ class Command(BaseCommand):
 
         return errors
 
+    def _update_cloud_cidrs(
+        self,
+        client: httpx.Client,
+        *,
+        cloud_cidrs_path: str,
+        force: bool,
+        dry_run: bool,
+    ) -> int:
+        target_path = _resolve_cloud_cidrs_target_path(cloud_cidrs_path)
+        wait_seconds = _check_mtime_cooldown(target_path, CLOUD_CIDRS_MIN_INTERVAL_SECONDS, force=force)
+        if wait_seconds is not None:
+            self.stdout.write(
+                f"Skipped Cloud CIDRs ({target_path.name}): updated recently, next check allowed in {wait_seconds}s."
+            )
+            return 0
+        if dry_run:
+            self.stdout.write(f"[dry-run] Would fetch AWS/GCP/OCI/Azure IP ranges -> {target_path}")
+            return 0
+
+        existing_by_provider = _load_existing_cloud_cidrs_by_provider(target_path)
+        merged: Dict[str, List[str]] = {}
+        fetched_count = 0
+
+        for provider_name, fetcher in _CLOUD_CIDR_SOURCES:
+            try:
+                cidrs = fetcher(client)
+                if not cidrs:
+                    raise CommandError(f"{provider_name} returned no valid IP networks.")
+                merged[provider_name] = cidrs
+                fetched_count += 1
+            except (*_DOWNLOAD_UPDATE_ERRORS, KeyError, TypeError) as exc:
+                historical = existing_by_provider.get(provider_name, [])
+                if historical:
+                    merged[provider_name] = historical
+                    self.stderr.write(
+                        self.style.WARNING(
+                            f"Failed {provider_name} CIDR fetch ({exc}); retaining {len(historical)} historical CIDRs."
+                        )
+                    )
+                else:
+                    self.stderr.write(
+                        self.style.WARNING(f"Failed {provider_name} CIDR fetch ({exc}); no fallback data.")
+                    )
+
+        total_cidrs = sum(len(v) for v in merged.values())
+        if fetched_count == 0 and total_cidrs == 0:
+            self.stderr.write(self.style.ERROR("Failed Cloud CIDRs update: all providers failed with no fallback."))
+            return 1
+
+        _write_json_atomically(merged, target_path)
+        clear_offline_intelligence_caches()
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"Updated Cloud CIDRs ({target_path.name}, {total_cidrs} CIDRs across {len(merged)} providers)."
+            )
+        )
+        return 0
+
     def handle(self, *args, **options) -> None:
-        update_sfs, update_maxmind = self._parse_sources(options.get("sources") or ["all"])
+        update_sfs, update_maxmind, update_cloud_cidrs = self._parse_sources(options.get("sources") or ["all"])
         force = bool(options.get("force"))
         dry_run = bool(options.get("dry_run"))
         skip_listed_1 = bool(options.get("skip_listed_1"))
@@ -541,6 +768,7 @@ class Command(BaseCommand):
 
         sfs_dir = resolve_writable_data_dir(str(options.get("sfs_dir") or ""), "STOPFORUMSPAM_DB_DIR")
         maxmind_dir = resolve_writable_data_dir(str(options.get("maxmind_dir") or ""), "MAXMIND_DB_DIR")
+        cloud_cidrs_path = str(options.get("cloud_cidrs_path") or "")
 
         total_errors = 0
         with httpx.Client(
@@ -560,6 +788,13 @@ class Command(BaseCommand):
                 total_errors += self._update_maxmind(
                     client,
                     maxmind_dir=maxmind_dir,
+                    force=force,
+                    dry_run=dry_run,
+                )
+            if update_cloud_cidrs:
+                total_errors += self._update_cloud_cidrs(
+                    client,
+                    cloud_cidrs_path=cloud_cidrs_path,
                     force=force,
                     dry_run=dry_run,
                 )

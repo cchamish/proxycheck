@@ -458,6 +458,7 @@ class AsgiSmokeTests(SimpleTestCase):
         self.assertEqual(session_degraded_resp.status_code, 401)
         self.assertIn("Cookie", session_degraded_resp.headers.get("Vary", ""))
 
+
 class BatchDetectionEndpointTests(TestCase):
     """Tests for the batch IP detection endpoint covering authentication, validation, CORS, and mixed IP lookups."""
 
@@ -686,6 +687,7 @@ class BatchDetectionEndpointTests(TestCase):
         self.assertTrue(link_local_res["isNonPublic"])
         self.assertEqual(link_local_res["nonPublicCategory"], "link_local")
         self.assertEqual(link_local_res["results"], [])
+
 
 class CompactResponseAndCacheControlTests(TestCase):
     """Tests for compact response stripping, cache control headers, and shared cache preservation."""
@@ -939,6 +941,7 @@ class CompactResponseAndCacheControlTests(TestCase):
         self.assertEqual(default_resp.status_code, 200)
         for row in default_resp.json()["results"]["1.1.1.1"]["results"]:
             self.assertIn("rawJson", row)
+
 
 class TwoTierQueryModeTests(TestCase):
     """Tests for light and full two-tier detection modes across single, batch, and singleflight paths."""

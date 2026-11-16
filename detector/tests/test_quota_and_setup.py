@@ -697,6 +697,7 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
             self.assertEqual(fake_redis.strings[min_key], "1")
             self.assertEqual(fake_redis.strings[day_key], "1")
 
+
 class CheckSetupCommandTests(SimpleTestCase):
     """Tests environment detection, secret masking, interactive completion, and job checks."""
 
@@ -789,7 +790,7 @@ class CheckSetupCommandTests(SimpleTestCase):
                 self.assertIn("abus...xyz9", output)
                 self.assertNotIn("abuse-secret-token-xyz9", output)
                 self.assertIn("WIKIMEDIA_CLIENT_ID: MISSING", output)
-                self.assertIn("Tuning & Quota Limits (38 optional vars)", output)
+                self.assertIn("Tuning & Quota Limits (39 optional vars)", output)
 
                 with self.assertRaises(CommandError):
                     call_command(

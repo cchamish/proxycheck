@@ -7,9 +7,6 @@ export const REQUIRED_USER_RIGHTS = [
   'checkuser-temporary-account-no-preference',
 ] as const;
 
-export const REQUIRED_USER_RIGHTS_SUMMARY =
-  'users who hold either the checkuser-temporary-account or checkuser-temporary-account-no-preference permission on any Wikimedia project.';
-
 export interface ProviderRawResult {
   provider:
     | 'Cloudflare Radar'
@@ -85,15 +82,6 @@ export interface OfflineDatabaseEntry {
   staleAfterSeconds: number;
   status: 'healthy' | 'stale' | 'missing';
   statusLabel: string;
-}
-
-export interface OfflineDatabaseSourceSummary {
-  source: string;
-  status: 'healthy' | 'stale' | 'missing' | 'optional';
-  latestIso: string | null;
-  ageSeconds: number | null;
-  presentCount: number;
-  totalCount: number;
 }
 
 export interface SystemStatusResponse {
@@ -483,77 +471,6 @@ export function formatByteSize(sizeBytes?: number | null): string {
     return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
   }
   return `${(sizeBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-}
-
-/**
- * Aggregates individual offline database entries into per-source health summaries.
- */
-export function summarizeOfflineDatabases(
-  entries: OfflineDatabaseEntry[] | undefined | null
-): OfflineDatabaseSourceSummary[] {
-  if (!Array.isArray(entries) || entries.length === 0) {
-    return [];
-  }
-  const bySource = new Map<string, OfflineDatabaseEntry[]>();
-  for (const item of entries) {
-    if (!item || typeof item !== 'object' || !item.source) {
-      continue;
-    }
-    const existing = bySource.get(item.source);
-    if (existing) {
-      existing.push(item);
-    } else {
-      bySource.set(item.source, [item]);
-    }
-  }
-
-  const summaries: OfflineDatabaseSourceSummary[] = [];
-  for (const [source, rows] of bySource.entries()) {
-    let presentCount = 0;
-    let hasStale = false;
-    let hasRequiredMissing = false;
-    let latestMs = -1;
-    let latestIso: string | null = null;
-    let latestAge: number | null = null;
-
-    for (const row of rows) {
-      if (row.exists) {
-        presentCount += 1;
-        if (row.status === 'stale') {
-          hasStale = true;
-        }
-        if (row.lastModifiedIso) {
-          const parsedMs = Date.parse(row.lastModifiedIso);
-          if (!Number.isNaN(parsedMs) && parsedMs > latestMs) {
-            latestMs = parsedMs;
-            latestIso = row.lastModifiedIso;
-            latestAge = row.ageSeconds ?? null;
-          }
-        }
-      } else if (!row.optional) {
-        hasRequiredMissing = true;
-      }
-    }
-
-    let summaryStatus: 'healthy' | 'stale' | 'missing' | 'optional' = 'healthy';
-    if (hasRequiredMissing) {
-      summaryStatus = 'missing';
-    } else if (presentCount === 0) {
-      summaryStatus = 'optional';
-    } else if (hasStale) {
-      summaryStatus = 'stale';
-    }
-
-    summaries.push({
-      source,
-      status: summaryStatus,
-      latestIso,
-      ageSeconds: latestAge,
-      presentCount,
-      totalCount: rows.length,
-    });
-  }
-  return summaries;
 }
 
 /**

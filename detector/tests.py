@@ -190,7 +190,7 @@ class DetectorAuthTests(TestCase):
         self.assertIn("StopForumSpam", result_providers)
         self.assertIn("DShield", result_providers)
 
-    # Verify switch_test_role dual guard behavior
+    # Verify switch_test_role dual guard behaviour
 
     @override_settings(DEBUG=False, ENABLE_TEST_AUTH=False)
     def test_switch_test_role_blocked_in_production(self):
@@ -235,7 +235,7 @@ class DetectorAuthTests(TestCase):
         self.assertTrue(data["hasAccess"])
         self.assertEqual(self.client.session["wikimedia_user"]["role"], "Steward")
 
-    # Verify oauth_login fallback behavior and state generation
+    # Verify oauth_login fallback behaviour and state generation
 
     @override_settings(
         DEBUG=False,
@@ -1059,7 +1059,7 @@ class AggregationAndCacheIntegrityTests(TestCase):
         self.assertEqual(input_rows, snapshot)
         self.assertEqual(input_rows[0]["securityFlags"], [{"label": "No Flags", "isHighRisk": False}])
 
-        # Verify returned copy normalizes hosting flags without mutating inputs
+        # Verify returned copy normalises hosting flags without mutating inputs
         out_rows = {row["provider"]: row for row in aggregated["results"]}
         self.assertEqual(out_rows["IPData"]["securityFlags"], [{"label": "Hosting", "isHighRisk": True}])
         self.assertEqual(out_rows["IPRegistry"]["securityFlags"], [{"label": "Proxy", "isHighRisk": True}])
@@ -1655,7 +1655,7 @@ class MetaWikiRightsAndSessionTtlTests(TestCase):
 
 
 class IpCanonicalizationAndSecurityBaselineTests(TestCase):
-    """Tests IPv4 and IPv6 address canonicalization for cache consistency and production security settings."""
+    """Tests IPv4 and IPv6 address canonicalisation for cache consistency and production security settings."""
 
     def setUp(self):
         dns_patcher = patch(
@@ -2070,7 +2070,7 @@ class ReverseDnsAndCidrAttributionTests(TestCase):
 
 
 class DetectEndpointRoutingAndValidationTests(TestCase):
-    """Tests for URL routing normalization and IP parameter validation on the detect endpoint."""
+    """Tests for URL routing normalisation and IP parameter validation on the detect endpoint."""
 
     def setUp(self):
         dns_patcher = patch(
@@ -2277,12 +2277,12 @@ class SettingsAndHardeningTests(TestCase):
         with (
             patch.dict(os.environ, {"DJANGO_SECRET_KEY": "", "DJANGO_DEBUG": "False"}),
             patch.object(sys, "argv", ["gunicorn"]),
+            self.assertRaises(ImproperlyConfigured),
         ):
-            with self.assertRaises(ImproperlyConfigured):
-                secret = os.environ.get("DJANGO_SECRET_KEY")
-                debug = os.environ.get("DJANGO_DEBUG", "False").lower() in ("true", "1", "yes")
-                if not secret and not debug and "test" not in sys.argv:
-                    raise ImproperlyConfigured("DJANGO_SECRET_KEY environment variable is required in production.")
+            secret = os.environ.get("DJANGO_SECRET_KEY")
+            debug = os.environ.get("DJANGO_DEBUG", "False").lower() in ("true", "1", "yes")
+            if not secret and not debug and "test" not in sys.argv:
+                raise ImproperlyConfigured("DJANGO_SECRET_KEY environment variable is required in production.")
 
     def test_allowed_hosts_fallback_to_local_defaults(self):
         with patch.dict(os.environ, {"DJANGO_ALLOWED_HOSTS": ""}):
@@ -3435,7 +3435,7 @@ class GadgetTokenAndCorsAuthTests(TestCase):
                 self.assertEqual(gadget_resp.status_code, 200)
                 self.assertEqual(gadget_resp.json()["username"], username)
 
-        # Verify Meta-Wiki local right fallback on transient globaluserinfo error matches gadget behavior
+        # Verify Meta-Wiki local right fallback on transient globaluserinfo error matches gadget behaviour
         session = self.client.session
         session["oauth_state"] = "state-local-fallback"
         session.pop("wikimedia_user", None)
@@ -3777,9 +3777,9 @@ class SingleflightCoalescingTests(TestCase):
         with (
             patch("detector.views.redis_client", None),
             patch("detector.views._execute_detection_with_cache", AsyncMock(side_effect=RuntimeError("boom"))),
+            self.assertRaises(RuntimeError),
         ):
-            with self.assertRaises(RuntimeError):
-                await self.async_client.get("/api/v1/detect?ip=8.8.4.4", headers=auth_headers)
+            await self.async_client.get("/api/v1/detect?ip=8.8.4.4", headers=auth_headers)
 
         self.assertEqual(len(views._ip_detect_inflight), 0)
 
@@ -6437,12 +6437,14 @@ class AsgiSmokeTests(SimpleTestCase):
         self.assertNotIn("proxycheck_sessionid", outage_resp.cookies)
 
         conflict_req = async_factory.get("/api/v1/auth/login/")
-        with patch(
-            "django.contrib.sessions.backends.cache.SessionStore.save",
-            side_effect=UpdateError("concurrent logout"),
+        with (
+            patch(
+                "django.contrib.sessions.backends.cache.SessionStore.save",
+                side_effect=UpdateError("concurrent logout"),
+            ),
+            self.assertRaises(SessionInterrupted),
         ):
-            with self.assertRaises(SessionInterrupted):
-                asyncio.run(mutating_middleware(conflict_req))
+            asyncio.run(mutating_middleware(conflict_req))
 
         release_save = threading.Event()
         unblocked_in_time = []
@@ -7623,7 +7625,7 @@ class FlagBasedArbitrationTests(SimpleTestCase):
             self._clean_row("IP2Location"),
         ]
 
-        # A single hosting tag with no behavioral signal is dismissed as a minor attribute dispute
+        # A single hosting tag with no behavioural signal is dismissed as a minor attribute dispute
         isolated_hosting = self._clean_row("IPHub")
         isolated_hosting["usageType"] = "hosting"
         isolated_hosting["securityFlags"] = [{"label": "Hosting", "isHighRisk": True}]
@@ -7632,7 +7634,7 @@ class FlagBasedArbitrationTests(SimpleTestCase):
         self.assertEqual(outlier_result["arbitrationVerdict"], "Clean Residential (1 Minor Attribute Dispute)")
         self.assertFalse(outlier_result["isMajorityProxyVpn"])
 
-        # Proxycheck riskScore counts as a behavioral signal and prevents outlier dismissal
+        # Proxycheck riskScore counts as a behavioural signal and prevents outlier dismissal
         risky_hosting = self._clean_row("Proxycheck")
         risky_hosting["usageType"] = "hosting"
         risky_hosting["securityFlags"] = [{"label": "Hosting", "isHighRisk": True}]
@@ -8553,6 +8555,7 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
             )
             self.assertEqual(fake_redis.strings[min_key], "1")
             self.assertEqual(fake_redis.strings[day_key], "1")
+
 
 class _BatchingFakeRedis(FakeAsyncRedis):
     """In-memory Redis double that records single reads, batch reads and pipeline flushes."""

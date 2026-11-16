@@ -23,6 +23,8 @@ select = [
   "I",
   "B",
   "S",
+  "BLE",
+  "SIM",
 ]
 ignore = [
   # Helpers forward HTTP timeout values to httpx rather than wrapping asyncio.timeout directly.

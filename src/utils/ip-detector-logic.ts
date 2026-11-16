@@ -1,5 +1,5 @@
 /**
- * Shared IP validation, canonicalization, result helpers, and detection request coordinator.
+ * Shared IP validation, canonicalisation, result helpers, and detection request coordinator.
  */
 
 export const REQUIRED_USER_RIGHTS = [
@@ -162,7 +162,8 @@ export function isValidIpAddress(ip: string): boolean {
 }
 
 /**
- * Normalizes a valid IPv4 or IPv6 address into its canonical compressed representation.
+ * Normalises a valid IPv4 or IPv6 address into its canonical compressed representation.
+ * Keep IPv4 and RFC 5952 IPv6 normalisation rules symmetric with canonicalizeIpKey in scripts/user-gadget.js.
  */
 export function canonicalizeIpAddress(rawIp: string): string | null {
   if (!isValidIpAddress(rawIp)) {
@@ -257,7 +258,7 @@ export function updateIpHistory(history: string[], newIp: string): string[] {
 }
 
 /**
- * Extracts and canonicalizes the `ip` query parameter from a URL search string.
+ * Extracts and canonicalises the `ip` query parameter from a URL search string.
  */
 export function extractCanonicalIpFromSearch(search?: string | null): string | null {
   try {
@@ -297,7 +298,7 @@ export function buildPageUrlWithIp(pathname: string, search: string, ip: string 
 }
 
 /**
- * Resolves a configured GitHub repository slug or URL into a normalized HTTPS base URL.
+ * Resolves a configured GitHub repository slug or URL into a normalised HTTPS base URL.
  */
 export function resolveRepoBaseUrl(configuredRepo?: string | null): string {
   const trimmed = String(configuredRepo ?? '').trim();
@@ -325,7 +326,7 @@ const ENGLISH_MONTH_ABBREVIATIONS = [
 ];
 
 /**
- * Normalizes a commit timestamp string so non-empty values end with " (UTC)".
+ * Normalises a commit timestamp string so non-empty values end with " (UTC)".
  */
 export function normalizeUtcCommitTimestamp(timestamp?: string | null): string {
   const trimmed = String(timestamp ?? '').trim();
@@ -526,7 +527,7 @@ export interface DiagnosticPayload {
 }
 
 /**
- * Normalizes backend diagnostic fields into non-negative duration and two-decimal megabyte values.
+ * Normalises backend diagnostic fields into non-negative duration and two-decimal megabyte values.
  */
 export function buildDiagnosticMetrics(
   payload?: DiagnosticPayload | null,

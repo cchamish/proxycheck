@@ -69,9 +69,7 @@ def _build_error_row(
     else:
         resolved_status = _ERROR_STATUS_LABELS.get(status_code, f"{status_code} Error")
 
-    resolved_flags = (
-        security_flags if security_flags is not None else [{"label": "No Flags", "isHighRisk": False}]
-    )
+    resolved_flags = security_flags if security_flags is not None else [{"label": "No Flags", "isHighRisk": False}]
     default_message = "API key not configured" if status_code is None else f"HTTP {status_code}"
     resolved_raw_json = raw_data if raw_data else {"status": "error", "message": raw_message or default_message}
 

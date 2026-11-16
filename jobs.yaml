@@ -1,6 +1,11 @@
 ---
-- name: update-offline-dbs
-  command: python manage.py update_offline_dbs
+- name: update-sfs-db
+  command: python manage.py update_offline_dbs --sources stopforumspam
   image: tool-proxycheck/tool-proxycheck:latest
-  schedule: "0 * * * *"
+  schedule: "@hourly"
+  mount: all
+- name: update-maxmind-db
+  command: python manage.py update_offline_dbs --sources maxmind
+  image: tool-proxycheck/tool-proxycheck:latest
+  schedule: "@daily"
   mount: all

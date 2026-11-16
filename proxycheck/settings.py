@@ -150,7 +150,7 @@ ASGI_APPLICATION = "proxycheck.asgi.application"
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+        "NAME": ":memory:" if _IS_TEST_RUN else BASE_DIR / "db.sqlite3",
     }
 }
 

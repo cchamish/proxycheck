@@ -56,10 +56,11 @@ def _parse_bool_env(name: str, default: bool = False) -> bool:
 RESTRICT_TO_ALLOWED_WIKI_USERS = _parse_bool_env("RESTRICT_TO_ALLOWED_WIKI_USERS")
 
 _IS_TEST_RUN = "test" in sys.argv or "pytest" in sys.modules
+_IS_SETUP_CHECK = "check_setup" in sys.argv[1:]
 
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY")
 if not SECRET_KEY:
-    if not DEBUG and not _IS_TEST_RUN and "collectstatic" not in sys.argv:
+    if not DEBUG and not _IS_TEST_RUN and not _IS_SETUP_CHECK and "collectstatic" not in sys.argv:
         raise ImproperlyConfigured("DJANGO_SECRET_KEY must be set in production.")
     SECRET_KEY = "django-insecure-dev-key"  # noqa: S105
 
@@ -339,7 +340,7 @@ def _expand_configured_path(raw_path: str) -> str:
     return os.path.expanduser(os.path.expandvars(cleaned))
 
 
-def _standard_data_directories(base_dir: Path | str) -> list[Path]:
+def _standard_data_directories(base_dir: Path | str, *, tool_data_dir: Optional[str] = None) -> list[Path]:
     """Returns local workspace and Toolforge data directories in lookup priority order."""
     base_path = Path(str(base_dir))
     directories = [

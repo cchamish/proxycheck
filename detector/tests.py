@@ -10105,3 +10105,485 @@ class UpdateOfflineDbsCommandTests(TestCase):
                 self.assertTrue(hit["appears"])
                 self.assertEqual(hit["frequency"], 7)
             offline_dbs.clear_stopforumspam_caches()
+
+
+class CheckSetupCommandTests(SimpleTestCase):
+    """Tests environment detection, secret masking, interactive completion, and job checks."""
+
+    def test_secret_masking_and_redis_url_redaction(self):
+        from detector.management.commands import check_setup
+
+        self.assertEqual(check_setup.mask_secret(""), "")
+        self.assertEqual(check_setup.mask_secret("abc"), "***")
+        self.assertEqual(check_setup.mask_secret("abcd1234"), "a******4")
+        self.assertEqual(check_setup.mask_secret("1234567890"), "12...90")
+        self.assertEqual(check_setup.mask_secret("sk_live_abcdefgh_9876"), "sk_l...9876")
+        self.assertEqual(
+            check_setup.redact_url_credentials("redis://:supersecret@redis.example.org:6379/0"),
+            "redis://:***@redis.example.org:6379/0",
+        )
+        self.assertEqual(
+            check_setup.redact_url_credentials("redis://127.0.0.1:6379/0"),
+            "redis://127.0.0.1:6379/0",
+        )
+
+    def test_environment_detection_and_toolforge_account_resolution(self):
+        from django.core.management.base import CommandError
+
+        from detector.management.commands import check_setup
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            wmcs_file = Path(tmp_dir) / "wmcs-project"
+            wmcs_file.write_text("tools\n", encoding="utf-8")
+
+            mode, toolforge_bin, account = check_setup.detect_runtime_environment(
+                "auto",
+                environ={"USER": "tools.proxycheck-dev", "HOME": "/data/project/proxycheck-dev"},
+                which_fn=lambda name: "/usr/bin/toolforge" if name == "toolforge" else None,
+                wmcs_project_path=wmcs_file,
+            )
+            self.assertEqual(mode, "bastion")
+            self.assertEqual(toolforge_bin, "/usr/bin/toolforge")
+            self.assertEqual(account, "proxycheck-dev")
+
+            container_mode, _, container_account = check_setup.detect_runtime_environment(
+                "auto",
+                environ={
+                    "CNB_STACK_ID": "heroku-22",
+                    "TOOL_DATA_DIR": "/data/project/proxycheck",
+                },
+                which_fn=lambda _name: None,
+                wmcs_project_path=Path(tmp_dir) / "absent",
+            )
+            self.assertEqual(container_mode, "local")
+            self.assertEqual(container_account, "proxycheck")
+
+            with self.assertRaises(CommandError):
+                check_setup.detect_runtime_environment(
+                    "bastion",
+                    environ={},
+                    which_fn=lambda _name: None,
+                )
+
+    def test_local_no_input_masks_secrets_and_strict_mode_fails_on_missing_required(self):
+        import io
+
+        from django.core.management import call_command
+        from django.core.management.base import CommandError
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            project_root = workspace / "proxycheck"
+            project_root.mkdir()
+            (project_root / ".env").write_text(
+                "DJANGO_SECRET_KEY='very-secret-key-abcdef123456'\nABUSEIPDB_API_KEY='abuse-secret-token-xyz9'\n",
+                encoding="utf-8",
+            )
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            clean_env = {
+                key: val
+                for key, val in os.environ.items()
+                if key not in ("DJANGO_SECRET_KEY", "WIKIMEDIA_CLIENT_ID", "WIKIMEDIA_CLIENT_SECRET", "TOOL_DATA_DIR")
+            }
+            with (
+                override_settings(BASE_DIR=project_root),
+                patch.dict(os.environ, clean_env, clear=True),
+                patch("pathlib.Path.home", return_value=workspace / "home"),
+            ):
+                call_command("check_setup", no_input=True, env_mode="local", stdout=stdout, stderr=stderr)
+                output = stdout.getvalue()
+                self.assertIn("very...3456", output)
+                self.assertNotIn("very-secret-key-abcdef123456", output)
+                self.assertIn("abus...xyz9", output)
+                self.assertNotIn("abuse-secret-token-xyz9", output)
+                self.assertIn("WIKIMEDIA_CLIENT_ID: MISSING", output)
+                self.assertIn("Tuning & Quota Limits (38 optional vars)", output)
+
+                with self.assertRaises(CommandError):
+                    call_command(
+                        "check_setup",
+                        no_input=True,
+                        env_mode="local",
+                        strict=True,
+                        stdout=io.StringIO(),
+                        stderr=io.StringIO(),
+                    )
+
+    def test_local_interactive_writes_dotenv_ensures_gitignore_and_creates_directory(self):
+        import io
+
+        from django.core.management import call_command
+        from dotenv import dotenv_values
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            project_root = workspace / "proxycheck"
+            project_root.mkdir()
+            (project_root / ".gitignore").write_text("*.pyc\n", encoding="utf-8")
+
+            stdout = io.StringIO()
+            # Required prompts: DJANGO_SECRET_KEY (gen), WIKIMEDIA_CLIENT_ID, WIKIMEDIA_CLIENT_SECRET
+            # Recommended prompts (7): all skipped via empty string
+            # Provider yes/no: N
+            # Missing directory prompt: y
+            getpass_answers = iter(["gen", "wiki-secret-1234567890", "", ""])
+            input_answers = iter(["wiki-client-id", "", "", "", "", "", "N", "y"])
+
+            clean_env = {
+                key: val
+                for key, val in os.environ.items()
+                if key
+                not in (
+                    "DJANGO_SECRET_KEY",
+                    "WIKIMEDIA_CLIENT_ID",
+                    "WIKIMEDIA_CLIENT_SECRET",
+                    "DJANGO_ALLOWED_HOSTS",
+                    "WIKIMEDIA_REDIRECT_URI",
+                    "REDIS_URL",
+                    "TOOL_DATA_DIR",
+                    "MAXMIND_ACCOUNT_ID",
+                    "MAXMIND_LICENSE_KEY",
+                    "ALLOWED_WIKI_USERS",
+                )
+            }
+            with (
+                override_settings(BASE_DIR=project_root),
+                patch.dict(os.environ, clean_env, clear=True),
+                patch("pathlib.Path.home", return_value=workspace / "home"),
+                patch("getpass.getpass", side_effect=lambda _prompt="": next(getpass_answers)),
+                patch("builtins.input", side_effect=lambda _prompt="": next(input_answers)),
+            ):
+                call_command("check_setup", env_mode="local", stdout=stdout, stderr=io.StringIO())
+
+            written_env = dotenv_values(project_root / ".env")
+            self.assertEqual(len(written_env["DJANGO_SECRET_KEY"]), 50)
+            self.assertEqual(written_env["WIKIMEDIA_CLIENT_ID"], "wiki-client-id")
+            self.assertEqual(written_env["WIKIMEDIA_CLIENT_SECRET"], "wiki-secret-1234567890")
+            self.assertNotIn(written_env["DJANGO_SECRET_KEY"], stdout.getvalue())
+            self.assertNotIn("wiki-secret-1234567890", stdout.getvalue())
+            self.assertIn(".env", (project_root / ".gitignore").read_text(encoding="utf-8").splitlines())
+            self.assertTrue((workspace / "data").is_dir())
+
+    def test_bastion_interactive_uses_stdin_for_envvars_and_adapts_dev_jobs(self):
+        import io
+        import subprocess
+
+        from django.core.management import call_command
+
+        from detector.management.commands import check_setup
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            project_root = workspace / "proxycheck"
+            project_root.mkdir()
+            (project_root / "jobs.yaml").write_text(
+                "---\n"
+                "- name: update-offline-dbs\n"
+                "  command: python manage.py update_offline_dbs\n"
+                "  image: tool-proxycheck/tool-proxycheck:latest\n"
+                '  schedule: "0 * * * *"\n'
+                "  mount: all\n",
+                encoding="utf-8",
+            )
+            home_dir = workspace / "home"
+            (home_dir / "data").mkdir(parents=True)
+
+            recorded_calls = []
+
+            def _fake_run(cmd, *, input=None, text=None, capture_output=None, timeout=None, check=None):
+                recorded_calls.append((list(cmd), input))
+                if cmd[1:] == ["envvars", "list", "--show-values"]:
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        stdout=(
+                            "name                    value\n"
+                            "DJANGO_ALLOWED_HOSTS     localhost\n"
+                            "WIKIMEDIA_REDIRECT_URI  https://proxycheck.toolforge.org/oauth/callback\n"
+                        ),
+                        stderr="",
+                    )
+                if cmd[1:] == ["jobs", "list"]:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="No jobs found.\n", stderr="")
+                if cmd[1:3] == ["envvars", "create"]:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=f"name value\n{cmd[3]} ***\n", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            # Missing required: DJANGO_SECRET_KEY (gen), WIKIMEDIA_CLIENT_ID, WIKIMEDIA_CLIENT_SECRET
+            # Attention recommended: DJANGO_ALLOWED_HOSTS (local only), WIKIMEDIA_REDIRECT_URI (prod URL on dev),
+            # REDIS_URL (missing), TOOL_DATA_DIR, MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY, ALLOWED_WIKI_USERS
+            # Provider y/N -> y, then 9 provider prompts (first set, remaining 8 skipped)
+            getpass_answers = iter(
+                [
+                    "gen",
+                    "wiki-secret-bastion-0001",
+                    "",
+                    "",
+                    "",
+                    "abuse-key-bastion-1234",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                ]
+            )
+            input_answers = iter(
+                [
+                    "wiki-client-bastion",
+                    "localhost,127.0.0.1,.toolforge.org,.wmcloud.org",
+                    "https://proxycheck-dev.toolforge.org/oauth/callback",
+                    "",
+                    "",
+                    "",
+                    "y",
+                ]
+            )
+
+            stdout = io.StringIO()
+            bastion_env = {
+                "USER": "tools.proxycheck-dev",
+                "HOME": str(home_dir),
+            }
+            with (
+                override_settings(BASE_DIR=project_root),
+                patch.dict(os.environ, bastion_env, clear=True),
+                patch("pathlib.Path.home", return_value=home_dir),
+                patch.object(check_setup.shutil, "which", return_value="/usr/bin/toolforge"),
+                patch.object(check_setup.subprocess, "run", side_effect=_fake_run),
+                patch("getpass.getpass", side_effect=lambda _prompt="": next(getpass_answers)),
+                patch("builtins.input", side_effect=lambda _prompt="": next(input_answers)),
+            ):
+                call_command("check_setup", env_mode="bastion", stdout=stdout, stderr=io.StringIO())
+
+            output = stdout.getvalue()
+            create_calls = [(cmd, val) for cmd, val in recorded_calls if cmd[1:3] == ["envvars", "create"]]
+            created_keys = [cmd[3] for cmd, _ in create_calls]
+            self.assertEqual(
+                created_keys,
+                [
+                    "DJANGO_SECRET_KEY",
+                    "WIKIMEDIA_CLIENT_ID",
+                    "WIKIMEDIA_CLIENT_SECRET",
+                    "DJANGO_ALLOWED_HOSTS",
+                    "WIKIMEDIA_REDIRECT_URI",
+                    "ABUSEIPDB_API_KEY",
+                ],
+            )
+            # Secret values must pass via stdin, never as CLI argv elements
+            for cmd, stdin_val in create_calls:
+                self.assertEqual(len(cmd), 4)
+                self.assertTrue(stdin_val)
+
+            self.assertIn("tool-proxycheck-dev/tool-proxycheck-dev:latest", output)
+            self.assertIn("toolforge webservice buildservice restart --mount=all", output)
+
+    def test_bastion_fallback_envvars_show_matching_jobs_and_nfs_mount_detection(self):
+        import io
+        import subprocess
+
+        from django.core.management import call_command
+
+        from detector.management.commands import check_setup
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            project_root = workspace / "proxycheck"
+            project_root.mkdir()
+            (project_root / "jobs.yaml").write_text(
+                "---\n"
+                "- name: update-offline-dbs\n"
+                "  command: python manage.py update_offline_dbs\n"
+                "  image: tool-proxycheck/tool-proxycheck:latest\n"
+                '  schedule: "0 * * * *"\n'
+                "  mount: all\n",
+                encoding="utf-8",
+            )
+            data_dir = workspace / "data"
+            data_dir.mkdir()
+            mounts_file = workspace / "mounts"
+            mounts_file.write_text(
+                f"nfs.svc:/tools {workspace.as_posix()} nfs4 rw,relatime 0 0\n",
+                encoding="utf-8",
+            )
+
+            def _fake_run(cmd, *, input=None, text=None, capture_output=None, timeout=None, check=None):
+                if cmd[1:] == ["envvars", "list", "--show-values"]:
+                    return subprocess.CompletedProcess(cmd, 2, stdout="", stderr="unknown option --show-values")
+                if cmd[1:] == ["envvars", "list"]:
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        stdout="name\nDJANGO_SECRET_KEY\nWIKIMEDIA_CLIENT_ID\nWIKIMEDIA_CLIENT_SECRET\n",
+                        stderr="",
+                    )
+                if cmd[1:3] == ["envvars", "show"]:
+                    key = cmd[3]
+                    if key == "DJANGO_SECRET_KEY":
+                        return subprocess.CompletedProcess(cmd, 0, stdout="********\n", stderr="")
+                    return subprocess.CompletedProcess(cmd, 0, stdout=f"{key} value-{key}-12345\n", stderr="")
+                if cmd[1:] == ["jobs", "list"]:
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        stdout=(
+                            "Job name:              Job type:              Status:\n"
+                            "---------------------- ---------------------- -------------------\n"
+                            "update-offline-dbs     scheduled: 0 * * * *   Waiting for next\n"
+                        ),
+                        stderr="",
+                    )
+                if cmd[1:] == ["jobs", "show", "update-offline-dbs"]:
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        stdout=(
+                            "Job name: update-offline-dbs\n"
+                            "Command: python manage.py update_offline_dbs\n"
+                            "Image: tool-proxycheck/tool-proxycheck:latest\n"
+                            "Schedule: 0 * * * *\n"
+                            "Mount: all\n"
+                        ),
+                        stderr="",
+                    )
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            mounts = check_setup._parse_mounts_table(mounts_file)
+            mount_summary, is_ephemeral = check_setup._detect_mount_info(data_dir, mounts=mounts)
+            self.assertIn("NFS (nfs4, rw)", mount_summary)
+            self.assertFalse(is_ephemeral)
+
+            stdout = io.StringIO()
+            with (
+                override_settings(BASE_DIR=project_root),
+                patch.dict(os.environ, {"USER": "tools.proxycheck", "HOME": str(workspace)}, clear=True),
+                patch("pathlib.Path.home", return_value=workspace),
+                patch.object(check_setup.shutil, "which", return_value="/usr/bin/toolforge"),
+                patch.object(check_setup.subprocess, "run", side_effect=_fake_run),
+            ):
+                call_command("check_setup", no_input=True, env_mode="bastion", stdout=stdout, stderr=io.StringIO())
+
+            output = stdout.getvalue()
+            self.assertIn("DJANGO_SECRET_KEY: CONFIGURED (hidden by CLI", output)
+            self.assertIn("update-offline-dbs: OK", output)
+            self.assertIn("Toolforge scheduled jobs match jobs.yaml.", output)
+
+    def test_manage_py_check_setup_starts_without_secret_key(self):
+        import subprocess
+
+        manage_py = Path(__file__).resolve().parent.parent / "manage.py"
+        clean_env = {key: val for key, val in os.environ.items() if key not in ("DJANGO_SECRET_KEY", "DJANGO_DEBUG")}
+        clean_env["DJANGO_DEBUG"] = "False"
+        completed = subprocess.run(  # noqa: S603
+            [sys.executable, str(manage_py), "check_setup", "--no-input", "--env", "local"],
+            env=clean_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+        self.assertIn("Proxy Detector Environment Check", completed.stdout)
+
+    def test_all_options_offline_db_health_and_job_mismatch_warnings(self):
+        import io
+        import subprocess
+
+        from django.core.management import call_command
+
+        from detector.management.commands import check_setup
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            project_root = workspace / "proxycheck"
+            project_root.mkdir()
+            (project_root / "jobs.yaml").write_text(
+                "---\n"
+                "- name: update-offline-dbs\n"
+                "  command: python manage.py update_offline_dbs\n"
+                "  image: tool-proxycheck/tool-proxycheck:latest\n"
+                '  schedule: "0 * * * *"\n'
+                "  mount: all\n",
+                encoding="utf-8",
+            )
+            data_dir = workspace / "data"
+            data_dir.mkdir()
+            for fname in (
+                "GeoLite2-Country.mmdb",
+                "GeoLite2-City.mmdb",
+                "GeoLite2-ASN.mmdb",
+                "toxic_ip_cidr.txt",
+                "listed_ip_90_ipv46_all.zip",
+            ):
+                (data_dir / fname).write_bytes(b"stub-db")
+            stale_time = time.time() - (20 * 86400)
+            os.utime(data_dir / "GeoLite2-Country.mmdb", (stale_time, stale_time))
+
+            def _fake_run(cmd, *, input=None, text=None, capture_output=None, timeout=None, check=None):
+                if cmd[1:] == ["envvars", "list", "--show-values"]:
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        stdout=(
+                            "name                         value\n"
+                            "DJANGO_SECRET_KEY            test-secret-value-000001\n"
+                            "WIKIMEDIA_CLIENT_ID          client-id\n"
+                            "WIKIMEDIA_CLIENT_SECRET      client-secret-000001\n"
+                            "ABUSEIPDB_DAILY_LIMIT        500\n"
+                        ),
+                        stderr="",
+                    )
+                if cmd[1:] == ["jobs", "list"]:
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        stdout=(
+                            "Job name:              Job type:              Status:\n"
+                            "---------------------- ---------------------- -------------------\n"
+                            "update-offline-dbs     scheduled: 0 * * * *   Running\n"
+                        ),
+                        stderr="",
+                    )
+                if cmd[1:] == ["jobs", "show", "update-offline-dbs"]:
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        stdout=(
+                            "Job name: update-offline-dbs\n"
+                            "Command: python manage.py update_offline_dbs\n"
+                            "Image: tool-proxycheck/tool-proxycheck:latest\n"
+                            "Schedule: 0 * * * *\n"
+                            "Mount: none\n"
+                        ),
+                        stderr="",
+                    )
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            stdout = io.StringIO()
+            with (
+                override_settings(BASE_DIR=project_root),
+                patch.dict(os.environ, {"USER": "tools.proxycheck-dev", "HOME": str(workspace)}, clear=True),
+                patch("pathlib.Path.home", return_value=workspace),
+                patch.object(check_setup.shutil, "which", return_value="/usr/bin/toolforge"),
+                patch.object(check_setup.subprocess, "run", side_effect=_fake_run),
+            ):
+                call_command(
+                    "check_setup",
+                    no_input=True,
+                    env_mode="bastion",
+                    all_options=True,
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                )
+
+            output = stdout.getvalue()
+            self.assertIn("ABUSEIPDB_DAILY_LIMIT: CUSTOMISED = 500", output)
+            self.assertIn("PROVIDER_STATIC_CACHE_TTL_SECONDS: USING DEFAULT (86400)", output)
+            self.assertIn("GeoLite2-Country.mmdb): STALE", output)
+            self.assertIn("GeoLite2-City.mmdb): HEALTHY", output)
+            self.assertIn("mount is 'none' (expected 'all')", output)
+            self.assertIn("image is 'tool-proxycheck/tool-proxycheck:latest'", output)

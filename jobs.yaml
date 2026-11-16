@@ -1,0 +1,6 @@
+---
+- name: update-offline-dbs
+  command: python manage.py update_offline_dbs
+  image: tool-proxycheck/tool-proxycheck:latest
+  schedule: "0 * * * *"
+  mount: all

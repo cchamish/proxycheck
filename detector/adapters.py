@@ -438,53 +438,68 @@ def _normalize_cloud_provider_name(raw_name: Any, default: str = "Cloud Provider
     return default
 
 
+def _parse_cloud_cidr_list(items: List[Any], default_provider: str) -> List[Tuple[str, str]]:
+    """Extracts (cidr, provider_name) entries from a list of CIDR strings or rule objects."""
+    entries: List[Tuple[str, str]] = []
+    for item in items:
+        if isinstance(item, str):
+            entries.append((item, default_provider))
+            continue
+        if not isinstance(item, dict):
+            continue
+        raw_cidr = (
+            item.get("range")
+            or item.get("cidr")
+            or item.get("prefix")
+            or item.get("ip_prefix")
+            or item.get("ipv6_prefix")
+        )
+        if isinstance(raw_cidr, str):
+            provider_name = _normalize_cloud_provider_name(
+                item.get("provider") or item.get("providerName") or item.get("service") or item.get("name"),
+                default=default_provider,
+            )
+            entries.append((raw_cidr, provider_name))
+    return entries
+
+
+def _parse_aws_ip_ranges(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Extracts IPv4 and IPv6 prefixes from an AWS ip-ranges document."""
+    entries: List[Tuple[str, str]] = []
+    for key in ("prefixes", "ipv6_prefixes"):
+        prefix_list = payload.get(key)
+        if not isinstance(prefix_list, list):
+            continue
+        for item in prefix_list:
+            if not isinstance(item, dict):
+                continue
+            raw_cidr = item.get("ip_prefix") or item.get("ipv6_prefix") or item.get("cidr") or item.get("range")
+            if isinstance(raw_cidr, str):
+                entries.append((raw_cidr, "Amazon AWS"))
+    return entries
+
+
 def _parse_cloud_cidr_payload(payload: Any, default_provider: str = "Cloud Provider") -> List[Tuple[str, str]]:
     """Extracts (cidr, provider_name) entries from computehosts, AWS ip-ranges, or provider-keyed JSON."""
-    entries: List[Tuple[str, str]] = []
     if isinstance(payload, list):
-        for item in payload:
-            if isinstance(item, str):
-                entries.append((item, default_provider))
-            elif isinstance(item, dict):
-                raw_cidr = (
-                    item.get("range")
-                    or item.get("cidr")
-                    or item.get("prefix")
-                    or item.get("ip_prefix")
-                    or item.get("ipv6_prefix")
-                )
-                provider_name = _normalize_cloud_provider_name(
-                    item.get("provider") or item.get("providerName") or item.get("service") or item.get("name"),
-                    default=default_provider,
-                )
-                if isinstance(raw_cidr, str):
-                    entries.append((raw_cidr, provider_name))
-        return entries
+        return _parse_cloud_cidr_list(payload, default_provider)
 
-    if isinstance(payload, dict):
-        if isinstance(payload.get("prefixes"), list) or isinstance(payload.get("ipv6_prefixes"), list):
-            for key in ("prefixes", "ipv6_prefixes"):
-                prefix_list = payload.get(key)
-                if isinstance(prefix_list, list):
-                    for item in prefix_list:
-                        if not isinstance(item, dict):
-                            continue
-                        raw_cidr = (
-                            item.get("ip_prefix") or item.get("ipv6_prefix") or item.get("cidr") or item.get("range")
-                        )
-                        if isinstance(raw_cidr, str):
-                            entries.append((raw_cidr, "Amazon AWS"))
-            return entries
+    if not isinstance(payload, dict):
+        return []
 
-        for key, value in payload.items():
-            if not isinstance(key, str):
-                continue
-            key_lower = key.strip().lower()
-            if key_lower in ("ranges", "cidrs", "entries", "items") and isinstance(value, list):
-                entries.extend(_parse_cloud_cidr_payload(value, default_provider=default_provider))
-            elif isinstance(value, list):
-                provider_name = _normalize_cloud_provider_name(key, default=default_provider)
-                entries.extend(_parse_cloud_cidr_payload(value, default_provider=provider_name))
+    if isinstance(payload.get("prefixes"), list) or isinstance(payload.get("ipv6_prefixes"), list):
+        return _parse_aws_ip_ranges(payload)
+
+    entries: List[Tuple[str, str]] = []
+    for key, value in payload.items():
+        if not isinstance(key, str) or not isinstance(value, list):
+            continue
+        provider_name = (
+            default_provider
+            if key.strip().lower() in ("ranges", "cidrs", "entries", "items")
+            else _normalize_cloud_provider_name(key, default=default_provider)
+        )
+        entries.extend(_parse_cloud_cidr_payload(value, default_provider=provider_name))
     return entries
 
 
@@ -576,7 +591,28 @@ def _ingest_hosting_rule_entry(
             asn_map[parsed_asn] = f"AS{parsed_asn}"
 
 
+def _ingest_hosting_asns_block(raw_asns: Any, asn_map: Dict[int, str], keywords: List[str]) -> None:
+    """Ingests top-level ASN mappings or rule lists into asn_map and keywords."""
+    if isinstance(raw_asns, dict):
+        for k, v in raw_asns.items():
+            parsed_asn = _normalize_asn_number(k)
+            if parsed_asn is not None:
+                asn_map[parsed_asn] = v.strip() if isinstance(v, str) and v.strip() else f"AS{parsed_asn}"
+    elif isinstance(raw_asns, list):
+        for item in raw_asns:
+            _ingest_hosting_rule_entry(item, asn_map, keywords)
+
+
+def _ingest_hosting_keywords_block(mapping: Dict[str, Any], keywords: List[str]) -> None:
+    """Collects normalised hosting organisation keywords from a rule mapping."""
+    for kw_key in ("keywords", "orgKeywords", "searchterms"):
+        raw_kws = mapping.get(kw_key)
+        if isinstance(raw_kws, list):
+            keywords.extend(kw.strip().lower() for kw in raw_kws if isinstance(kw, str) and kw.strip())
+
+
 def _parse_hosting_rules_payload(payload: Any) -> Tuple[Dict[int, str], List[str]]:
+    """Extracts hosting ASN labels and organisation keywords from rule JSON."""
     asn_map: Dict[int, str] = {}
     keywords: List[str] = []
 
@@ -585,34 +621,16 @@ def _parse_hosting_rules_payload(payload: Any) -> Tuple[Dict[int, str], List[str
             _ingest_hosting_rule_entry(item, asn_map, keywords)
         return asn_map, keywords
 
-    if isinstance(payload, dict):
-        raw_asns = payload.get("asns")
-        if isinstance(raw_asns, dict):
-            for k, v in raw_asns.items():
-                parsed_asn = _normalize_asn_number(k)
-                if parsed_asn is not None:
-                    label = v.strip() if isinstance(v, str) and v.strip() else f"AS{parsed_asn}"
-                    asn_map[parsed_asn] = label
-        elif isinstance(raw_asns, list):
-            for item in raw_asns:
-                _ingest_hosting_rule_entry(item, asn_map, keywords)
+    if not isinstance(payload, dict):
+        return asn_map, keywords
 
-        for hosts_key in ("hosts", "providers", "rules"):
-            raw_hosts = payload.get(hosts_key)
-            if isinstance(raw_hosts, list):
-                for entry in raw_hosts:
-                    _ingest_hosting_rule_entry(entry, asn_map, keywords)
-            elif isinstance(raw_hosts, dict):
-                for entry in raw_hosts.values():
-                    _ingest_hosting_rule_entry(entry, asn_map, keywords)
-
-        for kw_key in ("keywords", "orgKeywords", "searchterms"):
-            raw_kws = payload.get(kw_key)
-            if isinstance(raw_kws, list):
-                for kw in raw_kws:
-                    if isinstance(kw, str) and kw.strip():
-                        keywords.append(kw.strip().lower())
-
+    _ingest_hosting_asns_block(payload.get("asns"), asn_map, keywords)
+    for hosts_key in ("hosts", "providers", "rules"):
+        raw_hosts = payload.get(hosts_key)
+        entries = raw_hosts if isinstance(raw_hosts, list) else (raw_hosts.values() if isinstance(raw_hosts, dict) else ())
+        for entry in entries:
+            _ingest_hosting_rule_entry(entry, asn_map, keywords)
+    _ingest_hosting_keywords_block(payload, keywords)
     return asn_map, keywords
 
 
@@ -746,6 +764,85 @@ def _extract_carrier_name(carrier_val: Any) -> Optional[str]:
     return None
 
 
+def _empty_cidr_attribution() -> Dict[str, Optional[str]]:
+    return {
+        "recommendedCidr": None,
+        "defaultCidr": None,
+        "mmdbCidr": None,
+        "cloudCidr": None,
+        "cloudProvider": None,
+        "cidrNote": None,
+    }
+
+
+def _resolve_cloud_cidr_attribution(
+    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    cloud_cidr: Optional[str],
+    cloud_provider: Optional[str],
+) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+    """Validates or looks up matching cloud CIDR metadata for the target IP."""
+    resolved_provider = cloud_provider.strip() if isinstance(cloud_provider, str) and cloud_provider.strip() else None
+    raw_cloud_cidr = cloud_cidr
+    if raw_cloud_cidr is None:
+        cloud_hit = match_cloud_cidr(addr.compressed)
+        if cloud_hit is not None:
+            raw_cloud_cidr = cloud_hit["cidr"]
+            if resolved_provider is None:
+                resolved_provider = cloud_hit.get("provider")
+
+    if isinstance(raw_cloud_cidr, str) and raw_cloud_cidr.strip():
+        try:
+            cloud_net = ipaddress.ip_network(raw_cloud_cidr.strip(), strict=False)
+            if cloud_net.version == addr.version and cloud_net.prefixlen > 0 and addr in cloud_net:
+                return str(cloud_net), resolved_provider, cloud_net.prefixlen
+        except ValueError:
+            pass
+    return None, None, None
+
+
+def _select_cidr_recommendation(
+    default_cidr: str,
+    default_prefix: int,
+    mmdb_cidr: Optional[str],
+    valid_mmdb_prefix: Optional[int],
+    resolved_cloud_cidr: Optional[str],
+    resolved_cloud_provider: Optional[str],
+    valid_cloud_prefix: Optional[int],
+) -> Tuple[str, str]:
+    """Selects the recommended CIDR and human-readable rationale note."""
+    narrow_mmdb = valid_mmdb_prefix is not None and valid_mmdb_prefix > default_prefix
+    narrow_cloud = valid_cloud_prefix is not None and valid_cloud_prefix > default_prefix
+    provider_label = f"{resolved_cloud_provider} " if resolved_cloud_provider else ""
+
+    if narrow_mmdb and mmdb_cidr is not None and (not narrow_cloud or (valid_mmdb_prefix or 0) >= (valid_cloud_prefix or 0)):
+        return mmdb_cidr, (
+            f"Narrower MMDB prefix /{valid_mmdb_prefix} selected over default "
+            f"/{default_prefix} to avoid collateral blocking"
+        )
+    if narrow_cloud and resolved_cloud_cidr is not None:
+        return resolved_cloud_cidr, (
+            f"Narrower {provider_label}cloud prefix /{valid_cloud_prefix} selected over default "
+            f"/{default_prefix} to avoid collateral blocking"
+        )
+    if valid_mmdb_prefix is not None and valid_mmdb_prefix < default_prefix:
+        note = (
+            f"Default /{default_prefix} retained because MMDB prefix "
+            f"/{valid_mmdb_prefix} is wider than standard block granularity"
+        )
+    elif valid_mmdb_prefix == default_prefix:
+        note = f"MMDB prefix matches default /{default_prefix} block granularity"
+    elif valid_cloud_prefix is not None and valid_cloud_prefix < default_prefix:
+        note = (
+            f"Default /{default_prefix} retained because {provider_label}cloud prefix "
+            f"/{valid_cloud_prefix} is wider than standard block granularity"
+        )
+    elif valid_cloud_prefix == default_prefix:
+        note = f"{provider_label}Cloud prefix matches default /{default_prefix} block granularity"
+    else:
+        note = f"Default /{default_prefix} range selected"
+    return default_cidr, note
+
+
 def compute_cidr_attribution(
     ip: str,
     mmdb_prefix_len: Optional[int] = None,
@@ -758,118 +855,39 @@ def compute_cidr_attribution(
     official cloud prefix when available to prevent collateral blocks while capping wider prefixes.
     """
     if not ip or not isinstance(ip, str):
-        return {
-            "recommendedCidr": None,
-            "defaultCidr": None,
-            "mmdbCidr": None,
-            "cloudCidr": None,
-            "cloudProvider": None,
-            "cidrNote": None,
-        }
+        return _empty_cidr_attribution()
 
     try:
         addr = ipaddress.ip_address(ip.strip())
     except ValueError:
-        return {
-            "recommendedCidr": None,
-            "defaultCidr": None,
-            "mmdbCidr": None,
-            "cloudCidr": None,
-            "cloudProvider": None,
-            "cidrNote": None,
-        }
+        return _empty_cidr_attribution()
 
     default_prefix = 24 if addr.version == 4 else 64
-    max_prefix = addr.max_prefixlen
     default_cidr = str(ipaddress.ip_network(f"{addr.compressed}/{default_prefix}", strict=False))
-
-    valid_mmdb_prefix: Optional[int] = None
-    if not isinstance(mmdb_prefix_len, bool) and isinstance(mmdb_prefix_len, int) and 0 < mmdb_prefix_len <= max_prefix:
-        valid_mmdb_prefix = mmdb_prefix_len
+    valid_mmdb_prefix = (
+        mmdb_prefix_len
+        if not isinstance(mmdb_prefix_len, bool) and isinstance(mmdb_prefix_len, int) and 0 < mmdb_prefix_len <= addr.max_prefixlen
+        else None
+    )
     mmdb_cidr = (
         str(ipaddress.ip_network(f"{addr.compressed}/{valid_mmdb_prefix}", strict=False))
         if valid_mmdb_prefix is not None
         else None
     )
-
-    resolved_cloud_cidr: Optional[str] = None
-    resolved_cloud_provider: Optional[str] = (
-        cloud_provider.strip() if isinstance(cloud_provider, str) and cloud_provider.strip() else None
+    resolved_cloud_cidr, resolved_cloud_provider, valid_cloud_prefix = _resolve_cloud_cidr_attribution(
+        addr, cloud_cidr, cloud_provider
     )
-    valid_cloud_prefix: Optional[int] = None
-
-    raw_cloud_cidr = cloud_cidr
-    if raw_cloud_cidr is None:
-        cloud_hit = match_cloud_cidr(addr.compressed)
-        if cloud_hit is not None:
-            raw_cloud_cidr = cloud_hit["cidr"]
-            if resolved_cloud_provider is None:
-                resolved_cloud_provider = cloud_hit.get("provider")
-
-    if isinstance(raw_cloud_cidr, str) and raw_cloud_cidr.strip():
-        try:
-            cloud_net = ipaddress.ip_network(raw_cloud_cidr.strip(), strict=False)
-            if cloud_net.version == addr.version and cloud_net.prefixlen > 0 and addr in cloud_net:
-                resolved_cloud_cidr = str(cloud_net)
-                valid_cloud_prefix = cloud_net.prefixlen
-        except ValueError:
-            resolved_cloud_cidr = None
-            valid_cloud_prefix = None
-
-    if resolved_cloud_cidr is None:
-        resolved_cloud_provider = None
-
-    narrow_mmdb = valid_mmdb_prefix is not None and valid_mmdb_prefix > default_prefix
-    narrow_cloud = valid_cloud_prefix is not None and valid_cloud_prefix > default_prefix
-
-    if narrow_mmdb and (not narrow_cloud or (valid_mmdb_prefix or 0) >= (valid_cloud_prefix or 0)):
-        return {
-            "recommendedCidr": mmdb_cidr,
-            "defaultCidr": default_cidr,
-            "mmdbCidr": mmdb_cidr,
-            "cloudCidr": resolved_cloud_cidr,
-            "cloudProvider": resolved_cloud_provider,
-            "cidrNote": (
-                f"Narrower MMDB prefix /{valid_mmdb_prefix} selected over default "
-                f"/{default_prefix} to avoid collateral blocking"
-            ),
-        }
-
-    if narrow_cloud and resolved_cloud_cidr is not None:
-        provider_label = f"{resolved_cloud_provider} " if resolved_cloud_provider else ""
-        return {
-            "recommendedCidr": resolved_cloud_cidr,
-            "defaultCidr": default_cidr,
-            "mmdbCidr": mmdb_cidr,
-            "cloudCidr": resolved_cloud_cidr,
-            "cloudProvider": resolved_cloud_provider,
-            "cidrNote": (
-                f"Narrower {provider_label}cloud prefix /{valid_cloud_prefix} selected over default "
-                f"/{default_prefix} to avoid collateral blocking"
-            ),
-        }
-
-    if valid_mmdb_prefix is not None and valid_mmdb_prefix < default_prefix:
-        cidr_note = (
-            f"Default /{default_prefix} retained because MMDB prefix "
-            f"/{valid_mmdb_prefix} is wider than standard block granularity"
-        )
-    elif valid_mmdb_prefix == default_prefix:
-        cidr_note = f"MMDB prefix matches default /{default_prefix} block granularity"
-    elif valid_cloud_prefix is not None and valid_cloud_prefix < default_prefix:
-        provider_label = f"{resolved_cloud_provider} " if resolved_cloud_provider else ""
-        cidr_note = (
-            f"Default /{default_prefix} retained because {provider_label}cloud prefix "
-            f"/{valid_cloud_prefix} is wider than standard block granularity"
-        )
-    elif valid_cloud_prefix == default_prefix:
-        provider_label = f"{resolved_cloud_provider} " if resolved_cloud_provider else ""
-        cidr_note = f"{provider_label}Cloud prefix matches default /{default_prefix} block granularity"
-    else:
-        cidr_note = f"Default /{default_prefix} range selected"
-
+    recommended_cidr, cidr_note = _select_cidr_recommendation(
+        default_cidr,
+        default_prefix,
+        mmdb_cidr,
+        valid_mmdb_prefix,
+        resolved_cloud_cidr,
+        resolved_cloud_provider,
+        valid_cloud_prefix,
+    )
     return {
-        "recommendedCidr": default_cidr,
+        "recommendedCidr": recommended_cidr,
         "defaultCidr": default_cidr,
         "mmdbCidr": mmdb_cidr,
         "cloudCidr": resolved_cloud_cidr,
@@ -1224,39 +1242,15 @@ def _extract_maxmind_subdivision(raw_subdivisions: Any) -> str:
     return ""
 
 
-def adapt_maxmind(
-    raw_data: Optional[Dict[str, Any]],
-    has_db: bool = True,
-    status_code: int = 200,
-    *,
-    ip: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Normalises combined GeoLite2 and GeoIP2 Country, City, and ASN MMDB records."""
-    if not has_db:
-        return _build_error_row(
-            "MaxMind",
-            status="Database Missing",
-            raw_message="Local MMDB files not found",
-        )
-
-    raw_data, status_code = _guard_payload(raw_data, status_code)
-    if status_code != 200 or not raw_data:
-        return _build_error_row("MaxMind", status_code, raw_data)
-
-    asn_val = raw_data.get("autonomous_system_number") or raw_data.get("asn")
-    asn_str = f"AS{asn_val}" if asn_val and not str(asn_val).startswith("AS") else (str(asn_val) if asn_val else "-")
-    org_name = raw_data.get("autonomous_system_organization") or raw_data.get("as") or raw_data.get("isp") or "-"
-
+def _extract_maxmind_geo(raw_data: Dict[str, Any]) -> Tuple[str, Optional[str], Optional[str]]:
+    """Extracts country code, formatted location string, and coordinates from MMDB data."""
     country_obj = raw_data.get("country") or {}
     country_name = _extract_maxmind_name(country_obj)
     country_code = ""
-    if isinstance(country_obj, dict):
-        raw_iso = country_obj.get("iso_code")
-        if isinstance(raw_iso, str) and raw_iso.strip():
-            country_code = raw_iso.strip().upper()
-
+    if isinstance(country_obj, dict) and isinstance(country_obj.get("iso_code"), str):
+        country_code = country_obj["iso_code"].strip().upper()
     if not country_code and raw_data.get("country_code"):
-        country_code = str(raw_data.get("country_code")).strip().upper()
+        country_code = str(raw_data["country_code"]).strip().upper()
 
     subdivision_name = _extract_maxmind_subdivision(raw_data.get("subdivisions") or raw_data.get("subdivision"))
     city_name = _extract_maxmind_name(raw_data.get("city"))
@@ -1284,42 +1278,67 @@ def adapt_maxmind(
     loc_str = ", ".join(loc_parts) if loc_parts else "-"
     if coords:
         loc_str = f"{loc_str} ({coords})" if loc_parts else f"Unknown ({coords})"
+    return loc_str, country_code or None, coords
 
-    traits = raw_data.get("traits")
-    if not isinstance(traits, dict):
-        traits = {}
-    # Free GeoLite2 databases do not ship traits.user_type, so a missing value falls back to offline cloud CIDR and hosting ASN rules before remaining unknown.
+
+def _extract_maxmind_signals(
+    raw_data: Dict[str, Any],
+    *,
+    cloud_match: Optional[Dict[str, Any]],
+    hosting_match: Optional[Dict[str, Any]],
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Derives MaxMind usage type and risk flags using MMDB traits and offline hosting hints."""
+    traits = raw_data.get("traits") if isinstance(raw_data.get("traits"), dict) else {}
+    # Free GeoLite2 databases omit traits.user_type, so offline cloud CIDR and hosting ASN rules fill the gap
     raw_user_type = traits.get("user_type") or raw_data.get("usage_type") or raw_data.get("user_type")
     usage_type = str(raw_user_type).strip() if isinstance(raw_user_type, str) and raw_user_type.strip() else "unknown"
     usage_lower = usage_type.lower()
+
     is_hosting = usage_lower in ("hosting", "datacenter", "data center") or bool(traits.get("is_hosting_provider"))
-    is_proxy = bool(traits.get("is_anonymous_proxy") or traits.get("is_public_proxy"))
-    is_vpn = bool(traits.get("is_anonymous_vpn"))
-    is_tor = bool(traits.get("is_tor_exit_node"))
-
-    target_ip = ip if isinstance(ip, str) and ip.strip() else raw_data.get("_ip")
-    cloud_match = match_cloud_cidr(target_ip) if target_ip else None
-    hosting_match = match_hosting_asn_or_org(asn_val, org_name)
-
     if usage_lower == "unknown" and (cloud_match is not None or hosting_match is not None):
         is_hosting = True
         usage_type = "hosting"
 
-    flags: List[Dict[str, Any]] = []
-    if is_tor:
-        flags.append({"label": "Tor", "isHighRisk": True})
-    if is_proxy:
-        flags.append({"label": "Proxy", "isHighRisk": True})
-    if is_vpn:
-        flags.append({"label": "VPN", "isHighRisk": True})
-    if is_hosting:
-        flags.append({"label": "Hosting", "isHighRisk": True})
+    flag_specs = (
+        ("Tor", bool(traits.get("is_tor_exit_node"))),
+        ("Proxy", bool(traits.get("is_anonymous_proxy") or traits.get("is_public_proxy"))),
+        ("VPN", bool(traits.get("is_anonymous_vpn"))),
+        ("Hosting", is_hosting),
+    )
+    flags = [{"label": label, "isHighRisk": True} for label, active in flag_specs if active]
+    return usage_type, flags or [{"label": "No Flags", "isHighRisk": False}]
+
+
+def adapt_maxmind(
+    raw_data: Optional[Dict[str, Any]],
+    has_db: bool = True,
+    status_code: int = 200,
+    *,
+    ip: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Normalises combined GeoLite2 and GeoIP2 Country, City, and ASN MMDB records."""
+    if not has_db:
+        return _build_error_row("MaxMind", status="Database Missing", raw_message="Local MMDB files not found")
+
+    raw_data, status_code = _guard_payload(raw_data, status_code)
+    if status_code != 200 or not raw_data:
+        return _build_error_row("MaxMind", status_code, raw_data)
+
+    asn_val = raw_data.get("autonomous_system_number") or raw_data.get("asn")
+    asn_str = f"AS{asn_val}" if asn_val and not str(asn_val).startswith("AS") else (str(asn_val) if asn_val else "-")
+    org_name = raw_data.get("autonomous_system_organization") or raw_data.get("as") or raw_data.get("isp") or "-"
+    loc_str, country_code, coords = _extract_maxmind_geo(raw_data)
+
+    target_ip = ip if isinstance(ip, str) and ip.strip() else raw_data.get("_ip")
+    cloud_match = match_cloud_cidr(target_ip) if target_ip else None
+    hosting_match = match_hosting_asn_or_org(asn_val, org_name)
+    usage_type, flags = _extract_maxmind_signals(raw_data, cloud_match=cloud_match, hosting_match=hosting_match)
 
     raw_prefix_val = raw_data.get("_mmdb_prefix_len")
     if raw_prefix_val is None:
         raw_prefix_val = raw_data.get("prefix_len")
     prefix_length = _safe_int(raw_prefix_val, default=None)
-    if prefix_length is not None and (prefix_length <= 0 or prefix_length > 128):
+    if prefix_length is not None and not (0 < prefix_length <= 128):
         prefix_length = None
 
     internal_keys = ("_mmdb_prefix_len", "_ip", "_offline_db_updated_at")
@@ -1338,8 +1357,8 @@ def adapt_maxmind(
         "organisation": org_name,
         "location": loc_str,
         "usageType": usage_type,
-        "securityFlags": flags if flags else [{"label": "No Flags", "isHighRisk": False}],
-        "countryCode": country_code or None,
+        "securityFlags": flags,
+        "countryCode": country_code,
         "coordinates": coords,
         "rawJson": clean_raw_json,
     }
@@ -1451,68 +1470,93 @@ def _extract_proxycheck_port(value: Any) -> Optional[int]:
     return None
 
 
+def _proxycheck_bool(val: Any) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in ("yes", "true", "1")
+    if isinstance(val, (int, float)):
+        return val > 0
+    return False
+
+
+def _extract_proxycheck_ip_obj(raw_data: Dict[str, Any], ip: str) -> Dict[str, Any]:
+    """Resolves the IP-scoped sub-object across Proxycheck v2 and v3 response shapes."""
+    if ip and isinstance(raw_data.get(ip), dict):
+        return raw_data[ip]
+    for k, v in raw_data.items():
+        if k not in ("status", "message", "query_time") and isinstance(v, dict):
+            return v
+    return raw_data
+
+
+def _extract_proxycheck_flags(
+    detections: Dict[str, Any],
+    ip_obj: Dict[str, Any],
+    network: Dict[str, Any],
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Extracts Proxycheck usage type and security flags."""
+    raw_type = network.get("type") or ip_obj.get("type") or detections.get("type") or ""
+    type_str = str(raw_type).strip().upper()
+    is_hosting = _proxycheck_bool(
+        detections.get("hosting", ip_obj.get("hosting", ip_obj.get("is_hosting")))
+    ) or type_str in ("HOSTING", "DATACENTER", "DATA CENTER")
+    is_proxy = _proxycheck_bool(detections.get("proxy", ip_obj.get("proxy", ip_obj.get("is_proxy")))) or (
+        type_str == "PROXY"
+    )
+    is_tor = _proxycheck_bool(detections.get("tor", ip_obj.get("tor", ip_obj.get("is_tor")))) or type_str == "TOR"
+    is_vpn = _proxycheck_bool(detections.get("vpn", ip_obj.get("vpn", ip_obj.get("is_vpn")))) or type_str == "VPN"
+
+    flag_specs = (("Proxy", is_proxy), ("VPN", is_vpn), ("Tor", is_tor), ("Hosting", is_hosting))
+    flags = [{"label": label, "isHighRisk": True} for label, active in flag_specs if active]
+    usage_type = "hosting" if is_hosting else (str(raw_type).strip().lower() if raw_type else "-")
+    return usage_type, flags or [{"label": "No Flags", "isHighRisk": False}]
+
+
+def _extract_proxycheck_location(ip_obj: Dict[str, Any]) -> Tuple[str, Optional[str], Optional[str]]:
+    """Extracts formatted location, uppercase country code, and coordinates from Proxycheck."""
+    loc_obj = ip_obj.get("location") or {}
+    country_name = ip_obj.get("country") or loc_obj.get("country_name") or ""
+    country_code = ip_obj.get("isocode") or ip_obj.get("country_code") or loc_obj.get("country_code") or ""
+    city_name = ip_obj.get("city") or loc_obj.get("city") or ""
+    lat = ip_obj.get("latitude") or loc_obj.get("latitude")
+    lon = ip_obj.get("longitude") or loc_obj.get("longitude")
+    coords = f"{lat}, {lon}" if lat is not None and lon is not None else None
+    loc_parts = [p for p in (city_name, country_name) if p]
+    loc_str = ", ".join(loc_parts) if loc_parts else (country_code or "-")
+    if coords and loc_str != "-":
+        loc_str += f" ({coords})"
+    return loc_str, (str(country_code).upper() if country_code else None), coords
+
+
+def _extract_proxycheck_first_match(candidates: Tuple[Any, ...], parser: Any) -> Any:
+    for candidate in candidates:
+        parsed = parser(candidate)
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def adapt_proxycheck(
     raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_code: int = 200, ip: str = ""
 ) -> Dict[str, Any]:
     """Normalises Proxycheck v2 and v3 responses, handling both IP-keyed and flat payloads."""
     extra = {"port": None, "lastSeen": None}
     if not has_api_key:
-        return _build_error_row(
-            "Proxycheck",
-            raw_message="PROXYCHECK_API_KEY not configured",
-            extra=extra,
-        )
+        return _build_error_row("Proxycheck", raw_message="PROXYCHECK_API_KEY not configured", extra=extra)
 
     raw_data, status_code = _guard_payload(raw_data, status_code)
     if status_code != 200 or not raw_data or str(raw_data.get("status", "")).lower() in ("error", "denied"):
         return _build_error_row("Proxycheck", status_code, raw_data, extra=extra)
 
-    # Proxycheck v2 and v3 responses nest data under the queried IP key or at the top level
-    ip_obj = raw_data.get(ip) if (ip and isinstance(raw_data.get(ip), dict)) else None
-    if ip_obj is None:
-        for k, v in raw_data.items():
-            if k not in ("status", "message", "query_time") and isinstance(v, dict):
-                ip_obj = v
-                break
-    if ip_obj is None:
-        ip_obj = raw_data
-
+    ip_obj = _extract_proxycheck_ip_obj(raw_data, ip)
     detections = ip_obj.get("detections") if isinstance(ip_obj.get("detections"), dict) else {}
     network = ip_obj.get("network") if isinstance(ip_obj.get("network"), dict) else {}
-
-    def _to_bool(val: Any) -> bool:
-        if isinstance(val, bool):
-            return val
-        if isinstance(val, str):
-            return val.strip().lower() in ("yes", "true", "1")
-        if isinstance(val, (int, float)):
-            return val > 0
-        return False
-
-    raw_type = network.get("type") or ip_obj.get("type") or detections.get("type") or ""
-    type_str = str(raw_type).strip().upper()
-    is_hosting = _to_bool(detections.get("hosting", ip_obj.get("hosting", ip_obj.get("is_hosting")))) or type_str in (
-        "HOSTING",
-        "DATACENTER",
-        "DATA CENTER",
-    )
-    is_proxy = _to_bool(detections.get("proxy", ip_obj.get("proxy", ip_obj.get("is_proxy")))) or type_str == "PROXY"
-    is_tor = _to_bool(detections.get("tor", ip_obj.get("tor", ip_obj.get("is_tor")))) or type_str == "TOR"
-    is_vpn = _to_bool(detections.get("vpn", ip_obj.get("vpn", ip_obj.get("is_vpn")))) or type_str == "VPN"
-
-    flags: List[Dict[str, Any]] = []
-    if is_proxy:
-        flags.append({"label": "Proxy", "isHighRisk": True})
-    if is_vpn:
-        flags.append({"label": "VPN", "isHighRisk": True})
-    if is_tor:
-        flags.append({"label": "Tor", "isHighRisk": True})
-    if is_hosting:
-        flags.append({"label": "Hosting", "isHighRisk": True})
+    usage_type, flags = _extract_proxycheck_flags(detections, ip_obj, network)
+    loc_str, country_code, coords = _extract_proxycheck_location(ip_obj)
 
     asn_val = ip_obj.get("asn") or network.get("asn")
     asn_str = f"AS{asn_val}" if asn_val and not str(asn_val).startswith("AS") else (str(asn_val) if asn_val else "-")
-
     org_val = (
         ip_obj.get("organisation")
         or ip_obj.get("organization")
@@ -1525,20 +1569,6 @@ def adapt_proxycheck(
         or "-"
     )
 
-    country_name = ip_obj.get("country") or (ip_obj.get("location") or {}).get("country_name") or ""
-    country_code = (
-        ip_obj.get("isocode") or ip_obj.get("country_code") or (ip_obj.get("location") or {}).get("country_code") or ""
-    )
-    city_name = ip_obj.get("city") or (ip_obj.get("location") or {}).get("city") or ""
-    lat = ip_obj.get("latitude") or (ip_obj.get("location") or {}).get("latitude")
-    lon = ip_obj.get("longitude") or (ip_obj.get("location") or {}).get("longitude")
-    coords = f"{lat}, {lon}" if lat is not None and lon is not None else None
-
-    loc_parts = [p for p in [city_name, country_name] if p]
-    loc_str = ", ".join(loc_parts) if loc_parts else (country_code or "-")
-    if coords and loc_str != "-":
-        loc_str += f" ({coords})"
-
     raw_risk = detections.get("risk") if detections.get("risk") is not None else ip_obj.get("risk")
     parsed_risk: Optional[int] = None
     if raw_risk is not None and not isinstance(raw_risk, bool):
@@ -1547,32 +1577,27 @@ def adapt_proxycheck(
         except ValueError, TypeError:
             parsed_risk = None
 
-    usage_type = "hosting" if is_hosting else (str(raw_type).strip().lower() if raw_type else "-")
-
-    normalized_port: Optional[int] = None
-    for port_candidate in (detections.get("port"), ip_obj.get("port"), network.get("port")):
-        normalized_port = _extract_proxycheck_port(port_candidate)
-        if normalized_port is not None:
-            break
-
-    normalized_last_seen: Optional[str] = None
-    for seen_candidate in (
-        ip_obj.get("lastSeen"),
-        ip_obj.get("last_seen"),
-        ip_obj.get("last seen human"),
-        ip_obj.get("last_seen_human"),
-        ip_obj.get("last seen"),
-        detections.get("lastSeen"),
-        detections.get("last_seen"),
-        detections.get("last seen human"),
-        detections.get("last_seen_human"),
-        detections.get("last seen"),
-        ip_obj.get("seen"),
-        detections.get("seen"),
-    ):
-        normalized_last_seen = _normalize_timestamp_or_text(seen_candidate)
-        if normalized_last_seen is not None:
-            break
+    normalized_port = _extract_proxycheck_first_match(
+        (detections.get("port"), ip_obj.get("port"), network.get("port")),
+        _extract_proxycheck_port,
+    )
+    normalized_last_seen = _extract_proxycheck_first_match(
+        (
+            ip_obj.get("lastSeen"),
+            ip_obj.get("last_seen"),
+            ip_obj.get("last seen human"),
+            ip_obj.get("last_seen_human"),
+            ip_obj.get("last seen"),
+            detections.get("lastSeen"),
+            detections.get("last_seen"),
+            detections.get("last seen human"),
+            detections.get("last_seen_human"),
+            detections.get("last seen"),
+            ip_obj.get("seen"),
+            detections.get("seen"),
+        ),
+        _normalize_timestamp_or_text,
+    )
 
     return {
         "provider": "Proxycheck",
@@ -1583,11 +1608,11 @@ def adapt_proxycheck(
         "organisation": org_val,
         "location": loc_str,
         "usageType": usage_type,
-        "securityFlags": flags if flags else [{"label": "No Flags", "isHighRisk": False}],
+        "securityFlags": flags,
         "riskScore": parsed_risk,
         "port": normalized_port,
         "lastSeen": normalized_last_seen,
-        "countryCode": str(country_code).upper() if country_code else None,
+        "countryCode": country_code,
         "coordinates": coords,
         "rawJson": raw_data,
     }
@@ -1967,6 +1992,78 @@ def _parse_optional_bool(value: Any) -> Optional[bool]:
     return None
 
 
+def _match_onionoo_relay(
+    relay: Dict[str, Any], target_ip: Optional[str]
+) -> Tuple[bool, bool, List[str], bool]:
+    """Checks whether an Onionoo relay matches target_ip and returns (matched, matched_exit, flags, running)."""
+    or_entries: List[Any] = []
+    for list_key in ("a", "or_addresses"):
+        candidate_list = relay.get(list_key)
+        if isinstance(candidate_list, list):
+            or_entries.extend(candidate_list)
+    exit_entries = relay.get("exit_addresses") if isinstance(relay.get("exit_addresses"), list) else []
+
+    matched_or = target_ip is not None and any(
+        _extract_canonical_ip_from_onionoo_entry(entry) == target_ip for entry in or_entries
+    )
+    matched_exit = target_ip is not None and any(
+        _extract_canonical_ip_from_onionoo_entry(entry) == target_ip for entry in exit_entries
+    )
+    if not matched_or and not matched_exit:
+        return False, False, [], False
+
+    raw_flags = relay.get("flags")
+    relay_flags = [f.strip() for f in raw_flags if isinstance(f, str) and f.strip()] if isinstance(raw_flags, list) else []
+
+    running_val = _parse_optional_bool(relay.get("running"))
+    if running_val is None:
+        running_val = _parse_optional_bool(relay.get("r"))
+    if running_val is None:
+        running_val = any(f.lower() == "running" for f in relay_flags)
+    return True, matched_exit, relay_flags, bool(running_val)
+
+
+def _merge_unique_onionoo_flags(relay_flags: List[str], seen_flags: set[str], target_flags: List[str]) -> None:
+    for flag in relay_flags:
+        key = flag.lower()
+        if key not in seen_flags:
+            seen_flags.add(key)
+            target_flags.append(flag)
+
+
+def _build_onionoo_response(
+    raw_data: Dict[str, Any],
+    *,
+    isp: str,
+    usage_type: str,
+    security_flags: List[Dict[str, Any]],
+    is_tor: bool,
+    tor_is_exit: bool,
+    tor_running: bool,
+    tor_flags: List[str],
+    tor_label: Optional[str],
+    tor_summary: str,
+) -> Dict[str, Any]:
+    return {
+        "provider": "Tor Onionoo",
+        "status": "200 OK",
+        "statusCode": 200,
+        "asn": "-",
+        "isp": isp,
+        "organisation": isp,
+        "location": "-",
+        "usageType": usage_type,
+        "securityFlags": security_flags,
+        "isTor": is_tor,
+        "torIsExit": tor_is_exit,
+        "torRunning": tor_running,
+        "torFlags": tor_flags,
+        "torLabel": tor_label,
+        "torSummary": tor_summary,
+        "rawJson": raw_data,
+    }
+
+
 def adapt_tor_onionoo(
     raw_data: Optional[Dict[str, Any]],
     status_code: int = 200,
@@ -1997,137 +2094,123 @@ def adapt_tor_onionoo(
 
     target_ip = _extract_canonical_ip_from_onionoo_entry(ip)
     active_flags: List[str] = []
-    seen_active_flags = set()
+    seen_active: set[str] = set()
     offline_flags: List[str] = []
-    seen_offline_flags = set()
-    active_match_count = 0
-    offline_match_count = 0
+    seen_offline: set[str] = set()
+    active_matches = 0
+    offline_matches = 0
     active_is_exit = False
-    active_is_guard = False
 
     for relay in relays:
         if not isinstance(relay, dict):
             continue
-
-        or_entries = []
-        for list_key in ("a", "or_addresses"):
-            candidate_list = relay.get(list_key)
-            if isinstance(candidate_list, list):
-                or_entries.extend(candidate_list)
-
-        exit_entries = relay.get("exit_addresses") if isinstance(relay.get("exit_addresses"), list) else []
-
-        matched_or = any(
-            target_ip is not None and _extract_canonical_ip_from_onionoo_entry(entry) == target_ip
-            for entry in or_entries
-        )
-        matched_exit = any(
-            target_ip is not None and _extract_canonical_ip_from_onionoo_entry(entry) == target_ip
-            for entry in exit_entries
-        )
-        if not matched_or and not matched_exit:
+        matched, matched_exit, relay_flags, running_val = _match_onionoo_relay(relay, target_ip)
+        if not matched:
             continue
-
-        raw_flags = relay.get("flags")
-        relay_flags: List[str] = []
-        if isinstance(raw_flags, list):
-            for flag in raw_flags:
-                if isinstance(flag, str) and flag.strip():
-                    relay_flags.append(flag.strip())
-
-        running_val = _parse_optional_bool(relay.get("running"))
-        if running_val is None:
-            running_val = _parse_optional_bool(relay.get("r"))
-        if running_val is None:
-            running_val = any(f.lower() == "running" for f in relay_flags)
-
         if running_val:
-            active_match_count += 1
-            for flag in relay_flags:
-                key = flag.lower()
-                if key not in seen_active_flags:
-                    seen_active_flags.add(key)
-                    active_flags.append(flag)
-            if matched_exit and "exit" not in seen_active_flags:
-                seen_active_flags.add("exit")
+            active_matches += 1
+            _merge_unique_onionoo_flags(relay_flags, seen_active, active_flags)
+            if matched_exit and "exit" not in seen_active:
+                seen_active.add("exit")
                 active_flags.append("Exit")
-            if matched_exit or "exit" in seen_active_flags:
-                active_is_exit = True
-            if "guard" in seen_active_flags:
-                active_is_guard = True
+            active_is_exit = active_is_exit or matched_exit or ("exit" in seen_active)
         else:
-            offline_match_count += 1
-            for flag in relay_flags:
-                key = flag.lower()
-                if key not in seen_offline_flags:
-                    seen_offline_flags.add(key)
-                    offline_flags.append(flag)
+            offline_matches += 1
+            _merge_unique_onionoo_flags(relay_flags, seen_offline, offline_flags)
 
-    if active_match_count > 0:
-        tor_label = "Tor Exit" if active_is_exit else ("Tor Guard" if active_is_guard else "Tor Node")
+    if active_matches > 0:
+        tor_label = "Tor Exit" if active_is_exit else ("Tor Guard" if "guard" in seen_active else "Tor Node")
         tor_summary = f"{tor_label} (Flags: {', '.join(active_flags)})" if active_flags else f"{tor_label} (Running)"
-        return {
-            "provider": "Tor Onionoo",
-            "status": "200 OK",
-            "statusCode": 200,
-            "asn": "-",
-            "isp": "Tor Network",
-            "organisation": "Tor Network",
-            "location": "-",
-            "usageType": tor_summary,
-            "securityFlags": [{"label": tor_label, "isHighRisk": True}],
-            "isTor": True,
-            "torIsExit": active_is_exit,
-            "torRunning": True,
-            "torFlags": active_flags,
-            "torLabel": tor_label,
-            "torSummary": tor_summary,
-            "rawJson": raw_data,
-        }
+        return _build_onionoo_response(
+            raw_data,
+            isp="Tor Network",
+            usage_type=tor_summary,
+            security_flags=[{"label": tor_label, "isHighRisk": True}],
+            is_tor=True,
+            tor_is_exit=active_is_exit,
+            tor_running=True,
+            tor_flags=active_flags,
+            tor_label=tor_label,
+            tor_summary=tor_summary,
+        )
 
-    if offline_match_count > 0:
+    if offline_matches > 0:
         offline_summary = (
             f"Offline Tor Relay (Flags: {', '.join(offline_flags)})"
             if offline_flags
             else "Offline Tor Relay (Not Running)"
         )
-        return {
-            "provider": "Tor Onionoo",
-            "status": "200 OK",
-            "statusCode": 200,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": offline_summary,
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "isTor": False,
-            "torIsExit": False,
-            "torRunning": False,
-            "torFlags": offline_flags,
-            "torLabel": None,
-            "torSummary": offline_summary,
-            "rawJson": raw_data,
-        }
+        return _build_onionoo_response(
+            raw_data,
+            isp="-",
+            usage_type=offline_summary,
+            security_flags=[{"label": "No Flags", "isHighRisk": False}],
+            is_tor=False,
+            tor_is_exit=False,
+            tor_running=False,
+            tor_flags=offline_flags,
+            tor_label=None,
+            tor_summary=offline_summary,
+        )
 
-    return {
-        "provider": "Tor Onionoo",
-        "status": "200 OK",
-        "statusCode": 200,
-        "asn": "-",
-        "isp": "-",
-        "organisation": "-",
-        "location": "-",
-        "usageType": "Not a Tor Node",
-        "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-        "isTor": False,
-        "torIsExit": False,
-        "torRunning": False,
-        "torFlags": [],
-        "torLabel": None,
-        "torSummary": "Not a Tor Node",
-        "rawJson": raw_data,
-    }
+    return _build_onionoo_response(
+        raw_data,
+        isp="-",
+        usage_type="Not a Tor Node",
+        security_flags=[{"label": "No Flags", "isHighRisk": False}],
+        is_tor=False,
+        tor_is_exit=False,
+        tor_running=False,
+        tor_flags=[],
+        tor_label=None,
+        tor_summary="Not a Tor Node",
+    )
+
+
+def _extract_sfs_confidence(ip_block: Dict[str, Any], blacklisted: bool, appears: bool) -> Optional[float]:
+    raw_conf = ip_block.get("confidence")
+    if raw_conf is not None and not isinstance(raw_conf, bool):
+        try:
+            conf_num = float(raw_conf)
+            if math.isfinite(conf_num):
+                return round(max(0.0, min(100.0, conf_num)), 2)
+        except TypeError, ValueError:
+            pass
+    if blacklisted:
+        return 100.0
+    return 0.0 if not appears else None
+
+
+def _extract_sfs_asn(ip_block: Dict[str, Any]) -> str:
+    asn_val = ip_block.get("asn")
+    asn_int = _safe_int(asn_val, default=None)
+    if asn_int is not None and asn_int > 0:
+        return f"AS{asn_int}"
+    if isinstance(asn_val, str) and asn_val.strip().upper().startswith("AS"):
+        return asn_val.strip().upper()
+    return "-"
+
+
+def _build_sfs_flags_and_usage(
+    blacklisted: bool,
+    toxic_cidr: Optional[str],
+    appears: bool,
+    frequency: int,
+) -> Tuple[List[Dict[str, Any]], str]:
+    flags: List[Dict[str, Any]] = []
+    if blacklisted:
+        toxic_label = f"Blacklisted Toxic CIDR ({toxic_cidr})" if toxic_cidr else "Blacklisted Toxic CIDR"
+        flags.append({"label": toxic_label, "isHighRisk": True})
+    if appears and (frequency > 0 or not blacklisted):
+        flags.append({"label": f"Forum Spam ({frequency}x)", "isHighRisk": True})
+
+    if blacklisted and frequency > 0:
+        return flags, "Blacklisted Toxic CIDR / Forum Spam Reported"
+    if blacklisted:
+        return flags, "Blacklisted Toxic CIDR"
+    if appears:
+        return flags, "Forum Spam Reported"
+    return [{"label": "No Flags", "isHighRisk": False}], "Clean (Not Listed)"
 
 
 def adapt_stopforumspam(
@@ -2173,59 +2256,18 @@ def adapt_stopforumspam(
     appears = blacklisted or (
         raw_appears if isinstance(raw_appears, bool) else (_safe_int(raw_appears, default=0) or 0) > 0
     )
-
     frequency = max(0, _safe_int(ip_block.get("frequency"), default=0) or 0)
-
-    raw_conf = ip_block.get("confidence")
-    confidence: Optional[float] = None
-    if raw_conf is not None and not isinstance(raw_conf, bool):
-        try:
-            conf_num = float(raw_conf)
-            if math.isfinite(conf_num):
-                confidence = round(max(0.0, min(100.0, conf_num)), 2)
-        except TypeError, ValueError:
-            confidence = None
-    if confidence is None:
-        if blacklisted:
-            confidence = 100.0
-        elif not appears:
-            confidence = 0.0
-
+    confidence = _extract_sfs_confidence(ip_block, blacklisted, appears)
     last_seen = _normalize_timestamp_or_text(
         ip_block.get("lastseen") or ip_block.get("last_seen") or ip_block.get("lastSeen")
     )
-
-    asn_val = ip_block.get("asn")
-    asn_int = _safe_int(asn_val, default=None)
-    if asn_int is not None and asn_int > 0:
-        asn_str = f"AS{asn_int}"
-    elif isinstance(asn_val, str) and asn_val.strip().upper().startswith("AS"):
-        asn_str = asn_val.strip().upper()
-    else:
-        asn_str = "-"
-
-    flags: List[Dict[str, Any]] = []
-    if blacklisted:
-        toxic_label = f"Blacklisted Toxic CIDR ({toxic_cidr})" if toxic_cidr else "Blacklisted Toxic CIDR"
-        flags.append({"label": toxic_label, "isHighRisk": True})
-    if appears and (frequency > 0 or not blacklisted):
-        flags.append({"label": f"Forum Spam ({frequency}x)", "isHighRisk": True})
-
-    if blacklisted and frequency > 0:
-        usage_type = "Blacklisted Toxic CIDR / Forum Spam Reported"
-    elif blacklisted:
-        usage_type = "Blacklisted Toxic CIDR"
-    elif appears:
-        usage_type = "Forum Spam Reported"
-    else:
-        flags = [{"label": "No Flags", "isHighRisk": False}]
-        usage_type = "Clean (Not Listed)"
+    flags, usage_type = _build_sfs_flags_and_usage(blacklisted, toxic_cidr, appears, frequency)
 
     row: Dict[str, Any] = {
         "provider": "StopForumSpam",
         "status": "200 OK",
         "statusCode": 200,
-        "asn": asn_str,
+        "asn": _extract_sfs_asn(ip_block),
         "isp": "-",
         "organisation": "-",
         "location": "-",

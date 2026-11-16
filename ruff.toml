@@ -25,12 +25,16 @@ select = [
   "S",
   "BLE",
   "SIM",
+  "C90",
 ]
 ignore = [
   # Helpers forward HTTP timeout values to httpx rather than wrapping asyncio.timeout directly.
   "ASYNC109",
 ]
 
+[lint.mccabe]
+max-complexity = 15
+
 [lint.per-file-ignores]
 # Test fixtures use dummy credentials and non-routable IP literals such as 0.0.0.0.
-"detector/tests.py" = ["S101", "S104", "S105", "S106"]
+"detector/tests/**/*.py" = ["S101", "S104", "S105", "S106"]

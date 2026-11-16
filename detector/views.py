@@ -362,22 +362,27 @@ def _is_compact_request(request, body: Optional[Dict[str, Any]] = None) -> bool:
     return False
 
 
-def _normalize_query_mode(raw_mode: Any) -> str:
-    """Normalizes the requested detection mode to either light or full."""
-    normalized = str(raw_mode or "full").strip().lower()
-    return "light" if normalized == "light" else "full"
+def _normalize_query_mode(raw_mode: Any, *, default: str = "full") -> str:
+    """Normalises the requested detection mode to either light or full."""
+    fallback = "light" if default == "light" else "full"
+    cleaned = str(raw_mode or "").strip().lower()
+    if cleaned == "light":
+        return "light"
+    if cleaned == "full":
+        return "full"
+    return fallback
 
 
-def _resolve_query_mode(request, body: Optional[Dict[str, Any]] = None) -> str:
+def _resolve_query_mode(request, body: Optional[Dict[str, Any]] = None, *, default: str = "full") -> str:
     """Checks query parameters and optional JSON body for the detection query mode."""
     raw_query = request.GET.get("mode")
     if raw_query is not None and str(raw_query).strip():
-        return _normalize_query_mode(raw_query)
+        return _normalize_query_mode(raw_query, default=default)
     if isinstance(body, dict) and "mode" in body and body.get("mode") is not None:
         raw_body_mode = str(body.get("mode")).strip()
         if raw_body_mode:
-            return _normalize_query_mode(raw_body_mode)
-    return "full"
+            return _normalize_query_mode(raw_body_mode, default=default)
+    return "light" if default == "light" else "full"
 
 
 def canonicalize_ip(raw_ip: str) -> Optional[str]:
@@ -1329,6 +1334,7 @@ DYNAMIC_CACHE_PROVIDERS = frozenset(
 
 DEFAULT_STATIC_CACHE_TTL_SECONDS = 86400
 DEFAULT_DYNAMIC_CACHE_TTL_SECONDS = 7200
+DEFAULT_GETIPINTEL_STABLE_CACHE_TTL_SECONDS = 259200
 DEFAULT_COOLDOWN_SECONDS = 120
 MIN_COOLDOWN_SECONDS = 60
 MAX_COOLDOWN_SECONDS = 300
@@ -1345,17 +1351,44 @@ def _get_positive_int_setting(name: str, default: int) -> int:
     return configured
 
 
-def _get_provider_cache_ttl(provider_key: str) -> int:
+def _is_stable_getipintel_result(row: Optional[Dict[str, Any]]) -> bool:
+    """Returns True when GetIPIntel yields a high-confidence stable score (<= 5% or >= 95%)."""
+    if not isinstance(row, dict):
+        return False
+    raw_json = row.get("rawJson")
+    if isinstance(raw_json, dict) and "result" in raw_json:
+        try:
+            raw_prob = float(raw_json["result"])
+        except TypeError, ValueError:
+            raw_prob = None
+        if raw_prob is not None and math.isfinite(raw_prob) and 0.0 <= raw_prob <= 1.0:
+            return raw_prob <= 0.05 or raw_prob >= 0.95
+    chance = row.get("chance")
+    if isinstance(chance, (int, float)) and not isinstance(chance, bool):
+        chance_val = float(chance)
+        if math.isfinite(chance_val) and 0.0 <= chance_val <= 100.0:
+            return chance_val <= 5.0 or chance_val >= 95.0
+    return False
+
+
+def _get_provider_cache_ttl(provider_key: str, row: Optional[Dict[str, Any]] = None) -> int:
     """Returns the Redis TTL in seconds for a static commercial or dynamic threat feed."""
     if provider_key in DYNAMIC_CACHE_PROVIDERS:
         return _get_positive_int_setting(
             "PROVIDER_DYNAMIC_CACHE_TTL_SECONDS",
             DEFAULT_DYNAMIC_CACHE_TTL_SECONDS,
         )
-    return _get_positive_int_setting(
+    static_ttl = _get_positive_int_setting(
         "PROVIDER_STATIC_CACHE_TTL_SECONDS",
         DEFAULT_STATIC_CACHE_TTL_SECONDS,
     )
+    if provider_key == "getipintel" and _is_stable_getipintel_result(row):
+        stable_ttl = _get_positive_int_setting(
+            "GETIPINTEL_STABLE_CACHE_TTL_SECONDS",
+            DEFAULT_GETIPINTEL_STABLE_CACHE_TTL_SECONDS,
+        )
+        return max(static_ttl, stable_ttl)
+    return static_ttl
 
 
 def _get_cooldown_bounds() -> Tuple[int, int, int]:
@@ -2720,7 +2753,7 @@ async def _execute_detection_with_cache(
                     (
                         _provider_cache_key(provider_key, ip),
                         cache_entry,
-                        _get_provider_cache_ttl(provider_key),
+                        _get_provider_cache_ttl(provider_key, row),
                     )
                 )
             elif supports_cooldown:
@@ -3554,7 +3587,7 @@ async def _detect_ip_batch_post(request):
         )
 
     is_compact = _is_compact_request(request, body)
-    query_mode = _resolve_query_mode(request, body)
+    query_mode = _resolve_query_mode(request, body, default="light")
     semaphore = asyncio.Semaphore(_BATCH_DETECT_CONCURRENCY)
 
     async def _detect_bounded(canonical_ip: str) -> Tuple[str, Dict[str, Any]]:

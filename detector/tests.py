@@ -4033,12 +4033,13 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
             "ipdata",
             "ipregistry",
             "ip2location",
-            "getipintel",
             "iphub",
             "iphunter",
         ):
             self.assertIn(f"proxycheck:v1:prov:{healthy_key}:8.8.8.8", cache_store)
             self.assertEqual(written_ttls[f"proxycheck:v1:prov:{healthy_key}:8.8.8.8"], 86400)
+        self.assertIn("proxycheck:v1:prov:getipintel:8.8.8.8", cache_store)
+        self.assertEqual(written_ttls["proxycheck:v1:prov:getipintel:8.8.8.8"], 259200)
         self.assertEqual(written_ttls["proxycheck:v1:prov:ptr:8.8.8.8"], 7200)
 
         requested_urls.clear()
@@ -4119,6 +4120,20 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
         self.assertNotIn("proxycheck:v1:prov:proxycheck:8.8.8.8", cache_store)
         self.assertEqual(written_ttls.get("proxycheck:v1:prov:ptr:8.8.8.8"), 1800)
         self.assertEqual(written_ttls.get("proxycheck:v1:prov:cloudflare_radar:8.8.8.8"), 43200)
+
+    def test_getipintel_stable_scores_extend_cache_ttl(self):
+        stable_low_row = views.adapt_getipintel({"status": "success", "result": "0.05"}, True, 200)
+        stable_high_row = views.adapt_getipintel({"status": "success", "result": "0.95"}, True, 200)
+        uncertain_row = views.adapt_getipintel({"status": "success", "result": "0.50"}, True, 200)
+
+        self.assertEqual(views._get_provider_cache_ttl("getipintel", stable_low_row), 259200)
+        self.assertEqual(views._get_provider_cache_ttl("getipintel", stable_high_row), 259200)
+        self.assertEqual(views._get_provider_cache_ttl("getipintel", uncertain_row), 86400)
+        self.assertEqual(views._get_provider_cache_ttl("getipintel"), 86400)
+
+        with override_settings(PROVIDER_STATIC_CACHE_TTL_SECONDS=86400, GETIPINTEL_STABLE_CACHE_TTL_SECONDS=604800):
+            self.assertEqual(views._get_provider_cache_ttl("getipintel", stable_low_row), 604800)
+            self.assertEqual(views._get_provider_cache_ttl("getipintel", uncertain_row), 86400)
 
 
 class HttpClientLifecycleTests(TestCase):
@@ -9651,6 +9666,63 @@ class TwoTierQueryModeTests(TestCase):
         mocks["getipintel"].assert_not_awaited()
         for row in ip_payload["results"]:
             self.assertNotIn("rawJson", row)
+
+    def test_batch_detect_defaults_to_light_mode_and_honours_explicit_full_mode(self):
+        fake_redis = _BatchingFakeRedis()
+        mocks = self._patch_provider_suite()
+        bearer_token = views.issue_gadget_token("SysopUser")
+        headers = {"HTTP_AUTHORIZATION": f"Bearer {bearer_token}"}
+
+        with (
+            override_settings(**TEST_UPSTREAM_SECRETS),
+            patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
+            patch("detector.views.redis_client", fake_redis),
+        ):
+            default_resp = self.client.post(
+                "/api/v1/detect/batch",
+                data=json.dumps({"ips": ["8.8.8.8"]}),
+                content_type="application/json",
+                **headers,
+            )
+            invalid_resp = self.client.post(
+                "/api/v1/detect/batch",
+                data=json.dumps({"ips": ["1.1.1.1"], "mode": "unknown"}),
+                content_type="application/json",
+                **headers,
+            )
+
+        self.assertEqual(default_resp.status_code, 200)
+        default_payload = default_resp.json()
+        self.assertEqual(default_payload["queryMode"], "light")
+        self.assertTrue(default_payload["results"]["8.8.8.8"]["isPartialMode"])
+        self.assertEqual(default_payload["results"]["8.8.8.8"]["queryMode"], "light")
+
+        self.assertEqual(invalid_resp.status_code, 200)
+        invalid_payload = invalid_resp.json()
+        self.assertEqual(invalid_payload["queryMode"], "light")
+        self.assertTrue(invalid_payload["results"]["1.1.1.1"]["isPartialMode"])
+
+        mocks["getipintel"].assert_not_awaited()
+        self.assertFalse(any(key.startswith("proxycheck:v1:quota:getipintel:") for key in fake_redis.strings))
+
+        with (
+            override_settings(**TEST_UPSTREAM_SECRETS),
+            patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
+            patch("detector.views.redis_client", fake_redis),
+        ):
+            explicit_full_resp = self.client.post(
+                "/api/v1/detect/batch",
+                data=json.dumps({"ips": ["8.8.8.8"], "mode": "full"}),
+                content_type="application/json",
+                **headers,
+            )
+
+        self.assertEqual(explicit_full_resp.status_code, 200)
+        full_payload = explicit_full_resp.json()
+        self.assertEqual(full_payload["queryMode"], "full")
+        self.assertFalse(full_payload["results"]["8.8.8.8"]["isPartialMode"])
+        self.assertEqual(full_payload["results"]["8.8.8.8"]["getipintel_chance"], 0.985)
+        mocks["getipintel"].assert_awaited_once()
 
     async def test_concurrent_light_and_full_requests_do_not_collide_in_singleflight(self):
         light_started = asyncio.Event()

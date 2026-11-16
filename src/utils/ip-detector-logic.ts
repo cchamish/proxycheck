@@ -89,7 +89,7 @@ export interface OfflineDatabaseEntry {
 
 export interface OfflineDatabaseSourceSummary {
   source: string;
-  status: 'healthy' | 'stale' | 'missing';
+  status: 'healthy' | 'stale' | 'missing' | 'optional';
   latestIso: string | null;
   ageSeconds: number | null;
   presentCount: number;
@@ -151,7 +151,6 @@ export interface DetectionResponse {
   cloudCidr?: string | null;
   cloudProvider?: string | null;
   cidrNote?: string | null;
-  offlineDatabases?: OfflineDatabaseEntry[];
   results: ProviderRawResult[];
 }
 
@@ -538,9 +537,11 @@ export function summarizeOfflineDatabases(
       }
     }
 
-    let summaryStatus: 'healthy' | 'stale' | 'missing' = 'healthy';
-    if (presentCount === 0 || hasRequiredMissing) {
+    let summaryStatus: 'healthy' | 'stale' | 'missing' | 'optional' = 'healthy';
+    if (hasRequiredMissing) {
       summaryStatus = 'missing';
+    } else if (presentCount === 0) {
+      summaryStatus = 'optional';
     } else if (hasStale) {
       summaryStatus = 'stale';
     }

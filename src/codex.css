@@ -1308,65 +1308,11 @@ body {
   color: var(--cdx-color-muted);
 }
 
-.offline-dbs-panel {
-  margin-top: 20px;
-  padding: 14px 16px;
-  background-color: var(--cdx-bg-surface);
-  border: 1px solid var(--cdx-border-subtle);
-  border-radius: 4px;
-}
-
-.offline-dbs-header {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.offline-dbs-title-group {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 10px;
-}
-
-.offline-dbs-title {
-  margin: 0;
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--cdx-color-base);
-}
-
-.offline-dbs-summary-pills {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.offline-dbs-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.offline-dbs-error {
-  margin: 10px 0 0;
-  font-size: 12px;
-  color: var(--cdx-color-destructive);
-}
-
-.offline-dbs-table-wrapper {
-  margin-top: 12px;
-  overflow-x: auto;
-}
-
 .offline-db-table td,
 .offline-db-table th {
   font-size: 12px;
 }
 
-.offline-db-size,
 .offline-db-mtime {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;

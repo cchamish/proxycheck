@@ -724,14 +724,14 @@ test('Quota percentage, tone thresholds, and upstream quota label formatters han
   );
 });
 
-test('App.vue gates the API Quota & Health dashboard modal to authorised administrators', () => {
+test('App.vue gates the Status dashboard modal to authorised administrators', () => {
   const appVue = fs.readFileSync(path.resolve(process.cwd(), 'src/App.vue'), 'utf8');
   const dashboardModalVue = fs.readFileSync(
     path.resolve(process.cwd(), 'src/components/ProviderDashboardModal.vue'),
     'utf8'
   );
 
-  assert.match(appVue, /v-if="isAdminUser"[\s\S]*?API Quota &(?:amp;)? Health/);
+  assert.match(appVue, /v-if="isAdminUser"[\s\S]*?>\s*Status\s*<\/cdx-button>/);
   assert.match(appVue, /<provider-dashboard-modal/);
   assert.match(dashboardModalVue, /\/api\/v1\/admin\/provider-dashboard|Refresh/);
   assert.match(dashboardModalVue, /Total Requests Today/);
@@ -1787,17 +1787,33 @@ test('Offline database helpers format UTC mtime timestamps, byte sizes, and sour
       status: 'missing',
       statusLabel: 'Missing',
     },
+    {
+      key: 'cloud_cidrs',
+      source: 'Cloud CIDRs',
+      name: 'Cloud Provider CIDRs',
+      filename: 'cloud_cidrs.json',
+      exists: false,
+      optional: true,
+      sizeBytes: null,
+      lastModifiedIso: null,
+      ageSeconds: null,
+      staleAfterSeconds: 7776000,
+      status: 'missing',
+      statusLabel: 'Built-in (Optional)',
+    },
   ]);
 
-  assert.equal(summaries.length, 2);
+  assert.equal(summaries.length, 3);
   assert.equal(summaries[0].source, 'MaxMind');
   assert.equal(summaries[0].status, 'healthy');
   assert.equal(summaries[0].presentCount, 1);
   assert.equal(summaries[1].source, 'StopForumSpam');
   assert.equal(summaries[1].status, 'missing');
+  assert.equal(summaries[2].source, 'Cloud CIDRs');
+  assert.equal(summaries[2].status, 'optional');
 });
 
-test('Web UI templates expose Offline Databases Status panel and database timestamp bindings', () => {
+test('Offline Databases Status panel stays inside admin-gated modal and is excluded from public main page', () => {
   const appPath = path.resolve(import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname), '../App.vue');
   const modalPath = path.resolve(
     import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname),
@@ -1806,8 +1822,8 @@ test('Web UI templates expose Offline Databases Status panel and database timest
   const appSource = fs.readFileSync(appPath, 'utf8');
   const modalSource = fs.readFileSync(modalPath, 'utf8');
 
-  assert.match(appSource, /Offline Databases Status/);
-  assert.match(appSource, /\/api\/v1\/status\//);
+  assert.doesNotMatch(appSource, /offline-dbs-panel/);
+  assert.doesNotMatch(appSource, /\/api\/v1\/status\//);
   assert.match(appSource, /formatOfflineDbTimestamp/);
   assert.match(appSource, /Offline DB Missing/);
   assert.match(modalSource, /Offline Databases Status/);

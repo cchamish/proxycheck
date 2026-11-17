@@ -186,8 +186,12 @@ async def _fetch_upstream_json(
     return payload, parsed_status
 
 
+def _get_provider_secret(setting_name: str) -> str:
+    return os.environ.get(setting_name) or getattr(settings, setting_name, "")
+
+
 async def query_cloudflare_radar(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
-    token = os.environ.get("CLOUDFLARE_RADAR_TOKEN") or getattr(settings, "CLOUDFLARE_RADAR_TOKEN", "")
+    token = _get_provider_secret("CLOUDFLARE_RADAR_TOKEN")
     if not token:
         return adapt_cloudflare_radar(None, False)
 
@@ -200,7 +204,7 @@ async def query_cloudflare_radar(client: httpx.AsyncClient, ip: str) -> Dict[str
 
 
 async def query_abuseipdb(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
-    api_key = os.environ.get("ABUSEIPDB_API_KEY") or getattr(settings, "ABUSEIPDB_API_KEY", "")
+    api_key = _get_provider_secret("ABUSEIPDB_API_KEY")
     if not api_key:
         return adapt_abuseipdb(None, False)
 
@@ -213,7 +217,7 @@ async def query_abuseipdb(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
 
 
 async def query_ipdata(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
-    api_key = os.environ.get("IPDATA_API_KEY") or getattr(settings, "IPDATA_API_KEY", "")
+    api_key = _get_provider_secret("IPDATA_API_KEY")
     if not api_key:
         return adapt_ipdata(None, False)
 
@@ -223,7 +227,7 @@ async def query_ipdata(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
 
 
 async def query_ipregistry(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
-    api_key = os.environ.get("IPREGISTRY_API_KEY") or getattr(settings, "IPREGISTRY_API_KEY", "")
+    api_key = _get_provider_secret("IPREGISTRY_API_KEY")
     if not api_key:
         return adapt_ipregistry(None, False)
 
@@ -233,7 +237,7 @@ async def query_ipregistry(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]
 
 
 async def query_ip2location(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
-    api_key = os.environ.get("IP2LOCATION_API_KEY") or getattr(settings, "IP2LOCATION_API_KEY", "")
+    api_key = _get_provider_secret("IP2LOCATION_API_KEY")
     if not api_key:
         return adapt_ip2location(None, False)
 
@@ -244,7 +248,7 @@ async def query_ip2location(client: httpx.AsyncClient, ip: str) -> Dict[str, Any
 
 async def query_getipintel(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
     """GetIPIntel requires a valid contact email in the query string instead of an API key."""
-    contact_email = os.environ.get("GETIPINTEL_CONTACT_EMAIL") or getattr(settings, "GETIPINTEL_CONTACT_EMAIL", "")
+    contact_email = _get_provider_secret("GETIPINTEL_CONTACT_EMAIL")
     if not contact_email:
         return adapt_getipintel(None, False)
 
@@ -254,7 +258,7 @@ async def query_getipintel(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]
 
 
 async def query_proxycheck(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
-    api_key = os.environ.get("PROXYCHECK_API_KEY") or getattr(settings, "PROXYCHECK_API_KEY", "")
+    api_key = _get_provider_secret("PROXYCHECK_API_KEY")
     if not api_key:
         return adapt_proxycheck(None, False, 200, ip)
 
@@ -264,7 +268,7 @@ async def query_proxycheck(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]
 
 
 async def query_iphub(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
-    api_key = os.environ.get("IPHUB_API_KEY") or getattr(settings, "IPHUB_API_KEY", "")
+    api_key = _get_provider_secret("IPHUB_API_KEY")
     if not api_key:
         return adapt_iphub(None, False)
 
@@ -275,7 +279,7 @@ async def query_iphub(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
 
 
 async def query_iphunter(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
-    api_key = os.environ.get("IPHUNTER_API_KEY") or getattr(settings, "IPHUNTER_API_KEY", "")
+    api_key = _get_provider_secret("IPHUNTER_API_KEY")
     if not api_key:
         return adapt_iphunter(None, False)
 

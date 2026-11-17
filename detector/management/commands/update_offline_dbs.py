@@ -82,20 +82,19 @@ MAXMIND_EDITION_SPECS: Tuple[Tuple[str, str], ...] = (
 _DOWNLOAD_UPDATE_ERRORS = (httpx.HTTPError, CommandError, OSError, ValueError, tarfile.TarError, zipfile.BadZipFile)
 
 
-def _file_md5_hex(file_path: Path) -> str:
-    hasher = hashlib.md5(usedforsecurity=False)
+def _file_digest_hex(file_path: Path, hasher: Any) -> str:
     with file_path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(65536), b""):
             hasher.update(chunk)
     return hasher.hexdigest().lower()
+
+
+def _file_md5_hex(file_path: Path) -> str:
+    return _file_digest_hex(file_path, hashlib.md5(usedforsecurity=False))
 
 
 def _file_sha256_hex(file_path: Path) -> str:
-    hasher = hashlib.sha256()
-    with file_path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(65536), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest().lower()
+    return _file_digest_hex(file_path, hashlib.sha256())
 
 
 def _check_mtime_cooldown(target_path: Path, min_interval_seconds: int, *, force: bool) -> Optional[int]:

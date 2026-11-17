@@ -22,6 +22,8 @@ from .middleware import is_session_backend_error
 from .oauth import (
     DEFAULT_RIGHTS_TTL_SECONDS,
     REQUIRED_WIKIMEDIA_RIGHTS_SET,
+    WIKIMEDIA_BETA_SUFFIXES,
+    WIKIMEDIA_HOST_SUFFIXES,
     MetaWikiRightsFetchError,
     evaluate_wikimedia_rights,
     extract_wikimedia_domain_from_project,
@@ -36,14 +38,8 @@ from .quota_telemetry import is_admin_user
 logger = logging.getLogger("detector.views")
 
 _WIKIMEDIA_ORIGIN_RE = re.compile(
-    r"^https://([a-z0-9-]+\.)*(?:"
-    r"wikipedia|wikimedia|wiktionary|wikibooks|wikinews|wikiquote|"
-    r"wikisource|wikiversity|wikivoyage|wikidata|mediawiki|wikifunctions|wikimediafoundation"
-    r")\.org$"
-    r"|^https://([a-z0-9-]+\.)*(?:"
-    r"wikipedia|wikimedia|wiktionary|wikibooks|wikinews|wikiquote|"
-    r"wikisource|wikiversity|wikivoyage|wikidata|mediawiki|wikifunctions"
-    r")\.beta\.wm(?:cloud|flabs)\.org$"
+    rf"^https://([a-z0-9-]+\.)*(?:{WIKIMEDIA_HOST_SUFFIXES})\.org$"
+    rf"|^https://([a-z0-9-]+\.)*(?:{WIKIMEDIA_BETA_SUFFIXES})\.beta\.wm(?:cloud|flabs)\.org$"
 )
 _LOCAL_DEV_ORIGIN_RE = re.compile(r"^https?://(?:localhost|127\.0\.0\.1)(?::\d{1,5})?$")
 

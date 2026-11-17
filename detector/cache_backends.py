@@ -322,64 +322,64 @@ def _is_maxmind_probe_mocked() -> bool:
     )
 
 
-def _has_local_maxmind_city_db() -> bool:
-    """Returns True when GeoLite2-City.mmdb is present on disk at its resolved location."""
-    global _maxmind_city_db_cache
-
+def _probe_maxmind_db_with_ttl(
+    slot_name: str,
+    current_cache: Optional[Tuple[Tuple[Any, ...], float, bool]],
+    mocked_probe: Callable[[Any, Any], bool],
+    unmocked_probe: Callable[[str, Any, Any, Any], bool],
+) -> Tuple[bool, Optional[Tuple[Tuple[Any, ...], float, bool]]]:
     exists_fn = os.path.exists
     resolve_paths_fn = _views_attr("_resolve_maxmind_db_paths", _resolve_maxmind_db_paths)
     resolve_file_fn = _views_attr("_resolve_db_file", _resolve_db_file)
     if _is_maxmind_probe_mocked():
-        city_path = resolve_paths_fn().get("city", "")
-        return bool(city_path and exists_fn(city_path))
+        return mocked_probe(exists_fn, resolve_paths_fn), current_cache
 
     base_dir = getattr(settings, "BASE_DIR", os.getcwd())
     configured_dir = resolve_configured_data_dir()
     tool_data_dir = str(getattr(settings, "TOOL_DATA_DIR", "") or os.environ.get("TOOL_DATA_DIR", "")).strip()
     cache_key = (configured_dir, str(base_dir), tool_data_dir, exists_fn, resolve_paths_fn, resolve_file_fn)
     now_mono = _views_attr("time", time).monotonic()
-    cached = _views_attr("_maxmind_city_db_cache", _maxmind_city_db_cache)
+    cached = _views_attr(slot_name, current_cache)
     if (
         cached is not None
         and cached[0] == cache_key
         and 0.0 <= (now_mono - cached[1]) < _MAXMIND_CITY_DB_CACHE_TTL_SECONDS
     ):
-        return cached[2]
+        return cached[2], current_cache
 
-    city_path = resolve_file_fn(configured_dir, MAXMIND_CITY_DB_FILENAME, base_dir)
-    has_city = bool(city_path and exists_fn(city_path))
-    updated = (cache_key, now_mono, has_city)
-    _maxmind_city_db_cache = updated
-    _set_views_attr("_maxmind_city_db_cache", updated)
+    result = unmocked_probe(configured_dir, base_dir, exists_fn, resolve_file_fn)
+    updated = (cache_key, now_mono, result)
+    _set_views_attr(slot_name, updated)
+    return result, updated
+
+
+def _has_local_maxmind_city_db() -> bool:
+    """Returns True when GeoLite2-City.mmdb is present on disk at its resolved location."""
+    global _maxmind_city_db_cache
+    has_city, _maxmind_city_db_cache = _probe_maxmind_db_with_ttl(
+        "_maxmind_city_db_cache",
+        _maxmind_city_db_cache,
+        lambda exists_fn, resolve_paths_fn: bool(
+            (city_path := resolve_paths_fn().get("city", "")) and exists_fn(city_path)
+        ),
+        lambda configured_dir, base_dir, exists_fn, resolve_file_fn: bool(
+            (city_path := resolve_file_fn(configured_dir, MAXMIND_CITY_DB_FILENAME, base_dir)) and exists_fn(city_path)
+        ),
+    )
     return has_city
 
 
 def _has_any_local_maxmind_db() -> bool:
     global _maxmind_any_db_cache
-
-    exists_fn = os.path.exists
-    resolve_paths_fn = _views_attr("_resolve_maxmind_db_paths", _resolve_maxmind_db_paths)
-    resolve_file_fn = _views_attr("_resolve_db_file", _resolve_db_file)
-    if _is_maxmind_probe_mocked():
-        return any(path and exists_fn(path) for path in resolve_paths_fn().values())
-
-    base_dir = getattr(settings, "BASE_DIR", os.getcwd())
-    configured_dir = resolve_configured_data_dir()
-    tool_data_dir = str(getattr(settings, "TOOL_DATA_DIR", "") or os.environ.get("TOOL_DATA_DIR", "")).strip()
-    cache_key = (configured_dir, str(base_dir), tool_data_dir, exists_fn, resolve_paths_fn, resolve_file_fn)
-    now_mono = _views_attr("time", time).monotonic()
-    cached = _views_attr("_maxmind_any_db_cache", _maxmind_any_db_cache)
-    if (
-        cached is not None
-        and cached[0] == cache_key
-        and 0.0 <= (now_mono - cached[1]) < _MAXMIND_CITY_DB_CACHE_TTL_SECONDS
-    ):
-        return cached[2]
-
-    has_any = any(path and exists_fn(path) for path in resolve_paths_fn().values())
-    updated = (cache_key, now_mono, has_any)
-    _maxmind_any_db_cache = updated
-    _set_views_attr("_maxmind_any_db_cache", updated)
+    has_any, _maxmind_any_db_cache = _probe_maxmind_db_with_ttl(
+        "_maxmind_any_db_cache",
+        _maxmind_any_db_cache,
+        lambda exists_fn, resolve_paths_fn: any(path and exists_fn(path) for path in resolve_paths_fn().values()),
+        lambda _configured_dir, _base_dir, exists_fn, _resolve_file_fn: any(
+            path and exists_fn(path)
+            for path in _views_attr("_resolve_maxmind_db_paths", _resolve_maxmind_db_paths)().values()
+        ),
+    )
     return has_any
 
 

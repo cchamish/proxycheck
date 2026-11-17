@@ -27,6 +27,7 @@ from .adapters import (
     warm_offline_intelligence_caches,
 )
 from .cache_backends import (
+    _MAXMIND_DB_SPECS,
     _UNSET_MOCK_ATTR,
     _evict_maxmind_reader,
     _evict_missing_maxmind_readers,
@@ -183,11 +184,7 @@ def _read_maxmind_sync(ip: str) -> Dict[str, Any]:
     db_paths = _views_attr("_resolve_maxmind_db_paths", _resolve_maxmind_db_paths)()
     available_paths = {key: path for key, path in db_paths.items() if os.path.exists(path)}
 
-    for key, filename in (
-        ("country", "GeoLite2-Country.mmdb"),
-        ("city", "GeoLite2-City.mmdb"),
-        ("asn", "GeoLite2-ASN.mmdb"),
-    ):
+    for key, filename in _MAXMIND_DB_SPECS:
         if key not in available_paths:
             _evict_missing_maxmind_readers(filename, db_paths[key])
 
@@ -296,16 +293,7 @@ def _get_positive_float_setting(name: str, default: float) -> float:
 
 def _get_dns_timeouts() -> Tuple[float, float]:
     timeout_s = _get_positive_float_setting("DNS_QUERY_TIMEOUT_SECONDS", DEFAULT_DNS_TIMEOUT_SECONDS)
-    raw_lifetime = getattr(settings, "DNS_QUERY_LIFETIME_SECONDS", timeout_s)
-    if (
-        isinstance(raw_lifetime, bool)
-        or not isinstance(raw_lifetime, (int, float))
-        or not math.isfinite(float(raw_lifetime))
-        or float(raw_lifetime) <= 0
-    ):
-        lifetime_s = timeout_s
-    else:
-        lifetime_s = float(raw_lifetime)
+    lifetime_s = _get_positive_float_setting("DNS_QUERY_LIFETIME_SECONDS", timeout_s)
     return timeout_s, lifetime_s
 
 

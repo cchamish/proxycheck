@@ -14,23 +14,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from django.http import JsonResponse
 
 from .adapters import classify_rdns_hostname, compute_cidr_attribution
+from .cache_backends import _set_views_attr, _views_attr
 
 _PROC_RSS_CACHE_TTL_SECONDS = 1.0
 _DEFAULT_BUILTIN_OPEN = builtins.open
 _proc_rss_cache: Optional[Tuple[float, float]] = None
-
-
-def _views_attr(name: str, default: Any) -> Any:
-    views_mod = sys.modules.get("detector.views")
-    if views_mod is not None and name in views_mod.__dict__:
-        return views_mod.__dict__[name]
-    return default
-
-
-def _set_views_attr(name: str, value: Any) -> None:
-    views_mod = sys.modules.get("detector.views")
-    if views_mod is not None:
-        views_mod.__dict__[name] = value
 
 
 def _is_builtin_open_mocked() -> bool:

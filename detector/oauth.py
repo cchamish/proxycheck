@@ -19,14 +19,11 @@ MEDIAWIKI_API_URL = "https://meta.wikimedia.org/w/api.php"
 WIKIMEDIA_USER_AGENT = "ProxyCheck/1.0 (https://proxycheck.toolforge.org; tools.proxycheck@toolforge.org)"
 DEFAULT_RIGHTS_TTL_SECONDS = 3600
 
-WIKIMEDIA_HOST_SUFFIXES = (
-    r"wikipedia|wikimedia|wiktionary|wikibooks|wikinews|wikiquote|"
-    r"wikisource|wikiversity|wikivoyage|wikidata|mediawiki|wikifunctions|wikimediafoundation"
-)
 WIKIMEDIA_BETA_SUFFIXES = (
     r"wikipedia|wikimedia|wiktionary|wikibooks|wikinews|wikiquote|"
     r"wikisource|wikiversity|wikivoyage|wikidata|mediawiki|wikifunctions"
 )
+WIKIMEDIA_HOST_SUFFIXES = rf"{WIKIMEDIA_BETA_SUFFIXES}|wikimediafoundation"
 WIKIMEDIA_HOST_RE = re.compile(
     rf"^(?:[a-z0-9-]+\.)*(?:{WIKIMEDIA_HOST_SUFFIXES})\.org$"
     rf"|^(?:[a-z0-9-]+\.)*(?:{WIKIMEDIA_BETA_SUFFIXES})\.beta\.wm(?:cloud|flabs)\.org$"

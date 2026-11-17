@@ -122,11 +122,22 @@
         }
     }
 
-    function clearRequestQueue() {
+    function clearBatchDebounceTimer() {
         if (batchDebounceTimer !== null) {
             window.clearTimeout(batchDebounceTimer);
             batchDebounceTimer = null;
         }
+    }
+
+    function clearContributionsFallbackTimer() {
+        if (ipContributionsFallbackTimer !== null) {
+            window.clearTimeout(ipContributionsFallbackTimer);
+            ipContributionsFallbackTimer = null;
+        }
+    }
+
+    function clearRequestQueue() {
+        clearBatchDebounceTimer();
         while (pendingBatchQueue.length > 0) {
             var pending = pendingBatchQueue.shift();
             pending.resolve(null);
@@ -161,10 +172,7 @@
             window.clearTimeout(ipContributionsObserverTimer);
             ipContributionsObserverTimer = null;
         }
-        if (ipContributionsFallbackTimer !== null) {
-            window.clearTimeout(ipContributionsFallbackTimer);
-            ipContributionsFallbackTimer = null;
-        }
+        clearContributionsFallbackTimer();
         pendingContributionsPageCheck = false;
         pendingSpurRefresh = false;
         clearRequestQueue();
@@ -754,6 +762,12 @@
         latestResultByIp.set(cacheKey, data);
     }
 
+    function deleteKeyFromPersistedStore(backend, store, cacheKey, now) {
+        var nextEntries = cloneEntriesExcluding(store.entries, cacheKey);
+        pruneExpiredResultEntries(nextEntries, now);
+        writePersistedResultStore(backend, { entries: nextEntries }, null);
+    }
+
     function readPersistedIpResultEntry(cacheKey) {
         if (!cacheKey || typeof cacheKey !== 'string') {
             return null;
@@ -767,9 +781,7 @@
         var now = Date.now();
         var entry = store.entries[cacheKey];
         if (!isResultEntryValid(entry, now)) {
-            var nextEntries = cloneEntriesExcluding(store.entries, cacheKey);
-            pruneExpiredResultEntries(nextEntries, now);
-            writePersistedResultStore(backend, { entries: nextEntries }, null);
+            deleteKeyFromPersistedStore(backend, store, cacheKey, now);
             return null;
         }
 
@@ -790,9 +802,7 @@
         if (!store || !Object.prototype.hasOwnProperty.call(store.entries, cacheKey)) {
             return;
         }
-        var nextEntries = cloneEntriesExcluding(store.entries, cacheKey);
-        pruneExpiredResultEntries(nextEntries, Date.now());
-        writePersistedResultStore(backend, { entries: nextEntries }, null);
+        deleteKeyFromPersistedStore(backend, store, cacheKey, Date.now());
     }
 
     function invalidateIpResultCache(ip) {
@@ -1130,6 +1140,20 @@
         return refreshGadgetToken(null);
     }
 
+    function handleDetectAuthStatus(status, token, hasRetried, retryFn) {
+        if (status === 403 || (status === 401 && hasRetried)) {
+            clearStoredToken();
+            blockAccess();
+            return null;
+        }
+        return refreshGadgetToken(token).then(function (freshToken) {
+            if (!freshToken || accessBlocked) {
+                return null;
+            }
+            return retryFn(freshToken);
+        });
+    }
+
     function fetchDetectWithToken(ip, token, hasRetried, mode) {
         var resolvedMode = normalizeQueryMode(mode);
         return fetch(
@@ -1145,21 +1169,8 @@
                 headers: { 'Authorization': 'Bearer ' + token }
             }
         ).then(function (response) {
-            if (response.status === 403) {
-                clearStoredToken();
-                blockAccess();
-                return null;
-            }
-            if (response.status === 401) {
-                if (hasRetried) {
-                    clearStoredToken();
-                    blockAccess();
-                    return null;
-                }
-                return refreshGadgetToken(token).then(function (freshToken) {
-                    if (!freshToken || accessBlocked) {
-                        return null;
-                    }
+            if (response.status === 401 || response.status === 403) {
+                return handleDetectAuthStatus(response.status, token, hasRetried, function (freshToken) {
                     return fetchDetectWithToken(ip, freshToken, true, resolvedMode);
                 });
             }
@@ -1256,21 +1267,8 @@
                 batchEndpointSupported = false;
                 return { fallbackSingle: true };
             }
-            if (response.status === 403) {
-                clearStoredToken();
-                blockAccess();
-                return null;
-            }
-            if (response.status === 401) {
-                if (hasRetried) {
-                    clearStoredToken();
-                    blockAccess();
-                    return null;
-                }
-                return refreshGadgetToken(token).then(function (freshToken) {
-                    if (!freshToken || accessBlocked) {
-                        return null;
-                    }
+            if (response.status === 401 || response.status === 403) {
+                return handleDetectAuthStatus(response.status, token, hasRetried, function (freshToken) {
                     return fetchBatchDetectWithToken(ips, freshToken, true, resolvedMode);
                 });
             }
@@ -1367,10 +1365,7 @@
             });
         }).then(function (batchPayload) {
             if (batchPayload && batchPayload.fallbackSingle) {
-                if (batchDebounceTimer !== null) {
-                    window.clearTimeout(batchDebounceTimer);
-                    batchDebounceTimer = null;
-                }
+                clearBatchDebounceTimer();
                 var remainingItems = pendingBatchQueue.splice(0, pendingBatchQueue.length);
                 fallbackBatchItemsToSingle(bucketItems.concat(remainingItems));
                 return;
@@ -1416,10 +1411,7 @@
     }
 
     function flushPendingBatch() {
-        if (batchDebounceTimer !== null) {
-            window.clearTimeout(batchDebounceTimer);
-            batchDebounceTimer = null;
-        }
+        clearBatchDebounceTimer();
         if (accessBlocked) {
             clearRequestQueue();
             return;
@@ -1991,6 +1983,23 @@
         });
     }
 
+    function upsertProviderEntry(byKey, entries, key, value, provider) {
+        var entry = byKey.get(key);
+        if (!entry) {
+            entry = {
+                value: value,
+                providers: [],
+                showProviders: true,
+                defaultChecked: false
+            };
+            byKey.set(key, entry);
+            entries.push(entry);
+        }
+        if (provider && entry.providers.indexOf(provider) === -1) {
+            entry.providers.push(provider);
+        }
+    }
+
     function normalizeIspKey(value) {
         return value
             .toLowerCase()
@@ -2022,21 +2031,7 @@
             if (!key) {
                 return;
             }
-            var provider = (row && row.provider) || 'Provider';
-            var entry = byKey.get(key);
-            if (!entry) {
-                entry = {
-                    value: cleaned,
-                    providers: [],
-                    showProviders: true,
-                    defaultChecked: false
-                };
-                byKey.set(key, entry);
-                entries.push(entry);
-            }
-            if (entry.providers.indexOf(provider) === -1) {
-                entry.providers.push(provider);
-            }
+            upsertProviderEntry(byKey, entries, key, cleaned, (row && row.provider) || 'Provider');
         });
 
         return entries;
@@ -2075,21 +2070,7 @@
                 return;
             }
             var key = normalized.toLowerCase().replace(/\s*,\s*/g, ', ').replace(/\s+/g, ' ').trim();
-            var provider = row.provider || 'Provider';
-            var entry = byKey.get(key);
-            if (!entry) {
-                entry = {
-                    value: normalized,
-                    providers: [],
-                    showProviders: true,
-                    defaultChecked: false
-                };
-                byKey.set(key, entry);
-                entries.push(entry);
-            }
-            if (entry.providers.indexOf(provider) === -1) {
-                entry.providers.push(provider);
-            }
+            upsertProviderEntry(byKey, entries, key, normalized, row.provider || 'Provider');
         });
 
         return entries;
@@ -2130,21 +2111,7 @@
             if (!text) {
                 return;
             }
-            var key = text.toLowerCase();
-            var entry = byKey.get(key);
-            if (!entry) {
-                entry = {
-                    value: text,
-                    providers: [],
-                    showProviders: true,
-                    defaultChecked: false
-                };
-                byKey.set(key, entry);
-                entries.push(entry);
-            }
-            if (provider && entry.providers.indexOf(provider) === -1) {
-                entry.providers.push(provider);
-            }
+            upsertProviderEntry(byKey, entries, text.toLowerCase(), text, provider);
         }
 
         if (risk.isTor) {
@@ -2194,10 +2161,6 @@
         return entries;
     }
 
-    function isSpurIpInfoPage() {
-        return isContributionsSpecialPage();
-    }
-
     function extractDomLines(element) {
         if (!element) {
             return [];
@@ -2241,7 +2204,7 @@
 
     // Read Spur proxy types from MediaWiki IPInfo when rendered on contributions special pages
     function getSpurProxyText() {
-        if (!isSpurIpInfoPage()) {
+        if (!isContributionsSpecialPage()) {
             return '';
         }
         var $panel = $('.ext-ipinfo-panel-layout').first();
@@ -3090,6 +3053,17 @@
                     'class': 'proxycheck-retry-full-btn',
                     text: 'Retry Full Check'
                 });
+                function restoreAfterRetryFailure(previousData) {
+                    retryInFlight = false;
+                    if (cacheKey && previousData) {
+                        recordLatestIpResult(cacheKey, previousData);
+                    }
+                    if (!dialogClosed) {
+                        $statusLabel.text('Full check retry failed. ');
+                        $retryBtn.prop('disabled', false).text('Retry Full Check');
+                    }
+                }
+
                 $retryBtn.on('click', function (event) {
                     event.preventDefault();
                     event.stopPropagation();
@@ -3102,17 +3076,11 @@
                     invalidateIpResultCache(targetIp);
 
                     fetchIpIntelligence(targetIp, 'full').then(function (retryData) {
-                        retryInFlight = false;
                         if (!retryData || typeof retryData !== 'object') {
-                            if (cacheKey && previousData) {
-                                recordLatestIpResult(cacheKey, previousData);
-                            }
-                            if (!dialogClosed) {
-                                $statusLabel.text('Full check retry failed. ');
-                                $retryBtn.prop('disabled', false).text('Retry Full Check');
-                            }
+                            restoreAfterRetryFailure(previousData);
                             return;
                         }
+                        retryInFlight = false;
                         activeData = retryData;
                         refreshRenderedBadgesForIp(retryData.ip || targetIp, retryData);
                         if (dialogClosed) {
@@ -3122,14 +3090,7 @@
                         renderDialogBody(retryData, retryRisk);
                         syncDegradedRetrySection(retryData, retryRisk);
                     }).catch(function () {
-                        retryInFlight = false;
-                        if (cacheKey && previousData) {
-                            recordLatestIpResult(cacheKey, previousData);
-                        }
-                        if (!dialogClosed) {
-                            $statusLabel.text('Full check retry failed. ');
-                            $retryBtn.prop('disabled', false).text('Retry Full Check');
-                        }
+                        restoreAfterRetryFailure(previousData);
                     });
                 });
 
@@ -3238,15 +3199,6 @@
         badge.textContent = options.text;
         badge.title = options.title;
         applyBaseBadgeStyle(badge);
-        if (options.backgroundColor) {
-            badge.style.backgroundColor = options.backgroundColor;
-        }
-        if (options.color) {
-            badge.style.color = options.color;
-        }
-        if (options.border) {
-            badge.style.border = options.border;
-        }
         badge.style.cursor = 'pointer';
 
         badge.addEventListener('click', function (event) {
@@ -3688,10 +3640,7 @@
             return;
         }
 
-        if (ipContributionsFallbackTimer !== null) {
-            window.clearTimeout(ipContributionsFallbackTimer);
-            ipContributionsFallbackTimer = null;
-        }
+        clearContributionsFallbackTimer();
 
         ipContributionsPending = true;
         var $box = null;

@@ -18,6 +18,9 @@ from .offline_dbs import (
     resolve_cloud_cidr_path,
     resolve_configured_data_dir,
 )
+from .offline_dbs import (
+    _get_setting as _get_django_setting,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -246,15 +249,7 @@ _DYNAMIC_RESIDENTIAL_TOKENS = {
 
 def classify_rdns_hostname(hostname: Optional[str]) -> Dict[str, Any]:
     """Classifies a reverse DNS PTR hostname into residential, cloud gateway, or unclassified categories."""
-    if not hostname or not isinstance(hostname, str):
-        return {
-            "ptrHostname": None,
-            "ptrCategory": "none",
-            "ptrLabel": "No PTR Record",
-            "isHighRisk": False,
-        }
-
-    cleaned = hostname.strip().rstrip(".").lower()
+    cleaned = hostname.strip().rstrip(".").lower() if isinstance(hostname, str) else ""
     if not cleaned:
         return {
             "ptrHostname": None,
@@ -373,17 +368,6 @@ _cloud_cidr_cache_key: Optional[Tuple[str, Tuple[int, int] | int]] = None
 _cloud_cidr_cache_index: Optional["_CloudCidrIndex"] = None
 _hosting_rules_cache_key: Optional[Tuple[Any, ...]] = None
 _hosting_rules_cache_data: Optional[Tuple[Dict[int, str], Optional[re.Pattern[str]]]] = None
-
-
-def _get_django_setting(name: str, default: Any = None) -> Any:
-    try:
-        from django.conf import settings as django_settings
-
-        if django_settings.configured:
-            return getattr(django_settings, name, default)
-    except ImportError, RuntimeError:
-        return default
-    return default
 
 
 def _resolve_offline_file(setting_name: str, filenames: Tuple[str, ...]) -> Optional[Path]:
@@ -756,6 +740,21 @@ def warm_offline_intelligence_caches() -> None:
     _get_cloud_cidr_index()
     _get_hosting_rules()
     warm_stopforumspam_caches()
+
+
+def _format_asn_str(asn_val: Any) -> str:
+    """Formats a non-empty ASN value with a leading AS prefix, falling back to a hyphen."""
+    return f"AS{asn_val}" if asn_val and not str(asn_val).startswith("AS") else (str(asn_val) if asn_val else "-")
+
+
+def _format_numeric_or_prefixed_asn(asn_val: Any) -> str:
+    """Formats a positive numeric ASN or uppercase AS-prefixed string, falling back to a hyphen."""
+    asn_int = _safe_int(asn_val, default=None)
+    if asn_int is not None and asn_int > 0:
+        return f"AS{asn_int}"
+    if isinstance(asn_val, str) and asn_val.strip().upper().startswith("AS"):
+        return asn_val.strip().upper()
+    return "-"
 
 
 def _extract_carrier_name(carrier_val: Any) -> Optional[str]:
@@ -1181,8 +1180,7 @@ def adapt_ip2location(raw_data: Optional[Dict[str, Any]], has_api_key: bool, sta
     if is_spam:
         flags.append({"label": "Threat Detected", "isHighRisk": True})
 
-    asn_val = raw_data.get("asn")
-    asn_str = f"AS{asn_val}" if asn_val and not str(asn_val).startswith("AS") else (str(asn_val) if asn_val else "-")
+    asn_str = _format_asn_str(raw_data.get("asn"))
 
     loc_parts = [p for p in [raw_data.get("city_name"), raw_data.get("region_name"), raw_data.get("country_name")] if p]
     loc_str = ", ".join(loc_parts)
@@ -1340,7 +1338,7 @@ def adapt_maxmind(
         return _build_error_row("MaxMind", status_code, raw_data)
 
     asn_val = raw_data.get("autonomous_system_number") or raw_data.get("asn")
-    asn_str = f"AS{asn_val}" if asn_val and not str(asn_val).startswith("AS") else (str(asn_val) if asn_val else "-")
+    asn_str = _format_asn_str(asn_val)
     org_name = raw_data.get("autonomous_system_organization") or raw_data.get("as") or raw_data.get("isp") or "-"
     loc_str, country_code, coords = _extract_maxmind_geo(raw_data)
 
@@ -1422,19 +1420,13 @@ def adapt_getipintel(
 
     # GetIPIntel returns HTTP 200 with negative result codes on invalid input or rate limits.
     if raw_result < 0 or str(raw_data.get("status", "")).lower() == "error":
-        return {
-            "provider": "GetIPIntel",
-            "status": "400 Error",
-            "statusCode": 400,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "ML Prediction",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "chance": None,
-            "rawJson": raw_data,
-        }
+        return _build_error_row(
+            "GetIPIntel",
+            400,
+            raw_data,
+            usage_type="ML Prediction",
+            extra={"chance": None},
+        )
 
     chance = round(raw_result * 100.0, 3)
     flags: List[Dict[str, Any]] = []
@@ -1570,8 +1562,7 @@ def adapt_proxycheck(
     usage_type, flags = _extract_proxycheck_flags(detections, ip_obj, network)
     loc_str, country_code, coords = _extract_proxycheck_location(ip_obj)
 
-    asn_val = ip_obj.get("asn") or network.get("asn")
-    asn_str = f"AS{asn_val}" if asn_val and not str(asn_val).startswith("AS") else (str(asn_val) if asn_val else "-")
+    asn_str = _format_asn_str(ip_obj.get("asn") or network.get("asn"))
     org_val = (
         ip_obj.get("organisation")
         or ip_obj.get("organization")
@@ -1658,8 +1649,7 @@ def adapt_iphub(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_co
     elif block_val == 2:
         flags.append({"label": "Suspicious / Mixed (Block 2)", "isHighRisk": True})
 
-    asn_val = raw_data.get("asn")
-    asn_str = f"AS{asn_val}" if asn_val and not str(asn_val).startswith("AS") else (str(asn_val) if asn_val else "-")
+    asn_str = _format_asn_str(raw_data.get("asn"))
     isp_val = raw_data.get("isp") or raw_data.get("hostname") or "-"
     country_name = raw_data.get("countryName") or ""
     country_code = raw_data.get("countryCode") or ""
@@ -1717,8 +1707,7 @@ def adapt_iphunter(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status
     elif block_val == 2:
         flags.append({"label": "Suspicious (Block 2)", "isHighRisk": True})
 
-    asn_val = data.get("asn")
-    asn_str = f"AS{asn_val}" if asn_val and not str(asn_val).startswith("AS") else (str(asn_val) if asn_val else "-")
+    asn_str = _format_asn_str(data.get("asn"))
     isp_val = data.get("isp") or data.get("domain") or "-"
     city_name = data.get("city") or ""
     country_name = data.get("country_name") or ""
@@ -1782,22 +1771,17 @@ def _adapt_dnsbl_precheck(
     state = str(payload.get("status") or "").strip().lower()
 
     if state == "skipped_ipv6":
-        return {
-            "provider": provider_name,
-            "status": "Skipped (IPv6)",
-            "statusCode": None,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "IPv4 Only (Skipped for IPv6)",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "isListed": False,
-            "isSkippedIpv6": True,
-            "listedCodes": [],
-            "listedCategories": [],
-            "rawJson": payload,
-        }, payload
+        return (
+            _build_error_row(
+                provider_name,
+                None,
+                payload,
+                status="Skipped (IPv6)",
+                usage_type="IPv4 Only (Skipped for IPv6)",
+                extra={"isListed": False, "isSkippedIpv6": True, "listedCodes": [], "listedCategories": []},
+            ),
+            payload,
+        )
 
     if effective_status != 200 or state in ("timeout", "error") or not raw_data:
         if state == "timeout" or effective_status == 504:
@@ -1809,21 +1793,17 @@ def _adapt_dnsbl_precheck(
         else:
             out_code = effective_status if effective_status != 200 else 502
             status_text = f"{out_code} DNS Error"
-        return {
-            "provider": provider_name,
-            "status": status_text,
-            "statusCode": out_code,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "isListed": False,
-            "listedCodes": [],
-            "listedCategories": [],
-            "rawJson": payload or {"status": "error", "message": status_text},
-        }, payload
+        return (
+            _build_error_row(
+                provider_name,
+                out_code,
+                payload or None,
+                status=status_text,
+                raw_message=status_text,
+                extra={"isListed": False, "listedCodes": [], "listedCategories": []},
+            ),
+            payload,
+        )
 
     return None, payload
 
@@ -1860,22 +1840,15 @@ def adapt_spamhaus_zen(raw_data: Optional[Dict[str, Any]], status_code: int = 20
             if any(c in ("127.255.255.254", "127.255.255.255") for c in blocked_codes)
             else "Query Format Error"
         )
-        return {
-            "provider": "Spamhaus ZEN",
-            "status": "429 Query Blocked",
-            "statusCode": 429,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": f"Query Restricted ({', '.join(blocked_codes)}: {reason_detail})",
-            "securityFlags": [{"label": "Query Restricted (Unapplied)", "isHighRisk": False}],
-            "isListed": False,
-            "isQueryRestricted": True,
-            "listedCodes": [],
-            "listedCategories": [],
-            "rawJson": payload,
-        }
+        return _build_error_row(
+            "Spamhaus ZEN",
+            429,
+            payload,
+            status="429 Query Blocked",
+            usage_type=f"Query Restricted ({', '.join(blocked_codes)}: {reason_detail})",
+            security_flags=[{"label": "Query Restricted (Unapplied)", "isHighRisk": False}],
+            extra={"isListed": False, "isQueryRestricted": True, "listedCodes": [], "listedCategories": []},
+        )
 
     if not codes:
         return _build_clean_dnsbl_row("Spamhaus ZEN", payload)
@@ -2196,16 +2169,6 @@ def _extract_sfs_confidence(ip_block: Dict[str, Any], blacklisted: bool, appears
     return 0.0 if not appears else None
 
 
-def _extract_sfs_asn(ip_block: Dict[str, Any]) -> str:
-    asn_val = ip_block.get("asn")
-    asn_int = _safe_int(asn_val, default=None)
-    if asn_int is not None and asn_int > 0:
-        return f"AS{asn_int}"
-    if isinstance(asn_val, str) and asn_val.strip().upper().startswith("AS"):
-        return asn_val.strip().upper()
-    return "-"
-
-
 def _build_sfs_flags_and_usage(
     blacklisted: bool,
     toxic_cidr: Optional[str],
@@ -2282,7 +2245,7 @@ def adapt_stopforumspam(
         "provider": "StopForumSpam",
         "status": "200 OK",
         "statusCode": 200,
-        "asn": _extract_sfs_asn(ip_block),
+        "asn": _format_numeric_or_prefixed_asn(ip_block.get("asn")),
         "isp": "-",
         "organisation": "-",
         "location": "-",
@@ -2380,14 +2343,7 @@ def adapt_dshield(raw_data: Optional[Dict[str, Any]], status_code: int = 200) ->
         or _normalize_timestamp_or_text(ip_block.get("updated"))
     )
 
-    asn_val = ip_block.get("as") or ip_block.get("asn")
-    asn_int = _safe_int(asn_val, default=None)
-    if asn_int is not None and asn_int > 0:
-        asn_str = f"AS{asn_int}"
-    elif isinstance(asn_val, str) and asn_val.strip().upper().startswith("AS"):
-        asn_str = asn_val.strip().upper()
-    else:
-        asn_str = "-"
+    asn_str = _format_numeric_or_prefixed_asn(ip_block.get("as") or ip_block.get("asn"))
 
     isp_val = str(ip_block.get("asname") or ip_block.get("org") or "-").strip() or "-"
     loc_val = str(ip_block.get("ascountry") or "-").strip() or "-"

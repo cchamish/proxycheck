@@ -27,6 +27,9 @@ from proxycheck.settings import (
     MAXMIND_COUNTRY_DB_FILENAME,
     resolve_tool_data_subdir,
 )
+from proxycheck.settings import (
+    _expand_configured_path as _expand_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,13 +99,6 @@ def _get_positive_int_setting(name: str, default: int) -> int:
     if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
         return default
     return raw
-
-
-def _expand_path(raw_path: str) -> str:
-    cleaned = str(raw_path or "").strip()
-    if not cleaned:
-        return ""
-    return os.path.expanduser(os.path.expandvars(cleaned))
 
 
 def _base_dir() -> Path:

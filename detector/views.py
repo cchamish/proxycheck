@@ -10,7 +10,7 @@ import os
 import secrets
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Tuple
+from typing import Any, Awaitable, Callable, Dict, Tuple
 from urllib.parse import urlencode
 
 import dns
@@ -22,60 +22,24 @@ from django.views.decorators.csrf import csrf_exempt
 
 from .adapters import adapt_getipintel, warm_offline_intelligence_caches
 from .cache_backends import (
-    _DEFAULT_OS_PATH_EXISTS,
-    _DEFAULT_RESOLVE_DB_FILE,
-    _DEFAULT_RESOLVE_MAXMIND_DB_PATHS,
-    _MAXMIND_CITY_DB_CACHE_TTL_SECONDS,
-    _MAXMIND_DB_SPECS,
-    _REDIS_CIRCUIT_BREAKER_DEFAULT_SECONDS,
-    _REDIS_CIRCUIT_FAILURE_ERRORS,
-    _REDIS_INIT_ERRORS,
-    _REDIS_SOCKET_TIMEOUT_SECONDS,
-    _UNSET_MOCK_ATTR,
-    DEFAULT_COOLDOWN_SECONDS,
-    DEFAULT_DYNAMIC_CACHE_TTL_SECONDS,
-    DEFAULT_GETIPINTEL_STABLE_CACHE_TTL_SECONDS,
-    DEFAULT_STATIC_CACHE_TTL_SECONDS,
-    DYNAMIC_CACHE_PROVIDERS,
-    MAX_COOLDOWN_SECONDS,
-    MIN_COOLDOWN_SECONDS,
     _decode_cached_provider_entry,
-    _decode_cached_ptr_entry,
-    _decode_cooldown_entry,
-    _decode_redis_text_value,
-    _DecodedProviderRow,
-    _discard_pending_awaitable,
-    _evict_maxmind_reader,
-    _evict_missing_maxmind_readers,
-    _get_circuit_breaker_cooldown_seconds,
-    _get_cooldown_bounds,
-    _get_maxmind_reader,
     _get_provider_cache_ttl,
     _get_redis_client,
     _has_any_local_maxmind_db,
-    _has_local_maxmind_city_db,
-    _is_maxmind_probe_mocked,
-    _is_stable_getipintel_result,
     _maxmind_any_db_cache,
     _maxmind_city_db_cache,
-    _maxmind_lock,
     _maxmind_reader_stats,
     _maxmind_readers,
-    _missing_city_db_logged_paths,
     _provider_cache_key,
     _provider_cooldown_key,
     _redis_client_lock,
     _redis_clients_by_loop,
     _resolve_db_file,
     _resolve_maxmind_db_paths,
-    _run_redis_cache_op,
     _safe_redis_get,
     _safe_redis_mget,
     _safe_redis_set,
     _safe_redis_set_many,
-    _should_refresh_cached_maxmind_entry,
-    _should_refresh_cached_stopforumspam_entry,
-    _try_pipelined_set_many,
     aioredis,
     is_redis_circuit_open,
     mark_redis_failure,
@@ -83,12 +47,6 @@ from .cache_backends import (
     reset_redis_circuit_breaker,
 )
 from .detection_service import (
-    _DEFAULT_HTTP_LIMITS,
-    _DNSBL_PROVIDER_KEYS,
-    _LIGHT_MODE_ACTIVE_PROVIDERS,
-    _OFFLINE_PROVIDER_KEYS,
-    _assemble_detection_payload,
-    _await_inflight_task,
     _build_cookieless_http_client,
     _close_http_client_safely,
     _detect_single_canonical_ip,
@@ -97,35 +55,15 @@ from .detection_service import (
     _http_client_lock,
     _http_clients_by_loop,
     _ip_detect_inflight,
-    _ip_detect_inflight_lock,
     _is_provider_cache_expected,
     _read_provider_caches,
     _release_inflight_task,
-    _StaleInflightLoopError,
-    _strip_raw_json_from_payload,
-    _strip_request_cookie_header,
 )
 from .dns_providers import (
-    _DEFAULT_ASYNC_RESOLVER_CLS,
-    DEFAULT_DNS_TIMEOUT_SECONDS,
-    _async_resolver_lock,
-    _cached_async_resolvers,
-    _cached_base_nameservers,
     _create_async_resolver,
-    _extract_dnsbl_a_records,
-    _extract_ptr_hostname,
-    _is_valid_mmdb_prefix_tuple,
-    _lookup_mmdb_record_and_prefix,
-    _merge_maxmind_dict_field,
-    _merge_maxmind_records,
     _provider_upstream_events,
-    _query_dnsbl_zone,
     _rdns_context_state,
     _read_maxmind_sync,
-    _read_stopforumspam_sync,
-    _record_upstream_event,
-    _reverse_ipv4_octets,
-    _should_use_custom_mmdb_get,
     query_maxmind,
     query_rdns_ptr,
     query_spamcop,
@@ -133,16 +71,10 @@ from .dns_providers import (
     query_stopforumspam,
 )
 from .intelligence import (
-    _CGNAT_NETWORK,
-    _DOC_NETWORKS,
-    _PROC_RSS_CACHE_TTL_SECONDS,
     MAX_BATCH_IPS,
     _attach_request_diagnostics,
     _build_non_public_response_payload,
-    _classify_non_public_ip,
-    _is_builtin_open_mocked,
     _is_compact_request,
-    _normalize_query_mode,
     _parse_batch_ips,
     _proc_rss_cache,
     _read_proc_rss_mb,
@@ -164,12 +96,6 @@ from .providers import (
     _PROVIDER_SPECS,
     USER_AGENT_HEADER,
     _build_cooldown_provider_row,
-    _build_deferred_provider_row,
-    _build_unhandled_provider_error_row,
-    _extract_retry_after_header,
-    _fetch_upstream_json,
-    _is_provider_result_cacheable,
-    _is_unconfigured_provider_row,
     _parse_retry_after_seconds,
     query_abuseipdb,
     query_cloudflare_radar,
@@ -191,23 +117,13 @@ from .quota_telemetry import (
     record_provider_outcomes_batch,
 )
 from .sanitization import (
-    _MIN_SECRET_LENGTH,
-    _SECRET_SETTING_NAMES,
-    REDACTED_PLACEHOLDER,
     _configured_secret_values,
-    _extract_response_log_details,
-    _parse_upstream_json_with_error,
     _sanitize_error_message,
     _sanitize_payload,
 )
 from .session_auth import (
-    _LOCAL_DEV_ORIGIN_RE,
-    _MAX_MERGED_PROJECT_RIGHTS_LOOKUPS,
-    _MERGED_PROJECT_RIGHTS_BATCH_SIZE,
     _SESSION_UNAVAILABLE_ERROR,
     _TEST_ROLE_PROFILES,
-    _WIKIMEDIA_ORIGIN_RE,
-    DEFAULT_GADGET_TOKEN_TTL_SECONDS,
     GADGET_TOKEN_SALT,
     _apply_detect_cors_headers,
     _authenticate_detect_request,
@@ -215,131 +131,51 @@ from .session_auth import (
     _flush_session_async,
     _get_gadget_token_ttl_seconds,
     _get_session_user,
-    _is_allowed_wikimedia_origin,
-    _merged_project_edit_count,
     _parse_gadget_token_payload,
     _persist_authenticated_session,
     _persist_oauth_login_context,
     _pop_oauth_login_context,
     _populate_merged_project_rights,
-    _read_session_user_sync,
     _resolve_wikimedia_access,
-    _safe_flush_session,
-    _safe_save_session,
     _verify_gadget_bearer_token,
     issue_gadget_token,
 )
 
 __all__ = [
-    "DEFAULT_COOLDOWN_SECONDS",
-    "DEFAULT_DNS_TIMEOUT_SECONDS",
-    "DEFAULT_DYNAMIC_CACHE_TTL_SECONDS",
-    "DEFAULT_GADGET_TOKEN_TTL_SECONDS",
-    "DEFAULT_GETIPINTEL_STABLE_CACHE_TTL_SECONDS",
-    "DEFAULT_STATIC_CACHE_TTL_SECONDS",
-    "DYNAMIC_CACHE_PROVIDERS",
     "GADGET_TOKEN_SALT",
     "MAX_BATCH_IPS",
-    "MAX_COOLDOWN_SECONDS",
-    "MIN_COOLDOWN_SECONDS",
-    "REDACTED_PLACEHOLDER",
     "USER_AGENT_HEADER",
-    "_CGNAT_NETWORK",
-    "_DEFAULT_ASYNC_RESOLVER_CLS",
-    "_DEFAULT_HTTP_LIMITS",
-    "_DEFAULT_OS_PATH_EXISTS",
-    "_DEFAULT_RESOLVE_DB_FILE",
-    "_DEFAULT_RESOLVE_MAXMIND_DB_PATHS",
-    "_DNSBL_PROVIDER_KEYS",
-    "_DOC_NETWORKS",
-    "_DecodedProviderRow",
-    "_LIGHT_MODE_ACTIVE_PROVIDERS",
-    "_LOCAL_DEV_ORIGIN_RE",
-    "_MAXMIND_CITY_DB_CACHE_TTL_SECONDS",
-    "_MAXMIND_DB_SPECS",
-    "_MAX_MERGED_PROJECT_RIGHTS_LOOKUPS",
-    "_MERGED_PROJECT_RIGHTS_BATCH_SIZE",
-    "_MIN_SECRET_LENGTH",
-    "_OFFLINE_PROVIDER_KEYS",
-    "_PROC_RSS_CACHE_TTL_SECONDS",
     "_PROVIDER_SPECS",
-    "_REDIS_CIRCUIT_BREAKER_DEFAULT_SECONDS",
-    "_REDIS_CIRCUIT_FAILURE_ERRORS",
-    "_REDIS_INIT_ERRORS",
-    "_REDIS_SOCKET_TIMEOUT_SECONDS",
-    "_SECRET_SETTING_NAMES",
     "_SESSION_UNAVAILABLE_ERROR",
-    "_StaleInflightLoopError",
-    "_UNSET_MOCK_ATTR",
-    "_WIKIMEDIA_ORIGIN_RE",
     "_apply_detect_cors_headers",
-    "_assemble_detection_payload",
-    "_async_resolver_lock",
     "_attach_request_diagnostics",
     "_authenticate_detect_request",
     "_authorize_admin_session_request",
-    "_await_inflight_task",
     "_build_cookieless_http_client",
     "_build_cooldown_provider_row",
-    "_build_deferred_provider_row",
     "_build_non_public_response_payload",
-    "_build_unhandled_provider_error_row",
-    "_cached_async_resolvers",
-    "_cached_base_nameservers",
-    "_classify_non_public_ip",
     "_close_http_client_safely",
     "_configured_secret_values",
     "_create_async_resolver",
     "_decode_cached_provider_entry",
-    "_decode_cached_ptr_entry",
-    "_decode_cooldown_entry",
-    "_decode_redis_text_value",
     "_detect_single_canonical_ip",
-    "_discard_pending_awaitable",
-    "_evict_maxmind_reader",
-    "_evict_missing_maxmind_readers",
     "_execute_detection_with_cache",
-    "_extract_dnsbl_a_records",
-    "_extract_ptr_hostname",
-    "_extract_response_log_details",
-    "_extract_retry_after_header",
-    "_fetch_upstream_json",
     "_flush_session_async",
-    "_get_circuit_breaker_cooldown_seconds",
-    "_get_cooldown_bounds",
     "_get_gadget_token_ttl_seconds",
-    "_get_maxmind_reader",
     "_get_provider_cache_ttl",
     "_get_redis_client",
     "_get_session_user",
     "_get_shared_http_client",
     "_has_any_local_maxmind_db",
-    "_has_local_maxmind_city_db",
     "_http_client_lock",
     "_http_clients_by_loop",
     "_ip_detect_inflight",
-    "_ip_detect_inflight_lock",
-    "_is_allowed_wikimedia_origin",
-    "_is_builtin_open_mocked",
-    "_is_maxmind_probe_mocked",
     "_is_provider_cache_expected",
-    "_is_provider_result_cacheable",
-    "_is_stable_getipintel_result",
-    "_is_unconfigured_provider_row",
-    "_is_valid_mmdb_prefix_tuple",
-    "_lookup_mmdb_record_and_prefix",
     "_maxmind_any_db_cache",
     "_maxmind_city_db_cache",
-    "_maxmind_lock",
     "_maxmind_reader_stats",
     "_maxmind_readers",
-    "_merge_maxmind_dict_field",
-    "_merge_maxmind_records",
-    "_merged_project_edit_count",
-    "_missing_city_db_logged_paths",
-    "_normalize_query_mode",
     "_parse_retry_after_seconds",
-    "_parse_upstream_json_with_error",
     "_persist_authenticated_session",
     "_persist_oauth_login_context",
     "_pop_oauth_login_context",
@@ -348,36 +184,22 @@ __all__ = [
     "_provider_cache_key",
     "_provider_cooldown_key",
     "_provider_upstream_events",
-    "_query_dnsbl_zone",
     "_rdns_context_state",
     "_read_maxmind_sync",
     "_read_proc_rss_mb",
     "_read_provider_caches",
-    "_read_session_user_sync",
-    "_read_stopforumspam_sync",
-    "_record_upstream_event",
     "_redis_client_lock",
     "_redis_clients_by_loop",
     "_release_inflight_task",
     "_resolve_db_file",
     "_resolve_maxmind_db_paths",
     "_resolve_wikimedia_access",
-    "_reverse_ipv4_octets",
-    "_run_redis_cache_op",
-    "_safe_flush_session",
     "_safe_redis_get",
     "_safe_redis_mget",
     "_safe_redis_set",
     "_safe_redis_set_many",
-    "_safe_save_session",
     "_sanitize_error_message",
     "_sanitize_payload",
-    "_should_refresh_cached_maxmind_entry",
-    "_should_refresh_cached_stopforumspam_entry",
-    "_should_use_custom_mmdb_get",
-    "_strip_raw_json_from_payload",
-    "_strip_request_cookie_header",
-    "_try_pipelined_set_many",
     "_verify_gadget_bearer_token",
     "adapt_getipintel",
     "admin_provider_dashboard",
@@ -435,17 +257,50 @@ logger = logging.getLogger(__name__)
 _BATCH_DETECT_CONCURRENCY = 6
 
 _OAUTH_CALLBACK_ERROR_CODES = {
-    "access_denied": "access_denied",
-    "consent_required": "consent_required",
-    "interaction_required": "interaction_required",
-    "invalid_request": "invalid_request",
-    "invalid_scope": "invalid_scope",
-    "login_required": "login_required",
-    "server_error": "server_error",
-    "temporarily_unavailable": "temporarily_unavailable",
-    "unauthorized_client": "unauthorized_client",
-    "unsupported_response_type": "unsupported_response_type",
+    code: code
+    for code in (
+        "access_denied",
+        "consent_required",
+        "interaction_required",
+        "invalid_request",
+        "invalid_scope",
+        "login_required",
+        "server_error",
+        "temporarily_unavailable",
+        "unauthorized_client",
+        "unsupported_response_type",
+    )
 }
+
+
+def _build_unauthenticated_user_payload() -> Dict[str, Any]:
+    return {
+        "isLoggedIn": False,
+        "username": "",
+        "role": "",
+        "hasAccess": False,
+        "isAdmin": False,
+        "localGroups": [],
+        "globalGroups": [],
+    }
+
+
+async def _dispatch_cors_endpoint(
+    request,
+    expected_method: str,
+    handler: Callable[[Any], Awaitable[HttpResponse]],
+) -> HttpResponse:
+    allowed_methods = f"{expected_method}, OPTIONS"
+    if request.method == "OPTIONS":
+        return _apply_detect_cors_headers(request, HttpResponse(status=204), methods=allowed_methods)
+    if request.method != expected_method:
+        return _apply_detect_cors_headers(
+            request,
+            JsonResponse({"error": "Method not allowed"}, status=405),
+            methods=allowed_methods,
+        )
+    response = await handler(request)
+    return _apply_detect_cors_headers(request, response, methods=allowed_methods)
 
 
 @csrf_exempt
@@ -454,18 +309,7 @@ async def exchange_gadget_token(request):
     Exchanges a one-time MediaWiki CentralAuth token for a signed gadget Bearer token
     after verifying identity and unified RBAC permissions with Meta-Wiki.
     """
-    if request.method == "OPTIONS":
-        return _apply_detect_cors_headers(request, HttpResponse(status=204), methods="POST, OPTIONS")
-
-    if request.method != "POST":
-        return _apply_detect_cors_headers(
-            request,
-            JsonResponse({"error": "Method not allowed"}, status=405),
-            methods="POST, OPTIONS",
-        )
-
-    response = await _exchange_gadget_token_post(request)
-    return _apply_detect_cors_headers(request, response, methods="POST, OPTIONS")
+    return await _dispatch_cors_endpoint(request, "POST", _exchange_gadget_token_post)
 
 
 async def _exchange_gadget_token_post(request):
@@ -530,14 +374,7 @@ async def detect_ip(request):
     Aggregates IP intelligence across upstream providers with non-public IP interception,
     singleflight coalescing, tiered per-provider Redis caching, and cooldown circuit breaking.
     """
-    if request.method == "OPTIONS":
-        return _apply_detect_cors_headers(request, HttpResponse(status=204))
-
-    if request.method != "GET":
-        return _apply_detect_cors_headers(request, JsonResponse({"error": "Method not allowed"}, status=405))
-
-    response = await _detect_ip_get(request)
-    return _apply_detect_cors_headers(request, response)
+    return await _dispatch_cors_endpoint(request, "GET", _detect_ip_get)
 
 
 async def _detect_ip_get(request):
@@ -585,18 +422,7 @@ async def detect_ip_batch(request):
     Executes bounded-concurrency batch IP intelligence detection for up to MAX_BATCH_IPS
     addresses in a single POST request.
     """
-    if request.method == "OPTIONS":
-        return _apply_detect_cors_headers(request, HttpResponse(status=204), methods="POST, OPTIONS")
-
-    if request.method != "POST":
-        return _apply_detect_cors_headers(
-            request,
-            JsonResponse({"error": "Method not allowed"}, status=405),
-            methods="POST, OPTIONS",
-        )
-
-    response = await _detect_ip_batch_post(request)
-    return _apply_detect_cors_headers(request, response, methods="POST, OPTIONS")
+    return await _dispatch_cors_endpoint(request, "POST", _detect_ip_batch_post)
 
 
 async def _detect_ip_batch_post(request):
@@ -660,15 +486,7 @@ async def get_current_user(request):
     session_user = await _get_session_user(request, context="get_current_user")
 
     if not isinstance(session_user, dict) or not session_user:
-        payload = {
-            "isLoggedIn": False,
-            "username": "",
-            "role": "",
-            "hasAccess": False,
-            "isAdmin": False,
-            "localGroups": [],
-            "globalGroups": [],
-        }
+        payload = _build_unauthenticated_user_payload()
     else:
         payload = dict(session_user)
         payload["isAdmin"] = is_admin_user(session_user)
@@ -886,17 +704,7 @@ async def switch_test_role(request):
 
     if target == "unauthenticated":
         await _flush_session_async(request, context="switch_test_role")
-        return JsonResponse(
-            {
-                "isLoggedIn": False,
-                "username": "",
-                "role": "",
-                "hasAccess": False,
-                "isAdmin": False,
-                "localGroups": [],
-                "globalGroups": [],
-            }
-        )
+        return JsonResponse(_build_unauthenticated_user_payload())
 
     user_data = dict(_TEST_ROLE_PROFILES.get(target, _TEST_ROLE_PROFILES["sysop"]))
     user_data["rights_updated_at"] = time.time()

@@ -84,13 +84,6 @@ export interface OfflineDatabaseEntry {
   statusLabel: string;
 }
 
-export interface SystemStatusResponse {
-  generatedAt: string;
-  offlineDatabases: OfflineDatabaseEntry[];
-  durationSeconds?: number;
-  memoryMb?: number | null;
-}
-
 export type PtrCategory = 'dynamic_residential' | 'hosting_or_gateway' | 'unclassified' | 'none';
 
 export interface CacheMeta {
@@ -630,6 +623,18 @@ export interface UserSessionState {
   globalGroups?: string[];
 }
 
+export function createLoggedOutUserState(): UserSessionState {
+  return {
+    isLoggedIn: false,
+    username: '',
+    role: '',
+    hasAccess: false,
+    isAdmin: false,
+    localGroups: [],
+    globalGroups: [],
+  };
+}
+
 export interface ProviderDashboardTelemetry {
   ok: number;
   cacheHit: number;
@@ -814,15 +819,7 @@ export function createDetectionCoordinator(
         const expiredMessage = 'Your session has expired. Please log in again with Wikimedia.';
         state.sessionExpiredMessage = expiredMessage;
         state.validationError = expiredMessage;
-        state.user = {
-          isLoggedIn: false,
-          username: '',
-          role: '',
-          hasAccess: false,
-          isAdmin: false,
-          localGroups: [],
-          globalGroups: [],
-        };
+        state.user = createLoggedOutUserState();
         state.detectionData = null;
         state.diagnostic = null;
         return;

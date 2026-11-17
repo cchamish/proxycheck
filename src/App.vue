@@ -430,6 +430,7 @@ import {
   REQUIRED_USER_RIGHTS,
   buildOAuthLoginUrl,
   buildPageUrlWithIp,
+  createLoggedOutUserState,
   isAuthorisedAdminUser,
   isValidIpAddress,
   filterComparisonResults,
@@ -516,15 +517,7 @@ const uiState = reactive<DetectionCoordinatorState>({
   sessionExpiredMessage: '',
   detectionData: null,
   diagnostic: null,
-  user: {
-    isLoggedIn: false,
-    username: '',
-    role: '',
-    hasAccess: false,
-    isAdmin: false,
-    localGroups: [],
-    globalGroups: [],
-  },
+  user: createLoggedOutUserState(),
   ipHistory: loadStoredHistory(),
 });
 
@@ -729,8 +722,12 @@ function formatChance(score?: number | string | null): number {
   return Number(num.toFixed(3));
 }
 
+function nowPerfMs(): number {
+  return typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : 0;
+}
+
 async function fetchUserStatus() {
-  const requestStart = typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : 0;
+  const requestStart = nowPerfMs();
   try {
     const res = await fetch('/api/v1/auth/user/');
     const fallbackDuration = measureElapsedSeconds(requestStart);
@@ -767,7 +764,7 @@ function handleLogin() {
 }
 
 async function handleLogout() {
-  const requestStart = typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : 0;
+  const requestStart = nowPerfMs();
   try {
     const res = await fetch('/api/v1/auth/logout/');
     const fallbackDuration = measureElapsedSeconds(requestStart);
@@ -776,15 +773,7 @@ async function handleLogout() {
       return;
     }
     const data = await res.json().catch(() => null);
-    user.value = {
-      isLoggedIn: false,
-      username: '',
-      role: '',
-      hasAccess: false,
-      isAdmin: false,
-      localGroups: [],
-      globalGroups: [],
-    };
+    user.value = createLoggedOutUserState();
     isDashboardOpen.value = false;
     inputIp.value = '';
     detectionData.value = null;

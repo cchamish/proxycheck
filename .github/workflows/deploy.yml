@@ -172,6 +172,21 @@ jobs:
                 fi
               fi
 
+              build_image="tool-${toolforge_tool}/tool-${toolforge_tool}:latest"
+
+              echo "Running database schema migrations before restarting web service"
+              toolforge jobs delete migrate-db 2>/dev/null || true
+              if ! toolforge jobs run migrate-db \
+                  --command "python manage.py migrate --noinput" \
+                  --image "$build_image" \
+                  --mount=all \
+                  --wait; then
+                echo "Database migration job failed; inspecting job status before aborting deployment."
+                toolforge jobs show migrate-db 2>&1 || true
+                exit 1
+              fi
+              toolforge jobs delete migrate-db 2>/dev/null || true
+
               echo "Restarting Build Service web service and verifying status"
               if ! toolforge webservice buildservice restart --mount=all; then
                 toolforge webservice stop 2>/dev/null || true
@@ -179,6 +194,17 @@ jobs:
               fi
               sleep 6
               toolforge webservice status
+
+              if [[ -f "$repo_dir/jobs.yaml" ]]; then
+                echo "Synchronising Toolforge scheduled jobs from jobs.yaml"
+                rendered_jobs="$(mktemp)"
+                sed "s|tool-proxycheck/tool-proxycheck:latest|$build_image|g" "$repo_dir/jobs.yaml" > "$rendered_jobs"
+                if ! toolforge jobs load "$rendered_jobs"; then
+                  rm -f "$rendered_jobs"
+                  exit 1
+                fi
+                rm -f "$rendered_jobs"
+              fi
           EOF
           } | ssh -i ~/.ssh/id_deploy -o BatchMode=yes -o StrictHostKeyChecking=yes "${TOOLFORGE_USER}@${TOOLFORGE_HOST}" "become $TOOLFORGE_TOOL bash -s"
 

@@ -20,24 +20,23 @@ import httpx
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
-from detector.adapters import _parse_cloud_cidr_payload, clear_offline_intelligence_caches
+from detector.cidr_attribution import clear_offline_intelligence_caches, parse_cloud_cidr_payload
 from detector.offline_dbs import (
+    CLOUD_CIDRS_FILENAME,
+    MAXMIND_EDITION_SPECS,
+    SFS_LISTED_1_ZIP_NAME,
+    SFS_LISTED_90_ZIP_NAME,
     SFS_SQLITE_FILENAME,
     SFS_TOXIC_CIDR_FILENAME,
+    atomic_temp_path,
     build_stopforumspam_sqlite_index,
     clear_stopforumspam_caches,
+    replace_temp_file_atomically,
     resolve_configured_data_dir,
     resolve_writable_data_dir,
 )
-from detector.offline_dbs import (
-    atomic_replace_with_retry as _atomic_replace,
-)
-from detector.views import USER_AGENT_HEADER
-from proxycheck.settings import (
-    MAXMIND_ASN_DB_FILENAME,
-    MAXMIND_CITY_DB_FILENAME,
-    MAXMIND_COUNTRY_DB_FILENAME,
-)
+from detector.provider_registry import USER_AGENT_HEADER
+from detector.sanitization import sanitize_error_message
 
 try:
     import maxminddb
@@ -46,10 +45,8 @@ except ImportError:
 
 SFS_BASE_URL = "https://www.stopforumspam.com/downloads"
 SFS_TOXIC_CIDR_URL = f"{SFS_BASE_URL}/{SFS_TOXIC_CIDR_FILENAME}"
-SFS_LISTED_90_ZIP_NAME = "listed_ip_90_ipv46_all.zip"
 SFS_LISTED_90_ZIP_URL = f"{SFS_BASE_URL}/{SFS_LISTED_90_ZIP_NAME}"
 SFS_LISTED_90_MD5_URL = f"{SFS_LISTED_90_ZIP_URL}.md5"
-SFS_LISTED_1_ZIP_NAME = "listed_ip_1_ipv46_all.zip"
 SFS_LISTED_1_ZIP_URL = f"{SFS_BASE_URL}/{SFS_LISTED_1_ZIP_NAME}"
 SFS_LISTED_1_MD5_URL = f"{SFS_LISTED_1_ZIP_URL}.md5"
 
@@ -61,7 +58,6 @@ SFS_1_MIN_INTERVAL_SECONDS = 3600 - 120
 MAXMIND_MIN_INTERVAL_SECONDS = 24 * 3600 - 300
 CLOUD_CIDRS_MIN_INTERVAL_SECONDS = 24 * 3600 - 300
 
-CLOUD_CIDRS_FILENAME = "cloud_cidrs.json"
 AWS_IP_RANGES_URL = "https://ip-ranges.amazonaws.com/ip-ranges.json"
 GCP_IP_RANGES_URL = "https://www.gstatic.com/ipranges/cloud.json"
 OCI_IP_RANGES_URL = "https://docs.oracle.com/en-us/iaas/tools/public_ip_ranges.json"
@@ -73,12 +69,6 @@ _AZURE_SERVICETAGS_URL_RE = re.compile(
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 _HEX_32_RE = re.compile(r"\b([0-9a-fA-F]{32})\b")
 _HEX_64_RE = re.compile(r"\b([0-9a-fA-F]{64})\b")
-
-MAXMIND_EDITION_SPECS: Tuple[Tuple[str, str], ...] = (
-    ("GeoLite2-Country", MAXMIND_COUNTRY_DB_FILENAME),
-    ("GeoLite2-City", MAXMIND_CITY_DB_FILENAME),
-    ("GeoLite2-ASN", MAXMIND_ASN_DB_FILENAME),
-)
 _DOWNLOAD_UPDATE_ERRORS = (httpx.HTTPError, CommandError, OSError, ValueError, tarfile.TarError, zipfile.BadZipFile)
 
 
@@ -117,8 +107,8 @@ def _parse_hex_digest(raw_text: str, pattern: re.Pattern[str]) -> Optional[str]:
     return match.group(1).lower() if match else None
 
 
-def _redact_text(message: str, secrets_to_hide: Iterable[str]) -> str:
-    cleaned = message
+def _redact_update_error(message: str, secrets_to_hide: Iterable[str] = ()) -> str:
+    cleaned = sanitize_error_message(message)
     for secret in secrets_to_hide:
         if secret:
             cleaned = cleaned.replace(secret, "[REDACTED]")
@@ -140,9 +130,7 @@ def _stream_download_to_temp(
     tmp_path = Path(tmp_name)
     total_bytes = 0
     try:
-        request_kwargs: Dict[str, object] = {}
-        if auth is not None:
-            request_kwargs["auth"] = auth
+        request_kwargs: Dict[str, object] = {"auth": auth} if auth is not None else {}
         with client.stream("GET", url, **request_kwargs) as response:
             response.raise_for_status()
             with tmp_path.open("wb") as out_handle:
@@ -171,15 +159,35 @@ def _validate_toxic_cidr_file(file_path: Path) -> int:
                 raise CommandError("Toxic CIDR download returned HTML instead of CIDR data.")
             if not stripped or stripped.startswith(("#", ";")):
                 continue
-            token = stripped.split()[0]
             try:
-                ipaddress.ip_network(token, strict=False)
+                ipaddress.ip_network(stripped.split()[0], strict=False)
                 valid_networks += 1
             except ValueError:
                 continue
     if valid_networks <= 0:
         raise CommandError("Toxic CIDR download contained no valid IP networks.")
     return valid_networks
+
+
+def _validate_sfs_zip_sample_rows(zf: zipfile.ZipFile, primary_member: zipfile.ZipInfo) -> int:
+    sample_ips = 0
+    with zf.open(primary_member, "r") as raw_member:
+        for idx in range(25):
+            raw_line = raw_member.readline()
+            if not raw_line:
+                break
+            decoded = raw_line.decode("utf-8", errors="replace").strip()
+            if idx == 0 and decoded.lower().startswith(("<!doctype", "<html")):
+                raise CommandError("StopForumSpam archive contained HTML instead of CSV data.")
+            first_col = decoded.split(",", 1)[0].strip().strip('"')
+            if not first_col or first_col.startswith("#"):
+                continue
+            try:
+                ipaddress.ip_address(first_col)
+                sample_ips += 1
+            except ValueError:
+                continue
+    return sample_ips
 
 
 def _validate_sfs_zip_file(zip_path: Path, expected_md5: Optional[str]) -> int:
@@ -189,7 +197,6 @@ def _validate_sfs_zip_file(zip_path: Path, expected_md5: Optional[str]) -> int:
             raise CommandError(f"MD5 mismatch for {zip_path.name}: expected {expected_md5}, got {actual_md5}.")
     if not zipfile.is_zipfile(zip_path):
         raise CommandError(f"Downloaded file {zip_path.name} is not a valid zip archive.")
-    sample_ips = 0
     with zipfile.ZipFile(zip_path, "r") as zf:
         corrupt_member = zf.testzip()
         if corrupt_member is not None:
@@ -202,83 +209,52 @@ def _validate_sfs_zip_file(zip_path: Path, expected_md5: Optional[str]) -> int:
         primary_member = max(data_members, key=lambda info: info.file_size)
         if primary_member.file_size <= 0:
             raise CommandError("StopForumSpam zip archive data member is empty.")
-        with zf.open(primary_member, "r") as raw_member:
-            for idx in range(25):
-                raw_line = raw_member.readline()
-                if not raw_line:
-                    break
-                decoded = raw_line.decode("utf-8", errors="replace").strip()
-                if idx == 0 and decoded.lower().startswith(("<!doctype", "<html")):
-                    raise CommandError("StopForumSpam archive contained HTML instead of CSV data.")
-                first_col = decoded.split(",", 1)[0].strip().strip('"')
-                if not first_col or first_col.startswith("#"):
-                    continue
-                try:
-                    ipaddress.ip_address(first_col)
-                    sample_ips += 1
-                except ValueError:
-                    continue
+        sample_ips = _validate_sfs_zip_sample_rows(zf, primary_member)
     if sample_ips <= 0:
         raise CommandError("StopForumSpam zip archive did not contain recognisable IP records.")
     return sample_ips
 
 
-def _extract_mmdb_from_tar_gz(tar_path: Path, edition_name: str, target_dir: Path) -> Path:
+def _extract_mmdb_into_file(tar_path: Path, edition_name: str, destination_path: Path) -> None:
     expected_basename = f"{edition_name}.mmdb"
-    fd, tmp_mmdb_name = tempfile.mkstemp(prefix=f".{expected_basename}.tmp.", dir=str(target_dir))
-    os.close(fd)
-    tmp_mmdb_path = Path(tmp_mmdb_name)
-    try:
-        with tarfile.open(tar_path, "r:gz") as archive:
-            target_member = None
-            for member in archive.getmembers():
-                if not member.isfile():
-                    continue
-                if Path(member.name).name == expected_basename:
-                    target_member = member
-                    break
-            if target_member is None:
-                raise CommandError(f"Could not find {expected_basename} inside MaxMind archive.")
-            extracted = archive.extractfile(target_member)
-            if extracted is None:
-                raise CommandError(f"Failed to read {expected_basename} from MaxMind archive.")
-            written = 0
-            with extracted, tmp_mmdb_path.open("wb") as out_handle:
-                for chunk in iter(lambda: extracted.read(65536), b""):
-                    written += len(chunk)
-                    if written > MAX_ARCHIVE_BYTES:
-                        raise CommandError(f"Extracted {expected_basename} exceeded safety size limit.")
-                    out_handle.write(chunk)
-            if written <= 0:
-                raise CommandError(f"Extracted {expected_basename} is empty.")
+    with tarfile.open(tar_path, "r:gz") as archive:
+        target_member = next(
+            (m for m in archive.getmembers() if m.isfile() and Path(m.name).name == expected_basename),
+            None,
+        )
+        if target_member is None:
+            raise CommandError(f"Could not find {expected_basename} inside MaxMind archive.")
+        extracted = archive.extractfile(target_member)
+        if extracted is None:
+            raise CommandError(f"Failed to read {expected_basename} from MaxMind archive.")
+        written = 0
+        with extracted, destination_path.open("wb") as out_handle:
+            for chunk in iter(lambda: extracted.read(65536), b""):
+                written += len(chunk)
+                if written > MAX_ARCHIVE_BYTES:
+                    raise CommandError(f"Extracted {expected_basename} exceeded safety size limit.")
+                out_handle.write(chunk)
+        if written <= 0:
+            raise CommandError(f"Extracted {expected_basename} is empty.")
 
-        if maxminddb is not None:
-            reader = maxminddb.open_database(str(tmp_mmdb_path))
-            try:
-                _ = reader.metadata()
-            finally:
-                reader.close()
-        return tmp_mmdb_path
-    except Exception:
-        with contextlib.suppress(OSError):
-            tmp_mmdb_path.unlink()
-        raise
+    if maxminddb is not None:
+        reader = maxminddb.open_database(str(destination_path))
+        try:
+            _ = reader.metadata()
+        finally:
+            reader.close()
 
 
 def _normalize_cidr_list(raw_cidrs: Iterable[Any]) -> List[str]:
     """Validates, normalises, and deduplicates raw CIDR strings in deterministic order."""
     seen: set[str] = set()
     for raw in raw_cidrs:
-        if not isinstance(raw, str):
-            continue
-        cleaned = raw.strip()
-        if not cleaned:
+        if not isinstance(raw, str) or not raw.strip():
             continue
         try:
-            net = ipaddress.ip_network(cleaned, strict=False)
+            seen.add(str(ipaddress.ip_network(raw.strip(), strict=False)))
         except ValueError:
             continue
-        seen.add(str(net))
     return sorted(seen)
 
 
@@ -315,11 +291,8 @@ def _parse_oci_cloud_cidrs(payload: Any) -> List[str]:
         raise CommandError("OCI IP ranges payload missing regions list.")
     raw: List[Any] = []
     for region in regions:
-        if not isinstance(region, dict):
-            continue
-        cidrs = region.get("cidrs")
-        if isinstance(cidrs, list):
-            raw.extend(item.get("cidr") for item in cidrs if isinstance(item, dict))
+        if isinstance(region, dict) and isinstance(region.get("cidrs"), list):
+            raw.extend(item.get("cidr") for item in region["cidrs"] if isinstance(item, dict))
     return _normalize_cidr_list(raw)
 
 
@@ -338,11 +311,10 @@ def _parse_azure_cloud_cidrs(payload: Any) -> List[str]:
         raise CommandError("Azure ServiceTags payload missing values list.")
     raw: List[Any] = []
     for entry in values:
-        if not isinstance(entry, dict):
-            continue
-        props = entry.get("properties")
-        if isinstance(props, dict) and isinstance(props.get("addressPrefixes"), list):
-            raw.extend(props["addressPrefixes"])
+        if isinstance(entry, dict):
+            props = entry.get("properties")
+            if isinstance(props, dict) and isinstance(props.get("addressPrefixes"), list):
+                raw.extend(props["addressPrefixes"])
     return _normalize_cidr_list(raw)
 
 
@@ -350,9 +322,7 @@ def _fetch_json_payload(client: httpx.Client, url: str) -> Any:
     resp = client.get(url)
     resp.raise_for_status()
     json_fn = getattr(resp, "json", None)
-    if callable(json_fn):
-        return json_fn()
-    return json.loads(resp.text)
+    return json_fn() if callable(json_fn) else json.loads(resp.text)
 
 
 def _fetch_azure_cloud_cidrs(client: httpx.Client) -> List[str]:
@@ -378,25 +348,14 @@ def _load_existing_cloud_cidrs_by_provider(target_path: Path) -> Dict[str, List[
     except OSError, ValueError:
         return {}
     grouped: Dict[str, List[str]] = {}
-    for raw_cidr, provider_name in _parse_cloud_cidr_payload(payload):
+    for raw_cidr, provider_name in parse_cloud_cidr_payload(payload):
         grouped.setdefault(provider_name, []).append(raw_cidr)
     return {provider: _normalize_cidr_list(cidrs) for provider, cidrs in grouped.items()}
 
 
 def _write_json_atomically(payload: Dict[str, List[str]], target_path: Path) -> None:
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{target_path.name}.tmp.", dir=str(target_path.parent))
-    os.close(fd)
-    tmp_path = Path(tmp_name)
-    try:
+    with atomic_temp_path(target_path) as tmp_path:
         tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        with contextlib.suppress(OSError):
-            os.chmod(tmp_path, 0o644)
-        _atomic_replace(tmp_path, target_path)
-    finally:
-        if tmp_path.exists():
-            with contextlib.suppress(OSError):
-                tmp_path.unlink()
 
 
 class Command(BaseCommand):
@@ -439,10 +398,7 @@ class Command(BaseCommand):
     def _parse_sources(self, raw_sources: Iterable[str]) -> Tuple[bool, bool, bool]:
         tokens: List[str] = []
         for entry in raw_sources:
-            for part in str(entry).split(","):
-                cleaned = part.strip().lower()
-                if cleaned:
-                    tokens.append(cleaned)
+            tokens.extend(part.strip().lower() for part in str(entry).split(",") if part.strip())
         if not tokens or "all" in tokens:
             return True, True, True
         valid_tokens = {"stopforumspam", "sfs", "maxmind", "cloud_cidrs", "cloud-cidrs", "cloud", "all"}
@@ -495,9 +451,7 @@ class Command(BaseCommand):
         tmp_zip = _stream_download_to_temp(client, zip_url, target_path.parent, f".{target_path.name}.tmp.")
         try:
             _validate_sfs_zip_file(tmp_zip, expected_md5)
-            with contextlib.suppress(OSError):
-                os.chmod(tmp_zip, 0o644)
-            _atomic_replace(tmp_zip, target_path)
+            replace_temp_file_atomically(tmp_zip, target_path)
         finally:
             if tmp_zip.exists():
                 with contextlib.suppress(OSError):
@@ -505,6 +459,38 @@ class Command(BaseCommand):
 
         self.stdout.write(self.style.SUCCESS(f"Updated {label} ({target_path.name}, md5={expected_md5})."))
         return True
+
+    def _update_toxic_cidr(self, client: httpx.Client, toxic_target: Path, *, force: bool, dry_run: bool) -> int:
+        toxic_wait = _check_mtime_cooldown(toxic_target, SFS_TOXIC_MIN_INTERVAL_SECONDS, force=force)
+        if toxic_wait is not None:
+            self.stdout.write(
+                f"Skipped StopForumSpam Toxic CIDR ({toxic_target.name}): updated recently, wait {toxic_wait}s."
+            )
+            return 0
+        if dry_run:
+            self.stdout.write(f"[dry-run] Would download StopForumSpam Toxic CIDR -> {toxic_target}")
+            return 0
+
+        try:
+            tmp_toxic = _stream_download_to_temp(
+                client, SFS_TOXIC_CIDR_URL, toxic_target.parent, f".{toxic_target.name}.tmp."
+            )
+            try:
+                network_count = _validate_toxic_cidr_file(tmp_toxic)
+                replace_temp_file_atomically(tmp_toxic, toxic_target)
+                self.stdout.write(
+                    self.style.SUCCESS(
+                        f"Updated StopForumSpam Toxic CIDR ({toxic_target.name}, {network_count} CIDRs)."
+                    )
+                )
+            finally:
+                if tmp_toxic.exists():
+                    with contextlib.suppress(OSError):
+                        tmp_toxic.unlink()
+        except _DOWNLOAD_UPDATE_ERRORS as exc:
+            self.stderr.write(self.style.ERROR(_redact_update_error(f"Failed StopForumSpam Toxic CIDR update: {exc}")))
+            return 1
+        return 0
 
     def _update_stopforumspam(
         self,
@@ -520,69 +506,49 @@ class Command(BaseCommand):
         listed_1_target = sfs_dir / SFS_LISTED_1_ZIP_NAME
         sqlite_target = sfs_dir / SFS_SQLITE_FILENAME
 
-        errors = 0
+        errors = self._update_toxic_cidr(client, toxic_target, force=force, dry_run=dry_run)
         updated_listed = False
 
-        toxic_wait = _check_mtime_cooldown(toxic_target, SFS_TOXIC_MIN_INTERVAL_SECONDS, force=force)
-        if toxic_wait is not None:
-            self.stdout.write(
-                f"Skipped StopForumSpam Toxic CIDR ({toxic_target.name}): updated recently, wait {toxic_wait}s."
+        sfs_feeds = [
+            (
+                "StopForumSpam Listed IPs (90d)",
+                SFS_LISTED_90_ZIP_URL,
+                SFS_LISTED_90_MD5_URL,
+                listed_90_target,
+                SFS_90_MIN_INTERVAL_SECONDS,
+                "90d",
             )
-        elif dry_run:
-            self.stdout.write(f"[dry-run] Would download StopForumSpam Toxic CIDR -> {toxic_target}")
-        else:
-            try:
-                tmp_toxic = _stream_download_to_temp(client, SFS_TOXIC_CIDR_URL, sfs_dir, f".{toxic_target.name}.tmp.")
-                try:
-                    network_count = _validate_toxic_cidr_file(tmp_toxic)
-                    with contextlib.suppress(OSError):
-                        os.chmod(tmp_toxic, 0o644)
-                    _atomic_replace(tmp_toxic, toxic_target)
-                    self.stdout.write(
-                        self.style.SUCCESS(
-                            f"Updated StopForumSpam Toxic CIDR ({toxic_target.name}, {network_count} CIDRs)."
-                        )
-                    )
-                finally:
-                    if tmp_toxic.exists():
-                        with contextlib.suppress(OSError):
-                            tmp_toxic.unlink()
-            except _DOWNLOAD_UPDATE_ERRORS as exc:
-                errors += 1
-                self.stderr.write(self.style.ERROR(f"Failed StopForumSpam Toxic CIDR update: {exc}"))
-
-        try:
-            if self._download_sfs_zip(
-                client,
-                label="StopForumSpam Listed IPs (90d)",
-                zip_url=SFS_LISTED_90_ZIP_URL,
-                md5_url=SFS_LISTED_90_MD5_URL,
-                target_path=listed_90_target,
-                min_interval_seconds=SFS_90_MIN_INTERVAL_SECONDS,
-                force=force,
-                dry_run=dry_run,
-            ):
-                updated_listed = True
-        except _DOWNLOAD_UPDATE_ERRORS as exc:
-            errors += 1
-            self.stderr.write(self.style.ERROR(f"Failed StopForumSpam 90d update: {exc}"))
-
+        ]
         if not skip_listed_1:
+            sfs_feeds.append(
+                (
+                    "StopForumSpam Listed IPs (1d)",
+                    SFS_LISTED_1_ZIP_URL,
+                    SFS_LISTED_1_MD5_URL,
+                    listed_1_target,
+                    SFS_1_MIN_INTERVAL_SECONDS,
+                    "1d",
+                )
+            )
+
+        for label, zip_url, md5_url, target_path, min_interval, short_tag in sfs_feeds:
             try:
                 if self._download_sfs_zip(
                     client,
-                    label="StopForumSpam Listed IPs (1d)",
-                    zip_url=SFS_LISTED_1_ZIP_URL,
-                    md5_url=SFS_LISTED_1_MD5_URL,
-                    target_path=listed_1_target,
-                    min_interval_seconds=SFS_1_MIN_INTERVAL_SECONDS,
+                    label=label,
+                    zip_url=zip_url,
+                    md5_url=md5_url,
+                    target_path=target_path,
+                    min_interval_seconds=min_interval,
                     force=force,
                     dry_run=dry_run,
                 ):
                     updated_listed = True
             except _DOWNLOAD_UPDATE_ERRORS as exc:
                 errors += 1
-                self.stderr.write(self.style.ERROR(f"Failed StopForumSpam 1d update: {exc}"))
+                self.stderr.write(
+                    self.style.ERROR(_redact_update_error(f"Failed StopForumSpam {short_tag} update: {exc}"))
+                )
 
         has_any_listed = listed_90_target.is_file() or listed_1_target.is_file()
         if not dry_run and has_any_listed and (updated_listed or not sqlite_target.is_file()):
@@ -642,7 +608,6 @@ class Command(BaseCommand):
             tar_url = f"https://download.maxmind.com/geoip/databases/{edition}/download?suffix=tar.gz"
             sha_url = f"{tar_url}.sha256"
             tmp_tar: Optional[Path] = None
-            tmp_mmdb: Optional[Path] = None
             try:
                 sha_resp = client.get(sha_url, auth=(account_id, license_key))
                 sha_resp.raise_for_status()
@@ -660,19 +625,18 @@ class Command(BaseCommand):
                 actual_sha = _file_sha256_hex(tmp_tar)
                 if actual_sha != expected_sha:
                     raise CommandError(f"SHA-256 mismatch for {edition}: expected {expected_sha}, got {actual_sha}.")
-                tmp_mmdb = _extract_mmdb_from_tar_gz(tmp_tar, edition, maxmind_dir)
-                with contextlib.suppress(OSError):
-                    os.chmod(tmp_mmdb, 0o644)
-                _atomic_replace(tmp_mmdb, target_path)
+                with atomic_temp_path(target_path, prefix=f".{edition}.mmdb.tmp.") as tmp_mmdb:
+                    _extract_mmdb_into_file(tmp_tar, edition, tmp_mmdb)
                 self.stdout.write(self.style.SUCCESS(f"Updated {edition} ({filename}, sha256={expected_sha[:12]}...)."))
             except _DOWNLOAD_UPDATE_ERRORS as exc:
                 errors += 1
-                self.stderr.write(self.style.ERROR(_redact_text(f"Failed {edition} update: {exc}", secrets_to_hide)))
+                self.stderr.write(
+                    self.style.ERROR(_redact_update_error(f"Failed {edition} update: {exc}", secrets_to_hide))
+                )
             finally:
-                for leftover in (tmp_tar, tmp_mmdb):
-                    if leftover is not None and leftover.exists():
-                        with contextlib.suppress(OSError):
-                            leftover.unlink()
+                if tmp_tar is not None and tmp_tar.exists():
+                    with contextlib.suppress(OSError):
+                        tmp_tar.unlink()
 
         return errors
 

@@ -5,7 +5,8 @@ import socket
 import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any, Callable, Dict, Optional, Tuple
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import dns.exception
 import dns.name
@@ -13,6 +14,14 @@ import dns.resolver
 import dns.reversename
 import uvicorn
 
+from detector import (
+    cache_backends,
+    cidr_attribution,
+    detection_service,
+    dns_providers,
+    http_client,
+    intelligence,
+)
 from detector.adapters import (
     adapt_abuseipdb,
     adapt_cloudflare_radar,
@@ -28,6 +37,7 @@ from detector.adapters import (
     adapt_stopforumspam,
     adapt_tor_onionoo,
 )
+from detector.provider_registry import PROVIDER_REGISTRY
 
 TEST_UPSTREAM_SECRETS = {
     "CLOUDFLARE_RADAR_TOKEN": "cf-radar-token-7a1c",
@@ -394,3 +404,85 @@ def clean_dns_side_effect(qname, rdtype):
         answer.__str__ = lambda self: "dns.google."
         return [answer]
     raise dns.resolver.NXDOMAIN()
+
+
+_DNS_PROVIDER_KEYS = frozenset({"maxmind", "spamhaus_zen", "spamcop", "stopforumspam"})
+
+CANONICAL_PROVIDER_PATCH_TARGETS: Dict[str, str] = {
+    meta.key: (
+        f"detector.dns_providers.query_{meta.key}"
+        if meta.key in _DNS_PROVIDER_KEYS
+        else f"detector.providers.query_{meta.key}"
+    )
+    for meta in PROVIDER_REGISTRY
+}
+
+NON_DNSBL_PROVIDER_PATCH_SPECS: Tuple[Tuple[str, str, str], ...] = tuple(
+    (meta.key, CANONICAL_PROVIDER_PATCH_TARGETS[meta.key], meta.label)
+    for meta in PROVIDER_REGISTRY
+    if not meta.is_dnsbl
+)
+
+
+def stub_unconfigured_provider_row(name: str) -> Dict[str, Any]:
+    """Builds a clean unconfigured stub row for a named upstream provider."""
+    return {
+        "provider": name,
+        "status": "No API Key",
+        "statusCode": None,
+        "asn": "-",
+        "isp": "-",
+        "organisation": "-",
+        "location": "-",
+        "usageType": "-",
+        "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
+        "rawJson": {"status": "error", "message": "API key not configured"},
+    }
+
+
+def start_non_dnsbl_provider_stubs(
+    test_case,
+    *,
+    overrides: Optional[Dict[str, Any]] = None,
+    row_builder: Callable[[str], Dict[str, Any]] = stub_unconfigured_provider_row,
+) -> Dict[str, AsyncMock]:
+    """Starts canonical AsyncMock patches for all 13 non-DNSBL providers and registers cleanup."""
+    mocks: Dict[str, AsyncMock] = {}
+    custom = overrides or {}
+    for key, target_path, label in NON_DNSBL_PROVIDER_PATCH_SPECS:
+        return_row = custom[key] if key in custom else row_builder(label)
+        patcher = patch(target_path, new_callable=AsyncMock, return_value=return_row)
+        mocks[key] = patcher.start()
+        test_case.addCleanup(patcher.stop)
+    return mocks
+
+
+@contextlib.contextmanager
+def patch_non_dnsbl_providers(
+    side_effect_builder: Callable[[str], Any],
+    *,
+    overrides: Optional[Dict[str, Any]] = None,
+):
+    """Context manager patching all non-DNSBL providers with a per-label side effect or override mock."""
+    custom = overrides or {}
+    with contextlib.ExitStack() as stack:
+        mocks: Dict[str, Any] = {}
+        for key, target_path, label in NON_DNSBL_PROVIDER_PATCH_SPECS:
+            if key in custom:
+                mocks[key] = stack.enter_context(patch(target_path, custom[key]))
+            else:
+                mocks[key] = stack.enter_context(patch(target_path, side_effect=side_effect_builder(label)))
+        yield mocks
+
+
+def reset_detector_caches() -> None:
+    """Resets shared HTTP, Redis, MaxMind, DNS, offline, and singleflight caches between tests."""
+    with http_client.http_client_lock:
+        http_client.http_clients_by_loop.clear()
+    cache_backends.clear_redis_clients()
+    cache_backends.clear_maxmind_readers()
+    cache_backends.clear_maxmind_probe_cache()
+    dns_providers.clear_dns_resolver_cache()
+    intelligence.clear_proc_rss_cache()
+    detection_service._ip_detect_inflight.clear()
+    cidr_attribution.clear_offline_intelligence_caches()

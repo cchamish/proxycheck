@@ -11,11 +11,13 @@ from typing import Optional
 from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
+from detector.provider_registry import PROVIDER_REGISTRY
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
-def _resolve_dotenv_path(base_dir: Path, tool_data_dir: str = "") -> Optional[Path]:
-    """Locate an environment file from local project roots or Toolforge mounted storage."""
+def resolve_dotenv_path(base_dir: Path, tool_data_dir: str = "") -> Optional[Path]:
+    """Locates an environment file from local project roots or Toolforge mounted storage."""
     candidates = [
         base_dir / ".env",
         base_dir.parent / ".env",
@@ -36,7 +38,7 @@ def _resolve_dotenv_path(base_dir: Path, tool_data_dir: str = "") -> Optional[Pa
 
 
 _TOOL_DATA_DIR = os.environ.get("TOOL_DATA_DIR", "").strip()
-_dotenv_path = _resolve_dotenv_path(BASE_DIR, _TOOL_DATA_DIR)
+_dotenv_path = resolve_dotenv_path(BASE_DIR, _TOOL_DATA_DIR)
 if _dotenv_path is not None:
     load_dotenv(dotenv_path=_dotenv_path)
 else:
@@ -267,63 +269,26 @@ PROVIDER_COOLDOWN_MAX_SECONDS = _parse_positive_int_env("PROVIDER_COOLDOWN_MAX_S
 DNS_QUERY_TIMEOUT_SECONDS = _parse_positive_float_env("DNS_QUERY_TIMEOUT_SECONDS", 2.0)
 DNS_QUERY_LIFETIME_SECONDS = _parse_positive_float_env("DNS_QUERY_LIFETIME_SECONDS", 2.0)
 
-CLOUDFLARE_RADAR_TOKEN = os.environ.get("CLOUDFLARE_RADAR_TOKEN", "")
-ABUSEIPDB_API_KEY = os.environ.get("ABUSEIPDB_API_KEY", "")
-IPDATA_API_KEY = os.environ.get("IPDATA_API_KEY", "")
-IPREGISTRY_API_KEY = os.environ.get("IPREGISTRY_API_KEY", "")
-IP2LOCATION_API_KEY = os.environ.get("IP2LOCATION_API_KEY", "")
-GETIPINTEL_CONTACT_EMAIL = os.environ.get("GETIPINTEL_CONTACT_EMAIL", "")
-PROXYCHECK_API_KEY = os.environ.get("PROXYCHECK_API_KEY", "")
-IPHUB_API_KEY = os.environ.get("IPHUB_API_KEY", "")
-IPHUNTER_API_KEY = os.environ.get("IPHUNTER_API_KEY", "")
-
-# Optional per-provider soft quota limits (zero disables local interception)
-CLOUDFLARE_RADAR_RPM_LIMIT = _parse_non_negative_int_env("CLOUDFLARE_RADAR_RPM_LIMIT", 240)
-CLOUDFLARE_RADAR_DAILY_LIMIT = _parse_non_negative_int_env("CLOUDFLARE_RADAR_DAILY_LIMIT", 0)
-ABUSEIPDB_RPM_LIMIT = _parse_non_negative_int_env("ABUSEIPDB_RPM_LIMIT", 0)
-ABUSEIPDB_DAILY_LIMIT = _parse_non_negative_int_env("ABUSEIPDB_DAILY_LIMIT", 1000)
-IPDATA_RPM_LIMIT = _parse_non_negative_int_env("IPDATA_RPM_LIMIT", 0)
-IPDATA_DAILY_LIMIT = _parse_non_negative_int_env("IPDATA_DAILY_LIMIT", 1000)
-IPREGISTRY_RPM_LIMIT = _parse_non_negative_int_env("IPREGISTRY_RPM_LIMIT", 50)
-IPREGISTRY_DAILY_LIMIT = _parse_non_negative_int_env("IPREGISTRY_DAILY_LIMIT", 0)
-IP2LOCATION_RPM_LIMIT = _parse_non_negative_int_env("IP2LOCATION_RPM_LIMIT", 0)
-IP2LOCATION_DAILY_LIMIT = _parse_non_negative_int_env("IP2LOCATION_DAILY_LIMIT", 1000)
-GETIPINTEL_RPM_LIMIT = _parse_non_negative_int_env("GETIPINTEL_RPM_LIMIT", 15)
-GETIPINTEL_DAILY_LIMIT = _parse_non_negative_int_env("GETIPINTEL_DAILY_LIMIT", 500)
-PROXYCHECK_RPM_LIMIT = _parse_non_negative_int_env("PROXYCHECK_RPM_LIMIT", 0)
-PROXYCHECK_DAILY_LIMIT = _parse_non_negative_int_env("PROXYCHECK_DAILY_LIMIT", 1000)
-IPHUB_RPM_LIMIT = _parse_non_negative_int_env("IPHUB_RPM_LIMIT", 0)
-IPHUB_DAILY_LIMIT = _parse_non_negative_int_env("IPHUB_DAILY_LIMIT", 1000)
-IPHUNTER_RPM_LIMIT = _parse_non_negative_int_env("IPHUNTER_RPM_LIMIT", 0)
-IPHUNTER_DAILY_LIMIT = _parse_non_negative_int_env("IPHUNTER_DAILY_LIMIT", 1000)
-SPAMHAUS_ZEN_RPM_LIMIT = _parse_non_negative_int_env("SPAMHAUS_ZEN_RPM_LIMIT", 1000)
-SPAMHAUS_ZEN_DAILY_LIMIT = _parse_non_negative_int_env("SPAMHAUS_ZEN_DAILY_LIMIT", 0)
-SPAMCOP_RPM_LIMIT = _parse_non_negative_int_env("SPAMCOP_RPM_LIMIT", 0)
-SPAMCOP_DAILY_LIMIT = _parse_non_negative_int_env("SPAMCOP_DAILY_LIMIT", 0)
-TOR_ONIONOO_RPM_LIMIT = _parse_non_negative_int_env("TOR_ONIONOO_RPM_LIMIT", 0)
-TOR_ONIONOO_DAILY_LIMIT = _parse_non_negative_int_env("TOR_ONIONOO_DAILY_LIMIT", 0)
-STOPFORUMSPAM_RPM_LIMIT = 0
-STOPFORUMSPAM_DAILY_LIMIT = 0
-DSHIELD_RPM_LIMIT = _parse_non_negative_int_env("DSHIELD_RPM_LIMIT", 1000)
-DSHIELD_DAILY_LIMIT = _parse_non_negative_int_env("DSHIELD_DAILY_LIMIT", 0)
+for _provider_meta in PROVIDER_REGISTRY:
+    if _provider_meta.credential_setting is not None:
+        globals()[_provider_meta.credential_setting] = os.environ.get(_provider_meta.credential_setting, "")
+    if _provider_meta.has_quota_env_vars:
+        _rpm_limit = _parse_non_negative_int_env(_provider_meta.rpm_setting, _provider_meta.default_rpm_limit)
+        _daily_limit = _parse_non_negative_int_env(_provider_meta.daily_setting, _provider_meta.default_daily_limit)
+    else:
+        _rpm_limit = 0
+        _daily_limit = 0
+    globals()[_provider_meta.rpm_setting] = _rpm_limit
+    globals()[_provider_meta.daily_setting] = _daily_limit
 
 PROVIDER_QUOTA_LIMITS = {
-    "cloudflare_radar": {"rpm": CLOUDFLARE_RADAR_RPM_LIMIT, "daily": CLOUDFLARE_RADAR_DAILY_LIMIT},
-    "abuseipdb": {"rpm": ABUSEIPDB_RPM_LIMIT, "daily": ABUSEIPDB_DAILY_LIMIT},
-    "ipdata": {"rpm": IPDATA_RPM_LIMIT, "daily": IPDATA_DAILY_LIMIT},
-    "ipregistry": {"rpm": IPREGISTRY_RPM_LIMIT, "daily": IPREGISTRY_DAILY_LIMIT},
-    "ip2location": {"rpm": IP2LOCATION_RPM_LIMIT, "daily": IP2LOCATION_DAILY_LIMIT},
-    "getipintel": {"rpm": GETIPINTEL_RPM_LIMIT, "daily": GETIPINTEL_DAILY_LIMIT},
-    "proxycheck": {"rpm": PROXYCHECK_RPM_LIMIT, "daily": PROXYCHECK_DAILY_LIMIT},
-    "iphub": {"rpm": IPHUB_RPM_LIMIT, "daily": IPHUB_DAILY_LIMIT},
-    "iphunter": {"rpm": IPHUNTER_RPM_LIMIT, "daily": IPHUNTER_DAILY_LIMIT},
-    "maxmind": {"rpm": 0, "daily": 0},
-    "spamhaus_zen": {"rpm": SPAMHAUS_ZEN_RPM_LIMIT, "daily": SPAMHAUS_ZEN_DAILY_LIMIT},
-    "spamcop": {"rpm": SPAMCOP_RPM_LIMIT, "daily": SPAMCOP_DAILY_LIMIT},
-    "tor_onionoo": {"rpm": TOR_ONIONOO_RPM_LIMIT, "daily": TOR_ONIONOO_DAILY_LIMIT},
-    "stopforumspam": {"rpm": STOPFORUMSPAM_RPM_LIMIT, "daily": STOPFORUMSPAM_DAILY_LIMIT},
-    "dshield": {"rpm": DSHIELD_RPM_LIMIT, "daily": DSHIELD_DAILY_LIMIT},
+    meta.key: {
+        "rpm": globals()[meta.rpm_setting],
+        "daily": globals()[meta.daily_setting],
+    }
+    for meta in PROVIDER_REGISTRY
 }
+del _provider_meta, _rpm_limit, _daily_limit
 
 
 def _parse_csv_env(name: str) -> tuple[str, ...]:
@@ -333,7 +298,7 @@ def _parse_csv_env(name: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in raw_value.split(",") if item.strip())
 
 
-def _expand_configured_path(raw_path: str) -> str:
+def expand_configured_path(raw_path: str) -> str:
     """Expands environment variables and user home shortcuts in configured paths."""
     cleaned = str(raw_path or "").strip()
     if not cleaned:
@@ -344,29 +309,29 @@ def _expand_configured_path(raw_path: str) -> str:
 def _configured_tool_data_dir(explicit_tool_data_dir: Optional[str] = None) -> str:
     """Returns the configured TOOL_DATA_DIR from an explicit override, Django settings, or environment."""
     if explicit_tool_data_dir is not None:
-        return _expand_configured_path(explicit_tool_data_dir)
+        return expand_configured_path(explicit_tool_data_dir)
     try:
         from django.conf import settings as django_settings
 
         if django_settings.configured:
             setting_val = getattr(django_settings, "TOOL_DATA_DIR", "")
             if isinstance(setting_val, str) and setting_val.strip():
-                return _expand_configured_path(setting_val)
+                return expand_configured_path(setting_val)
     except ImportError, RuntimeError:
         pass
-    return _expand_configured_path(os.environ.get("TOOL_DATA_DIR", ""))
+    return expand_configured_path(os.environ.get("TOOL_DATA_DIR", ""))
 
 
 def resolve_tool_data_subdir(tool_data_dir: str) -> Path:
     """Resolves the persistent offline data subdirectory beneath a configured TOOL_DATA_DIR root."""
-    tool_root = Path(_expand_configured_path(tool_data_dir))
+    tool_root = Path(expand_configured_path(tool_data_dir))
     legacy_www_data = tool_root / "www" / "python" / "data"
     if legacy_www_data.is_dir():
         return legacy_www_data
     return tool_root / "data"
 
 
-def _standard_data_directories(base_dir: Path | str, *, tool_data_dir: Optional[str] = None) -> list[Path]:
+def standard_data_directories(base_dir: Path | str, *, tool_data_dir: Optional[str] = None) -> list[Path]:
     """Returns local workspace and Toolforge data directories in lookup priority order."""
     resolved_tool_dir = _configured_tool_data_dir(tool_data_dir)
     if resolved_tool_dir:
@@ -388,7 +353,7 @@ def _standard_data_directories(base_dir: Path | str, *, tool_data_dir: Optional[
     ]
 
 
-def _find_mmdb_in_directory(directory: Path, filename: str) -> Optional[Path]:
+def find_mmdb_in_directory(directory: Path, filename: str) -> Optional[Path]:
     """Finds an MMDB file directly inside directory or one extracted archive subdirectory."""
     direct = directory / filename
     if direct.exists():
@@ -408,7 +373,7 @@ def resolve_data_file(
     default_missing: Optional[str] = None,
 ) -> str:
     """Finds a local intelligence data file across configured, workspace, and Toolforge data paths."""
-    expanded_configured = _expand_configured_path(configured_path)
+    expanded_configured = expand_configured_path(configured_path)
     if expanded_configured:
         configured = Path(expanded_configured)
         if configured.is_file():
@@ -417,7 +382,7 @@ def resolve_data_file(
             return str(configured / filename)
 
     # Check local workspace directories and Toolforge mounted data paths in order.
-    for directory in _standard_data_directories(base_dir):
+    for directory in standard_data_directories(base_dir):
         candidate = directory / filename
         if candidate.exists():
             return str(candidate)
@@ -433,12 +398,12 @@ def resolve_mmdb_file(
     default_missing: Optional[str] = None,
 ) -> str:
     """Resolves an MMDB file from a configured directory or standard data locations."""
-    expanded_configured = _expand_configured_path(configured_path)
+    expanded_configured = expand_configured_path(configured_path)
     if expanded_configured:
         configured = Path(expanded_configured)
         if configured.is_file():
             return str(configured)
-        matched = _find_mmdb_in_directory(configured, filename)
+        matched = find_mmdb_in_directory(configured, filename)
         if matched is not None:
             return str(matched)
         return str(configured / filename)
@@ -457,8 +422,8 @@ def resolve_mmdb_file(
     if resolved_direct:
         return resolved_direct
 
-    for directory in _standard_data_directories(base_dir):
-        matched = _find_mmdb_in_directory(directory, filename)
+    for directory in standard_data_directories(base_dir):
+        matched = find_mmdb_in_directory(directory, filename)
         if matched is not None:
             return str(matched)
 

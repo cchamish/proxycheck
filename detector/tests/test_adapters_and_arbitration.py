@@ -1,9 +1,11 @@
-"""Tests for provider adapters, secret redaction, rDNS/CIDR attribution, and arbitration."""
+"""Tests for provider adapters, secret redaction, reverse DNS and CIDR attribution, and arbitration."""
 
 import asyncio
 import copy
 import json
 import os
+import re
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import dns.exception
@@ -13,7 +15,7 @@ import dns.reversename
 import httpx
 from django.test import SimpleTestCase, TestCase, override_settings
 
-from detector import views
+from detector import cache_backends, dns_providers, providers, sanitization, views
 from detector.adapters import (
     _safe_int,
     adapt_abuseipdb,
@@ -28,6 +30,11 @@ from detector.adapters import (
     classify_rdns_hostname,
     compute_cidr_attribution,
 )
+from detector.provider_registry import (
+    COMMERCIAL_ARBITRATION_PROVIDERS,
+    DEFAULT_QUOTA_LIMITS,
+    PROVIDER_REGISTRY,
+)
 
 from .helpers import (
     ALL_ADAPTERS,
@@ -40,6 +47,7 @@ from .helpers import (
     _mock_response,
     _patch_async_client,
     _ptr_or_clean_dns_side_effect,
+    start_non_dnsbl_provider_stubs,
 )
 
 
@@ -64,7 +72,7 @@ class CredentialRedactionTests(TestCase):
                 "and https://check.getipintel.net/check.php?ip=1.1.1.1&contact=me@example.org&format=json "
                 "and token=tok-777 secret=s3cr3t password=hunter2 access_token='bearer-xyz'"
             )
-            cleaned = views._sanitize_error_message(message)
+            cleaned = sanitization.sanitize_error_message(message)
 
         for leaked in ("secret123", "abc999", "me@example.org", "tok-777", "s3cr3t", "hunter2", "bearer-xyz"):
             self.assertNotIn(leaked, cleaned)
@@ -75,7 +83,7 @@ class CredentialRedactionTests(TestCase):
 
     def test_sanitize_redacts_configured_and_dynamic_keys_and_handles_edge_inputs(self):
         with override_settings(**TEST_UPSTREAM_SECRETS), patch.dict(os.environ, TEST_UPSTREAM_SECRETS):
-            cleaned = views._sanitize_error_message(
+            cleaned = sanitization.sanitize_error_message(
                 "Header X-Key iphub-key-81fa rejected, contact ops-contact%40example.org"
             )
         self.assertNotIn("iphub-key-81fa", cleaned)
@@ -83,14 +91,14 @@ class CredentialRedactionTests(TestCase):
         self.assertEqual(cleaned.count("***REDACTED***"), 2)
 
         with override_settings(**EMPTY_UPSTREAM_SECRETS), patch.dict(os.environ, EMPTY_UPSTREAM_SECRETS):
-            self.assertEqual(views._sanitize_error_message("plain upstream failure"), "plain upstream failure")
-            self.assertEqual(views._sanitize_error_message(""), "")
-            self.assertEqual(views._sanitize_error_message(None), "")
+            self.assertEqual(sanitization.sanitize_error_message("plain upstream failure"), "plain upstream failure")
+            self.assertEqual(sanitization.sanitize_error_message(""), "")
+            self.assertEqual(sanitization.sanitize_error_message(None), "")
 
             with override_settings(IPDATA_API_KEY="first-dynamic-key-1001"):
-                first_cached = views._configured_secret_values()
-                self.assertIs(first_cached, views._configured_secret_values())
-                first_cleaned = views._sanitize_error_message(
+                first_cached = sanitization.configured_secret_values()
+                self.assertIs(first_cached, sanitization.configured_secret_values())
+                first_cleaned = sanitization.sanitize_error_message(
                     "Upstream rejected key first-dynamic-key-1001 with Bearer tok-abc123"
                 )
                 self.assertNotIn("first-dynamic-key-1001", first_cleaned)
@@ -98,14 +106,14 @@ class CredentialRedactionTests(TestCase):
                 self.assertIn("Bearer ***REDACTED***", first_cleaned)
 
             with override_settings(IPDATA_API_KEY="rotated-dynamic-key-2002"):
-                rotated_cached = views._configured_secret_values()
+                rotated_cached = sanitization.configured_secret_values()
                 self.assertIsNot(first_cached, rotated_cached)
-                rotated_cleaned = views._sanitize_error_message("Upstream rejected key rotated-dynamic-key-2002")
+                rotated_cleaned = sanitization.sanitize_error_message("Upstream rejected key rotated-dynamic-key-2002")
                 self.assertNotIn("rotated-dynamic-key-2002", rotated_cleaned)
                 self.assertIn("***REDACTED***", rotated_cleaned)
 
-    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
-    @patch("detector.views.httpx.AsyncClient")
+    @patch("detector.dns_providers.query_maxmind", new_callable=AsyncMock)
+    @patch("detector.http_client.httpx.AsyncClient")
     def test_upstream_timeouts_are_redacted_in_response_logs_and_cache(self, mock_async_client_cls, mock_mm):
         mock_mm.return_value = dict(MAXMIND_STUB)
 
@@ -122,7 +130,7 @@ class CredentialRedactionTests(TestCase):
         with (
             override_settings(**TEST_UPSTREAM_SECRETS),
             patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-            patch("detector.views.redis_client", mock_redis),
+            patch("detector.cache_backends.redis_client", mock_redis),
             self.assertLogs("detector.views", level="ERROR") as captured_logs,
         ):
             response = self.client.get("/api/v1/detect?ip=8.8.8.8")
@@ -143,8 +151,8 @@ class CredentialRedactionTests(TestCase):
         self.assertEqual(rows["Proxycheck"]["status"], "502 Error")
         self.assertIn("key=***REDACTED***", rows["Proxycheck"]["rawJson"]["message"])
 
-    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
-    @patch("detector.views.httpx.AsyncClient")
+    @patch("detector.dns_providers.query_maxmind", new_callable=AsyncMock)
+    @patch("detector.http_client.httpx.AsyncClient")
     def test_upstream_body_echoing_key_is_redacted(self, mock_async_client_cls, mock_mm):
         mock_mm.return_value = dict(MAXMIND_STUB)
 
@@ -160,7 +168,7 @@ class CredentialRedactionTests(TestCase):
         with (
             override_settings(**TEST_UPSTREAM_SECRETS),
             patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-            patch("detector.views.redis_client", None),
+            patch("detector.cache_backends.redis_client", None),
         ):
             response = self.client.get("/api/v1/detect?ip=8.8.8.8")
 
@@ -236,8 +244,8 @@ class UpstreamPayloadDefenceTests(TestCase):
         self.assertEqual(cf_null["asn"], "-")
         self.assertEqual(adapt_abuseipdb({"data": None}, True, 200)["status"], "200 Error")
 
-    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
-    @patch("detector.views.httpx.AsyncClient")
+    @patch("detector.dns_providers.query_maxmind", new_callable=AsyncMock)
+    @patch("detector.http_client.httpx.AsyncClient")
     def test_detect_ip_survives_malformed_upstream_bodies(self, mock_async_client_cls, mock_mm):
         cases = (
             ("null block", {"json_value": {"block": None}}, ("IPHub", "IPHunter")),
@@ -264,7 +272,7 @@ class UpstreamPayloadDefenceTests(TestCase):
                 with (
                     override_settings(**TEST_UPSTREAM_SECRETS),
                     patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-                    patch("detector.views.redis_client", None),
+                    patch("detector.cache_backends.redis_client", None),
                     self.assertNoLogs("detector.views", level="ERROR"),
                 ):
                     response = self.client.get("/api/v1/detect?ip=8.8.8.8")
@@ -402,12 +410,12 @@ class AggregationAndCacheIntegrityTests(TestCase):
                 "cachedAt": "2026-11-15T08:00:00+00:00",
             }
         )
-        with patch("detector.views._sanitize_payload", wraps=views._sanitize_payload) as spy_sanitize:
-            decoded_sanitized = views._decode_cached_provider_entry(sanitized_entry)
+        with patch("detector.sanitization.sanitize_payload", wraps=sanitization.sanitize_payload) as spy_sanitize:
+            decoded_sanitized = cache_backends._decode_cached_provider_entry(sanitized_entry)
             self.assertIsNotNone(decoded_sanitized)
             self.assertEqual(spy_sanitize.call_count, 0)
 
-            decoded_legacy = views._decode_cached_provider_entry(legacy_entry)
+            decoded_legacy = cache_backends._decode_cached_provider_entry(legacy_entry)
             self.assertIsNotNone(decoded_legacy)
             self.assertGreater(spy_sanitize.call_count, 0)
             self.assertIn("key=***REDACTED***", decoded_legacy[0]["rawJson"]["detail"])
@@ -417,8 +425,8 @@ class AggregationAndCacheIntegrityTests(TestCase):
         new_callable=AsyncMock,
         side_effect=dns.exception.Timeout("DNS timed out"),
     )
-    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
-    @patch("detector.views.httpx.AsyncClient")
+    @patch("detector.dns_providers.query_maxmind", new_callable=AsyncMock)
+    @patch("detector.http_client.httpx.AsyncClient")
     def test_transient_429_and_5xx_errors_do_not_pollute_redis_cache(self, mock_async_client_cls, mock_mm, _mock_dns):
         mock_mm.return_value = dict(MAXMIND_STUB)
         _login_authorised(self)
@@ -437,7 +445,7 @@ class AggregationAndCacheIntegrityTests(TestCase):
                 with (
                     override_settings(**TEST_UPSTREAM_SECRETS),
                     patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-                    patch("detector.views.redis_client", mock_redis),
+                    patch("detector.cache_backends.redis_client", mock_redis),
                 ):
                     response = self.client.get("/api/v1/detect?ip=8.8.8.8")
 
@@ -471,7 +479,7 @@ class ReverseDnsAndCidrAttributionTests(TestCase):
             new_callable=AsyncMock,
             return_value=_mock_ptr_answer("EC2-54-239-28-85.compute-1.amazonaws.com."),
         ) as mock_dns:
-            hostname = asyncio.run(views.query_rdns_ptr("54.239.28.85"))
+            hostname = asyncio.run(dns_providers.query_rdns_ptr("54.239.28.85"))
             mock_dns.assert_awaited_once_with(
                 dns.reversename.from_address("54.239.28.85"),
                 "PTR",
@@ -499,41 +507,44 @@ class ReverseDnsAndCidrAttributionTests(TestCase):
         self.assertFalse(none_info["isHighRisk"])
 
     def test_cidr_attribution_defaults_and_mmdb_prefix_selection(self):
-        # Verify IPv4 default prefix 24 and IPv6 default prefix 64 when no MMDB prefix is present
-        v4_default = compute_cidr_attribution("203.0.113.45", None)
-        self.assertEqual(v4_default["recommendedCidr"], "203.0.113.0/24")
-        self.assertEqual(v4_default["defaultCidr"], "203.0.113.0/24")
-        self.assertIsNone(v4_default["mmdbCidr"])
-
-        v6_default = compute_cidr_attribution("2001:db8:abcd:1234:5678::1", None)
-        self.assertEqual(v6_default["recommendedCidr"], "2001:db8:abcd:1234::/64")
-        self.assertEqual(v6_default["defaultCidr"], "2001:db8:abcd:1234::/64")
-        self.assertIsNone(v6_default["mmdbCidr"])
-
-        # Verify narrower MMDB prefix is selected over the default granularity
-        v4_narrow = compute_cidr_attribution("203.0.113.45", 28)
-        self.assertEqual(v4_narrow["recommendedCidr"], "203.0.113.32/28")
-        self.assertEqual(v4_narrow["defaultCidr"], "203.0.113.0/24")
-        self.assertEqual(v4_narrow["mmdbCidr"], "203.0.113.32/28")
-
-        v6_narrow = compute_cidr_attribution("2001:db8:abcd:1234:5678::1", 80)
-        self.assertEqual(v6_narrow["recommendedCidr"], "2001:db8:abcd:1234:5678::/80")
-        self.assertEqual(v6_narrow["defaultCidr"], "2001:db8:abcd:1234::/64")
-        self.assertEqual(v6_narrow["mmdbCidr"], "2001:db8:abcd:1234:5678::/80")
-
-        # Verify wider MMDB prefix is capped at default granularity while preserving mmdbCidr
-        v4_wide = compute_cidr_attribution("203.0.113.45", 16)
-        self.assertEqual(v4_wide["recommendedCidr"], "203.0.113.0/24")
-        self.assertEqual(v4_wide["defaultCidr"], "203.0.113.0/24")
-        self.assertEqual(v4_wide["mmdbCidr"], "203.0.0.0/16")
-
-        v6_wide = compute_cidr_attribution("2001:db8:abcd:1234:5678::1", 48)
-        self.assertEqual(v6_wide["recommendedCidr"], "2001:db8:abcd:1234::/64")
-        self.assertEqual(v6_wide["defaultCidr"], "2001:db8:abcd:1234::/64")
-        self.assertEqual(v6_wide["mmdbCidr"], "2001:db8:abcd::/48")
+        cases = (
+            ("v4_default", "203.0.113.45", None, "203.0.113.0/24", "203.0.113.0/24", None),
+            (
+                "v6_default",
+                "2001:db8:abcd:1234:5678::1",
+                None,
+                "2001:db8:abcd:1234::/64",
+                "2001:db8:abcd:1234::/64",
+                None,
+            ),
+            ("v4_narrow", "203.0.113.45", 28, "203.0.113.32/28", "203.0.113.0/24", "203.0.113.32/28"),
+            (
+                "v6_narrow",
+                "2001:db8:abcd:1234:5678::1",
+                80,
+                "2001:db8:abcd:1234:5678::/80",
+                "2001:db8:abcd:1234::/64",
+                "2001:db8:abcd:1234:5678::/80",
+            ),
+            ("v4_wide", "203.0.113.45", 16, "203.0.113.0/24", "203.0.113.0/24", "203.0.0.0/16"),
+            (
+                "v6_wide",
+                "2001:db8:abcd:1234:5678::1",
+                48,
+                "2001:db8:abcd:1234::/64",
+                "2001:db8:abcd:1234::/64",
+                "2001:db8:abcd::/48",
+            ),
+        )
+        for label, ip, prefix_len, expected_rec, expected_def, expected_mmdb in cases:
+            with self.subTest(case=label):
+                attribution = compute_cidr_attribution(ip, prefix_len)
+                self.assertEqual(attribution["recommendedCidr"], expected_rec)
+                self.assertEqual(attribution["defaultCidr"], expected_def)
+                self.assertEqual(attribution["mmdbCidr"], expected_mmdb)
 
     def test_maxmind_sync_extracts_prefix_length_for_aggregation(self):
-        views._maxmind_readers.clear()
+        cache_backends._maxmind_readers.clear()
         mock_asn_reader = MagicMock()
         mock_asn_reader.get.return_value = {
             "autonomous_system_number": 16509,
@@ -547,10 +558,10 @@ class ReverseDnsAndCidrAttributionTests(TestCase):
         mock_maxmind_module.open_database.return_value = mock_asn_reader
 
         with (
-            patch("detector.views.os.path.exists", side_effect=lambda p: "asn" in str(p).lower()),
+            patch("detector.dns_providers.os.path.exists", side_effect=lambda p: "asn" in str(p).lower()),
             patch.dict("sys.modules", {"maxminddb": mock_maxmind_module}),
         ):
-            mm_row = views._read_maxmind_sync("54.239.28.85")
+            mm_row = dns_providers._read_maxmind_sync("54.239.28.85")
 
         self.assertEqual(mm_row["status"], "200 OK")
         self.assertEqual(mm_row["prefixLength"], 26)
@@ -566,35 +577,7 @@ class ReverseDnsAndCidrAttributionTests(TestCase):
         self.assertEqual(aggregated["mmdbCidr"], "54.239.28.64/26")
         self.assertEqual(aggregated["ptrCategory"], "hosting_or_gateway")
 
-    @patch("detector.views.query_dshield", new_callable=AsyncMock)
-    @patch("detector.views.query_stopforumspam", new_callable=AsyncMock)
-    @patch("detector.views.query_tor_onionoo", new_callable=AsyncMock)
-    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
-    @patch("detector.views.query_iphunter", new_callable=AsyncMock)
-    @patch("detector.views.query_iphub", new_callable=AsyncMock)
-    @patch("detector.views.query_proxycheck", new_callable=AsyncMock)
-    @patch("detector.views.query_getipintel", new_callable=AsyncMock)
-    @patch("detector.views.query_ip2location", new_callable=AsyncMock)
-    @patch("detector.views.query_ipregistry", new_callable=AsyncMock)
-    @patch("detector.views.query_ipdata", new_callable=AsyncMock)
-    @patch("detector.views.query_abuseipdb", new_callable=AsyncMock)
-    @patch("detector.views.query_cloudflare_radar", new_callable=AsyncMock)
-    def test_cache_conditions_preserved_across_rdns_and_upstream_states(
-        self,
-        mock_cf,
-        mock_abuse,
-        mock_ipdata,
-        mock_ipreg,
-        mock_ip2loc,
-        mock_gii,
-        mock_pc,
-        mock_iphub,
-        mock_iphunter,
-        mock_mm,
-        mock_tor,
-        mock_sfs,
-        mock_dshield,
-    ):
+    def test_cache_conditions_preserved_across_rdns_and_upstream_states(self):
         def _ok_provider(name):
             return {
                 "provider": name,
@@ -610,22 +593,12 @@ class ReverseDnsAndCidrAttributionTests(TestCase):
                 "rawJson": {},
             }
 
-        for m, name in (
-            (mock_cf, "Cloudflare Radar"),
-            (mock_abuse, "AbuseIPDB"),
-            (mock_ipdata, "IPData"),
-            (mock_ipreg, "IPRegistry"),
-            (mock_ip2loc, "IP2Location"),
-            (mock_gii, "GetIPIntel"),
-            (mock_pc, "Proxycheck"),
-            (mock_iphub, "IPHub"),
-            (mock_iphunter, "IPHunter"),
-            (mock_tor, "Tor Onionoo"),
-            (mock_sfs, "StopForumSpam"),
-            (mock_dshield, "DShield"),
-        ):
-            m.return_value = _ok_provider(name)
-        mock_mm.return_value = dict(MAXMIND_STUB)
+        mocks = start_non_dnsbl_provider_stubs(
+            self,
+            overrides={"maxmind": dict(MAXMIND_STUB)},
+            row_builder=_ok_provider,
+        )
+        mock_cf = mocks["cloudflare_radar"]
 
         cache_store = {}
         written_ttls = {}
@@ -643,7 +616,7 @@ class ReverseDnsAndCidrAttributionTests(TestCase):
 
         # Transient DNS timeout skips caching PTR while healthy HTTP providers still cache
         with (
-            patch("detector.views.redis_client", mock_redis),
+            patch("detector.cache_backends.redis_client", mock_redis),
             patch(
                 "dns.asyncresolver.Resolver.resolve",
                 new_callable=AsyncMock,
@@ -663,7 +636,7 @@ class ReverseDnsAndCidrAttributionTests(TestCase):
 
         # Subsequent lookup recovers PTR using cached providers without re-querying HTTP APIs
         with (
-            patch("detector.views.redis_client", mock_redis),
+            patch("detector.cache_backends.redis_client", mock_redis),
             patch(
                 "dns.asyncresolver.Resolver.resolve",
                 new_callable=AsyncMock,
@@ -840,3 +813,44 @@ class FlagBasedArbitrationTests(SimpleTestCase):
         self.assertTrue(confirmed_result["isMajorityProxyVpn"])
         self.assertEqual(confirmed_result["arbitrationTier"], "destructive")
         self.assertIn("Confirmed Proxy", confirmed_result["arbitrationVerdict"])
+
+
+class CrossStackProviderContractTests(SimpleTestCase):
+    """Tests provider registry alignment across backend, TypeScript helpers, and MediaWiki gadget."""
+
+    def test_provider_registry_aligns_with_frontend_and_userscript_contracts(self):
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        ts_source = (repo_root / "src" / "utils" / "ip-detector-logic.ts").read_text(encoding="utf-8")
+        gadget_source = (repo_root / "scripts" / "user-gadget.js").read_text(encoding="utf-8")
+
+        expected_labels = [meta.label for meta in PROVIDER_REGISTRY]
+        spec_labels = [spec.label for spec in providers.PROVIDER_SPECS]
+        self.assertEqual(spec_labels, expected_labels)
+        self.assertEqual(DEFAULT_QUOTA_LIMITS["getipintel"], (15, 500))
+
+        ts_provider_block = re.search(r"export const PROVIDER_NAMES\s*=\s*\[(.*?)\]\s*as const;", ts_source, re.S)
+        self.assertIsNotNone(ts_provider_block)
+        ts_providers = re.findall(r"'([^']+)'", ts_provider_block.group(1))
+        self.assertEqual(ts_providers, expected_labels)
+
+        ts_comm_block = re.search(
+            r"export const COMMERCIAL_ARBITRATION_PROVIDERS\s*=\s*\[(.*?)\]\s*as const;",
+            ts_source,
+            re.S,
+        )
+        self.assertIsNotNone(ts_comm_block)
+        ts_commercial = set(re.findall(r"'([^']+)'", ts_comm_block.group(1)))
+        self.assertEqual(ts_commercial, set(COMMERCIAL_ARBITRATION_PROVIDERS))
+
+        gadget_comm_block = re.search(r"var COMMERCIAL_PROVIDERS\s*=\s*\{(.*?)\};", gadget_source, re.S)
+        self.assertIsNotNone(gadget_comm_block)
+        gadget_commercial = set(re.findall(r"'([^']+)'\s*:\s*true", gadget_comm_block.group(1)))
+        self.assertEqual(gadget_commercial, set(COMMERCIAL_ARBITRATION_PROVIDERS))
+
+        palette_block = re.search(r"var PROVIDER_BADGE_PALETTES\s*=\s*\{(.*?)\n    \};", gadget_source, re.S)
+        self.assertIsNotNone(palette_block)
+        palette_keys = set(re.findall(r"'([^']+)'\s*:\s*\{", palette_block.group(1)))
+        self.assertTrue(set(expected_labels).issubset(palette_keys))
+
+        self.assertNotIn(".html(", gadget_source)
+        self.assertNotIn("innerHTML", gadget_source)

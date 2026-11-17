@@ -1,4 +1,4 @@
-"""Tests for async DNS/DNSBL resolution, OSINT feeds, and Proxycheck extensions."""
+"""Tests for async DNS and DNSBL resolution, OSINT feeds, and Proxycheck extensions."""
 
 import asyncio
 import json
@@ -16,7 +16,7 @@ import dns.reversename
 import httpx
 from django.test import TestCase, override_settings
 
-from detector import views
+from detector import dns_providers, http_client, providers
 from detector.adapters import (
     adapt_dshield,
     adapt_proxycheck,
@@ -33,6 +33,7 @@ from .helpers import (
     _mock_ptr_answer,
     _mock_response,
     _patch_async_client,
+    start_non_dnsbl_provider_stubs,
 )
 
 
@@ -44,7 +45,7 @@ class AsyncDnsAndDnsblTests(TestCase):
 
     async def test_async_ptr_success_nxdomain_and_resolver_timeouts(self):
         with override_settings(DNS_QUERY_TIMEOUT_SECONDS=1.5, DNS_QUERY_LIFETIME_SECONDS=3.0):
-            resolver = views._create_async_resolver()
+            resolver = dns_providers._create_async_resolver()
             self.assertEqual(resolver.timeout, 1.5)
             self.assertEqual(resolver.lifetime, 3.0)
 
@@ -54,12 +55,12 @@ class AsyncDnsAndDnsblTests(TestCase):
             return_value=_mock_ptr_answer("DNS.GOOGLE."),
         ) as mock_resolve:
             state = {"status": "ok"}
-            token = views._rdns_context_state.set(state)
+            token = dns_providers._rdns_context_state.set(state)
             try:
-                v4_host = await views.query_rdns_ptr("8.8.8.8")
-                v6_host = await views.query_rdns_ptr("2001:4860:4860::8888")
+                v4_host = await dns_providers.query_rdns_ptr("8.8.8.8")
+                v6_host = await dns_providers.query_rdns_ptr("2001:4860:4860::8888")
             finally:
-                views._rdns_context_state.reset(token)
+                dns_providers._rdns_context_state.reset(token)
 
         self.assertEqual(v4_host, "dns.google")
         self.assertEqual(v6_host, "dns.google")
@@ -82,12 +83,12 @@ class AsyncDnsAndDnsblTests(TestCase):
         ):
             with self.subTest(case=label):
                 err_state = {"status": "ok"}
-                token = views._rdns_context_state.set(err_state)
+                token = dns_providers._rdns_context_state.set(err_state)
                 try:
                     with patch("dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock, side_effect=exc):
-                        res = await views.query_rdns_ptr("1.2.3.4")
+                        res = await dns_providers.query_rdns_ptr("1.2.3.4")
                 finally:
-                    views._rdns_context_state.reset(token)
+                    dns_providers._rdns_context_state.reset(token)
                 self.assertIsNone(res)
                 self.assertEqual(err_state["status"], expected_status)
 
@@ -97,7 +98,7 @@ class AsyncDnsAndDnsblTests(TestCase):
             new_callable=AsyncMock,
             return_value=_mock_a_answer("127.0.0.2"),
         ) as mock_resolve:
-            sbl_row = await views.query_spamhaus_zen("1.2.3.4")
+            sbl_row = await dns_providers.query_spamhaus_zen("1.2.3.4")
 
         mock_resolve.assert_awaited_once_with("4.3.2.1.zen.spamhaus.org", "A")
         self.assertEqual(sbl_row["status"], "200 OK")
@@ -110,7 +111,7 @@ class AsyncDnsAndDnsblTests(TestCase):
             new_callable=AsyncMock,
             return_value=_mock_a_answer("127.0.0.3", "127.0.0.4"),
         ):
-            combo_row = await views.query_spamhaus_zen("1.2.3.4")
+            combo_row = await dns_providers.query_spamhaus_zen("1.2.3.4")
         self.assertEqual(combo_row["status"], "200 OK")
         self.assertTrue(combo_row["isListed"])
         self.assertIn("CSS", combo_row["usageType"])
@@ -125,7 +126,7 @@ class AsyncDnsAndDnsblTests(TestCase):
                     new_callable=AsyncMock,
                     return_value=_mock_a_answer(pbl_code),
                 ):
-                    pbl_row = await views.query_spamhaus_zen("1.2.3.4")
+                    pbl_row = await dns_providers.query_spamhaus_zen("1.2.3.4")
                 self.assertEqual(pbl_row["status"], "200 OK")
                 self.assertTrue(pbl_row["isPolicyRange"])
                 self.assertIn("Policy/Dynamic ISP Range", pbl_row["usageType"])
@@ -138,7 +139,7 @@ class AsyncDnsAndDnsblTests(TestCase):
                     new_callable=AsyncMock,
                     return_value=_mock_a_answer(restricted_code),
                 ):
-                    blocked_row = await views.query_spamhaus_zen("1.2.3.4")
+                    blocked_row = await dns_providers.query_spamhaus_zen("1.2.3.4")
                 self.assertFalse(blocked_row["isListed"])
                 self.assertTrue(blocked_row.get("isQueryRestricted"))
                 self.assertEqual(blocked_row["statusCode"], 429)
@@ -151,7 +152,7 @@ class AsyncDnsAndDnsblTests(TestCase):
             new_callable=AsyncMock,
             side_effect=dns.resolver.NXDOMAIN(),
         ):
-            clean_row = await views.query_spamhaus_zen("1.2.3.4")
+            clean_row = await dns_providers.query_spamhaus_zen("1.2.3.4")
         self.assertEqual(clean_row["status"], "200 OK")
         self.assertFalse(clean_row["isListed"])
         self.assertEqual(clean_row["usageType"], "Clean (Not Listed)")
@@ -162,7 +163,7 @@ class AsyncDnsAndDnsblTests(TestCase):
             new_callable=AsyncMock,
             return_value=_mock_a_answer("127.0.0.2"),
         ) as mock_resolve:
-            listed_row = await views.query_spamcop("192.0.2.55")
+            listed_row = await dns_providers.query_spamcop("192.0.2.55")
 
         mock_resolve.assert_awaited_once_with("55.2.0.192.bl.spamcop.net", "A")
         self.assertEqual(listed_row["status"], "200 OK")
@@ -175,7 +176,7 @@ class AsyncDnsAndDnsblTests(TestCase):
             new_callable=AsyncMock,
             side_effect=dns.resolver.NXDOMAIN(),
         ):
-            clean_row = await views.query_spamcop("192.0.2.55")
+            clean_row = await dns_providers.query_spamcop("192.0.2.55")
         self.assertEqual(clean_row["status"], "200 OK")
         self.assertFalse(clean_row["isListed"])
         self.assertEqual(clean_row["usageType"], "Clean (Not Listed)")
@@ -188,9 +189,9 @@ class AsyncDnsAndDnsblTests(TestCase):
             raise dns.resolver.NXDOMAIN()
 
         with (
-            patch("detector.views.redis_client", None),
-            patch("detector.views.query_maxmind", AsyncMock(return_value=dict(MAXMIND_STUB))),
-            patch("detector.views.httpx.AsyncClient") as mock_async_client_cls,
+            patch("detector.cache_backends.redis_client", None),
+            patch("detector.dns_providers.query_maxmind", AsyncMock(return_value=dict(MAXMIND_STUB))),
+            patch("detector.http_client.httpx.AsyncClient") as mock_async_client_cls,
             patch("dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock, side_effect=_record_dns),
         ):
             _patch_async_client(
@@ -212,35 +213,7 @@ class AsyncDnsAndDnsblTests(TestCase):
             self.assertTrue(rows_by_provider[dnsbl_name].get("isSkippedIpv6"))
             self.assertIn("IPv6", rows_by_provider[dnsbl_name]["usageType"])
 
-    @patch("detector.views.query_dshield", new_callable=AsyncMock)
-    @patch("detector.views.query_stopforumspam", new_callable=AsyncMock)
-    @patch("detector.views.query_tor_onionoo", new_callable=AsyncMock)
-    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
-    @patch("detector.views.query_iphunter", new_callable=AsyncMock)
-    @patch("detector.views.query_iphub", new_callable=AsyncMock)
-    @patch("detector.views.query_proxycheck", new_callable=AsyncMock)
-    @patch("detector.views.query_getipintel", new_callable=AsyncMock)
-    @patch("detector.views.query_ip2location", new_callable=AsyncMock)
-    @patch("detector.views.query_ipregistry", new_callable=AsyncMock)
-    @patch("detector.views.query_ipdata", new_callable=AsyncMock)
-    @patch("detector.views.query_abuseipdb", new_callable=AsyncMock)
-    @patch("detector.views.query_cloudflare_radar", new_callable=AsyncMock)
-    def test_detect_endpoint_preserves_commercial_arbitration_and_handles_spamhaus_block(
-        self,
-        mock_cf,
-        mock_abuse,
-        mock_ipdata,
-        mock_ipreg,
-        mock_ip2loc,
-        mock_gii,
-        mock_pc,
-        mock_iphub,
-        mock_iphunter,
-        mock_mm,
-        mock_tor,
-        mock_sfs,
-        mock_dshield,
-    ):
+    def test_detect_endpoint_preserves_commercial_arbitration_and_handles_spamhaus_block(self):
         def _clean_commercial(name):
             return {
                 "provider": name,
@@ -256,24 +229,18 @@ class AsyncDnsAndDnsblTests(TestCase):
                 "rawJson": {},
             }
 
-        for m, name in (
-            (mock_cf, "Cloudflare Radar"),
-            (mock_abuse, "AbuseIPDB"),
-            (mock_ipdata, "IPData"),
-            (mock_ipreg, "IPRegistry"),
-            (mock_ip2loc, "IP2Location"),
-            (mock_gii, "GetIPIntel"),
-            (mock_pc, "Proxycheck"),
-            (mock_iphub, "IPHub"),
-            (mock_iphunter, "IPHunter"),
-        ):
-            m.return_value = _clean_commercial(name)
-        mock_tor.return_value = adapt_tor_onionoo({"relays": []}, 200, "1.2.3.4")
-        mock_sfs.return_value = adapt_stopforumspam(
-            {"success": 1, "ip": {"appears": 0, "frequency": 0, "confidence": 0.0}}, 200
+        start_non_dnsbl_provider_stubs(
+            self,
+            overrides={
+                "maxmind": dict(MAXMIND_STUB),
+                "tor_onionoo": adapt_tor_onionoo({"relays": []}, 200, "1.2.3.4"),
+                "stopforumspam": adapt_stopforumspam(
+                    {"success": 1, "ip": {"appears": 0, "frequency": 0, "confidence": 0.0}}, 200
+                ),
+                "dshield": adapt_dshield({"ip": {"attacks": 0, "count": 0}}, 200),
+            },
+            row_builder=_clean_commercial,
         )
-        mock_dshield.return_value = adapt_dshield({"ip": {"attacks": 0, "count": 0}}, 200)
-        mock_mm.return_value = dict(MAXMIND_STUB)
 
         cache_store = {}
         written_ttls = {}
@@ -300,7 +267,7 @@ class AsyncDnsAndDnsblTests(TestCase):
             raise dns.resolver.NXDOMAIN()
 
         with (
-            patch("detector.views.redis_client", mock_redis),
+            patch("detector.cache_backends.redis_client", mock_redis),
             patch("dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock, side_effect=_listed_dns_side_effect),
         ):
             resp = self.client.get("/api/v1/detect?ip=1.2.3.4")
@@ -330,7 +297,7 @@ class AsyncDnsAndDnsblTests(TestCase):
             raise dns.resolver.NXDOMAIN()
 
         with (
-            patch("detector.views.redis_client", mock_redis),
+            patch("detector.cache_backends.redis_client", mock_redis),
             patch(
                 "dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock, side_effect=_blocked_spamhaus_side_effect
             ),
@@ -516,7 +483,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         client.get.side_effect = _get
 
         with override_settings(**TEST_UPSTREAM_SECRETS), patch.dict(os.environ, TEST_UPSTREAM_SECRETS):
-            result = asyncio.run(views.query_proxycheck(client, "198.51.100.20"))
+            result = asyncio.run(providers.query_proxycheck(client, "198.51.100.20"))
 
         parsed = urlparse(captured["url"])
         qs = parse_qs(parsed.query)
@@ -586,56 +553,48 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         self.assertTrue(guard_v6["torRunning"])
         self.assertEqual(guard_v6["torLabel"], "Tor Guard")
 
-        prefix_miss = adapt_tor_onionoo(
-            {
-                "relays": [
-                    {"a": ["185.220.101.99"], "r": True, "flags": ["Exit"]},
-                ]
-            },
-            status_code=200,
-            ip="185.220.101.4",
-        )
-        self.assertFalse(prefix_miss["isTor"])
-
-        offline_relay = adapt_tor_onionoo(
-            {
-                "relays": [
-                    {"a": ["185.220.101.4"], "r": False, "flags": ["Exit", "Stable"]},
-                ]
-            },
-            status_code=200,
-            ip="185.220.101.4",
-        )
-        self.assertFalse(offline_relay["isTor"])
-        self.assertFalse(offline_relay["torRunning"])
-
-        inferred_offline = adapt_tor_onionoo(
-            {
-                "relays": [
-                    {"a": ["185.220.101.4"], "flags": ["Exit", "Stable"]},
-                ]
-            },
-            status_code=200,
-            ip="185.220.101.4",
-        )
-        self.assertFalse(inferred_offline["isTor"])
-        self.assertFalse(inferred_offline["torRunning"])
-
-        inferred_running = adapt_tor_onionoo(
-            {
-                "relays": [
-                    {"a": ["185.220.101.4"], "flags": ["Exit", "Running"]},
-                ]
-            },
-            status_code=200,
-            ip="185.220.101.4",
-        )
-        self.assertTrue(inferred_running["isTor"])
-        self.assertTrue(inferred_running["torRunning"])
-
-        empty_relays = adapt_tor_onionoo({"relays": []}, status_code=200, ip="8.8.8.8")
-        self.assertFalse(empty_relays["isTor"])
-        self.assertEqual(empty_relays["usageType"], "Not a Tor Node")
+        for label, payload, ip, expected_is_tor, expected_running, expected_usage in (
+            (
+                "prefix_miss",
+                {"relays": [{"a": ["185.220.101.99"], "r": True, "flags": ["Exit"]}]},
+                "185.220.101.4",
+                False,
+                None,
+                None,
+            ),
+            (
+                "offline_relay",
+                {"relays": [{"a": ["185.220.101.4"], "r": False, "flags": ["Exit", "Stable"]}]},
+                "185.220.101.4",
+                False,
+                False,
+                None,
+            ),
+            (
+                "inferred_offline",
+                {"relays": [{"a": ["185.220.101.4"], "flags": ["Exit", "Stable"]}]},
+                "185.220.101.4",
+                False,
+                False,
+                None,
+            ),
+            (
+                "inferred_running",
+                {"relays": [{"a": ["185.220.101.4"], "flags": ["Exit", "Running"]}]},
+                "185.220.101.4",
+                True,
+                True,
+                None,
+            ),
+            ("empty_relays", {"relays": []}, "8.8.8.8", False, None, "Not a Tor Node"),
+        ):
+            with self.subTest(case=label):
+                adapted = adapt_tor_onionoo(payload, status_code=200, ip=ip)
+                self.assertEqual(adapted["isTor"], expected_is_tor)
+                if expected_running is not None:
+                    self.assertEqual(adapted["torRunning"], expected_running)
+                if expected_usage is not None:
+                    self.assertEqual(adapted["usageType"], expected_usage)
 
         captured = {}
 
@@ -645,7 +604,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
 
         client = AsyncMock()
         client.get.side_effect = _get
-        queried = asyncio.run(views.query_tor_onionoo(client, "8.8.8.8"))
+        queried = asyncio.run(providers.query_tor_onionoo(client, "8.8.8.8"))
         self.assertEqual(captured["url"], "https://onionoo.torproject.org/summary?search=8.8.8.8")
         self.assertFalse(queried["isTor"])
 
@@ -688,8 +647,8 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
             toxic_file.write_text("198.51.100.0/24\n", encoding="utf-8")
             offline_dbs.clear_stopforumspam_caches()
             with override_settings(TOOL_DATA_DIR=tmp_dir):
-                hit_row = asyncio.run(views.query_stopforumspam(None, "198.51.100.5"))
-                clean_row = asyncio.run(views.query_stopforumspam(None, "203.0.113.5"))
+                hit_row = asyncio.run(dns_providers.query_stopforumspam(None, "198.51.100.5"))
+                clean_row = asyncio.run(dns_providers.query_stopforumspam(None, "203.0.113.5"))
             offline_dbs.clear_stopforumspam_caches()
 
         self.assertEqual(hit_row["status"], "200 OK")
@@ -702,7 +661,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         with tempfile.TemporaryDirectory() as empty_dir:
             offline_dbs.clear_stopforumspam_caches()
             with override_settings(TOOL_DATA_DIR=empty_dir):
-                missing_row = asyncio.run(views.query_stopforumspam(None, "198.51.100.5"))
+                missing_row = asyncio.run(dns_providers.query_stopforumspam(None, "198.51.100.5"))
             offline_dbs.clear_stopforumspam_caches()
         self.assertEqual(missing_row["status"], "Offline DB Missing")
         self.assertIsNone(missing_row["statusCode"])
@@ -755,7 +714,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
 
         client = AsyncMock()
         client.get.side_effect = _get
-        asyncio.run(views.query_dshield(client, "198.51.100.5"))
+        asyncio.run(providers.query_dshield(client, "198.51.100.5"))
         self.assertEqual(captured["url"], "https://isc.sans.edu/api/ip/198.51.100.5?json")
         self.assertIn("ProxyCheck", captured["headers"].get("User-Agent", ""))
         self.assertTrue(captured["follow_redirects"])
@@ -763,7 +722,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
 
     def test_dshield_retries_fallback_and_isolates_follow_redirects(self):
         # Verify the shared HTTP client and unrelated providers keep redirects disabled by default
-        shared_client = asyncio.run(views._get_shared_http_client())
+        shared_client = asyncio.run(http_client.get_shared_http_client())
         self.assertFalse(shared_client.follow_redirects)
 
         default_capture = {}
@@ -776,7 +735,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
 
         default_client = AsyncMock()
         default_client.get.side_effect = _default_get
-        asyncio.run(views.query_tor_onionoo(default_client, "198.51.100.5"))
+        asyncio.run(providers.query_tor_onionoo(default_client, "198.51.100.5"))
         self.assertFalse(default_capture["follow_redirects"])
         self.assertEqual(default_capture["timeout"], 5.0)
 
@@ -799,7 +758,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
                     primary_outcome.headers = {"Content-Type": "text/html"}
                 attempted = []
                 upstream_events = {}
-                token = views._provider_upstream_events.set(upstream_events)
+                token = dns_providers._provider_upstream_events.set(upstream_events)
 
                 async def _fallback_get(url, outcome=primary_outcome, captured_urls=attempted, **kwargs):
                     captured_urls.append((url, kwargs.get("follow_redirects"), kwargs.get("timeout")))
@@ -813,9 +772,9 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
                 fallback_client.get.side_effect = _fallback_get
                 try:
                     with self.assertLogs("detector.views", level="WARNING") as captured_logs:
-                        result = asyncio.run(views.query_dshield(fallback_client, "198.51.100.5"))
+                        result = asyncio.run(providers.query_dshield(fallback_client, "198.51.100.5"))
                 finally:
-                    views._provider_upstream_events.reset(token)
+                    dns_providers._provider_upstream_events.reset(token)
 
                 self.assertEqual(result["status"], "200 OK")
                 self.assertEqual(result["attacks"], 3)
@@ -843,14 +802,14 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
 
         both_bad_client.get.side_effect = _both_bad
         with self.assertLogs("detector.views", level="WARNING"):
-            failed_result = asyncio.run(views.query_dshield(both_bad_client, "198.51.100.5"))
+            failed_result = asyncio.run(providers.query_dshield(both_bad_client, "198.51.100.5"))
         self.assertEqual(failed_result["status"], "502 Error")
 
     def test_dshield_skips_fallback_on_timeout_slow_failure_or_non_gateway_status(self):
         # ReadTimeout on the primary endpoint must return immediately without hitting the fallback host
         timeout_urls = []
         upstream_events = {}
-        token = views._provider_upstream_events.set(upstream_events)
+        token = dns_providers._provider_upstream_events.set(upstream_events)
 
         async def _timeout_get(url, **kwargs):
             timeout_urls.append((url, kwargs.get("timeout")))
@@ -860,9 +819,9 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         timeout_client.get.side_effect = _timeout_get
         try:
             with self.assertLogs("detector.views", level="ERROR"):
-                timeout_result = asyncio.run(views.query_dshield(timeout_client, "198.51.100.5"))
+                timeout_result = asyncio.run(providers.query_dshield(timeout_client, "198.51.100.5"))
         finally:
-            views._provider_upstream_events.reset(token)
+            dns_providers._provider_upstream_events.reset(token)
 
         self.assertEqual(timeout_result["status"], "502 Error")
         self.assertEqual(timeout_urls, [("https://isc.sans.edu/api/ip/198.51.100.5?json", 10.0)])
@@ -878,10 +837,10 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         slow_error_client = AsyncMock()
         slow_error_client.get.side_effect = _slow_error_get
         with (
-            patch.object(views, "time", SimpleNamespace(monotonic=MagicMock(side_effect=[100.0, 105.31]))),
+            patch.object(providers, "time", SimpleNamespace(monotonic=MagicMock(side_effect=[100.0, 105.31]))),
             self.assertLogs("detector.views", level="WARNING"),
         ):
-            slow_error_result = asyncio.run(views.query_dshield(slow_error_client, "198.51.100.5"))
+            slow_error_result = asyncio.run(providers.query_dshield(slow_error_client, "198.51.100.5"))
 
         self.assertEqual(slow_error_result["status"], "503 Error")
         self.assertEqual(slow_error_urls, [("https://isc.sans.edu/api/ip/198.51.100.5?json", 10.0)])
@@ -895,8 +854,8 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
 
         slow_ok_client = AsyncMock()
         slow_ok_client.get.side_effect = _slow_ok_get
-        with patch.object(views, "time", SimpleNamespace(monotonic=MagicMock(side_effect=[200.0, 205.31]))):
-            slow_ok_result = asyncio.run(views.query_dshield(slow_ok_client, "198.51.100.5"))
+        with patch.object(providers, "time", SimpleNamespace(monotonic=MagicMock(side_effect=[200.0, 205.31]))):
+            slow_ok_result = asyncio.run(providers.query_dshield(slow_ok_client, "198.51.100.5"))
 
         self.assertEqual(slow_ok_result["status"], "200 OK")
         self.assertEqual(slow_ok_urls, [("https://isc.sans.edu/api/ip/198.51.100.5?json", 10.0)])
@@ -913,7 +872,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
                 status_client = AsyncMock()
                 status_client.get.side_effect = _status_get
                 with self.assertLogs("detector.views", level="WARNING"):
-                    res = asyncio.run(views.query_dshield(status_client, "198.51.100.5"))
+                    res = asyncio.run(providers.query_dshield(status_client, "198.51.100.5"))
                 self.assertEqual(len(attempted), 1)
                 self.assertEqual(res["statusCode"], status)
 
@@ -922,8 +881,8 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         new_callable=AsyncMock,
         side_effect=dns.resolver.NXDOMAIN(),
     )
-    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
-    @patch("detector.views.httpx.AsyncClient")
+    @patch("detector.dns_providers.query_maxmind", new_callable=AsyncMock)
+    @patch("detector.http_client.httpx.AsyncClient")
     def test_detect_endpoint_excludes_tor_from_comparison_and_preserves_commercial_verdict_over_osint_hits(
         self, mock_async_client_cls, mock_mm, _mock_dns
     ):
@@ -960,7 +919,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
             with (
                 override_settings(**{**TEST_UPSTREAM_SECRETS, "TOOL_DATA_DIR": sfs_tmp_dir}),
                 patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-                patch("detector.views.redis_client", mock_redis),
+                patch("detector.cache_backends.redis_client", mock_redis),
             ):
                 resp = self.client.get("/api/v1/detect?ip=185.220.101.4")
 
@@ -988,7 +947,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
             with (
                 override_settings(**{**TEST_UPSTREAM_SECRETS, "TOOL_DATA_DIR": sfs_tmp_dir}),
                 patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-                patch("detector.views.redis_client", mock_redis),
+                patch("detector.cache_backends.redis_client", mock_redis),
             ):
                 tor_resp = self.client.get("/api/v1/detect?ip=185.220.101.9")
             offline_dbs.clear_stopforumspam_caches()

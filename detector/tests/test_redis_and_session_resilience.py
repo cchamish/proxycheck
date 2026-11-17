@@ -17,7 +17,7 @@ from django.contrib.sessions.middleware import SessionInterrupted
 from django.http import HttpResponse
 from django.test import RequestFactory, TestCase, override_settings
 
-from detector import views
+from detector import cache_backends, detection_service, http_client, views
 from detector.middleware import ResilientSessionMiddleware
 
 from .helpers import (
@@ -25,6 +25,7 @@ from .helpers import (
     _login_authorised,
     _mock_response,
     _ptr_or_clean_dns_side_effect,
+    start_non_dnsbl_provider_stubs,
 )
 
 
@@ -32,11 +33,11 @@ class LoopIsolationAndSessionSettingsTests(TestCase):
     """Tests per-loop Redis and HTTP client isolation, empty error logging, and Redis sessions."""
 
     def tearDown(self):
-        with views._http_client_lock:
-            views._http_clients_by_loop.clear()
-        with views._redis_client_lock:
-            views._redis_clients_by_loop.clear()
-        views.reset_redis_circuit_breaker()
+        with http_client.http_client_lock:
+            http_client.http_clients_by_loop.clear()
+        with cache_backends._redis_client_lock:
+            cache_backends._redis_clients_by_loop.clear()
+        cache_backends.reset_redis_circuit_breaker()
 
     def test_redis_client_reused_within_loop_and_isolated_across_closed_loops(self):
         created_clients = []
@@ -47,12 +48,12 @@ class LoopIsolationAndSessionSettingsTests(TestCase):
             return client
 
         async def _acquire_twice():
-            first = views._get_redis_client()
-            second = views._get_redis_client()
+            first = cache_backends._get_redis_client()
+            second = cache_backends._get_redis_client()
             self.assertIs(first, second)
             return first
 
-        with patch.object(views.aioredis, "from_url", side_effect=_make_fake_redis):
+        with patch.object(cache_backends.aioredis, "from_url", side_effect=_make_fake_redis):
             client_one = asyncio.run(_acquire_twice())
             client_two = asyncio.run(_acquire_twice())
 
@@ -67,15 +68,15 @@ class LoopIsolationAndSessionSettingsTests(TestCase):
 
         def _worker():
             async def _inner():
-                redis_first = views._get_redis_client()
-                http_first = await views._get_shared_http_client()
+                redis_first = cache_backends._get_redis_client()
+                http_first = await http_client.get_shared_http_client()
                 barrier.wait(timeout=5)
-                redis_second = views._get_redis_client()
-                http_second = await views._get_shared_http_client()
+                redis_second = cache_backends._get_redis_client()
+                http_second = await http_client.get_shared_http_client()
                 self.assertIs(redis_first, redis_second)
                 self.assertIs(http_first, http_second)
                 self.assertFalse(http_first.is_closed)
-                await views._close_http_client_safely(http_first)
+                await http_client.close_http_client_safely(http_first)
                 return redis_first, http_first
 
             return asyncio.run(_inner())
@@ -104,7 +105,7 @@ class LoopIsolationAndSessionSettingsTests(TestCase):
         self.assertEqual(proc.returncode, 0, msg=proc.stderr or proc.stdout)
 
     def test_dotenv_resolver_supports_tool_data_dir(self):
-        from proxycheck.settings import _resolve_dotenv_path
+        from proxycheck.settings import resolve_dotenv_path
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tool_root = Path(tmpdir) / "tool"
@@ -114,7 +115,7 @@ class LoopIsolationAndSessionSettingsTests(TestCase):
             env_file = python_dir / ".env"
             env_file.write_text("DJANGO_DEBUG=False\n", encoding="utf-8")
 
-            resolved_env = _resolve_dotenv_path(Path(tmpdir) / "workspace", str(tool_root))
+            resolved_env = resolve_dotenv_path(Path(tmpdir) / "workspace", str(tool_root))
             self.assertEqual(resolved_env, env_file)
 
 
@@ -122,74 +123,38 @@ class RedisDegradationAndOAuthFallbackTests(TestCase):
     """Tests Redis cache fault tolerance, OAuth upstream error handling, and callback route aliases."""
 
     def tearDown(self):
-        views._ip_detect_inflight.clear()
-        with views._redis_client_lock:
-            views._redis_clients_by_loop.clear()
-        views.reset_redis_circuit_breaker()
+        detection_service._ip_detect_inflight.clear()
+        with cache_backends._redis_client_lock:
+            cache_backends._redis_clients_by_loop.clear()
+        cache_backends.reset_redis_circuit_breaker()
+
+    @staticmethod
+    def _ok_google_row(name: str) -> dict:
+        return {
+            "provider": name,
+            "status": "200 OK",
+            "statusCode": 200,
+            "asn": "AS15169",
+            "isp": "Google",
+            "organisation": "Google",
+            "location": "United States",
+            "usageType": "isp",
+            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
+            "countryCode": "US",
+            "rawJson": {},
+        }
 
     @patch(
         "dns.asyncresolver.Resolver.resolve",
         new_callable=AsyncMock,
         side_effect=_ptr_or_clean_dns_side_effect(ptr_hostname="dns.google."),
     )
-    @patch("detector.views.query_dshield", new_callable=AsyncMock)
-    @patch("detector.views.query_stopforumspam", new_callable=AsyncMock)
-    @patch("detector.views.query_tor_onionoo", new_callable=AsyncMock)
-    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
-    @patch("detector.views.query_iphunter", new_callable=AsyncMock)
-    @patch("detector.views.query_iphub", new_callable=AsyncMock)
-    @patch("detector.views.query_proxycheck", new_callable=AsyncMock)
-    @patch("detector.views.query_getipintel", new_callable=AsyncMock)
-    @patch("detector.views.query_ip2location", new_callable=AsyncMock)
-    @patch("detector.views.query_ipregistry", new_callable=AsyncMock)
-    @patch("detector.views.query_ipdata", new_callable=AsyncMock)
-    @patch("detector.views.query_abuseipdb", new_callable=AsyncMock)
-    @patch("detector.views.query_cloudflare_radar", new_callable=AsyncMock)
-    def test_detect_ip_returns_200_when_redis_raises_connection_or_timeout_errors(
-        self,
-        mock_cf,
-        mock_abuse,
-        mock_ipdata,
-        mock_ipreg,
-        mock_ip2loc,
-        mock_gii,
-        mock_pc,
-        mock_iphub,
-        mock_iphunter,
-        mock_mm,
-        mock_tor,
-        mock_sfs,
-        mock_dshield,
-        _mock_dns,
-    ):
-        for mock_fn, name in (
-            (mock_cf, "Cloudflare Radar"),
-            (mock_abuse, "AbuseIPDB"),
-            (mock_ipdata, "IPData"),
-            (mock_ipreg, "IPRegistry"),
-            (mock_ip2loc, "IP2Location"),
-            (mock_gii, "GetIPIntel"),
-            (mock_pc, "Proxycheck"),
-            (mock_iphub, "IPHub"),
-            (mock_iphunter, "IPHunter"),
-            (mock_tor, "Tor Onionoo"),
-            (mock_sfs, "StopForumSpam"),
-            (mock_dshield, "DShield"),
-        ):
-            mock_fn.return_value = {
-                "provider": name,
-                "status": "200 OK",
-                "statusCode": 200,
-                "asn": "AS15169",
-                "isp": "Google",
-                "organisation": "Google",
-                "location": "United States",
-                "usageType": "isp",
-                "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                "countryCode": "US",
-                "rawJson": {},
-            }
-        mock_mm.return_value = dict(MAXMIND_STUB)
+    def test_detect_ip_returns_200_when_redis_raises_connection_or_timeout_errors(self, _mock_dns):
+        start_non_dnsbl_provider_stubs(
+            self,
+            overrides={"maxmind": dict(MAXMIND_STUB)},
+            row_builder=self._ok_google_row,
+        )
 
         _login_authorised(self)
         bearer_token = views.issue_gadget_token("SysopUser")
@@ -208,7 +173,7 @@ class RedisDegradationAndOAuthFallbackTests(TestCase):
                     mock_redis.set = AsyncMock(side_effect=exc)
 
                     with (
-                        patch("detector.views.redis_client", mock_redis),
+                        patch("detector.cache_backends.redis_client", mock_redis),
                         self.assertLogs("detector.views", level="WARNING") as captured_logs,
                     ):
                         resp = self.client.get("/api/v1/detect?ip=8.8.8.8", **headers)
@@ -229,51 +194,51 @@ class RedisDegradationAndOAuthFallbackTests(TestCase):
         loop_client.get = AsyncMock(side_effect=[redis.exceptions.TimeoutError("Timed out"), "cached-ok"])
         loop_client.set = AsyncMock(return_value=True)
 
-        views.reset_redis_circuit_breaker()
+        cache_backends.reset_redis_circuit_breaker()
         with (
-            patch.object(views.aioredis, "from_url", return_value=loop_client),
-            patch("detector.views.time.monotonic", side_effect=lambda: monotonic_clock[0]),
+            patch.object(cache_backends.aioredis, "from_url", return_value=loop_client),
+            patch("detector.cache_backends.time.monotonic", side_effect=lambda: monotonic_clock[0]),
         ):
-            self.assertFalse(views.is_redis_circuit_open())
-            self.assertIs(views._get_redis_client(), loop_client)
+            self.assertFalse(cache_backends.is_redis_circuit_open())
+            self.assertIs(cache_backends._get_redis_client(), loop_client)
 
             # Non-connection exceptions must not trip the circuit breaker
-            views.mark_redis_failure(ValueError("unexpected serialization error"))
-            self.assertFalse(views.is_redis_circuit_open())
+            cache_backends.mark_redis_failure(ValueError("unexpected serialization error"))
+            self.assertFalse(cache_backends.is_redis_circuit_open())
 
             with self.assertLogs("detector.views", level="WARNING") as captured_logs:
-                first_read = await views._safe_redis_get("proxycheck:v1:prov:proxycheck:8.8.8.8")
+                first_read = await cache_backends._safe_redis_get("proxycheck:v1:prov:proxycheck:8.8.8.8")
 
             self.assertIsNone(first_read)
-            self.assertTrue(views.is_redis_circuit_open())
+            self.assertTrue(cache_backends.is_redis_circuit_open())
             self.assertTrue(any("circuit breaker opened" in line for line in captured_logs.output))
             self.assertEqual(loop_client.get.await_count, 1)
 
             # Within the cooldown window, client acquisition fails open immediately without calling Redis
             monotonic_clock[0] = 104.9
-            self.assertIsNone(views._get_redis_client())
+            self.assertIsNone(cache_backends._get_redis_client())
             self.assertIsNone(quota_telemetry._get_redis_client())
-            self.assertIsNone(await views._safe_redis_get("proxycheck:v1:prov:proxycheck:8.8.8.8"))
-            await views._safe_redis_set("proxycheck:v1:prov:proxycheck:8.8.8.8", "{}", ex=60)
+            self.assertIsNone(await cache_backends._safe_redis_get("proxycheck:v1:prov:proxycheck:8.8.8.8"))
+            await cache_backends._safe_redis_set("proxycheck:v1:prov:proxycheck:8.8.8.8", "{}", ex=60)
             self.assertEqual(loop_client.get.await_count, 1)
             self.assertEqual(loop_client.set.await_count, 0)
 
             # Once the cooldown elapses, the default client resumes automatically
             monotonic_clock[0] = 105.0
-            self.assertFalse(views.is_redis_circuit_open())
-            self.assertIs(views._get_redis_client(), loop_client)
-            recovered_read = await views._safe_redis_get("proxycheck:v1:prov:proxycheck:8.8.8.8")
+            self.assertFalse(cache_backends.is_redis_circuit_open())
+            self.assertIs(cache_backends._get_redis_client(), loop_client)
+            recovered_read = await cache_backends._safe_redis_get("proxycheck:v1:prov:proxycheck:8.8.8.8")
             self.assertEqual(recovered_read, "cached-ok")
             self.assertEqual(loop_client.get.await_count, 2)
 
             # Write errors also trip the breaker and explicit reset closes it immediately
             loop_client.set = AsyncMock(side_effect=ConnectionError("Connection reset by peer"))
-            await views._safe_redis_set("proxycheck:v1:prov:proxycheck:8.8.8.8", "{}", ex=60)
-            self.assertTrue(views.is_redis_circuit_open())
-            self.assertIsNone(views._get_redis_client())
-            views.reset_redis_circuit_breaker()
-            self.assertFalse(views.is_redis_circuit_open())
-            self.assertIs(views._get_redis_client(), loop_client)
+            await cache_backends._safe_redis_set("proxycheck:v1:prov:proxycheck:8.8.8.8", "{}", ex=60)
+            self.assertTrue(cache_backends.is_redis_circuit_open())
+            self.assertIsNone(cache_backends._get_redis_client())
+            cache_backends.reset_redis_circuit_breaker()
+            self.assertFalse(cache_backends.is_redis_circuit_open())
+            self.assertIs(cache_backends._get_redis_client(), loop_client)
 
     @override_settings(REDIS_CIRCUIT_BREAKER_SECONDS=5.0)
     @patch(
@@ -281,66 +246,14 @@ class RedisDegradationAndOAuthFallbackTests(TestCase):
         new_callable=AsyncMock,
         side_effect=_ptr_or_clean_dns_side_effect(ptr_hostname="dns.google."),
     )
-    @patch("detector.views.query_dshield", new_callable=AsyncMock)
-    @patch("detector.views.query_stopforumspam", new_callable=AsyncMock)
-    @patch("detector.views.query_tor_onionoo", new_callable=AsyncMock)
-    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
-    @patch("detector.views.query_iphunter", new_callable=AsyncMock)
-    @patch("detector.views.query_iphub", new_callable=AsyncMock)
-    @patch("detector.views.query_proxycheck", new_callable=AsyncMock)
-    @patch("detector.views.query_getipintel", new_callable=AsyncMock)
-    @patch("detector.views.query_ip2location", new_callable=AsyncMock)
-    @patch("detector.views.query_ipregistry", new_callable=AsyncMock)
-    @patch("detector.views.query_ipdata", new_callable=AsyncMock)
-    @patch("detector.views.query_abuseipdb", new_callable=AsyncMock)
-    @patch("detector.views.query_cloudflare_radar", new_callable=AsyncMock)
-    async def test_redis_circuit_breaker_short_circuits_multistage_detect_request(
-        self,
-        mock_cf,
-        mock_abuse,
-        mock_ipdata,
-        mock_ipreg,
-        mock_ip2loc,
-        mock_gii,
-        mock_pc,
-        mock_iphub,
-        mock_iphunter,
-        mock_mm,
-        mock_tor,
-        mock_sfs,
-        mock_dshield,
-        _mock_dns,
-    ):
+    async def test_redis_circuit_breaker_short_circuits_multistage_detect_request(self, _mock_dns):
         from django.test import AsyncClient
 
-        for mock_fn, name in (
-            (mock_cf, "Cloudflare Radar"),
-            (mock_abuse, "AbuseIPDB"),
-            (mock_ipdata, "IPData"),
-            (mock_ipreg, "IPRegistry"),
-            (mock_ip2loc, "IP2Location"),
-            (mock_gii, "GetIPIntel"),
-            (mock_pc, "Proxycheck"),
-            (mock_iphub, "IPHub"),
-            (mock_iphunter, "IPHunter"),
-            (mock_tor, "Tor Onionoo"),
-            (mock_sfs, "StopForumSpam"),
-            (mock_dshield, "DShield"),
-        ):
-            mock_fn.return_value = {
-                "provider": name,
-                "status": "200 OK",
-                "statusCode": 200,
-                "asn": "AS15169",
-                "isp": "Google",
-                "organisation": "Google",
-                "location": "United States",
-                "usageType": "isp",
-                "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                "countryCode": "US",
-                "rawJson": {},
-            }
-        mock_mm.return_value = dict(MAXMIND_STUB)
+        start_non_dnsbl_provider_stubs(
+            self,
+            overrides={"maxmind": dict(MAXMIND_STUB)},
+            row_builder=self._ok_google_row,
+        )
 
         loop_client = MagicMock(name="hanging-default-loop-redis")
         loop_client.mget = AsyncMock(side_effect=redis.exceptions.TimeoutError("Socket read timed out"))
@@ -351,18 +264,18 @@ class RedisDegradationAndOAuthFallbackTests(TestCase):
 
         bearer_token = views.issue_gadget_token("SysopUser")
         asgi_client = AsyncClient()
-        views.reset_redis_circuit_breaker()
+        cache_backends.reset_redis_circuit_breaker()
 
         with (
-            patch.object(views.aioredis, "from_url", return_value=loop_client),
-            patch("detector.views.time.monotonic", return_value=200.0),
+            patch.object(cache_backends.aioredis, "from_url", return_value=loop_client),
+            patch("detector.cache_backends.time.monotonic", return_value=200.0),
         ):
             resp = await asgi_client.get(
                 "/api/v1/detect?ip=8.8.8.8",
                 headers={"Authorization": f"Bearer {bearer_token}"},
             )
             self.assertEqual(resp.status_code, 200)
-            self.assertTrue(views.is_redis_circuit_open())
+            self.assertTrue(cache_backends.is_redis_circuit_open())
             # Only the first cache-read stage contacts Redis; cooldown, quota, cache write, and telemetry fail open cleanly
             self.assertEqual(loop_client.mget.await_count, 1)
             self.assertEqual(loop_client.get.await_count, 0)
@@ -375,7 +288,7 @@ class RedisDegradationAndOAuthFallbackTests(TestCase):
         WIKIMEDIA_CLIENT_SECRET="super_secret_oauth_value_999",
         WIKIMEDIA_REDIRECT_URI="https://proxycheck.toolforge.org/oauth/callback",
     )
-    @patch("detector.views.httpx.AsyncClient")
+    @patch("detector.http_client.httpx.AsyncClient")
     def test_oauth_callback_upstream_failures_log_without_leaks_and_redirect_home(self, mock_async_client_cls):
         failure_cases = (
             (
@@ -455,8 +368,8 @@ class RedisDegradationAndOAuthFallbackTests(TestCase):
         WIKIMEDIA_CLIENT_SECRET="test_client_secret",
         WIKIMEDIA_REDIRECT_URI="https://proxycheck.toolforge.org/oauth/callback",
     )
-    @patch("detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock)
-    @patch("detector.views.httpx.AsyncClient")
+    @patch("detector.oauth.fetch_user_rights_from_meta", new_callable=AsyncMock)
+    @patch("detector.http_client.httpx.AsyncClient")
     def test_oauth_callback_alias_routes_authenticate_and_consume_state(self, mock_async_client_cls, mock_fetch_meta):
         mock_fetch_meta.return_value = {
             "global_groups": ["steward"],
@@ -527,8 +440,8 @@ class RedisDegradationAndOAuthFallbackTests(TestCase):
         WIKIMEDIA_CLIENT_SECRET="super_secret_oauth_value_999",
         WIKIMEDIA_REDIRECT_URI="https://proxycheck.toolforge.org/oauth/callback",
     )
-    @patch("detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock)
-    @patch("detector.views.httpx.AsyncClient")
+    @patch("detector.oauth.fetch_user_rights_from_meta", new_callable=AsyncMock)
+    @patch("detector.http_client.httpx.AsyncClient")
     def test_oauth_callback_returns_503_when_session_save_fails_at_state_or_login(
         self, mock_async_client_cls, mock_fetch_meta
     ):

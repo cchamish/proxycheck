@@ -22,10 +22,12 @@ from django.core.asgi import get_asgi_application
 from django.http import HttpResponse
 from django.test import AsyncRequestFactory, RequestFactory, SimpleTestCase, TestCase, override_settings
 
-from detector import views
+from detector import detection_service, providers, quota_telemetry, views
 from detector.middleware import AsyncWhiteNoiseMiddleware, ResilientSessionMiddleware
+from detector.provider_registry import PROVIDER_REGISTRY
 
 from .helpers import (
+    CANONICAL_PROVIDER_PATCH_TARGETS,
     MAXMIND_STUB,
     TEST_UPSTREAM_SECRETS,
     FakeAsyncRedis,
@@ -35,6 +37,8 @@ from .helpers import (
     _run_uvicorn_smoke_server,
     build_provider_http_response,
     clean_dns_side_effect,
+    patch_non_dnsbl_providers,
+    start_non_dnsbl_provider_stubs,
 )
 
 
@@ -316,7 +320,7 @@ class BatchDetectionEndpointTests(TestCase):
     """Tests for the batch IP detection endpoint covering authentication, validation, CORS, and mixed IP lookups."""
 
     def setUp(self):
-        views._ip_detect_inflight.clear()
+        detection_service._ip_detect_inflight.clear()
         dns_patcher = patch(
             "dns.asyncresolver.Resolver.resolve",
             new_callable=AsyncMock,
@@ -326,43 +330,10 @@ class BatchDetectionEndpointTests(TestCase):
         self.addCleanup(dns_patcher.stop)
 
     def tearDown(self):
-        views._ip_detect_inflight.clear()
-
-    @staticmethod
-    def _stub_provider(name: str) -> dict:
-        return {
-            "provider": name,
-            "status": "No API Key",
-            "statusCode": None,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "rawJson": {"status": "error", "message": "API key not configured"},
-        }
+        detection_service._ip_detect_inflight.clear()
 
     def _patch_all_providers(self):
-        provider_map = (
-            ("detector.views.query_cloudflare_radar", "Cloudflare Radar"),
-            ("detector.views.query_abuseipdb", "AbuseIPDB"),
-            ("detector.views.query_ipdata", "IPData"),
-            ("detector.views.query_ipregistry", "IPRegistry"),
-            ("detector.views.query_ip2location", "IP2Location"),
-            ("detector.views.query_getipintel", "GetIPIntel"),
-            ("detector.views.query_proxycheck", "Proxycheck"),
-            ("detector.views.query_iphub", "IPHub"),
-            ("detector.views.query_iphunter", "IPHunter"),
-            ("detector.views.query_maxmind", "MaxMind"),
-            ("detector.views.query_tor_onionoo", "Tor Onionoo"),
-            ("detector.views.query_stopforumspam", "StopForumSpam"),
-            ("detector.views.query_dshield", "DShield"),
-        )
-        for target, name in provider_map:
-            patcher = patch(target, new_callable=AsyncMock, return_value=self._stub_provider(name))
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        start_non_dnsbl_provider_stubs(self)
 
     def test_batch_detect_unauthenticated_and_unauthorised_requests(self):
         for route in ("/api/v1/detect/batch", "/api/v1/detect/batch/"):
@@ -479,7 +450,7 @@ class BatchDetectionEndpointTests(TestCase):
                     "https://meta.wikimedia.org",
                 )
 
-    @patch("detector.views.redis_client", None)
+    @patch("detector.cache_backends.redis_client", None)
     def test_batch_detect_returns_mixed_public_and_non_public_results_with_deduplication(self):
         self._patch_all_providers()
         bearer_token = views.issue_gadget_token("SysopUser")
@@ -546,7 +517,7 @@ class CompactResponseAndCacheControlTests(TestCase):
     """Tests for compact response stripping, cache control headers, and shared cache preservation."""
 
     def setUp(self):
-        views._ip_detect_inflight.clear()
+        detection_service._ip_detect_inflight.clear()
         dns_patcher = patch(
             "dns.asyncresolver.Resolver.resolve",
             new_callable=AsyncMock,
@@ -556,7 +527,7 @@ class CompactResponseAndCacheControlTests(TestCase):
         self.addCleanup(dns_patcher.stop)
 
     def tearDown(self):
-        views._ip_detect_inflight.clear()
+        detection_service._ip_detect_inflight.clear()
 
     @staticmethod
     def _stub_provider(name: str) -> dict:
@@ -618,22 +589,13 @@ class CompactResponseAndCacheControlTests(TestCase):
         mock_client = AsyncMock()
         mock_client.is_closed = False
         with (
-            patch("detector.views.redis_client", None),
-            patch("detector.views._get_shared_http_client", AsyncMock(return_value=mock_client)),
-            patch("detector.views.query_maxmind", AsyncMock(return_value=dict(MAXMIND_STUB))),
-            patch("detector.views.query_rdns_ptr", AsyncMock(return_value="dns.google")),
-            patch("detector.views.query_cloudflare_radar", side_effect=_make_slow_ok("Cloudflare Radar")),
-            patch("detector.views.query_abuseipdb", side_effect=_make_slow_ok("AbuseIPDB")),
-            patch("detector.views.query_ipdata", side_effect=_make_slow_ok("IPData")),
-            patch("detector.views.query_ipregistry", side_effect=_make_slow_ok("IPRegistry")),
-            patch("detector.views.query_ip2location", side_effect=_make_slow_ok("IP2Location")),
-            patch("detector.views.query_getipintel", side_effect=_make_slow_ok("GetIPIntel")),
-            patch("detector.views.query_proxycheck", side_effect=_make_slow_ok("Proxycheck")),
-            patch("detector.views.query_iphub", side_effect=_make_slow_ok("IPHub")),
-            patch("detector.views.query_iphunter", side_effect=_make_slow_ok("IPHunter")),
-            patch("detector.views.query_tor_onionoo", side_effect=_make_slow_ok("Tor Onionoo")),
-            patch("detector.views.query_stopforumspam", side_effect=_make_slow_ok("StopForumSpam")),
-            patch("detector.views.query_dshield", side_effect=_make_slow_ok("DShield")),
+            patch("detector.cache_backends.redis_client", None),
+            patch("detector.http_client.get_shared_http_client", AsyncMock(return_value=mock_client)),
+            patch("detector.dns_providers.query_rdns_ptr", AsyncMock(return_value="dns.google")),
+            patch_non_dnsbl_providers(
+                _make_slow_ok,
+                overrides={"maxmind": AsyncMock(return_value=dict(MAXMIND_STUB))},
+            ),
         ):
             compact_resp, full_resp = await asyncio.gather(
                 views.detect_ip(compact_req),
@@ -665,10 +627,10 @@ class CompactResponseAndCacheControlTests(TestCase):
         fake_resolver.resolve = AsyncMock(side_effect=clean_dns_side_effect)
 
         with (
-            patch("detector.views.redis_client", fake_redis),
-            patch("detector.views.httpx.AsyncClient") as mock_client_cls,
-            patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver),
-            patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
+            patch("detector.cache_backends.redis_client", fake_redis),
+            patch("detector.http_client.httpx.AsyncClient") as mock_client_cls,
+            patch("detector.dns_providers.dns.asyncresolver.Resolver", return_value=fake_resolver),
+            patch("detector.dns_providers.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
         ):
             _patch_async_client(mock_client_cls, fake_get)
             compact_resp = self.client.get("/api/v1/detect?ip=8.8.8.8&compact=1")
@@ -701,10 +663,10 @@ class TwoTierQueryModeTests(TestCase):
     """Tests for light and full two-tier detection modes across single, batch, and singleflight paths."""
 
     def setUp(self):
-        views._ip_detect_inflight.clear()
+        detection_service._ip_detect_inflight.clear()
 
     def tearDown(self):
-        views._ip_detect_inflight.clear()
+        detection_service._ip_detect_inflight.clear()
 
     @staticmethod
     def _build_ok_row(provider_name: str, *, chance: Optional[float] = None) -> dict:
@@ -727,41 +689,25 @@ class TwoTierQueryModeTests(TestCase):
 
     def _patch_provider_suite(self):
         mocks = {}
-        provider_targets = (
-            ("cloudflare_radar", "detector.views.query_cloudflare_radar", "Cloudflare Radar", None),
-            ("abuseipdb", "detector.views.query_abuseipdb", "AbuseIPDB", None),
-            ("ipdata", "detector.views.query_ipdata", "IPData", None),
-            ("ipregistry", "detector.views.query_ipregistry", "IPRegistry", None),
-            ("ip2location", "detector.views.query_ip2location", "IP2Location", None),
-            ("getipintel", "detector.views.query_getipintel", "GetIPIntel", 0.985),
-            ("proxycheck", "detector.views.query_proxycheck", "Proxycheck", None),
-            ("iphub", "detector.views.query_iphub", "IPHub", None),
-            ("iphunter", "detector.views.query_iphunter", "IPHunter", None),
-            ("maxmind", "detector.views.query_maxmind", "MaxMind", None),
-            ("spamhaus_zen", "detector.views.query_spamhaus_zen", "Spamhaus ZEN", None),
-            ("spamcop", "detector.views.query_spamcop", "SpamCop", None),
-            ("tor_onionoo", "detector.views.query_tor_onionoo", "Tor Onionoo", None),
-            ("stopforumspam", "detector.views.query_stopforumspam", "StopForumSpam", None),
-            ("dshield", "detector.views.query_dshield", "DShield", None),
-        )
-        for key, target, name, chance in provider_targets:
-            mock_fn = AsyncMock(return_value=self._build_ok_row(name, chance=chance))
-            patcher = patch(target, mock_fn)
+        for meta in PROVIDER_REGISTRY:
+            chance = 0.985 if meta.key == "getipintel" else None
+            mock_fn = AsyncMock(return_value=self._build_ok_row(meta.label, chance=chance))
+            patcher = patch(CANONICAL_PROVIDER_PATCH_TARGETS[meta.key], mock_fn)
             patcher.start()
             self.addCleanup(patcher.stop)
-            mocks[key] = mock_fn
+            mocks[meta.key] = mock_fn
 
-        ptr_patcher = patch("detector.views.query_rdns_ptr", AsyncMock(return_value="dns.google"))
+        ptr_patcher = patch("detector.dns_providers.query_rdns_ptr", AsyncMock(return_value="dns.google"))
         ptr_patcher.start()
         self.addCleanup(ptr_patcher.stop)
 
         http_client = AsyncMock()
         http_client.is_closed = False
-        client_patcher = patch("detector.views._get_shared_http_client", AsyncMock(return_value=http_client))
+        client_patcher = patch("detector.http_client.get_shared_http_client", AsyncMock(return_value=http_client))
         client_patcher.start()
         self.addCleanup(client_patcher.stop)
 
-        mm_db_patcher = patch("detector.views._has_any_local_maxmind_db", return_value=True)
+        mm_db_patcher = patch("detector.cache_backends._has_any_local_maxmind_db", return_value=True)
         mm_db_patcher.start()
         self.addCleanup(mm_db_patcher.stop)
 
@@ -775,8 +721,11 @@ class TwoTierQueryModeTests(TestCase):
         with (
             override_settings(**TEST_UPSTREAM_SECRETS),
             patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-            patch("detector.views.redis_client", fake_redis),
-            patch("detector.views.check_and_consume_quota", wraps=views.check_and_consume_quota) as quota_spy,
+            patch("detector.cache_backends.redis_client", fake_redis),
+            patch(
+                "detector.quota_telemetry.check_and_consume_quota",
+                wraps=quota_telemetry.check_and_consume_quota,
+            ) as quota_spy,
         ):
             response = self.client.get("/api/v1/detect?ip=8.8.8.8&mode=light")
 
@@ -839,7 +788,7 @@ class TwoTierQueryModeTests(TestCase):
         with (
             override_settings(**TEST_UPSTREAM_SECRETS),
             patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-            patch("detector.views.redis_client", fake_redis),
+            patch("detector.cache_backends.redis_client", fake_redis),
         ):
             partial_resp = self.client.get("/api/v1/detect?ip=8.8.8.8&mode=light")
 
@@ -855,7 +804,7 @@ class TwoTierQueryModeTests(TestCase):
         self.assertEqual(partial_rows["Proxycheck"]["status"], "Deferred (Light Mode)")
 
         # Pre-populate the remaining commercial sources so light mode requires no deferrals
-        for provider_key, provider_name, _, _, _ in views._PROVIDER_SPECS:
+        for provider_key, provider_name, _, _, _ in providers._PROVIDER_SPECS:
             cache_key = f"proxycheck:v1:prov:{provider_key}:8.8.8.8"
             if cache_key not in fake_redis.strings:
                 chance_val = 0.972 if provider_key == "getipintel" else None
@@ -873,7 +822,7 @@ class TwoTierQueryModeTests(TestCase):
         with (
             override_settings(**TEST_UPSTREAM_SECRETS),
             patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-            patch("detector.views.redis_client", fake_redis),
+            patch("detector.cache_backends.redis_client", fake_redis),
         ):
             complete_resp = self.client.get("/api/v1/detect?ip=8.8.8.8&mode=light")
 
@@ -893,7 +842,7 @@ class TwoTierQueryModeTests(TestCase):
         with (
             override_settings(**TEST_UPSTREAM_SECRETS),
             patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-            patch("detector.views.redis_client", fake_redis),
+            patch("detector.cache_backends.redis_client", fake_redis),
         ):
             light_resp = self.client.get("/api/v1/detect?ip=8.8.8.8&mode=light")
             self.assertEqual(light_resp.status_code, 200)
@@ -928,7 +877,7 @@ class TwoTierQueryModeTests(TestCase):
         with (
             override_settings(**TEST_UPSTREAM_SECRETS),
             patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-            patch("detector.views.redis_client", fake_redis),
+            patch("detector.cache_backends.redis_client", fake_redis),
         ):
             default_resp = self.client.get("/api/v1/detect?ip=1.1.1.1")
             invalid_mode_resp = self.client.get("/api/v1/detect?ip=1.0.0.1&mode=invalid")
@@ -958,7 +907,7 @@ class TwoTierQueryModeTests(TestCase):
         with (
             override_settings(**TEST_UPSTREAM_SECRETS),
             patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-            patch("detector.views.redis_client", fake_redis),
+            patch("detector.cache_backends.redis_client", fake_redis),
         ):
             default_resp = self.client.post(
                 "/api/v1/detect/batch",
@@ -1008,7 +957,7 @@ class TwoTierQueryModeTests(TestCase):
         with (
             override_settings(**TEST_UPSTREAM_SECRETS),
             patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-            patch("detector.views.redis_client", fake_redis),
+            patch("detector.cache_backends.redis_client", fake_redis),
         ):
             explicit_full_resp = self.client.post(
                 "/api/v1/detect/batch",
@@ -1046,7 +995,7 @@ class TwoTierQueryModeTests(TestCase):
         with (
             override_settings(**TEST_UPSTREAM_SECRETS),
             patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-            patch("detector.views.redis_client", None),
+            patch("detector.cache_backends.redis_client", None),
         ):
             light_task = asyncio.create_task(views.detect_ip(light_req))
             await light_started.wait()
@@ -1067,4 +1016,4 @@ class TwoTierQueryModeTests(TestCase):
         self.assertTrue(light_payload["isPartialMode"])
         self.assertIsNone(light_payload["getipintel_chance"])
         mocks["getipintel"].assert_awaited_once()
-        self.assertEqual(len(views._ip_detect_inflight), 0)
+        self.assertEqual(len(detection_service._ip_detect_inflight), 0)

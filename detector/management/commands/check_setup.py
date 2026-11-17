@@ -12,7 +12,7 @@ import shutil
 import subprocess  # noqa: S404
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit, urlunsplit
@@ -23,29 +23,16 @@ from django.utils.crypto import get_random_string
 from dotenv import dotenv_values, set_key
 
 from detector.offline_dbs import (
-    _DEFAULT_STALE_CLOUD_CIDRS_SECONDS,
-    _DEFAULT_STALE_MAXMIND_SECONDS,
-    _DEFAULT_STALE_RULES_SECONDS,
-    _DEFAULT_STALE_SFS_1_SECONDS,
-    _DEFAULT_STALE_SFS_90_SECONDS,
-    _DEFAULT_STALE_SFS_TOXIC_SECONDS,
-    SFS_LISTED_1_FILENAMES,
-    SFS_LISTED_90_FILENAMES,
-    SFS_SQLITE_FILENAME,
-    SFS_TOXIC_CIDR_FILENAME,
-    _find_in_directory,
-    build_offline_database_entries,
+    DEFAULT_STALE_CLOUD_CIDRS_SECONDS,
+    DEFAULT_STALE_MAXMIND_SECONDS,
+    DEFAULT_STALE_RULES_SECONDS,
+    DEFAULT_STALE_SFS_1_SECONDS,
+    DEFAULT_STALE_SFS_90_SECONDS,
+    DEFAULT_STALE_SFS_TOXIC_SECONDS,
+    collect_offline_databases_status,
 )
-from proxycheck.settings import (
-    MAXMIND_ASN_DB_FILENAME,
-    MAXMIND_CITY_DB_FILENAME,
-    MAXMIND_COUNTRY_DB_FILENAME,
-    _expand_configured_path,
-    _find_mmdb_in_directory,
-    _resolve_dotenv_path,
-    _standard_data_directories,
-    resolve_tool_data_subdir,
-)
+from detector.provider_registry import PROVIDER_REGISTRY
+from proxycheck.settings import expand_configured_path, resolve_dotenv_path, resolve_tool_data_subdir
 
 ENV_MODES = ("auto", "bastion", "local")
 DEFAULT_PRODUCTION_REDIRECT_URI = "https://proxycheck.toolforge.org/oauth/callback"
@@ -67,22 +54,6 @@ _FAILED_JOB_STATUS_TOKENS = ("failed", "error", "crash", "backoff", "oom", "evic
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SEPARATOR_LINE_RE = re.compile(r"^[-=+|:\s]+$")
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
-
-_QUOTA_DEFAULT_PAIRS: Tuple[Tuple[str, int, int], ...] = (
-    ("CLOUDFLARE_RADAR", 240, 0),
-    ("ABUSEIPDB", 0, 1000),
-    ("IPDATA", 0, 1000),
-    ("IPREGISTRY", 50, 0),
-    ("IP2LOCATION", 0, 1000),
-    ("GETIPINTEL", 15, 500),
-    ("PROXYCHECK", 0, 1000),
-    ("IPHUB", 0, 1000),
-    ("IPHUNTER", 0, 1000),
-    ("SPAMHAUS_ZEN", 1000, 0),
-    ("SPAMCOP", 0, 0),
-    ("TOR_ONIONOO", 0, 0),
-    ("DSHIELD", 1000, 0),
-)
 
 
 @dataclass(frozen=True)
@@ -162,116 +133,114 @@ class BastionJobCheck:
 
 
 def _build_core_and_oauth_env_specs() -> Tuple[EnvVarSpec, ...]:
-    """Returns required core and production/Toolforge OAuth environment variable specs."""
-    return (
-        EnvVarSpec(
-            name="DJANGO_SECRET_KEY",
-            tier="required",
-            category="Core & OAuth",
-            sensitive=True,
-            default_display="(none in production)",
-            description="Django cryptographic signing key and gadget Bearer token secret",
+    """Returns required core and Toolforge OAuth environment variable specs."""
+    core_defs = (
+        (
+            "DJANGO_SECRET_KEY",
+            "required",
+            "Core & OAuth",
+            True,
+            "(none in production)",
+            "Django cryptographic signing key and gadget Bearer token secret",
         ),
-        EnvVarSpec(
-            name="WIKIMEDIA_CLIENT_ID",
-            tier="required",
-            category="Core & OAuth",
-            sensitive=False,
-            default_display="(unset)",
-            description="Wikimedia OAuth 2.0 application client ID",
+        (
+            "WIKIMEDIA_CLIENT_ID",
+            "required",
+            "Core & OAuth",
+            False,
+            "(unset)",
+            "Wikimedia OAuth 2.0 application client ID",
         ),
-        EnvVarSpec(
-            name="WIKIMEDIA_CLIENT_SECRET",
-            tier="required",
-            category="Core & OAuth",
-            sensitive=True,
-            default_display="(unset)",
-            description="Wikimedia OAuth 2.0 application client secret",
+        (
+            "WIKIMEDIA_CLIENT_SECRET",
+            "required",
+            "Core & OAuth",
+            True,
+            "(unset)",
+            "Wikimedia OAuth 2.0 application client secret",
         ),
-        EnvVarSpec(
-            name="DJANGO_ALLOWED_HOSTS",
-            tier="recommended",
-            category="Production / Toolforge Recommended",
-            sensitive=False,
-            default_display="127.0.0.1,localhost",
-            description="Comma-separated allowed hostnames (include .toolforge.org,.wmcloud.org in production)",
+        (
+            "DJANGO_ALLOWED_HOSTS",
+            "recommended",
+            "Production / Toolforge Recommended",
+            False,
+            "127.0.0.1,localhost",
+            "Comma-separated allowed hostnames (include .toolforge.org,.wmcloud.org in production)",
         ),
-        EnvVarSpec(
-            name="WIKIMEDIA_REDIRECT_URI",
-            tier="recommended",
-            category="Production / Toolforge Recommended",
-            sensitive=False,
-            default_display=DEFAULT_PRODUCTION_REDIRECT_URI,
-            description="OAuth 2.0 callback URL matching the deployed tool domain",
+        (
+            "WIKIMEDIA_REDIRECT_URI",
+            "recommended",
+            "Production / Toolforge Recommended",
+            False,
+            DEFAULT_PRODUCTION_REDIRECT_URI,
+            "OAuth 2.0 callback URL matching the deployed tool domain",
         ),
-        EnvVarSpec(
-            name="REDIS_URL",
-            tier="recommended",
-            category="Production / Toolforge Recommended",
-            sensitive=False,
-            default_display="redis://127.0.0.1:6379/0",
-            description="Redis connection URL for sessions, IP caches, quota guard, and telemetry",
+        (
+            "REDIS_URL",
+            "recommended",
+            "Production / Toolforge Recommended",
+            False,
+            "redis://127.0.0.1:6379/0",
+            "Redis connection URL for sessions, IP caches, quota guard, and telemetry",
         ),
-        EnvVarSpec(
-            name="TOOL_DATA_DIR",
-            tier="recommended",
-            category="Production / Toolforge Recommended",
-            sensitive=False,
-            default_display="(unset)",
-            description=(
-                "Toolforge tool home or persistent data root for .env and offline databases "
-                "(for example /data/project/<tool>)"
-            ),
+        (
+            "TOOL_DATA_DIR",
+            "recommended",
+            "Production / Toolforge Recommended",
+            False,
+            "(unset)",
+            "Toolforge tool home or persistent data root for .env and offline databases (for example /data/project/<tool>)",
         ),
-        EnvVarSpec(
-            name="MAXMIND_ACCOUNT_ID",
-            tier="recommended",
-            category="Production / Toolforge Recommended",
-            sensitive=True,
-            default_display="(unset)",
-            description="MaxMind account ID required by update_offline_dbs to fetch GeoLite2 MMDBs",
+        (
+            "MAXMIND_ACCOUNT_ID",
+            "recommended",
+            "Production / Toolforge Recommended",
+            True,
+            "(unset)",
+            "MaxMind account ID required by update_offline_dbs to fetch GeoLite2 MMDBs",
         ),
-        EnvVarSpec(
-            name="MAXMIND_LICENSE_KEY",
-            tier="recommended",
-            category="Production / Toolforge Recommended",
-            sensitive=True,
-            default_display="(unset)",
-            description="MaxMind license key paired with MAXMIND_ACCOUNT_ID",
+        (
+            "MAXMIND_LICENSE_KEY",
+            "recommended",
+            "Production / Toolforge Recommended",
+            True,
+            "(unset)",
+            "MaxMind license key paired with MAXMIND_ACCOUNT_ID",
         ),
-        EnvVarSpec(
-            name="ALLOWED_WIKI_USERS",
-            tier="recommended",
-            category="Production / Toolforge Recommended",
-            sensitive=False,
-            default_display="(unset)",
-            description="Comma-separated Wikimedia usernames granted admin dashboard and status access",
+        (
+            "ALLOWED_WIKI_USERS",
+            "recommended",
+            "Production / Toolforge Recommended",
+            False,
+            "(unset)",
+            "Comma-separated Wikimedia usernames granted admin dashboard and status access",
         ),
-    )
-
-
-def _build_provider_api_env_specs() -> Tuple[EnvVarSpec, ...]:
-    """Returns commercial IP intelligence provider credential variable specs."""
-    provider_defs = (
-        ("CLOUDFLARE_RADAR_TOKEN", "Cloudflare Radar API Bearer token"),
-        ("ABUSEIPDB_API_KEY", "AbuseIPDB v2 API key"),
-        ("IPDATA_API_KEY", "IPData API key"),
-        ("IPREGISTRY_API_KEY", "IPRegistry API key"),
-        ("IP2LOCATION_API_KEY", "IP2Location.io API key"),
-        ("GETIPINTEL_CONTACT_EMAIL", "Contact email address required by GetIPIntel API"),
-        ("PROXYCHECK_API_KEY", "Proxycheck.io API key"),
-        ("IPHUB_API_KEY", "IPHub API key"),
-        ("IPHUNTER_API_KEY", "IPHunter API key"),
     )
     return tuple(
         EnvVarSpec(
             name=name,
+            tier=tier,
+            category=category,
+            sensitive=sensitive,
+            default_display=default_display,
+            description=description,
+        )
+        for name, tier, category, sensitive, default_display, description in core_defs
+    )
+
+
+def _build_provider_api_env_specs() -> Tuple[EnvVarSpec, ...]:
+    """Returns commercial IP intelligence provider credential variable specs from the shared registry."""
+    return tuple(
+        EnvVarSpec(
+            name=meta.credential_setting,
             tier="provider",
             category="Upstream IP Intelligence Providers",
             sensitive=True,
-            description=description,
+            description=meta.credential_description or f"{meta.label} API credential",
         )
-        for name, description in provider_defs
+        for meta in PROVIDER_REGISTRY
+        if meta.credential_setting is not None
     )
 
 
@@ -298,7 +267,7 @@ def _build_runtime_and_path_env_specs() -> Tuple[EnvVarSpec, ...]:
         ("HOSTING_ASN_RULES_PATH", "(auto)", "Override path for hosting_asn_rules.json"),
         ("HOSTING_ASNS", "(built-in)", "Extra comma-separated hosting ASNs"),
         ("HOSTING_ORG_KEYWORDS", "(built-in)", "Extra comma-separated hosting organisation keywords"),
-        ("VITE_GITHUB_REPO", "(unset)", "Build-time GitHub repository slug (owner/repo) shown in the UI footer"),
+        ("VITE_GITHUB_REPO", "(unset)", "Build-time GitHub repository slug shown in the UI footer"),
         ("VITE_COMMIT_HASH", "(git HEAD)", "Build-time commit hash override for the frontend bundle"),
         (
             "VITE_COMMIT_TIMESTAMP",
@@ -330,30 +299,30 @@ def _build_tuning_and_quota_env_specs() -> Tuple[EnvVarSpec, ...]:
         ("DNS_QUERY_LIFETIME_SECONDS", "2.0", "Total DNS resolver query lifetime"),
         (
             "OFFLINE_DB_MAXMIND_STALE_SECONDS",
-            str(_DEFAULT_STALE_MAXMIND_SECONDS),
+            str(DEFAULT_STALE_MAXMIND_SECONDS),
             "MaxMind MMDB staleness warning threshold",
         ),
         (
             "OFFLINE_DB_SFS_TOXIC_STALE_SECONDS",
-            str(_DEFAULT_STALE_SFS_TOXIC_SECONDS),
+            str(DEFAULT_STALE_SFS_TOXIC_SECONDS),
             "StopForumSpam toxic_ip_cidr.txt staleness threshold",
         ),
         (
             "OFFLINE_DB_SFS_90_STALE_SECONDS",
-            str(_DEFAULT_STALE_SFS_90_SECONDS),
+            str(DEFAULT_STALE_SFS_90_SECONDS),
             "StopForumSpam 90-day dump staleness threshold",
         ),
         (
             "OFFLINE_DB_SFS_1_STALE_SECONDS",
-            str(_DEFAULT_STALE_SFS_1_SECONDS),
+            str(DEFAULT_STALE_SFS_1_SECONDS),
             "StopForumSpam 1-day dump staleness threshold",
         ),
         (
             "OFFLINE_DB_CLOUD_CIDRS_STALE_SECONDS",
-            str(_DEFAULT_STALE_CLOUD_CIDRS_SECONDS),
+            str(DEFAULT_STALE_CLOUD_CIDRS_SECONDS),
             "Cloud provider CIDRs staleness threshold",
         ),
-        ("OFFLINE_DB_RULES_STALE_SECONDS", str(_DEFAULT_STALE_RULES_SECONDS), "Hosting ASN rules staleness threshold"),
+        ("OFFLINE_DB_RULES_STALE_SECONDS", str(DEFAULT_STALE_RULES_SECONDS), "Hosting ASN rules staleness threshold"),
     )
     specs = [
         EnvVarSpec(
@@ -365,23 +334,25 @@ def _build_tuning_and_quota_env_specs() -> Tuple[EnvVarSpec, ...]:
         )
         for name, default_display, description in tuning_defs
     ]
-    for prefix, rpm_default, daily_default in _QUOTA_DEFAULT_PAIRS:
+    for meta in PROVIDER_REGISTRY:
+        if not meta.has_quota_env_vars:
+            continue
         specs.append(
             EnvVarSpec(
-                name=f"{prefix}_RPM_LIMIT",
+                name=meta.rpm_setting,
                 tier="tuning",
                 category="Tuning & Quota Limits",
-                default_display=str(rpm_default),
-                description=f"Soft requests-per-minute quota guard for {prefix.lower()}",
+                default_display=str(meta.default_rpm_limit),
+                description=f"Soft requests-per-minute quota guard for {meta.key}",
             )
         )
         specs.append(
             EnvVarSpec(
-                name=f"{prefix}_DAILY_LIMIT",
+                name=meta.daily_setting,
                 tier="tuning",
                 category="Tuning & Quota Limits",
-                default_display=str(daily_default),
-                description=f"Soft daily quota guard for {prefix.lower()}",
+                default_display=str(meta.default_daily_limit),
+                description=f"Soft daily quota guard for {meta.key}",
             )
         )
     return tuple(specs)
@@ -481,7 +452,7 @@ def detect_toolforge_account(
     environ: Optional[Mapping[str, str]] = None,
     home_dir: Optional[Path] = None,
 ) -> Optional[str]:
-    """Extracts the active Toolforge tool name from $USER, TOOL_DATA_DIR, or $HOME."""
+    """Extracts the active Toolforge tool name from USER, TOOL_DATA_DIR, or HOME."""
     env = os.environ if environ is None else environ
     for user_var in ("USER", "LOGNAME"):
         raw_user = str(env.get(user_var) or "").strip()
@@ -489,19 +460,12 @@ def detect_toolforge_account(
             if raw_user.startswith(prefix) and len(raw_user) > len(prefix):
                 return raw_user[len(prefix) :]
 
-    candidates: List[str] = []
-    if env.get("TOOL_DATA_DIR"):
-        candidates.append(str(env.get("TOOL_DATA_DIR") or ""))
-    if env.get("HOME"):
-        candidates.append(str(env.get("HOME") or ""))
+    candidates = [str(env.get(k) or "") for k in ("TOOL_DATA_DIR", "HOME") if env.get(k)]
     if home_dir is not None:
         candidates.append(str(home_dir))
 
     for candidate in candidates:
-        cleaned = candidate.strip()
-        if not cleaned:
-            continue
-        match = re.match(r"^/data/project/([^/]+)(?:/|$)", cleaned)
+        match = re.match(r"^/data/project/([^/]+)(?:/|$)", candidate.strip())
         if match:
             return match.group(1)
     return None
@@ -515,7 +479,7 @@ def detect_runtime_environment(
     wmcs_project_path: Path = Path("/etc/wmcs-project"),
     home_dir: Optional[Path] = None,
 ) -> Tuple[str, Optional[str], Optional[str]]:
-    """Detects whether execution targets Toolforge Bastion or local/container environment."""
+    """Detects whether execution targets Toolforge Bastion or a local or container environment."""
     normalized_mode = requested_mode.strip().lower()
     if normalized_mode not in ENV_MODES:
         raise CommandError(f"Unsupported --env mode '{requested_mode}'. Choose from: {', '.join(ENV_MODES)}.")
@@ -533,8 +497,7 @@ def detect_runtime_environment(
     if normalized_mode == "local":
         return "local", toolforge_bin, tool_account
 
-    # Auto mode: Bastion requires both the toolforge CLI and a WMCS/Toolforge host marker,
-    # whereas Buildpack containers omit the toolforge CLI entirely.
+    # Auto mode requires both the toolforge CLI and a WMCS host marker outside buildpack containers.
     raw_user = str(env.get("USER") or env.get("LOGNAME") or "").strip()
     raw_home = str(env.get("HOME") or (home_dir or "")).strip()
     is_container = bool(env.get("CNB_STACK_ID") or env.get("TOOL_TOOLFORGE_API_URL") or Path("/.dockerenv").exists())
@@ -628,11 +591,14 @@ def _parse_envvars_list_output(raw_output: str, *, with_values: bool) -> Tuple[D
 
 
 def _parse_envvar_show_output(name: str, raw_output: str) -> Optional[str]:
-    """Parses output from toolforge envvars show <NAME>, returning None when masked or unreadable."""
-    lines = [line.rstrip("\r\n") for line in raw_output.splitlines() if line.strip()]
-    if not lines:
+    """Parses output from toolforge envvars show, returning None when masked or unreadable."""
+    filtered = [
+        line.rstrip("\r\n")
+        for line in raw_output.splitlines()
+        if line.strip() and not _SEPARATOR_LINE_RE.match(line.strip())
+    ]
+    if not filtered:
         return None
-    filtered = [line for line in lines if not _SEPARATOR_LINE_RE.match(line.strip())]
     for line in filtered:
         stripped = line.strip()
         parts = stripped.split(None, 1)
@@ -641,7 +607,7 @@ def _parse_envvar_show_output(name: str, raw_output: str) -> Optional[str]:
         if len(parts) == 2 and parts[0] == name:
             val = parts[1].strip()
             return None if set(val) == {"*"} else val
-        if stripped.startswith(f"{name}:") or stripped.startswith(f"{name}="):
+        if stripped.startswith((f"{name}:", f"{name}=")):
             val = stripped[len(name) + 1 :].strip()
             return None if set(val) == {"*"} else val
     if len(filtered) == 1:
@@ -653,7 +619,6 @@ def _parse_envvar_show_output(name: str, raw_output: str) -> Optional[str]:
 
 def load_bastion_envvars(toolforge_bin: str, base_dir: Path) -> EnvLoadResult:
     """Reads configured environment variables via toolforge envvars list and show."""
-    warnings: List[str] = []
     values: Dict[str, str] = {}
     sources: Dict[str, str] = {}
     hidden_keys: set[str] = set()
@@ -666,15 +631,8 @@ def load_bastion_envvars(toolforge_bin: str, base_dir: Path) -> EnvLoadResult:
             if val:
                 values[key] = val
                 sources[key] = "toolforge envvars"
-        return EnvLoadResult(
-            values=values,
-            sources=sources,
-            hidden_keys=frozenset(),
-            dotenv_path=base_dir / ".env",
-            warnings=tuple(warnings),
-        )
+        return EnvLoadResult(values=values, sources=sources, hidden_keys=frozenset(), dotenv_path=base_dir / ".env")
 
-    # Fallback when --show-values is unsupported by an older Toolforge CLI release.
     rc_list, stdout_list, stderr_list = _run_toolforge_command(toolforge_bin, ("envvars", "list"))
     if rc_list != 0:
         err_detail = (stderr_list or stderr or stdout_list or stdout).strip()
@@ -686,12 +644,9 @@ def load_bastion_envvars(toolforge_bin: str, base_dir: Path) -> EnvLoadResult:
             continue
         rc_show, stdout_show, _ = _run_toolforge_command(toolforge_bin, ("envvars", "show", key))
         shown_val = _parse_envvar_show_output(key, stdout_show) if rc_show == 0 else None
-        if shown_val:
-            values[key] = shown_val
-            sources[key] = "toolforge envvars"
-        else:
-            values[key] = ""
-            sources[key] = "toolforge envvars"
+        values[key] = shown_val or ""
+        sources[key] = "toolforge envvars"
+        if not shown_val:
             hidden_keys.add(key)
 
     return EnvLoadResult(
@@ -699,7 +654,6 @@ def load_bastion_envvars(toolforge_bin: str, base_dir: Path) -> EnvLoadResult:
         sources=sources,
         hidden_keys=frozenset(hidden_keys),
         dotenv_path=base_dir / ".env",
-        warnings=tuple(warnings),
     )
 
 
@@ -709,9 +663,10 @@ def load_local_envvars(base_dir: Path, *, environ: Optional[Mapping[str, str]] =
     warnings: List[str] = []
 
     raw_tool_dir = str(env.get("TOOL_DATA_DIR") or "").strip()
-    resolved_dotenv = _resolve_dotenv_path(base_dir, raw_tool_dir)
+    resolved_dotenv = resolve_dotenv_path(base_dir, raw_tool_dir)
     read_dotenv_path = resolved_dotenv if resolved_dotenv is not None else (base_dir / ".env")
     write_dotenv_path = base_dir / ".env"
+    dotenv_label = read_dotenv_path.name if read_dotenv_path == write_dotenv_path else str(read_dotenv_path)
 
     dotenv_map: Dict[str, str] = {}
     if read_dotenv_path.is_file():
@@ -729,15 +684,12 @@ def load_local_envvars(base_dir: Path, *, environ: Optional[Mapping[str, str]] =
         dotenv_val = dotenv_map.get(name)
         if env_val is not None and env_val.strip():
             values[name] = env_val.strip()
-            if dotenv_val is not None and dotenv_val.strip() == env_val.strip():
-                sources[name] = (
-                    read_dotenv_path.name if read_dotenv_path == write_dotenv_path else str(read_dotenv_path)
-                )
-            else:
-                sources[name] = "process env"
+            sources[name] = (
+                dotenv_label if (dotenv_val is not None and dotenv_val.strip() == env_val.strip()) else "process env"
+            )
         elif dotenv_val is not None and dotenv_val.strip():
             values[name] = dotenv_val.strip()
-            sources[name] = read_dotenv_path.name if read_dotenv_path == write_dotenv_path else str(read_dotenv_path)
+            sources[name] = dotenv_label
 
     return EnvLoadResult(
         values=values,
@@ -754,11 +706,9 @@ def ensure_env_in_gitignore(base_dir: Path) -> Tuple[bool, str]:
     if gitignore_path.is_file():
         existing = gitignore_path.read_text(encoding="utf-8")
         for line in existing.splitlines():
-            entry = line.split("#", 1)[0].strip()
-            if entry in (".env", "/.env", "*.env"):
+            if line.split("#", 1)[0].strip() in (".env", "/.env", "*.env"):
                 return False, "already ignored"
-        needs_newline = bool(existing) and not existing.endswith("\n")
-        prefix = "\n" if needs_newline else ""
+        prefix = "\n" if existing and not existing.endswith("\n") else ""
         gitignore_path.write_text(f"{existing}{prefix}.env\n", encoding="utf-8")
         return True, f"appended '.env' to {gitignore_path}"
 
@@ -768,11 +718,7 @@ def ensure_env_in_gitignore(base_dir: Path) -> Tuple[bool, str]:
 
 def save_envvar_bastion(toolforge_bin: str, key: str, value: str) -> None:
     """Writes an environment variable to Toolforge via stdin so secrets stay off process argv."""
-    rc, stdout, stderr = _run_toolforge_command(
-        toolforge_bin,
-        ("envvars", "create", key),
-        input_text=value,
-    )
+    rc, stdout, stderr = _run_toolforge_command(toolforge_bin, ("envvars", "create", key), input_text=value)
     if rc != 0:
         detail = (stderr or stdout).strip()
         raise CommandError(f"Failed to set Toolforge envvar {key}: {detail or f'exit code {rc}'}")
@@ -792,10 +738,8 @@ def save_envvar_local(base_dir: Path, dotenv_path: Path, key: str, value: str) -
 
 
 def _is_weak_secret_key(value: str) -> Tuple[bool, Optional[str]]:
-    """Checks whether DJANGO_SECRET_KEY uses a placeholder pattern or insufficient length."""
     cleaned = value.strip()
-    lowered = cleaned.lower()
-    if any(lowered.startswith(prefix) for prefix in _PLACEHOLDER_SECRET_PREFIXES):
+    if any(cleaned.lower().startswith(prefix) for prefix in _PLACEHOLDER_SECRET_PREFIXES):
         return True, "appears to be a placeholder secret"
     if len(cleaned) < 32:
         return False, f"short secret ({len(cleaned)} chars; 50+ recommended)"
@@ -809,21 +753,19 @@ def _is_recommended_local_fallback(
     mode: str,
     tool_account: Optional[str],
 ) -> Optional[str]:
-    """Detects recommended settings that still hold local defaults in non-local deployments."""
     cleaned = value.strip()
     if not cleaned:
         return None
-
     if spec.name == "DJANGO_ALLOWED_HOSTS" and mode == "bastion":
         hosts = [entry.strip().lower() for entry in cleaned.split(",") if entry.strip()]
         if hosts and all(host in _LOCAL_HOSTS for host in hosts):
             return "contains only local hosts for a Toolforge environment"
-
-    if spec.name == "REDIS_URL" and mode == "bastion":
-        lowered = cleaned.lower()
-        if "127.0.0.1" in lowered or "localhost" in lowered:
-            return "points to localhost Redis inside Toolforge"
-
+    if (
+        spec.name == "REDIS_URL"
+        and mode == "bastion"
+        and ("127.0.0.1" in cleaned.lower() or "localhost" in cleaned.lower())
+    ):
+        return "points to localhost Redis inside Toolforge"
     if (
         spec.name == "WIKIMEDIA_REDIRECT_URI"
         and tool_account == "proxycheck-dev"
@@ -831,20 +773,16 @@ def _is_recommended_local_fallback(
         and "proxycheck-dev.toolforge.org" not in cleaned
     ):
         return "points to production callback URL while active tool is proxycheck-dev"
-
     return None
 
 
 def _suggested_value_hint(spec: EnvVarSpec, *, mode: str, tool_account: Optional[str]) -> str:
-    """Returns a concise context-aware example hint for interactive prompts."""
     if spec.name == "DJANGO_ALLOWED_HOSTS" and mode == "bastion":
         return DEFAULT_TOOLFORGE_ALLOWED_HOSTS
     if spec.name == "WIKIMEDIA_REDIRECT_URI":
         if tool_account:
             return f"https://{tool_account}.toolforge.org/oauth/callback"
-        if mode == "local":
-            return "http://127.0.0.1:8000/oauth/callback"
-        return DEFAULT_PRODUCTION_REDIRECT_URI
+        return "http://127.0.0.1:8000/oauth/callback" if mode == "local" else DEFAULT_PRODUCTION_REDIRECT_URI
     if spec.name == "REDIS_URL" and mode == "bastion":
         return DEFAULT_TOOLFORGE_REDIS_URL
     if spec.name == "TOOL_DATA_DIR" and mode == "bastion" and tool_account:
@@ -856,19 +794,15 @@ def _parse_mounts_table(mounts_path: Path = Path("/proc/mounts")) -> List[Tuple[
     """Reads Linux mount points as (mount_point, fs_type, options) tuples."""
     if not mounts_path.is_file():
         return []
-    entries: List[Tuple[str, str, str]] = []
     try:
         raw_lines = mounts_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return []
+    entries: List[Tuple[str, str, str]] = []
     for line in raw_lines:
         parts = line.split()
-        if len(parts) < 4:
-            continue
-        mount_point = parts[1].replace("\\040", " ")
-        fs_type = parts[2]
-        options = parts[3]
-        entries.append((mount_point, fs_type, options))
+        if len(parts) >= 4:
+            entries.append((parts[1].replace("\\040", " "), parts[2], parts[3]))
     return entries
 
 
@@ -876,7 +810,6 @@ def _detect_mount_info(target_path: Path, *, mounts: Sequence[Tuple[str, str, st
     """Determines the filesystem type and persistence status for a target path."""
     if not mounts:
         return "local filesystem", False
-
     try:
         probe = target_path.resolve()
     except OSError:
@@ -895,10 +828,8 @@ def _detect_mount_info(target_path: Path, *, mounts: Sequence[Tuple[str, str, st
 
     mount_point, fs_type, options = best_match
     rw_flag = "ro" if "ro" in options.split(",") else "rw"
-    is_nfs = fs_type.startswith("nfs")
-    is_ephemeral = fs_type in ("overlay", "tmpfs", "ramfs")
-    kind = "NFS" if is_nfs else fs_type
-    return f"{kind} ({fs_type}, {rw_flag}) at {mount_point}", is_ephemeral
+    kind = "NFS" if fs_type.startswith("nfs") else fs_type
+    return f"{kind} ({fs_type}, {rw_flag}) at {mount_point}", fs_type in ("overlay", "tmpfs", "ramfs")
 
 
 def _collect_target_directories(
@@ -907,7 +838,6 @@ def _collect_target_directories(
     *,
     mode: str,
 ) -> List[Tuple[str, Path, bool, bool]]:
-    """Returns deduplicated (label, path, required, persistent) directory targets."""
     entries: List[List[Any]] = []
     index_by_resolved: Dict[Path, int] = {}
 
@@ -927,7 +857,7 @@ def _collect_target_directories(
         index_by_resolved[normalized] = len(entries)
         entries.append([[source_tag] if source_tag else [], fallback_label, raw_path, required, persistent])
 
-    tool_data_dir = _expand_configured_path(env_values.get("TOOL_DATA_DIR", ""))
+    tool_data_dir = expand_configured_path(env_values.get("TOOL_DATA_DIR", ""))
     if tool_data_dir:
         _add(
             "TOOL_DATA_DIR",
@@ -939,13 +869,8 @@ def _collect_target_directories(
     elif mode == "bastion" or base_dir.parent == Path(base_dir.anchor):
         _add("~/data", "Persistent data directory", Path.home() / "data", required=True, persistent=True)
     else:
-        local_candidates = (
-            base_dir.parent / "data",
-            base_dir / "data",
-            Path.home() / "data",
-        )
-        existing_local = next((cand for cand in local_candidates if cand.is_dir()), None)
-        chosen_local = existing_local if existing_local is not None else (base_dir.parent / "data")
+        local_candidates = (base_dir.parent / "data", base_dir / "data", Path.home() / "data")
+        chosen_local = next((cand for cand in local_candidates if cand.is_dir()), base_dir.parent / "data")
         _add("", "Default offline data directory", chosen_local, required=True, persistent=True)
 
     _add("", "Frontend build assets (dist/assets)", base_dir / "dist" / "assets", required=False, persistent=False)
@@ -971,7 +896,6 @@ def _inspect_directory(
     persistent: bool,
     mounts: Sequence[Tuple[str, str, str]],
 ) -> DirectoryStatus:
-    """Checks directory existence, read/write permissions, and filesystem mount status."""
     mount_summary, is_ephemeral = _detect_mount_info(path, mounts=mounts)
     if not path.exists():
         return DirectoryStatus(
@@ -1003,6 +927,7 @@ def _inspect_directory(
         )
 
     readable = os.access(path, os.R_OK | os.X_OK)
+    read_err = ""
     if readable:
         try:
             with os.scandir(path):
@@ -1010,8 +935,6 @@ def _inspect_directory(
         except OSError as exc:
             readable = False
             read_err = str(exc)
-        else:
-            read_err = ""
     else:
         read_err = "read permission denied"
 
@@ -1022,12 +945,10 @@ def _inspect_directory(
             with tempfile.NamedTemporaryFile(dir=path, prefix=".check_setup_", delete=True):
                 writable = True
         except OSError as exc:
-            writable = False
             write_err = str(exc)
     else:
         writable = os.access(path, os.W_OK)
 
-    combined_error = "; ".join(msg for msg in (read_err, write_err) if msg)
     return DirectoryStatus(
         label=label,
         path=path,
@@ -1039,108 +960,8 @@ def _inspect_directory(
         writable=writable,
         mount_summary=mount_summary,
         is_ephemeral_mount=is_ephemeral,
-        error=combined_error,
+        error="; ".join(msg for msg in (read_err, write_err) if msg),
     )
-
-
-def _parse_pos_int(raw_val: str, default: int) -> int:
-    try:
-        parsed = int(str(raw_val or "").strip())
-        return parsed if parsed > 0 else default
-    except ValueError:
-        return default
-
-
-def _resolve_mmdb_for_env(
-    configured_dir: str,
-    filename: str,
-    standard_dirs: Sequence[Path],
-) -> Optional[Path]:
-    expanded = _expand_configured_path(configured_dir)
-    if expanded:
-        configured = Path(expanded)
-        if configured.is_file():
-            return configured
-        if configured.is_dir():
-            return _find_mmdb_in_directory(configured, filename)
-        return None
-    for directory in standard_dirs:
-        matched = _find_mmdb_in_directory(directory, filename)
-        if matched is not None:
-            return matched
-    return None
-
-
-def _resolve_sfs_for_env(
-    override_val: str,
-    configured_dir: str,
-    filenames: Tuple[str, ...],
-    standard_dirs: Sequence[Path],
-) -> Optional[Path]:
-    explicit_raw = _expand_configured_path(override_val)
-    if explicit_raw:
-        explicit = Path(explicit_raw)
-        if explicit.is_file():
-            return explicit
-        if explicit.is_dir():
-            return _find_in_directory(explicit, filenames)
-        return None
-    if configured_dir:
-        base = Path(_expand_configured_path(configured_dir))
-        if base.is_dir():
-            return _find_in_directory(base, filenames)
-        return None
-    for directory in standard_dirs:
-        matched = _find_in_directory(directory, filenames)
-        if matched is not None:
-            return matched
-    return None
-
-
-def _resolve_rule_for_env(
-    override_val: str,
-    filenames: Tuple[str, ...],
-    standard_dirs: Sequence[Path],
-) -> Tuple[Optional[Path], str]:
-    explicit_raw = _expand_configured_path(override_val)
-    if explicit_raw:
-        explicit = Path(explicit_raw)
-        if explicit.is_file():
-            return explicit, explicit.name
-        if explicit.is_dir():
-            for fname in filenames:
-                candidate = explicit / fname
-                if candidate.is_file():
-                    return candidate, candidate.name
-            return None, filenames[0]
-        return None, explicit.name or filenames[0]
-
-    for directory in standard_dirs:
-        for fname in filenames:
-            candidate = directory / fname
-            if candidate.is_file():
-                return candidate, candidate.name
-    return None, filenames[0]
-
-
-def _resolve_cloud_cidrs_for_env(
-    configured_dir: str,
-    standard_dirs: Sequence[Path],
-) -> Tuple[Optional[Path], str]:
-    filenames = ("cloud_cidrs.json", "computehosts.json")
-    if configured_dir:
-        base = Path(_expand_configured_path(configured_dir))
-        for fname in filenames:
-            candidate = base / fname
-            if candidate.is_file():
-                return candidate, candidate.name
-        return None, filenames[0]
-    for directory in standard_dirs:
-        for fname in filenames:
-            candidate = directory / fname
-            if candidate.is_file():
-                return candidate, candidate.name
-    return None, filenames[0]
 
 
 def collect_offline_status_for_env(
@@ -1150,91 +971,10 @@ def collect_offline_status_for_env(
     now_dt: Optional[datetime] = None,
 ) -> List[Dict[str, Any]]:
     """Inventories offline database and rule files against a resolved environment mapping."""
-    current_dt = now_dt or datetime.now(timezone.utc)
-    now_ts = current_dt.timestamp()
-    raw_tool_data_dir = env_values.get("TOOL_DATA_DIR", "")
-    standard_dirs = _standard_data_directories(base_dir, tool_data_dir=raw_tool_data_dir)
-    configured_dir = (
-        str(resolve_tool_data_subdir(raw_tool_data_dir)) if _expand_configured_path(raw_tool_data_dir) else ""
-    )
-
-    maxmind_stale = _parse_pos_int(
-        env_values.get("OFFLINE_DB_MAXMIND_STALE_SECONDS", ""), _DEFAULT_STALE_MAXMIND_SECONDS
-    )
-    sfs_toxic_stale = _parse_pos_int(
-        env_values.get("OFFLINE_DB_SFS_TOXIC_STALE_SECONDS", ""),
-        _DEFAULT_STALE_SFS_TOXIC_SECONDS,
-    )
-    sfs_90_stale = _parse_pos_int(env_values.get("OFFLINE_DB_SFS_90_STALE_SECONDS", ""), _DEFAULT_STALE_SFS_90_SECONDS)
-    sfs_1_stale = _parse_pos_int(env_values.get("OFFLINE_DB_SFS_1_STALE_SECONDS", ""), _DEFAULT_STALE_SFS_1_SECONDS)
-    cloud_cidrs_stale = _parse_pos_int(
-        env_values.get("OFFLINE_DB_CLOUD_CIDRS_STALE_SECONDS", ""),
-        _DEFAULT_STALE_CLOUD_CIDRS_SECONDS,
-    )
-    rules_stale = _parse_pos_int(env_values.get("OFFLINE_DB_RULES_STALE_SECONDS", ""), _DEFAULT_STALE_RULES_SECONDS)
-
-    sfs_toxic = _resolve_sfs_for_env(
-        env_values.get("STOPFORUMSPAM_TOXIC_CIDR_PATH", ""),
-        configured_dir,
-        (SFS_TOXIC_CIDR_FILENAME,),
-        standard_dirs,
-    )
-    sfs_90 = _resolve_sfs_for_env(
-        env_values.get("STOPFORUMSPAM_LISTED_90_PATH", ""),
-        configured_dir,
-        SFS_LISTED_90_FILENAMES,
-        standard_dirs,
-    )
-    sfs_1 = _resolve_sfs_for_env(
-        env_values.get("STOPFORUMSPAM_LISTED_1_PATH", ""),
-        configured_dir,
-        SFS_LISTED_1_FILENAMES,
-        standard_dirs,
-    )
-    sfs_sqlite = _resolve_sfs_for_env(
-        env_values.get("STOPFORUMSPAM_SQLITE_PATH", ""),
-        configured_dir,
-        (SFS_SQLITE_FILENAME,),
-        standard_dirs,
-    )
-    if sfs_sqlite is None:
-        for anchor in (sfs_90, sfs_1, sfs_toxic):
-            if anchor is not None:
-                candidate = anchor.parent / SFS_SQLITE_FILENAME
-                if candidate.is_file():
-                    sfs_sqlite = candidate
-                    break
-
-    cloud_path, cloud_name = _resolve_cloud_cidrs_for_env(configured_dir, standard_dirs)
-    hosting_path, hosting_name = _resolve_rule_for_env(
-        env_values.get("HOSTING_ASN_RULES_PATH", ""),
-        ("hosting_asn_rules.json",),
-        standard_dirs,
-    )
-
-    return build_offline_database_entries(
-        maxmind_paths={
-            "country": _resolve_mmdb_for_env(configured_dir, MAXMIND_COUNTRY_DB_FILENAME, standard_dirs),
-            "city": _resolve_mmdb_for_env(configured_dir, MAXMIND_CITY_DB_FILENAME, standard_dirs),
-            "asn": _resolve_mmdb_for_env(configured_dir, MAXMIND_ASN_DB_FILENAME, standard_dirs),
-        },
-        sfs_paths={
-            "toxic_cidr": sfs_toxic,
-            "listed_90": sfs_90,
-            "listed_1": sfs_1,
-            "sqlite_index": sfs_sqlite,
-        },
-        cloud_cidr_path=cloud_path,
-        cloud_cidr_name=cloud_name,
-        hosting_rules_path=hosting_path,
-        hosting_rules_name=hosting_name,
-        maxmind_stale=maxmind_stale,
-        sfs_toxic_stale=sfs_toxic_stale,
-        sfs_90_stale=sfs_90_stale,
-        sfs_1_stale=sfs_1_stale,
-        rules_stale=rules_stale,
-        cloud_cidrs_stale=cloud_cidrs_stale,
-        now_ts=now_ts,
+    return collect_offline_databases_status(
+        now_dt=now_dt,
+        env_overrides=env_values,
+        base_dir=base_dir,
         include_resolved_path=True,
     )
 
@@ -1269,20 +1009,17 @@ def parse_jobs_yaml(jobs_path: Path) -> List[JobSpec]:
     if current:
         raw_items.append(current)
 
-    parsed: List[JobSpec] = []
-    for item in raw_items:
-        name = item.get("name", "").strip()
-        if not name:
-            continue
-        parsed.append(
-            JobSpec(
-                name=name,
-                command=item.get("command", DEFAULT_JOB_SPEC.command).strip(),
-                image=item.get("image", DEFAULT_JOB_SPEC.image).strip(),
-                schedule=item.get("schedule", DEFAULT_JOB_SPEC.schedule).strip(),
-                mount=item.get("mount", DEFAULT_JOB_SPEC.mount).strip(),
-            )
+    parsed = [
+        JobSpec(
+            name=item["name"].strip(),
+            command=item.get("command", DEFAULT_JOB_SPEC.command).strip(),
+            image=item.get("image", DEFAULT_JOB_SPEC.image).strip(),
+            schedule=item.get("schedule", DEFAULT_JOB_SPEC.schedule).strip(),
+            mount=item.get("mount", DEFAULT_JOB_SPEC.mount).strip(),
         )
+        for item in raw_items
+        if item.get("name", "").strip()
+    ]
     return parsed or list(DEFAULT_JOB_SPECS)
 
 
@@ -1295,13 +1032,12 @@ def _split_bordered_row(line: str, plus_positions: Optional[List[int]]) -> List[
 
 
 def _parse_bordered_jobs_table(raw_output: str) -> Dict[str, RegisteredJob]:
-    """Parses prettytable ASCII grid output from toolforge jobs list --output long."""
-    lines = [line.rstrip("\r\n") for line in raw_output.splitlines() if line.strip()]
+    """Parses prettytable grid output from toolforge jobs list --output long."""
     plus_positions: Optional[List[int]] = None
     headers: Optional[List[str]] = None
     jobs: Dict[str, RegisteredJob] = {}
 
-    for line in lines:
+    for line in (ln.rstrip("\r\n") for ln in raw_output.splitlines() if ln.strip()):
         stripped = line.strip()
         if stripped.startswith("+") and "+" in stripped[1:] and set(stripped) <= {"+", "-", "="}:
             candidate_positions = [idx for idx, ch in enumerate(line) if ch == "+"]
@@ -1316,22 +1052,17 @@ def _parse_bordered_jobs_table(raw_output: str) -> Dict[str, RegisteredJob]:
             headers = [cell.rstrip(":").strip().lower() for cell in cells]
             continue
 
-        row_map: Dict[str, str] = {}
-        for idx, header in enumerate(headers):
-            if idx < len(cells):
-                row_map[header] = cells[idx]
-
+        row_map = {header: cells[idx] for idx, header in enumerate(headers) if idx < len(cells)}
         name = row_map.get("job name") or row_map.get("name") or ""
-        if not name:
-            continue
-        jobs[name] = RegisteredJob(
-            name=name,
-            command=row_map.get("command", ""),
-            job_type=row_map.get("job type") or row_map.get("type") or "",
-            image=row_map.get("image", ""),
-            mount=row_map.get("mounts") or row_map.get("mount") or "",
-            status=row_map.get("status", ""),
-        )
+        if name:
+            jobs[name] = RegisteredJob(
+                name=name,
+                command=row_map.get("command", ""),
+                job_type=row_map.get("job type") or row_map.get("type") or "",
+                image=row_map.get("image", ""),
+                mount=row_map.get("mounts") or row_map.get("mount") or "",
+                status=row_map.get("status", ""),
+            )
     return jobs
 
 
@@ -1342,23 +1073,22 @@ def _parse_toolforge_jobs_json(stripped: str) -> Optional[Dict[str, RegisteredJo
         return None
     if not isinstance(payload, list):
         return None
-    parsed: Dict[str, RegisteredJob] = {}
-    for entry in payload:
-        if isinstance(entry, dict) and entry.get("name"):
-            job_name = str(entry["name"]).strip()
-            parsed[job_name] = RegisteredJob(
-                name=job_name,
-                command=str(entry.get("command") or ""),
-                job_type=str(entry.get("type") or entry.get("job_type") or ""),
-                image=str(entry.get("image") or ""),
-                mount=str(entry.get("mount") or entry.get("mounts") or ""),
-                status=str(entry.get("status") or ""),
-            )
-    return parsed
+    return {
+        str(entry["name"]).strip(): RegisteredJob(
+            name=str(entry["name"]).strip(),
+            command=str(entry.get("command") or ""),
+            job_type=str(entry.get("type") or entry.get("job_type") or ""),
+            image=str(entry.get("image") or ""),
+            mount=str(entry.get("mount") or entry.get("mounts") or ""),
+            status=str(entry.get("status") or ""),
+        )
+        for entry in payload
+        if isinstance(entry, dict) and entry.get("name")
+    }
 
 
 def _parse_toolforge_jobs_list(raw_output: str) -> Dict[str, RegisteredJob]:
-    """Parses toolforge jobs list (--output long or compact) and JSON output."""
+    """Parses toolforge jobs list output across long, compact, and JSON formats."""
     stripped = raw_output.strip()
     if not stripped or "no jobs found" in stripped.lower():
         return {}
@@ -1373,11 +1103,9 @@ def _parse_toolforge_jobs_list(raw_output: str) -> Dict[str, RegisteredJob]:
         if bordered:
             return bordered
 
-    lines = [line.rstrip("\r\n") for line in raw_output.splitlines() if line.strip()]
     jobs: Dict[str, RegisteredJob] = {}
     col_bounds: Optional[List[Tuple[int, int]]] = None
-
-    for line in lines:
+    for line in (ln.rstrip("\r\n") for ln in raw_output.splitlines() if ln.strip()):
         if line.strip().lower().startswith("job name"):
             continue
         if _SEPARATOR_LINE_RE.match(line.strip()):
@@ -1404,20 +1132,17 @@ def _parse_toolforge_jobs_list(raw_output: str) -> Dict[str, RegisteredJob]:
 
 
 def _parse_toolforge_job_show(raw_output: str) -> Dict[str, str]:
-    """Parses key: value details from toolforge jobs show <name>."""
     details: Dict[str, str] = {}
     for line in raw_output.splitlines():
-        if ":" not in line:
-            continue
-        key, val = line.split(":", 1)
-        cleaned_key = key.strip().lower()
-        if cleaned_key:
-            details[cleaned_key] = val.strip()
+        if ":" in line:
+            key, val = line.split(":", 1)
+            cleaned_key = key.strip().lower()
+            if cleaned_key:
+                details[cleaned_key] = val.strip()
     return details
 
 
 def _extract_update_offline_sources(command: str) -> set[str]:
-    """Extracts covered update_offline_dbs sources from a job command string."""
     if not command or "update_offline_dbs" not in command:
         return set()
     try:
@@ -1453,31 +1178,24 @@ def _extract_update_offline_sources(command: str) -> set[str]:
     if not source_tokens or "all" in source_tokens:
         return {"stopforumspam", "maxmind", "cloud_cidrs"}
 
-    covered: set[str] = set()
-    for tok in source_tokens:
-        if tok in ("stopforumspam", "sfs"):
-            covered.add("stopforumspam")
-        elif tok == "maxmind":
-            covered.add("maxmind")
-        elif tok in ("cloud_cidrs", "cloud-cidrs", "cloud"):
-            covered.add("cloud_cidrs")
-    return covered
+    alias_map = {
+        "stopforumspam": "stopforumspam",
+        "sfs": "stopforumspam",
+        "maxmind": "maxmind",
+        "cloud_cidrs": "cloud_cidrs",
+        "cloud-cidrs": "cloud_cidrs",
+        "cloud": "cloud_cidrs",
+    }
+    return {alias_map[tok] for tok in source_tokens if tok in alias_map}
 
 
 def _schedule_matches_expected(expected_schedule: str, actual_job_type: str) -> bool:
-    """Checks scheduled job type against expected cron expressions or @hourly/@daily aliases."""
     lowered_type = actual_job_type.strip().lower()
     if "scheduled" not in lowered_type:
         return False
-    if ":" in lowered_type:
-        actual_cron = " ".join(lowered_type.split(":", 1)[1].split())
-    else:
-        actual_cron = " ".join(lowered_type.split())
-
+    actual_cron = " ".join((lowered_type.split(":", 1)[1] if ":" in lowered_type else lowered_type).split())
     norm_expected = " ".join(expected_schedule.strip().lower().split())
-    if not norm_expected:
-        return True
-    if norm_expected == actual_cron:
+    if not norm_expected or norm_expected == actual_cron:
         return True
     hourly_re = r"\d{1,2}\s+\*\s+\*\s+\*\s+\*"
     daily_re = r"\d{1,2}\s+\d{1,2}\s+\*\s+\*\s+\*"
@@ -1509,18 +1227,13 @@ def _validate_registered_job(
     if spec.schedule and not schedule_ok:
         job_warnings.append(f"schedule mismatch (expected '{spec.schedule}', got '{reg.job_type or 'unknown'}')")
 
-    mounted = reg.mount.strip().lower()
-    if mounted and spec.mount.lower() not in mounted:
+    if reg.mount.strip() and spec.mount.lower() not in reg.mount.strip().lower():
         job_warnings.append(f"mount is '{reg.mount}' (expected '{spec.mount}')")
-
     if tool_account and reg.image and reg.image != adapted_image:
         job_warnings.append(f"image is '{reg.image}' (expected '{adapted_image}')")
-
     if reg.command and not covered_by and "update_offline_dbs" not in reg.command:
         job_warnings.append(f"command is '{reg.command}' (expected '{spec.command}')")
-
-    lowered_status = reg.status.lower()
-    if any(token in lowered_status for token in _FAILED_JOB_STATUS_TOKENS):
+    if any(token in reg.status.lower() for token in _FAILED_JOB_STATUS_TOKENS):
         job_warnings.append(f"unhealthy job status '{reg.status}'")
 
     return BastionJobCheck(
@@ -1534,12 +1247,34 @@ def _validate_registered_job(
     )
 
 
+def _hydrate_missing_job_details(
+    toolforge_bin: str,
+    active_jobs: Dict[str, RegisteredJob],
+    expected_names: set[str],
+) -> None:
+    for job_name, reg in list(active_jobs.items()):
+        if job_name not in expected_names and "update" not in job_name and "db" not in job_name:
+            continue
+        if reg.command and reg.image and reg.mount:
+            continue
+        rc_show, show_stdout, _ = _run_toolforge_command(toolforge_bin, ("jobs", "show", job_name))
+        if rc_show == 0:
+            details = _parse_toolforge_job_show(show_stdout)
+            active_jobs[job_name] = RegisteredJob(
+                name=job_name,
+                command=details.get("command", reg.command),
+                job_type=reg.job_type or details.get("job type") or details.get("type") or "",
+                image=details.get("image", reg.image),
+                mount=details.get("mounts") or details.get("mount") or reg.mount,
+                status=reg.status or details.get("status", ""),
+            )
+
+
 def _check_bastion_jobs(
     toolforge_bin: str,
     base_dir: Path,
     tool_account: Optional[str],
 ) -> Tuple[List[BastionJobCheck], Optional[str]]:
-    """Checks expected scheduled jobs against toolforge jobs list --output long and jobs show."""
     expected_jobs = parse_jobs_yaml(base_dir / "jobs.yaml")
     used_long_output = True
     rc, stdout, stderr = _run_toolforge_command(toolforge_bin, ("jobs", "list", "--output", "long"))
@@ -1551,26 +1286,8 @@ def _check_bastion_jobs(
         return [], f"Unable to query toolforge jobs list: {detail or f'exit code {rc}'}"
 
     active_jobs = _parse_toolforge_jobs_list(stdout)
-
-    # Populate full details via jobs show only when --output long was unavailable.
     if not used_long_output:
-        expected_names = {spec.name for spec in expected_jobs}
-        for job_name, reg in list(active_jobs.items()):
-            if job_name not in expected_names and "update" not in job_name and "db" not in job_name:
-                continue
-            if reg.command and reg.image and reg.mount:
-                continue
-            rc_show, show_stdout, _ = _run_toolforge_command(toolforge_bin, ("jobs", "show", job_name))
-            if rc_show == 0:
-                details = _parse_toolforge_job_show(show_stdout)
-                active_jobs[job_name] = RegisteredJob(
-                    name=job_name,
-                    command=details.get("command", reg.command),
-                    job_type=reg.job_type or details.get("job type") or details.get("type") or "",
-                    image=details.get("image", reg.image),
-                    mount=details.get("mounts") or details.get("mount") or reg.mount,
-                    status=reg.status or details.get("status", ""),
-                )
+        _hydrate_missing_job_details(toolforge_bin, active_jobs, {spec.name for spec in expected_jobs})
 
     results: List[BastionJobCheck] = []
     for spec in expected_jobs:
@@ -1587,18 +1304,13 @@ def _check_bastion_jobs(
             continue
 
         needed_sources = _extract_update_offline_sources(spec.command)
-        covering_job: Optional[RegisteredJob] = None
-        if needed_sources:
-            candidates = [
-                reg for reg in active_jobs.values() if needed_sources <= _extract_update_offline_sources(reg.command)
-            ]
-            if candidates:
-                covering_job = next(
-                    (cand for cand in candidates if "scheduled" in cand.job_type.lower()),
-                    candidates[0],
-                )
-
-        if covering_job is not None:
+        candidates = (
+            [reg for reg in active_jobs.values() if needed_sources <= _extract_update_offline_sources(reg.command)]
+            if needed_sources
+            else []
+        )
+        if candidates:
+            covering_job = next((cand for cand in candidates if "scheduled" in cand.job_type.lower()), candidates[0])
             results.append(
                 _validate_registered_job(
                     spec,
@@ -1610,19 +1322,21 @@ def _check_bastion_jobs(
             )
             continue
 
-        warnings: List[str] = []
-        if tool_account and spec.image != adapted_image:
-            warnings.append(
+        warnings = (
+            (
                 f"jobs.yaml specifies template image '{spec.image}', whereas active account '{tool_account}' "
-                f"requires '{adapted_image}'"
+                f"requires '{adapted_image}'",
             )
+            if (tool_account and spec.image != adapted_image)
+            else ()
+        )
         results.append(
             BastionJobCheck(
                 expected=spec,
                 registered=False,
                 job_type="",
                 status="Missing",
-                warnings=tuple(warnings),
+                warnings=warnings,
                 adapted_image=adapted_image,
             )
         )
@@ -1693,9 +1407,7 @@ class Command(BaseCommand):
 
     def _prompt_yes_no(self, prompt: str) -> bool:
         response = self._prompt_text(prompt, sensitive=False)
-        if not response:
-            return False
-        return response.lower() in ("y", "yes")
+        return bool(response and response.lower() in ("y", "yes"))
 
     def _save_env_value(
         self,
@@ -1833,26 +1545,22 @@ class Command(BaseCommand):
         show_all_options: bool,
     ) -> Tuple[List[EnvVarSpec], List[EnvVarSpec], List[EnvVarSpec], List[EnvVarSpec]]:
         self.stdout.write("\n[1/4] Environment Variables")
-        values = env_result.values
-        sources = env_result.sources
-        hidden_keys = env_result.hidden_keys
+        values, sources, hidden_keys = env_result.values, env_result.sources, env_result.hidden_keys
 
         missing_required: List[EnvVarSpec] = []
         attention_recommended: List[EnvVarSpec] = []
         missing_providers: List[EnvVarSpec] = []
         missing_optional_all: List[EnvVarSpec] = []
 
-        for tier, heading in (
-            ("required", "Required Configuration"),
-            ("recommended", "Production / Toolforge Recommended"),
-            ("provider", "Upstream IP Intelligence Providers (Optional)"),
-            ("optional", "Runtime, Paths & Build Metadata (Optional)"),
-        ):
+        sections = (
+            ("required", "Required Configuration", "[REQUIRED]"),
+            ("recommended", "Production / Toolforge Recommended", "[RECOMMENDED]"),
+            ("provider", "Upstream IP Intelligence Providers (Optional)", "[OPTIONAL]"),
+            ("optional", "Runtime, Paths & Build Metadata (Optional)", "[OPTIONAL]"),
+        )
+        for tier, heading, tag in sections:
             self.stdout.write(f"\n  {heading}:")
-            tag = "[REQUIRED]" if tier == "required" else ("[RECOMMENDED]" if tier == "recommended" else "[OPTIONAL]")
-            for spec in ENV_SPECS:
-                if spec.tier != tier:
-                    continue
+            for spec in (s for s in ENV_SPECS if s.tier == tier):
                 if spec.name in hidden_keys:
                     self.stdout.write(
                         self.style.SUCCESS(
@@ -1870,17 +1578,17 @@ class Command(BaseCommand):
                         missing_providers=missing_providers,
                         missing_optional_all=missing_optional_all,
                     )
-                    continue
-                self._report_configured_env_spec(
-                    spec,
-                    val,
-                    tag=tag,
-                    source_label=sources.get(spec.name, "configured"),
-                    mode=mode,
-                    tool_account=tool_account,
-                    missing_required=missing_required,
-                    attention_recommended=attention_recommended,
-                )
+                else:
+                    self._report_configured_env_spec(
+                        spec,
+                        val,
+                        tag=tag,
+                        source_label=sources.get(spec.name, "configured"),
+                        mode=mode,
+                        tool_account=tool_account,
+                        missing_required=missing_required,
+                        attention_recommended=attention_recommended,
+                    )
 
         if values.get("ENABLE_TEST_AUTH") == "1" and (
             mode == "bastion" or values.get("DJANGO_DEBUG", "").lower() not in ("1", "true", "yes")
@@ -1915,7 +1623,7 @@ class Command(BaseCommand):
     ) -> int:
         updated_count = 0
 
-        def _prompt_and_store(spec: EnvVarSpec, *, hint: str = "") -> bool:
+        def _prompt_and_store(spec: EnvVarSpec, *, hint: str = "") -> None:
             nonlocal updated_count
             if spec.name == "DJANGO_SECRET_KEY":
                 prompt = (
@@ -1929,7 +1637,7 @@ class Command(BaseCommand):
 
             entered = self._prompt_text(prompt, sensitive=spec.sensitive)
             if not entered:
-                return False
+                return
 
             final_val = (
                 generate_secret_key() if spec.name == "DJANGO_SECRET_KEY" and entered.lower() == "gen" else entered
@@ -1943,9 +1651,7 @@ class Command(BaseCommand):
                 value=final_val,
             )
             updated_count += 1
-            preview = format_display_value(spec, final_val)
-            self.stdout.write(self.style.SUCCESS(f"    Saved {spec.name} = {preview}"))
-            return True
+            self.stdout.write(self.style.SUCCESS(f"    Saved {spec.name} = {format_display_value(spec, final_val)}"))
 
         if missing_required:
             self.stdout.write("\n  Interactive Setup: Required Variables")
@@ -1955,8 +1661,7 @@ class Command(BaseCommand):
         if attention_recommended:
             self.stdout.write("\n  Interactive Setup: Recommended Variables")
             for spec in attention_recommended:
-                hint = _suggested_value_hint(spec, mode=mode, tool_account=tool_account)
-                _prompt_and_store(spec, hint=hint)
+                _prompt_and_store(spec, hint=_suggested_value_hint(spec, mode=mode, tool_account=tool_account))
 
         if missing_providers:
             self.stdout.write("")
@@ -1991,13 +1696,7 @@ class Command(BaseCommand):
         created_dirs: List[Path] = []
 
         for label, path, required, persistent in targets:
-            status = _inspect_directory(
-                label,
-                path,
-                required=required,
-                persistent=persistent,
-                mounts=mounts,
-            )
+            status = _inspect_directory(label, path, required=required, persistent=persistent, mounts=mounts)
             tag = "[REQUIRED]" if required else "[OPTIONAL]"
             if not status.exists:
                 if not persistent and mode == "bastion":
@@ -2014,11 +1713,7 @@ class Command(BaseCommand):
                         path.mkdir(parents=True, exist_ok=True)
                         created_dirs.append(path)
                         status = _inspect_directory(
-                            label,
-                            path,
-                            required=required,
-                            persistent=persistent,
-                            mounts=mounts,
+                            label, path, required=required, persistent=persistent, mounts=mounts
                         )
                         self.stdout.write(self.style.SUCCESS(f"    Created {path}"))
                     except OSError as exc:
@@ -2066,20 +1761,17 @@ class Command(BaseCommand):
 
         for entry in entries:
             tag = "[OPTIONAL]" if entry["optional"] else "[REQUIRED]"
-            name = entry["name"]
-            filename = entry["filename"]
-            status = entry["status"]
-            resolved_path = entry["resolvedPath"]
-
-            if status == "healthy":
+            name, filename, status, resolved_path = (
+                entry["name"],
+                entry["filename"],
+                entry["status"],
+                entry["resolvedPath"],
+            )
+            if status in ("healthy", "stale"):
                 meta = f"{_format_bytes(entry['sizeBytes'])}, age {_format_age(entry['ageSeconds'])}"
+                style_fn = self.style.SUCCESS if status == "healthy" else self.style.WARNING
                 self.stdout.write(
-                    self.style.SUCCESS(f"  - {tag} {name} ({filename}): HEALTHY ({meta}) -> {resolved_path}")
-                )
-            elif status == "stale":
-                meta = f"{_format_bytes(entry['sizeBytes'])}, age {_format_age(entry['ageSeconds'])}"
-                self.stdout.write(
-                    self.style.WARNING(f"  - {tag} {name} ({filename}): STALE ({meta}) -> {resolved_path}")
+                    style_fn(f"  - {tag} {name} ({filename}): {status.upper()} ({meta}) -> {resolved_path}")
                 )
             elif entry["optional"] and entry["key"] in ("cloud_cidrs", "hosting_asn_rules"):
                 self.stdout.write(f"  - {tag} {name} ({filename}): BUILT-IN FALLBACK (no override file found)")
@@ -2114,30 +1806,28 @@ class Command(BaseCommand):
 
         for check in checks:
             spec = check.expected
+            coverage_note = f", covered by '{check.covered_by}'" if check.covered_by else ""
             if not check.registered:
                 self.stdout.write(
                     self.style.ERROR(
                         f"  - [REQUIRED] {spec.name}: MISSING (expected schedule '{spec.schedule}', command '{spec.command}')"
                     )
                 )
+                for warning in check.warnings:
+                    self.stdout.write(self.style.WARNING(f"    Note: {warning}"))
             elif check.warnings:
                 detail = "; ".join(check.warnings)
-                coverage_note = f", covered by '{check.covered_by}'" if check.covered_by else ""
                 self.stdout.write(
                     self.style.WARNING(
                         f"  - [REQUIRED] {spec.name}: REGISTERED WITH WARNINGS ({check.status}{coverage_note}; {detail})"
                     )
                 )
             else:
-                coverage_note = f", covered by '{check.covered_by}'" if check.covered_by else ""
                 self.stdout.write(
                     self.style.SUCCESS(
                         f"  - [REQUIRED] {spec.name}: OK ({check.job_type or spec.schedule}; {check.status}{coverage_note})"
                     )
                 )
-            for warning in check.warnings:
-                if not check.registered:
-                    self.stdout.write(self.style.WARNING(f"    Note: {warning}"))
         return checks, None
 
     def _collect_db_update_commands(
@@ -2146,7 +1836,7 @@ class Command(BaseCommand):
         mode: str,
         tool_account: Optional[str],
         values: Dict[str, str],
-        hidden: set[str],
+        hidden: frozenset[str],
         missing_or_stale_core_dbs: Sequence[Dict[str, Any]],
     ) -> List[str]:
         if not missing_or_stale_core_dbs:
@@ -2157,7 +1847,6 @@ class Command(BaseCommand):
             (values.get("MAXMIND_ACCOUNT_ID") or "MAXMIND_ACCOUNT_ID" in hidden)
             and (values.get("MAXMIND_LICENSE_KEY") or "MAXMIND_LICENSE_KEY" in hidden)
         )
-        commands: List[str] = []
         if mode == "bastion":
             target_image = f"tool-{tool_account}/tool-{tool_account}:latest" if tool_account else DEFAULT_JOB_SPEC.image
             if missing_maxmind_dbs and not has_maxmind_creds:
@@ -2167,14 +1856,14 @@ class Command(BaseCommand):
                         "configure them first or upload GeoLite2-*.mmdb manually into ~/data."
                     )
                 )
-            commands.append(
+            return [
                 f"toolforge jobs run update-offline-dbs-init --image {target_image} "
                 '--mount=all --wait --command "python manage.py update_offline_dbs"'
-            )
-            return commands
+            ]
 
         if missing_sfs_dbs and not missing_maxmind_dbs:
             return ["python manage.py update_offline_dbs --sources stopforumspam"]
+        commands: List[str] = []
         if missing_maxmind_dbs and not has_maxmind_creds:
             self.stdout.write(
                 self.style.WARNING(
@@ -2190,14 +1879,11 @@ class Command(BaseCommand):
     def _collect_job_remediation_commands(self, missing_or_warn_jobs: Sequence[BastionJobCheck]) -> List[str]:
         if not missing_or_warn_jobs:
             return []
-        commands: List[str] = []
-        for job in missing_or_warn_jobs:
-            spec = job.expected
-            target_job_name = job.covered_by or spec.name
-            commands.append(
-                f'toolforge jobs run {target_job_name} --command "{spec.command}" '
-                f'--image {job.adapted_image} --schedule "{spec.schedule}" --mount={spec.mount}'
-            )
+        commands = [
+            f'toolforge jobs run {job.covered_by or job.expected.name} --command "{job.expected.command}" '
+            f'--image {job.adapted_image} --schedule "{job.expected.schedule}" --mount={job.expected.mount}'
+            for job in missing_or_warn_jobs
+        ]
         if any(job.expected.image != job.adapted_image for job in missing_or_warn_jobs):
             template_img = missing_or_warn_jobs[0].expected.image
             adapted_img = missing_or_warn_jobs[0].adapted_image
@@ -2224,8 +1910,7 @@ class Command(BaseCommand):
     ) -> None:
         self.stdout.write("\nSummary & Next Steps")
 
-        values = env_result.values
-        hidden = env_result.hidden_keys
+        values, hidden = env_result.values, env_result.hidden_keys
         unresolved_required_env = [
             spec.name
             for spec in ENV_SPECS
@@ -2378,10 +2063,7 @@ class Command(BaseCommand):
             mode=mode,
             no_input=no_input,
         )
-        offline_entries = self._print_offline_db_section(
-            base_dir=base_dir,
-            env_values=env_result.values,
-        )
+        offline_entries = self._print_offline_db_section(base_dir=base_dir, env_values=env_result.values)
         job_checks, jobs_error = self._print_jobs_section(
             mode=mode,
             toolforge_bin=toolforge_bin,

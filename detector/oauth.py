@@ -2,21 +2,22 @@
 Wikimedia OAuth 2.0 group inspection, CentralAuth verification, and role-based access control.
 """
 
-import inspect
 import logging
 import os
 import re
 import time
-import unittest.mock
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 from django.conf import settings
 
+from .http_client import clear_client_cookies
+from .provider_registry import USER_AGENT_HEADER
+
 logger = logging.getLogger(__name__)
 
 MEDIAWIKI_API_URL = "https://meta.wikimedia.org/w/api.php"
-WIKIMEDIA_USER_AGENT = "ProxyCheck/1.0 (https://proxycheck.toolforge.org; tools.proxycheck@toolforge.org)"
+WIKIMEDIA_USER_AGENT = USER_AGENT_HEADER
 DEFAULT_RIGHTS_TTL_SECONDS = 3600
 
 WIKIMEDIA_BETA_SUFFIXES = (
@@ -73,31 +74,6 @@ def normalize_and_validate_wikimedia_domain(raw_domain: Any) -> Optional[str]:
         if not label or len(label) > 63 or label.startswith("-") or label.endswith("-"):
             return None
     return candidate
-
-
-def _clear_client_cookies(client: Any) -> None:
-    """Clears client cookies only when entries exist or clear is a synchronous mock."""
-    cookies = getattr(client, "cookies", None)
-    if cookies is None:
-        return
-    clear_fn = getattr(cookies, "clear", None)
-    if not callable(clear_fn):
-        return
-    if isinstance(clear_fn, unittest.mock.NonCallableMock):
-        # Avoid invoking AsyncMock.clear synchronously and creating an unawaited coroutine.
-        if not (isinstance(clear_fn, unittest.mock.AsyncMock) or inspect.iscoroutinefunction(clear_fn)):
-            clear_fn()
-        return
-    if isinstance(cookies, httpx.Cookies):
-        if len(cookies) > 0:
-            clear_fn()
-        return
-    try:
-        has_cookies = len(cookies) > 0 if hasattr(cookies, "__len__") else bool(cookies)
-    except TypeError:
-        has_cookies = False
-    if has_cookies:
-        clear_fn()
 
 
 def normalize_wiki_username(raw_username: Any) -> str:
@@ -267,7 +243,7 @@ async def verify_centralauth_userinfo(
         "centralauthtoken": centralauth_token,
     }
     headers = {"User-Agent": WIKIMEDIA_USER_AGENT}
-    _clear_client_cookies(client)
+    clear_client_cookies(client)
     try:
         resp = await client.get(api_url, params=params, headers=headers, timeout=10.0)
     except Exception as exc:
@@ -277,7 +253,7 @@ async def verify_centralauth_userinfo(
             mw_error={"code": "upstream_network_error", "exception": type(exc).__name__},
         ) from exc
     finally:
-        _clear_client_cookies(client)
+        clear_client_cookies(client)
 
     if resp.status_code != 200:
         logger.warning(f"{validated_domain} returned HTTP {resp.status_code} during CentralAuth verification")
@@ -399,14 +375,14 @@ async def fetch_user_rights_from_meta(
     headers = {
         "User-Agent": WIKIMEDIA_USER_AGENT,
     }
-    _clear_client_cookies(client)
+    clear_client_cookies(client)
     try:
         resp = await client.get(api_url, params=params, headers=headers, timeout=10.0)
     except Exception as exc:
         logger.warning(f"Error querying Meta-Wiki for user rights: {exc}")
         raise MetaWikiRightsFetchError(f"Meta-Wiki request failed: {exc}") from exc
     finally:
-        _clear_client_cookies(client)
+        clear_client_cookies(client)
 
     if resp.status_code != 200:
         logger.warning(f"Meta-Wiki returned HTTP {resp.status_code} for user rights query")
@@ -464,14 +440,14 @@ async def fetch_project_user_rights(
         "format": "json",
     }
     headers = {"User-Agent": WIKIMEDIA_USER_AGENT}
-    _clear_client_cookies(client)
+    clear_client_cookies(client)
     try:
         resp = await client.get(api_url, params=params, headers=headers, timeout=10.0)
     except httpx.HTTPError as exc:
         logger.warning(f"Error querying {validated_domain} for user rights: {type(exc).__name__}")
         return []
     finally:
-        _clear_client_cookies(client)
+        clear_client_cookies(client)
 
     if resp.status_code != 200:
         logger.warning(f"{validated_domain} returned HTTP {resp.status_code} for user rights query")

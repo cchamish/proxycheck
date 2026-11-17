@@ -1,5 +1,5 @@
 """
-Session persistence wrappers, Wikimedia OAuth/CentralAuth rights resolution,
+Session persistence wrappers, Wikimedia OAuth and CentralAuth rights resolution,
 gadget Bearer token verification, and CORS response helpers.
 """
 
@@ -16,7 +16,7 @@ from django.conf import settings
 from django.core import signing
 from django.http import JsonResponse
 
-from .cache_backends import _views_attr
+from . import oauth
 from .intelligence import canonicalize_ip
 from .middleware import is_session_backend_error
 from .oauth import (
@@ -27,8 +27,6 @@ from .oauth import (
     MetaWikiRightsFetchError,
     evaluate_wikimedia_rights,
     extract_wikimedia_domain_from_project,
-    fetch_project_user_rights,
-    fetch_user_rights_from_meta,
     is_allowlisted_wiki_user,
     is_session_rights_expired,
     normalize_and_validate_wikimedia_domain,
@@ -48,10 +46,10 @@ DEFAULT_GADGET_TOKEN_TTL_SECONDS = 3600
 
 _MAX_MERGED_PROJECT_RIGHTS_LOOKUPS = 15
 _MERGED_PROJECT_RIGHTS_BATCH_SIZE = 5
-_SESSION_UNAVAILABLE_ERROR = "Authentication session storage is temporarily unavailable."
+SESSION_UNAVAILABLE_ERROR = "Authentication session storage is temporarily unavailable."
 
 
-def _get_gadget_token_ttl_seconds() -> int:
+def get_gadget_token_ttl_seconds() -> int:
     configured = getattr(settings, "GADGET_TOKEN_TTL_SECONDS", DEFAULT_GADGET_TOKEN_TTL_SECONDS)
     if isinstance(configured, bool) or not isinstance(configured, int) or configured <= 0:
         return DEFAULT_GADGET_TOKEN_TTL_SECONDS
@@ -61,12 +59,11 @@ def _get_gadget_token_ttl_seconds() -> int:
 def issue_gadget_token(username: str) -> str:
     """Signs a gadget authentication payload for an authenticated and authorised Wikimedia user."""
     payload = {"u": username, "scope": "gadget"}
-    signing_mod = _views_attr("signing", signing)
-    return signing_mod.dumps(payload, salt=GADGET_TOKEN_SALT)
+    return signing.dumps(payload, salt=GADGET_TOKEN_SALT)
 
 
 def _verify_gadget_bearer_token(auth_header: str) -> Tuple[Optional[str], Optional[str]]:
-    """Validates an Authorization Bearer header containing a signed gadget token."""
+    """Validates a Bearer header containing a signed gadget token."""
     parts = auth_header.strip().split(None, 1)
     if len(parts) != 2 or parts[0].lower() != "bearer":
         return None, "Invalid authorization header."
@@ -74,12 +71,11 @@ def _verify_gadget_bearer_token(auth_header: str) -> Tuple[Optional[str], Option
     if not token:
         return None, "Invalid authorization header."
 
-    signing_mod = _views_attr("signing", signing)
     try:
-        payload = signing_mod.loads(
+        payload = signing.loads(
             token,
             salt=GADGET_TOKEN_SALT,
-            max_age=_get_gadget_token_ttl_seconds(),
+            max_age=get_gadget_token_ttl_seconds(),
         )
     except signing.SignatureExpired:
         return None, "Authentication token expired. Please re-authenticate."
@@ -109,7 +105,7 @@ def _is_allowed_wikimedia_origin(origin: Optional[str]) -> bool:
     return bool(getattr(settings, "DEBUG", False) and _LOCAL_DEV_ORIGIN_RE.match(candidate))
 
 
-def _apply_detect_cors_headers(request, response, methods: str = "GET, OPTIONS"):
+def apply_detect_cors_headers(request, response, methods: str = "GET, OPTIONS"):
     origin = request.headers.get("Origin")
     if _is_allowed_wikimedia_origin(origin):
         response["Access-Control-Allow-Origin"] = origin.strip()
@@ -181,12 +177,11 @@ async def _populate_merged_project_rights(
 
     candidates.sort()
     candidates = candidates[:_MAX_MERGED_PROJECT_RIGHTS_LOOKUPS]
-    fetch_project_fn = _views_attr("fetch_project_user_rights", fetch_project_user_rights)
 
     for start in range(0, len(candidates), _MERGED_PROJECT_RIGHTS_BATCH_SIZE):
         batch = candidates[start : start + _MERGED_PROJECT_RIGHTS_BATCH_SIZE]
         results = await asyncio.gather(
-            *(fetch_project_fn(client, username, domain) for _, _, _, domain in batch),
+            *(oauth.fetch_project_user_rights(client, username, domain) for _, _, _, domain in batch),
             return_exceptions=True,
         )
         found_required = False
@@ -202,7 +197,7 @@ async def _populate_merged_project_rights(
     return enriched
 
 
-async def _resolve_wikimedia_access(
+async def resolve_wikimedia_access(
     client: httpx.AsyncClient,
     username: str,
     local_groups: List[str],
@@ -228,9 +223,8 @@ async def _resolve_wikimedia_access(
         return evaluate_wikimedia_rights(base_info)
 
     local_eval = evaluate_wikimedia_rights(base_info)
-    fetch_meta_fn = _views_attr("fetch_user_rights_from_meta", fetch_user_rights_from_meta)
     try:
-        meta_rights = await fetch_meta_fn(
+        meta_rights = await oauth.fetch_user_rights_from_meta(
             client,
             username,
             wiki_domain=wiki_domain,
@@ -336,13 +330,13 @@ def _read_session_user_sync(request, *, context: str) -> Any:
 
 
 @sync_to_async(thread_sensitive=True)
-def _get_session_user(request, *, context: str = "session_rights_check") -> Any:
+def get_session_user(request, *, context: str = "session_rights_check") -> Any:
     """Thread-safe synchronous helper for reading and validating session user data."""
     return _read_session_user_sync(request, context=context)
 
 
 @sync_to_async(thread_sensitive=True)
-def _pop_oauth_login_context(request) -> Tuple[Any, Optional[str], bool]:
+def pop_oauth_login_context(request) -> Tuple[Any, Optional[str], bool]:
     """Pops the OAuth state token and optional post-login IP target from the session in one write."""
     try:
         state = request.session.pop("oauth_state", None)
@@ -363,7 +357,7 @@ def _pop_oauth_login_context(request) -> Tuple[Any, Optional[str], bool]:
 
 
 @sync_to_async(thread_sensitive=True)
-def _persist_oauth_login_context(request, state: str, post_login_ip: Optional[str]) -> bool:
+def persist_oauth_login_context(request, state: str, post_login_ip: Optional[str]) -> bool:
     """Persists OAuth state and an optional validated IP deep-link target with rollback on failure."""
     had_prev_ip = "oauth_post_login_ip" in request.session
     prev_ip = request.session.get("oauth_post_login_ip")
@@ -385,7 +379,7 @@ def _persist_oauth_login_context(request, state: str, post_login_ip: Optional[st
 
 
 @sync_to_async(thread_sensitive=True)
-def _persist_authenticated_session(
+def persist_authenticated_session(
     request,
     user_data: Dict[str, Any],
     *,
@@ -394,7 +388,7 @@ def _persist_authenticated_session(
     """Thread-safe synchronous helper for persisting authenticated user data in Django session storage."""
     payload = dict(user_data)
     if "rights_updated_at" not in payload:
-        payload["rights_updated_at"] = _views_attr("time", time).time()
+        payload["rights_updated_at"] = time.time()
     request.session["wikimedia_user"] = payload
     request.session.modified = True
     if not _safe_save_session(request, context=context):
@@ -405,7 +399,7 @@ def _persist_authenticated_session(
 
 
 @sync_to_async(thread_sensitive=True)
-def _flush_session_async(request, *, context: str) -> bool:
+def flush_session_async(request, *, context: str) -> bool:
     """Thread-safe synchronous helper for flushing Django session state under ASGI."""
     flushed = _safe_flush_session(request, context=context)
     if flushed:
@@ -413,7 +407,7 @@ def _flush_session_async(request, *, context: str) -> bool:
     return flushed
 
 
-async def _authenticate_detect_request(request) -> Tuple[Optional[str], Optional[JsonResponse]]:
+async def authenticate_detect_request(request) -> Tuple[Optional[str], Optional[JsonResponse]]:
     """Validates gadget Bearer token or Wikimedia session credentials for IP detection endpoints."""
     auth_header = request.headers.get("Authorization")
     if auth_header is not None and str(auth_header).strip():
@@ -430,7 +424,7 @@ async def _authenticate_detect_request(request) -> Tuple[Optional[str], Optional
             )
         return "gadget", None
 
-    session_user = await _get_session_user(request)
+    session_user = await get_session_user(request)
     if not isinstance(session_user, dict) or not session_user.get("isLoggedIn"):
         return None, JsonResponse(
             {"error": "Authentication required. Please log in with Wikimedia."},
@@ -444,7 +438,7 @@ async def _authenticate_detect_request(request) -> Tuple[Optional[str], Optional
     return "session", None
 
 
-async def _authorize_admin_session_request(request, *, context: str) -> Optional[JsonResponse]:
+async def authorize_admin_session_request(request, *, context: str) -> Optional[JsonResponse]:
     """Enforces GET-only allowlisted session access without accepting gadget Bearer tokens."""
     if request.method != "GET":
         return JsonResponse({"error": "Method not allowed"}, status=405)
@@ -456,7 +450,7 @@ async def _authorize_admin_session_request(request, *, context: str) -> Optional
             status=403,
         )
 
-    session_user = await _get_session_user(request, context=context)
+    session_user = await get_session_user(request, context=context)
     if not isinstance(session_user, dict) or not session_user.get("isLoggedIn"):
         return JsonResponse(
             {"error": "Authentication required. Please log in with Wikimedia."},
@@ -470,7 +464,7 @@ async def _authorize_admin_session_request(request, *, context: str) -> Optional
     return None
 
 
-_TEST_ROLE_PROFILES: Dict[str, Dict[str, Any]] = {
+TEST_ROLE_PROFILES: Dict[str, Dict[str, Any]] = {
     "unauthorised": {
         "isLoggedIn": True,
         "username": "StandardEditor",
@@ -506,7 +500,7 @@ _TEST_ROLE_PROFILES: Dict[str, Dict[str, Any]] = {
 }
 
 
-def _parse_gadget_token_payload(request) -> Tuple[Optional[Tuple[str, str]], Optional[JsonResponse]]:
+def parse_gadget_token_payload(request) -> Tuple[Optional[Tuple[str, str]], Optional[JsonResponse]]:
     """Parses and validates the CentralAuth token and Wikimedia domain from a gadget token request."""
     try:
         raw_body = request.body.decode("utf-8-sig") if request.body else ""

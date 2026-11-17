@@ -16,7 +16,7 @@ import dns.reversename
 import httpx
 from django.test import SimpleTestCase, TestCase, override_settings
 
-from detector import views
+from detector import detection_service, providers, views
 from detector.adapters import (
     adapt_dshield,
     adapt_stopforumspam,
@@ -34,6 +34,7 @@ from .helpers import (
     MAXMIND_STUB,
     _login_authorised,
     _mock_response,
+    start_non_dnsbl_provider_stubs,
 )
 
 
@@ -51,44 +52,18 @@ class DetectorAuthTests(TestCase):
 
     # Verify detect_ip authentication and role-based access control
     def _patch_detect_providers(self):
-        def _stub_provider(name):
-            return {
-                "provider": name,
-                "status": "No API Key",
-                "statusCode": None,
-                "asn": "-",
-                "isp": "-",
-                "organisation": "-",
-                "location": "-",
-                "usageType": "-",
-                "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-                "rawJson": {"status": "error", "message": "API key not configured"},
-            }
-
-        targets = (
-            ("detector.views.query_cloudflare_radar", _stub_provider("Cloudflare Radar")),
-            ("detector.views.query_abuseipdb", _stub_provider("AbuseIPDB")),
-            ("detector.views.query_ipdata", _stub_provider("IPData")),
-            ("detector.views.query_ipregistry", _stub_provider("IPRegistry")),
-            ("detector.views.query_ip2location", _stub_provider("IP2Location")),
-            ("detector.views.query_getipintel", _stub_provider("GetIPIntel")),
-            ("detector.views.query_proxycheck", _stub_provider("Proxycheck")),
-            ("detector.views.query_iphub", _stub_provider("IPHub")),
-            ("detector.views.query_iphunter", _stub_provider("IPHunter")),
-            ("detector.views.query_maxmind", _stub_provider("MaxMind")),
-            ("detector.views.query_tor_onionoo", adapt_tor_onionoo({"relays": []}, 200, "8.8.8.8")),
-            (
-                "detector.views.query_stopforumspam",
-                adapt_stopforumspam({"success": 1, "ip": {"appears": 0, "frequency": 0, "confidence": 0.0}}, 200),
-            ),
-            ("detector.views.query_dshield", adapt_dshield({"ip": {"attacks": 0, "count": 0}}, 200)),
+        start_non_dnsbl_provider_stubs(
+            self,
+            overrides={
+                "tor_onionoo": adapt_tor_onionoo({"relays": []}, 200, "8.8.8.8"),
+                "stopforumspam": adapt_stopforumspam(
+                    {"success": 1, "ip": {"appears": 0, "frequency": 0, "confidence": 0.0}}, 200
+                ),
+                "dshield": adapt_dshield({"ip": {"attacks": 0, "count": 0}}, 200),
+            },
         )
-        for target, stub in targets:
-            patcher = patch(target, new_callable=AsyncMock, return_value=stub)
-            patcher.start()
-            self.addCleanup(patcher.stop)
 
-    @patch("detector.views.redis_client", None)
+    @patch("detector.cache_backends.redis_client", None)
     def test_detect_ip_enforces_authentication_and_rbac(self):
         unauth_resp = self.client.get("/api/v1/detect?ip=8.8.8.8")
         self.assertEqual(unauth_resp.status_code, 401)
@@ -219,8 +194,8 @@ class DetectorAuthTests(TestCase):
         WIKIMEDIA_CLIENT_SECRET="test_client_secret",
         WIKIMEDIA_REDIRECT_URI="https://proxycheck.toolforge.org/api/v1/auth/callback",
     )
-    @patch("detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock)
-    @patch("detector.views.httpx.AsyncClient")
+    @patch("detector.oauth.fetch_user_rights_from_meta", new_callable=AsyncMock)
+    @patch("detector.http_client.httpx.AsyncClient")
     def test_oauth_callback_valid_state_authenticates_and_prevents_replay(self, mock_async_client_cls, mock_fetch_meta):
         mock_client = AsyncMock()
         mock_async_client_cls.return_value.__aenter__.return_value = mock_client
@@ -273,7 +248,7 @@ class DetectorAuthTests(TestCase):
         WIKIMEDIA_CLIENT_ID="test_client_id",
         WIKIMEDIA_CLIENT_SECRET="test_client_secret",
     )
-    @patch("detector.views.httpx.AsyncClient")
+    @patch("detector.http_client.httpx.AsyncClient")
     def test_oauth_callback_invalid_or_mismatched_state_clears_session(self, mock_async_client_cls):
         for label, expected_state, received_state in (
             ("mismatch", "expected_state_abc", "wrong_state_xyz"),
@@ -330,8 +305,8 @@ class DetectorAuthTests(TestCase):
         WIKIMEDIA_CLIENT_SECRET="test_client_secret",
         WIKIMEDIA_REDIRECT_URI="https://proxycheck.toolforge.org/api/v1/auth/callback",
     )
-    @patch("detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock)
-    @patch("detector.views.httpx.AsyncClient")
+    @patch("detector.oauth.fetch_user_rights_from_meta", new_callable=AsyncMock)
+    @patch("detector.http_client.httpx.AsyncClient")
     def test_oauth_callback_post_login_ip_redirect_and_sanitisation(self, mock_async_client_cls, mock_fetch_meta):
         cases = (
             (
@@ -378,7 +353,7 @@ class DetectorAuthTests(TestCase):
         WIKIMEDIA_CLIENT_ID="test_client_id",
         WIKIMEDIA_CLIENT_SECRET="test_client_secret",
     )
-    @patch("detector.views.httpx.AsyncClient")
+    @patch("detector.http_client.httpx.AsyncClient")
     def test_oauth_callback_error_parameter_cleans_state_without_raw_log_leak(self, mock_async_client_cls):
         session = self.client.session
         session["oauth_state"] = "state_to_be_cleaned"
@@ -509,8 +484,8 @@ class MetaWikiRightsAndSessionTtlTests(TestCase):
         WIKIMEDIA_CLIENT_SECRET="test_client_secret",
         WIKIMEDIA_REDIRECT_URI="https://proxycheck.toolforge.org/api/v1/auth/callback",
     )
-    @patch("detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock)
-    @patch("detector.views.httpx.AsyncClient")
+    @patch("detector.oauth.fetch_user_rights_from_meta", new_callable=AsyncMock)
+    @patch("detector.http_client.httpx.AsyncClient")
     def test_oauth_callback_does_not_persist_false_unauthorised_session_on_meta_failure(
         self, mock_async_client_cls, mock_fetch_meta
     ):
@@ -596,35 +571,7 @@ class IpCanonicalizationAndSecurityBaselineTests(TestCase):
         self.assertIsNone(views.canonicalize_ip("not-an-ip"))
         self.assertIsNone(views.canonicalize_ip("999.999.999.999"))
 
-    @patch("detector.views.query_dshield", new_callable=AsyncMock)
-    @patch("detector.views.query_stopforumspam", new_callable=AsyncMock)
-    @patch("detector.views.query_tor_onionoo", new_callable=AsyncMock)
-    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
-    @patch("detector.views.query_iphunter", new_callable=AsyncMock)
-    @patch("detector.views.query_iphub", new_callable=AsyncMock)
-    @patch("detector.views.query_proxycheck", new_callable=AsyncMock)
-    @patch("detector.views.query_getipintel", new_callable=AsyncMock)
-    @patch("detector.views.query_ip2location", new_callable=AsyncMock)
-    @patch("detector.views.query_ipregistry", new_callable=AsyncMock)
-    @patch("detector.views.query_ipdata", new_callable=AsyncMock)
-    @patch("detector.views.query_abuseipdb", new_callable=AsyncMock)
-    @patch("detector.views.query_cloudflare_radar", new_callable=AsyncMock)
-    def test_detect_ip_variants_hit_identical_canonical_cache_key(
-        self,
-        mock_cf,
-        mock_abuse,
-        mock_ipdata,
-        mock_ipreg,
-        mock_ip2loc,
-        mock_gii,
-        mock_pc,
-        mock_iphub,
-        mock_iphunter,
-        mock_mm,
-        mock_tor,
-        mock_sfs,
-        mock_dshield,
-    ):
+    def test_detect_ip_variants_hit_identical_canonical_cache_key(self):
         def _ok_provider(name):
             return {
                 "provider": name,
@@ -640,22 +587,11 @@ class IpCanonicalizationAndSecurityBaselineTests(TestCase):
                 "rawJson": {},
             }
 
-        for m, name in (
-            (mock_cf, "Cloudflare Radar"),
-            (mock_abuse, "AbuseIPDB"),
-            (mock_ipdata, "IPData"),
-            (mock_ipreg, "IPRegistry"),
-            (mock_ip2loc, "IP2Location"),
-            (mock_gii, "GetIPIntel"),
-            (mock_pc, "Proxycheck"),
-            (mock_iphub, "IPHub"),
-            (mock_iphunter, "IPHunter"),
-            (mock_tor, "Tor Onionoo"),
-            (mock_sfs, "StopForumSpam"),
-            (mock_dshield, "DShield"),
-        ):
-            m.return_value = _ok_provider(name)
-        mock_mm.return_value = dict(MAXMIND_STUB)
+        start_non_dnsbl_provider_stubs(
+            self,
+            overrides={"maxmind": dict(MAXMIND_STUB)},
+            row_builder=_ok_provider,
+        )
 
         cache_store = {}
 
@@ -669,7 +605,7 @@ class IpCanonicalizationAndSecurityBaselineTests(TestCase):
         mock_redis.get = AsyncMock(side_effect=_fake_get)
         mock_redis.set = AsyncMock(side_effect=_fake_set)
 
-        with patch("detector.views.redis_client", mock_redis):
+        with patch("detector.cache_backends.redis_client", mock_redis):
             first_resp = self.client.get("/api/v1/detect?ip=2001:0486:4860:0:0::8888")
             second_resp = self.client.get("/api/v1/detect?ip=2001:0486:4860:0000:0000:0000:0000:8888")
             third_resp = self.client.get("/api/v1/detect?ip=2001:486:4860::8888")
@@ -790,7 +726,7 @@ class SpaRoutingTests(SimpleTestCase):
 
 
 class OfflineDatabaseStatusEndpointTests(TestCase):
-    """Tests inventory reporting, stale detection, and /api/v1/status endpoint exposure."""
+    """Tests inventory reporting, stale detection, and system status endpoint exposure."""
 
     def test_collect_offline_databases_status_reports_healthy_stale_and_missing(self):
         from datetime import datetime, timezone
@@ -877,12 +813,12 @@ class OfflineDatabaseStatusEndpointTests(TestCase):
             self.assertEqual(post_resp.status_code, 405)
 
             detect_resp = asyncio.run(
-                views._execute_detection_with_cache(
+                detection_service._execute_detection_with_cache(
                     "8.8.8.8",
                     initial_cache=(
                         {
                             provider_key: ({"provider": name, "status": "200 OK", "statusCode": 200}, None)
-                            for provider_key, name, _, _, _ in views._PROVIDER_SPECS
+                            for provider_key, name, _, _, _ in providers._PROVIDER_SPECS
                         },
                         ("dns.google", None),
                     ),

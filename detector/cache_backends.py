@@ -8,7 +8,6 @@ import json
 import logging
 import math
 import os
-import sys
 import threading
 import time
 import weakref
@@ -23,32 +22,17 @@ from proxycheck.settings import (
     resolve_mmdb_file,
 )
 
+from . import sanitization
 from .offline_dbs import (
-    _get_file_stat_signature,
-    _get_positive_int_setting,
+    get_file_stat_signature,
     get_maxmind_newest_mtime_iso,
+    get_positive_int_setting,
     get_stopforumspam_db_version,
     resolve_configured_data_dir,
 )
-from .quota_telemetry import REDIS_KEY_NAMESPACE
-from .sanitization import _sanitize_payload
+from .provider_registry import REDIS_KEY_NAMESPACE, REDIS_TRANSPORT_ERRORS
 
 logger = logging.getLogger("detector.views")
-
-
-def _views_attr(name: str, default: Any) -> Any:
-    """Resolves a potentially mock-patched attribute from the detector.views facade."""
-    views_mod = sys.modules.get("detector.views")
-    if views_mod is not None and name in views_mod.__dict__:
-        return views_mod.__dict__[name]
-    return default
-
-
-def _set_views_attr(name: str, value: Any) -> None:
-    """Propagates updated cache slot values back to detector.views when loaded."""
-    views_mod = sys.modules.get("detector.views")
-    if views_mod is not None:
-        views_mod.__dict__[name] = value
 
 
 # Short socket timeouts prevent a degraded Toolforge Redis instance from stalling upstream queries.
@@ -58,47 +42,40 @@ except ImportError as redis_init_err:
     logger.warning(f"Redis initialization warning (fault tolerance active): {redis_init_err}")
     aioredis = None
 
-try:
-    from redis.exceptions import RedisError as _RedisError
-except ImportError:
-    _RedisError = None
-
 _REDIS_SOCKET_TIMEOUT_SECONDS = 2.0
 _REDIS_CIRCUIT_BREAKER_DEFAULT_SECONDS = 5.0
-_REDIS_CIRCUIT_FAILURE_ERRORS: Tuple[type[BaseException], ...] = (
-    (ConnectionError, TimeoutError, OSError, _RedisError)
-    if _RedisError is not None
-    else (ConnectionError, TimeoutError, OSError)
-)
+_REDIS_CIRCUIT_FAILURE_ERRORS: Tuple[type[BaseException], ...] = REDIS_TRANSPORT_ERRORS
 _REDIS_INIT_ERRORS: Tuple[type[BaseException], ...] = (*_REDIS_CIRCUIT_FAILURE_ERRORS, ValueError)
+_DEFAULT_REDIS_SENTINEL = object()
 _redis_client_lock = threading.Lock()
 _redis_clients_by_loop: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Tuple[str, Any]]" = (
     weakref.WeakKeyDictionary()
 )
-redis_client: Any = None
-_default_redis_sentinel: Any = None
+redis_client: Any = _DEFAULT_REDIS_SENTINEL
 _redis_circuit_open_until: float = 0.0
-_redis_circuit_client_ref: Any = None
-if aioredis is not None:
-    try:
-        redis_client = aioredis.from_url(
-            getattr(settings, "REDIS_URL", "redis://127.0.0.1:6379/0"),
-            encoding="utf-8",
-            decode_responses=True,
-            socket_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
-            socket_connect_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
-        )
-        _default_redis_sentinel = redis_client
-        _redis_circuit_client_ref = redis_client
-    except _REDIS_INIT_ERRORS as redis_init_err:
-        logger.warning(f"Redis initialization warning (fault tolerance active): {redis_init_err}")
-        redis_client = None
-        _default_redis_sentinel = None
-        _redis_circuit_client_ref = None
+_redis_circuit_client_ref: Any = _DEFAULT_REDIS_SENTINEL
 
 
 def _active_redis_client() -> Any:
-    return _views_attr("redis_client", redis_client)
+    return redis_client
+
+
+async def _close_redis_client_safely(client: Any) -> None:
+    """Closes a superseded async Redis client without propagating transport or loop errors."""
+    aclose_fn = getattr(client, "aclose", None)
+    if not callable(aclose_fn) or not inspect.iscoroutinefunction(aclose_fn):
+        return
+    try:
+        await aclose_fn()
+    except (*_REDIS_CIRCUIT_FAILURE_ERRORS, RuntimeError) as exc:
+        logger.debug("Ignoring error while closing superseded Redis client: %s", exc)
+
+
+def clear_redis_clients() -> None:
+    """Clears per-loop Redis client references and resets the Redis circuit breaker."""
+    with _redis_client_lock:
+        _redis_clients_by_loop.clear()
+    reset_redis_circuit_breaker()
 
 
 def _get_circuit_breaker_cooldown_seconds() -> float:
@@ -127,15 +104,14 @@ def _sync_circuit_client_ref_locked() -> None:
 def is_redis_circuit_open() -> bool:
     """Returns True while the default Redis client circuit breaker is within its cooldown window."""
     global _redis_circuit_open_until
-    time_mod = _views_attr("time", time)
     with _redis_client_lock:
         _sync_circuit_client_ref_locked()
         active_client = _active_redis_client()
-        if active_client is None or active_client is not _default_redis_sentinel:
+        if active_client is None or active_client is not _DEFAULT_REDIS_SENTINEL:
             return False
         if _redis_circuit_open_until <= 0.0:
             return False
-        if time_mod.monotonic() < _redis_circuit_open_until:
+        if time.monotonic() < _redis_circuit_open_until:
             return True
         _redis_circuit_open_until = 0.0
         return False
@@ -147,16 +123,15 @@ def mark_redis_failure(exc: BaseException) -> None:
     if not isinstance(exc, _REDIS_CIRCUIT_FAILURE_ERRORS):
         return
     cooldown_seconds = _get_circuit_breaker_cooldown_seconds()
-    time_mod = _views_attr("time", time)
     with _redis_client_lock:
         _sync_circuit_client_ref_locked()
         active_client = _active_redis_client()
-        if active_client is None or active_client is not _default_redis_sentinel:
+        if active_client is None or active_client is not _DEFAULT_REDIS_SENTINEL:
             return
         if cooldown_seconds <= 0.0:
             _redis_circuit_open_until = 0.0
             return
-        now = time_mod.monotonic()
+        now = time.monotonic()
         was_closed = now >= _redis_circuit_open_until
         candidate_until = now + cooldown_seconds
         if candidate_until > _redis_circuit_open_until:
@@ -173,19 +148,18 @@ def reset_redis_circuit_breaker() -> None:
         _redis_circuit_client_ref = _active_redis_client()
 
 
-def _get_redis_client() -> Optional[Any]:
+def get_redis_client() -> Optional[Any]:
     """Returns an async Redis client bound to the active running event loop."""
     active_client = _active_redis_client()
     if active_client is None:
         with _redis_client_lock:
             _sync_circuit_client_ref_locked()
         return None
-    if active_client is not _default_redis_sentinel:
+    if active_client is not _DEFAULT_REDIS_SENTINEL:
         with _redis_client_lock:
             _sync_circuit_client_ref_locked()
         return active_client
-    aioredis_mod = _views_attr("aioredis", aioredis)
-    if aioredis_mod is None or is_redis_circuit_open():
+    if aioredis is None or is_redis_circuit_open():
         return None
 
     try:
@@ -197,6 +171,8 @@ def _get_redis_client() -> Optional[Any]:
 
     redis_url = getattr(settings, "REDIS_URL", "redis://127.0.0.1:6379/0")
     init_err: Optional[BaseException] = None
+    superseded_client: Optional[Any] = None
+    selected_client: Optional[Any] = None
     with _redis_client_lock:
         closed_loops = [loop for loop in list(_redis_clients_by_loop.keys()) if loop.is_closed()]
         for stale_loop in closed_loops:
@@ -205,9 +181,12 @@ def _get_redis_client() -> Optional[Any]:
         cached_entry = _redis_clients_by_loop.get(current_loop)
         if cached_entry is not None and cached_entry[0] == redis_url:
             return cached_entry[1]
+        if cached_entry is not None:
+            superseded_client = cached_entry[1]
+            _redis_clients_by_loop.pop(current_loop, None)
 
         try:
-            loop_client = aioredis_mod.from_url(
+            loop_client = aioredis.from_url(
                 redis_url,
                 encoding="utf-8",
                 decode_responses=True,
@@ -217,67 +196,129 @@ def _get_redis_client() -> Optional[Any]:
         except _REDIS_INIT_ERRORS as redis_loop_err:
             logger.warning(f"Redis initialization warning (fault tolerance active): {redis_loop_err}")
             init_err = redis_loop_err
-            loop_client = None
         else:
             _redis_clients_by_loop[current_loop] = (redis_url, loop_client)
-            return loop_client
+            selected_client = loop_client
+
+    if superseded_client is not None and superseded_client is not selected_client and not current_loop.is_closed():
+        aclose_fn = getattr(superseded_client, "aclose", None)
+        if callable(aclose_fn) and inspect.iscoroutinefunction(aclose_fn):
+            current_loop.create_task(_close_redis_client_safely(superseded_client))
 
     if init_err is not None:
         mark_redis_failure(init_err)
-    return None
+    return selected_client
 
 
+_get_redis_client = get_redis_client
+
+
+_MAX_MAXMIND_READERS = 8
+_MAX_MISSING_CITY_LOGGED_PATHS = 16
 _maxmind_lock = threading.Lock()
 _maxmind_readers: Dict[str, Any] = {}
 _maxmind_reader_stats: Dict[str, Optional[Tuple[int, int]]] = {}
 _missing_city_db_logged_paths: set[str] = set()
-_UNSET_MOCK_ATTR = object()
 
 
-def _get_maxmind_reader(db_path: str, maxminddb_module: Any) -> Any:
-    """Returns a cached MaxMind reader, reopening it automatically when the file changes on disk."""
-    current_sig = _get_file_stat_signature(db_path)
+def _close_mmdb_reader_safely(reader: Any) -> None:
+    if reader is None:
+        return
+    close_fn = getattr(reader, "close", None)
+    if not callable(close_fn):
+        return
+    try:
+        close_fn()
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.debug(f"Failed to close MaxMind reader: {exc}")
+
+
+def get_maxmind_reader(db_path: str, maxminddb_module: Any) -> Any:
+    """Returns a cached MaxMind reader, reopening outside the lock when the file changes on disk."""
+    current_sig = get_file_stat_signature(db_path)
     stale_reader: Optional[Any] = None
     with _maxmind_lock:
         reader = _maxmind_readers.get(db_path)
         if reader is not None:
-            if current_sig is None or _maxmind_reader_stats.get(db_path) == current_sig:
+            if current_sig is not None and _maxmind_reader_stats.get(db_path) == current_sig:
+                _maxmind_readers[db_path] = _maxmind_readers.pop(db_path)
                 return reader
             stale_reader = _maxmind_readers.pop(db_path, None)
             _maxmind_reader_stats.pop(db_path, None)
-    if stale_reader is not None:
-        try:
-            stale_reader.close()
-        except (OSError, ValueError, RuntimeError) as exc:
-            logger.debug(f"Failed to close superseded MaxMind reader: {exc}")
+
+    _close_mmdb_reader_safely(stale_reader)
+
+    candidate_reader = maxminddb_module.open_database(db_path)
+    duplicate_reader: Optional[Any] = None
+    lru_evicted_reader: Optional[Any] = None
+    selected_reader = candidate_reader
+
     with _maxmind_lock:
-        reader = _maxmind_readers.get(db_path)
-        if reader is not None:
-            return reader
-        reader = maxminddb_module.open_database(db_path)
-        _maxmind_readers[db_path] = reader
-        _maxmind_reader_stats[db_path] = current_sig
-        return reader
+        existing_reader = _maxmind_readers.get(db_path)
+        if (
+            existing_reader is not None
+            and current_sig is not None
+            and _maxmind_reader_stats.get(db_path) == current_sig
+        ):
+            _maxmind_readers[db_path] = _maxmind_readers.pop(db_path)
+            selected_reader = existing_reader
+            duplicate_reader = candidate_reader
+        else:
+            if existing_reader is not None:
+                lru_evicted_reader = _maxmind_readers.pop(db_path, None)
+                _maxmind_reader_stats.pop(db_path, None)
+            elif len(_maxmind_readers) >= _MAX_MAXMIND_READERS:
+                oldest_key = next(iter(_maxmind_readers))
+                lru_evicted_reader = _maxmind_readers.pop(oldest_key, None)
+                _maxmind_reader_stats.pop(oldest_key, None)
+            if current_sig is not None:
+                _maxmind_readers[db_path] = candidate_reader
+                _maxmind_reader_stats[db_path] = current_sig
+
+    _close_mmdb_reader_safely(duplicate_reader)
+    _close_mmdb_reader_safely(lru_evicted_reader)
+    return selected_reader
 
 
-def _evict_maxmind_reader(db_path: str) -> None:
+def evict_maxmind_reader(db_path: str) -> None:
     """Removes and closes a cached MaxMind reader when an error occurs or the database file is absent."""
     with _maxmind_lock:
         reader = _maxmind_readers.pop(db_path, None)
         _maxmind_reader_stats.pop(db_path, None)
-    if reader is not None:
-        try:
-            reader.close()
-        except (OSError, ValueError, RuntimeError) as exc:
-            logger.debug(f"Failed to close MaxMind reader: {exc}")
+    _close_mmdb_reader_safely(reader)
 
 
-def _evict_missing_maxmind_readers(filename: str, resolved_path: str) -> None:
+def evict_missing_maxmind_readers(filename: str, resolved_path: str) -> None:
     """Evicts cached readers matching a missing MMDB path or filename so deleted files never leak handles."""
     with _maxmind_lock:
         stale_keys = [key for key in _maxmind_readers if key == resolved_path or os.path.basename(key) == filename]
     for key in stale_keys:
-        _evict_maxmind_reader(key)
+        evict_maxmind_reader(key)
+
+
+def clear_maxmind_readers() -> None:
+    """Closes and removes all cached MaxMind readers and resets missing-file log tracking."""
+    with _maxmind_lock:
+        readers = list(_maxmind_readers.values())
+        _maxmind_readers.clear()
+        _maxmind_reader_stats.clear()
+        _missing_city_db_logged_paths.clear()
+    for reader in readers:
+        _close_mmdb_reader_safely(reader)
+
+
+def record_city_db_presence(city_path: str, *, is_present: bool) -> bool:
+    """Updates missing City MMDB log state and returns True once per newly missing path."""
+    with _maxmind_lock:
+        if is_present:
+            _missing_city_db_logged_paths.discard(city_path)
+            return False
+        if city_path in _missing_city_db_logged_paths:
+            return False
+        if len(_missing_city_db_logged_paths) >= _MAX_MISSING_CITY_LOGGED_PATHS:
+            _missing_city_db_logged_paths.clear()
+        _missing_city_db_logged_paths.add(city_path)
+        return True
 
 
 def _resolve_db_file(configured_path: str, filename: str, base_dir: Any) -> str:
@@ -285,7 +326,7 @@ def _resolve_db_file(configured_path: str, filename: str, base_dir: Any) -> str:
     return resolve_mmdb_file(configured_path, filename, base_dir)
 
 
-_MAXMIND_DB_SPECS = (
+MAXMIND_DB_SPECS = (
     ("country", MAXMIND_COUNTRY_DB_FILENAME),
     ("city", MAXMIND_CITY_DB_FILENAME),
     ("asn", MAXMIND_ASN_DB_FILENAME),
@@ -293,72 +334,78 @@ _MAXMIND_DB_SPECS = (
 
 _MAXMIND_CITY_DB_CACHE_TTL_SECONDS = 5.0
 _DEFAULT_OS_PATH_EXISTS = os.path.exists
+_maxmind_probe_lock = threading.Lock()
 _maxmind_city_db_cache: Optional[Tuple[Tuple[Any, ...], float, bool]] = None
 _maxmind_any_db_cache: Optional[Tuple[Tuple[Any, ...], float, bool]] = None
 
 
-def _resolve_maxmind_db_paths() -> Dict[str, str]:
+def resolve_maxmind_db_paths() -> Dict[str, str]:
     """Resolves Country, City, and ASN MMDB paths using configured TOOL_DATA_DIR or fallbacks."""
     base_dir = getattr(settings, "BASE_DIR", os.getcwd())
     configured_dir = resolve_configured_data_dir()
-    resolve_fn = _views_attr("_resolve_db_file", _resolve_db_file)
-    return {key: resolve_fn(configured_dir, filename, base_dir) for key, filename in _MAXMIND_DB_SPECS}
+    return {key: _resolve_db_file(configured_dir, filename, base_dir) for key, filename in MAXMIND_DB_SPECS}
 
 
-_DEFAULT_RESOLVE_MAXMIND_DB_PATHS = _resolve_maxmind_db_paths
+_resolve_maxmind_db_paths = resolve_maxmind_db_paths
+
+_DEFAULT_RESOLVE_MAXMIND_DB_PATHS = resolve_maxmind_db_paths
 _DEFAULT_RESOLVE_DB_FILE = _resolve_db_file
 
 
-def _is_maxmind_probe_mocked() -> bool:
-    resolve_paths_fn = _views_attr("_resolve_maxmind_db_paths", _resolve_maxmind_db_paths)
-    resolve_file_fn = _views_attr("_resolve_db_file", _resolve_db_file)
+def clear_maxmind_probe_cache() -> None:
+    """Clears short-TTL MaxMind file existence probe caches."""
+    global _maxmind_city_db_cache, _maxmind_any_db_cache
+    with _maxmind_probe_lock:
+        _maxmind_city_db_cache = None
+        _maxmind_any_db_cache = None
+
+
+def _has_custom_maxmind_probe() -> bool:
     return (
-        (os.path.exists is not _DEFAULT_OS_PATH_EXISTS and getattr(os.path.exists, "_mock_wraps", None) is None)
-        or (
-            resolve_paths_fn is not _DEFAULT_RESOLVE_MAXMIND_DB_PATHS
-            and getattr(resolve_paths_fn, "_mock_wraps", None) is None
-        )
-        or (resolve_file_fn is not _DEFAULT_RESOLVE_DB_FILE and getattr(resolve_file_fn, "_mock_wraps", None) is None)
+        os.path.exists is not _DEFAULT_OS_PATH_EXISTS
+        or _resolve_maxmind_db_paths is not _DEFAULT_RESOLVE_MAXMIND_DB_PATHS
+        or _resolve_db_file is not _DEFAULT_RESOLVE_DB_FILE
     )
 
 
 def _probe_maxmind_db_with_ttl(
     slot_name: str,
-    current_cache: Optional[Tuple[Tuple[Any, ...], float, bool]],
-    mocked_probe: Callable[[Any, Any], bool],
-    unmocked_probe: Callable[[str, Any, Any, Any], bool],
-) -> Tuple[bool, Optional[Tuple[Tuple[Any, ...], float, bool]]]:
+    direct_probe: Callable[[Any, Any], bool],
+    cached_probe: Callable[[str, Any, Any, Any], bool],
+) -> bool:
+    global _maxmind_city_db_cache, _maxmind_any_db_cache
     exists_fn = os.path.exists
-    resolve_paths_fn = _views_attr("_resolve_maxmind_db_paths", _resolve_maxmind_db_paths)
-    resolve_file_fn = _views_attr("_resolve_db_file", _resolve_db_file)
-    if _is_maxmind_probe_mocked():
-        return mocked_probe(exists_fn, resolve_paths_fn), current_cache
+    if _has_custom_maxmind_probe():
+        return direct_probe(exists_fn, _resolve_maxmind_db_paths)
 
     base_dir = getattr(settings, "BASE_DIR", os.getcwd())
     configured_dir = resolve_configured_data_dir()
     tool_data_dir = str(getattr(settings, "TOOL_DATA_DIR", "") or os.environ.get("TOOL_DATA_DIR", "")).strip()
-    cache_key = (configured_dir, str(base_dir), tool_data_dir, exists_fn, resolve_paths_fn, resolve_file_fn)
-    now_mono = _views_attr("time", time).monotonic()
-    cached = _views_attr(slot_name, current_cache)
-    if (
-        cached is not None
-        and cached[0] == cache_key
-        and 0.0 <= (now_mono - cached[1]) < _MAXMIND_CITY_DB_CACHE_TTL_SECONDS
-    ):
-        return cached[2], current_cache
+    cache_key = (configured_dir, str(base_dir), tool_data_dir)
+    now_mono = time.monotonic()
+    with _maxmind_probe_lock:
+        current_cache = _maxmind_city_db_cache if slot_name == "city" else _maxmind_any_db_cache
+        if (
+            current_cache is not None
+            and current_cache[0] == cache_key
+            and 0.0 <= (now_mono - current_cache[1]) < _MAXMIND_CITY_DB_CACHE_TTL_SECONDS
+        ):
+            return current_cache[2]
 
-    result = unmocked_probe(configured_dir, base_dir, exists_fn, resolve_file_fn)
+    result = cached_probe(configured_dir, base_dir, exists_fn, _resolve_db_file)
     updated = (cache_key, now_mono, result)
-    _set_views_attr(slot_name, updated)
-    return result, updated
+    with _maxmind_probe_lock:
+        if slot_name == "city":
+            _maxmind_city_db_cache = updated
+        else:
+            _maxmind_any_db_cache = updated
+    return result
 
 
-def _has_local_maxmind_city_db() -> bool:
+def has_local_maxmind_city_db() -> bool:
     """Returns True when GeoLite2-City.mmdb is present on disk at its resolved location."""
-    global _maxmind_city_db_cache
-    has_city, _maxmind_city_db_cache = _probe_maxmind_db_with_ttl(
-        "_maxmind_city_db_cache",
-        _maxmind_city_db_cache,
+    return _probe_maxmind_db_with_ttl(
+        "city",
         lambda exists_fn, resolve_paths_fn: bool(
             (city_path := resolve_paths_fn().get("city", "")) and exists_fn(city_path)
         ),
@@ -366,21 +413,19 @@ def _has_local_maxmind_city_db() -> bool:
             (city_path := resolve_file_fn(configured_dir, MAXMIND_CITY_DB_FILENAME, base_dir)) and exists_fn(city_path)
         ),
     )
-    return has_city
 
 
-def _has_any_local_maxmind_db() -> bool:
-    global _maxmind_any_db_cache
-    has_any, _maxmind_any_db_cache = _probe_maxmind_db_with_ttl(
-        "_maxmind_any_db_cache",
-        _maxmind_any_db_cache,
+def has_any_local_maxmind_db() -> bool:
+    return _probe_maxmind_db_with_ttl(
+        "any",
         lambda exists_fn, resolve_paths_fn: any(path and exists_fn(path) for path in resolve_paths_fn().values()),
         lambda _configured_dir, _base_dir, exists_fn, _resolve_file_fn: any(
-            path and exists_fn(path)
-            for path in _views_attr("_resolve_maxmind_db_paths", _resolve_maxmind_db_paths)().values()
+            path and exists_fn(path) for path in _resolve_maxmind_db_paths().values()
         ),
     )
-    return has_any
+
+
+_has_any_local_maxmind_db = has_any_local_maxmind_db
 
 
 DYNAMIC_CACHE_PROVIDERS = frozenset(
@@ -415,13 +460,13 @@ def _is_stable_getipintel_result(row: Optional[Dict[str, Any]]) -> bool:
     return False
 
 
-def _get_provider_cache_ttl(provider_key: str, row: Optional[Dict[str, Any]] = None) -> int:
+def get_provider_cache_ttl(provider_key: str, row: Optional[Dict[str, Any]] = None) -> int:
     """Returns the Redis TTL in seconds for a static commercial or dynamic threat feed."""
     if provider_key in DYNAMIC_CACHE_PROVIDERS:
-        return _get_positive_int_setting("PROVIDER_DYNAMIC_CACHE_TTL_SECONDS", DEFAULT_DYNAMIC_CACHE_TTL_SECONDS)
-    static_ttl = _get_positive_int_setting("PROVIDER_STATIC_CACHE_TTL_SECONDS", DEFAULT_STATIC_CACHE_TTL_SECONDS)
+        return get_positive_int_setting("PROVIDER_DYNAMIC_CACHE_TTL_SECONDS", DEFAULT_DYNAMIC_CACHE_TTL_SECONDS)
+    static_ttl = get_positive_int_setting("PROVIDER_STATIC_CACHE_TTL_SECONDS", DEFAULT_STATIC_CACHE_TTL_SECONDS)
     if provider_key == "getipintel" and _is_stable_getipintel_result(row):
-        stable_ttl = _get_positive_int_setting(
+        stable_ttl = get_positive_int_setting(
             "GETIPINTEL_STABLE_CACHE_TTL_SECONDS",
             DEFAULT_GETIPINTEL_STABLE_CACHE_TTL_SECONDS,
         )
@@ -429,19 +474,25 @@ def _get_provider_cache_ttl(provider_key: str, row: Optional[Dict[str, Any]] = N
     return static_ttl
 
 
-def _get_cooldown_bounds() -> Tuple[int, int, int]:
-    min_s = _get_positive_int_setting("PROVIDER_COOLDOWN_MIN_SECONDS", MIN_COOLDOWN_SECONDS)
-    max_s = _get_positive_int_setting("PROVIDER_COOLDOWN_MAX_SECONDS", MAX_COOLDOWN_SECONDS)
+_get_provider_cache_ttl = get_provider_cache_ttl
+
+
+def get_cooldown_bounds() -> Tuple[int, int, int]:
+    min_s = get_positive_int_setting("PROVIDER_COOLDOWN_MIN_SECONDS", MIN_COOLDOWN_SECONDS)
+    max_s = get_positive_int_setting("PROVIDER_COOLDOWN_MAX_SECONDS", MAX_COOLDOWN_SECONDS)
     low, high = min(min_s, max_s), max(min_s, max_s)
-    default_s = _get_positive_int_setting("PROVIDER_COOLDOWN_DEFAULT_SECONDS", DEFAULT_COOLDOWN_SECONDS)
+    default_s = get_positive_int_setting("PROVIDER_COOLDOWN_DEFAULT_SECONDS", DEFAULT_COOLDOWN_SECONDS)
     return max(low, min(high, default_s)), low, high
 
 
-def _provider_cache_key(provider_key: str, canonical_ip: str) -> str:
+def provider_cache_key(provider_key: str, canonical_ip: str) -> str:
     return f"{REDIS_KEY_NAMESPACE}:prov:{provider_key}:{canonical_ip}"
 
 
-def _provider_cooldown_key(provider_key: str) -> str:
+_provider_cache_key = provider_cache_key
+
+
+def provider_cooldown_key(provider_key: str) -> str:
     return f"{REDIS_KEY_NAMESPACE}:cooldown:{provider_key}"
 
 
@@ -474,13 +525,19 @@ async def _run_redis_cache_op(
         return default
 
 
-async def _safe_redis_get(key: str) -> Optional[str]:
+async def safe_redis_get(key: str) -> Optional[str]:
     raw_value = await _run_redis_cache_op("read", key, lambda client: client.get(key))
     return _decode_redis_text_value(raw_value)
 
 
-async def _safe_redis_set(key: str, value: str, *, ex: int) -> None:
+_safe_redis_get = safe_redis_get
+
+
+async def safe_redis_set(key: str, value: str, *, ex: int) -> None:
     await _run_redis_cache_op("write", key, lambda client: client.set(key, value, ex=ex))
+
+
+_safe_redis_set = safe_redis_set
 
 
 def _discard_pending_awaitable(pending: Any) -> None:
@@ -490,9 +547,9 @@ def _discard_pending_awaitable(pending: Any) -> None:
         close_method()
 
 
-async def _safe_redis_mget(keys: List[str]) -> List[Optional[str]]:
+async def safe_redis_mget(keys: List[str]) -> List[Optional[str]]:
     """Reads several keys in one round trip, falling back to single reads for clients without mget."""
-    client = _get_redis_client()
+    client = get_redis_client()
     if client is None or not keys:
         return [None] * len(keys)
     mget_method = getattr(client, "mget", None)
@@ -510,7 +567,10 @@ async def _safe_redis_mget(keys: List[str]) -> List[Optional[str]]:
             # Test doubles without a real mget hand back mock objects, so only trust a list of matching length
             if isinstance(raw_values, (list, tuple)) and len(raw_values) == len(keys):
                 return [_decode_redis_text_value(raw_value) for raw_value in raw_values]
-    return list(await asyncio.gather(*(_safe_redis_get(key) for key in keys)))
+    return list(await asyncio.gather(*(safe_redis_get(key) for key in keys)))
+
+
+_safe_redis_mget = safe_redis_mget
 
 
 async def _try_pipelined_set_many(client: Any, entries: List[Tuple[str, str, int]]) -> bool:
@@ -538,11 +598,11 @@ async def _try_pipelined_set_many(client: Any, entries: List[Tuple[str, str, int
     return isinstance(results, (list, tuple)) and len(results) == len(entries)
 
 
-async def _safe_redis_set_many(entries: List[Tuple[str, str, int]]) -> None:
+async def safe_redis_set_many(entries: List[Tuple[str, str, int]]) -> None:
     """Writes several keys with expiry in one pipelined round trip, falling back to single writes."""
     if not entries:
         return
-    client = _get_redis_client()
+    client = get_redis_client()
     if client is None:
         return
     try:
@@ -554,7 +614,10 @@ async def _safe_redis_set_many(entries: List[Tuple[str, str, int]]) -> None:
         mark_redis_failure(redis_write_err)
         logger.warning(f"Redis batch cache write bypassed for {len(entries)} keys due to error: {redis_write_err}")
         return
-    await asyncio.gather(*(_safe_redis_set(key, value, ex=ttl_seconds) for key, value, ttl_seconds in entries))
+    await asyncio.gather(*(safe_redis_set(key, value, ex=ttl_seconds) for key, value, ttl_seconds in entries))
+
+
+_safe_redis_set_many = safe_redis_set_many
 
 
 class _DecodedProviderRow(dict):
@@ -578,7 +641,7 @@ class _DecodedProviderRow(dict):
         self._source_raw_value = source_raw_value
 
 
-def _decode_cached_provider_entry(raw_value: Optional[str]) -> Optional[Tuple[Dict[str, Any], Optional[str]]]:
+def decode_cached_provider_entry(raw_value: Optional[str]) -> Optional[Tuple[Dict[str, Any], Optional[str]]]:
     if not raw_value:
         return None
     try:
@@ -594,7 +657,7 @@ def _decode_cached_provider_entry(raw_value: Optional[str]) -> Optional[Tuple[Di
     db_version = (
         int(raw_db_version) if isinstance(raw_db_version, int) and not isinstance(raw_db_version, bool) else None
     )
-    sanitize_fn = _views_attr("_sanitize_payload", _sanitize_payload)
+    sanitize_fn = sanitization.sanitize_payload
     if "row" in parsed and isinstance(parsed["row"], dict):
         row = parsed["row"]
         if not parsed.get("sanitized") and isinstance(row.get("rawJson"), (dict, list)):
@@ -627,7 +690,10 @@ def _decode_cached_provider_entry(raw_value: Optional[str]) -> Optional[Tuple[Di
     return None
 
 
-def _decode_cached_ptr_entry(raw_value: Optional[str]) -> Optional[Tuple[Optional[str], Optional[str]]]:
+_decode_cached_provider_entry = decode_cached_provider_entry
+
+
+def decode_cached_ptr_entry(raw_value: Optional[str]) -> Optional[Tuple[Optional[str], Optional[str]]]:
     if not raw_value:
         return None
     try:
@@ -643,7 +709,7 @@ def _decode_cached_ptr_entry(raw_value: Optional[str]) -> Optional[Tuple[Optiona
     return hostname, (cached_at if isinstance(cached_at, str) and cached_at else None)
 
 
-def _decode_cooldown_entry(raw_value: Optional[str]) -> Optional[Dict[str, Any]]:
+def decode_cooldown_entry(raw_value: Optional[str]) -> Optional[Dict[str, Any]]:
     if not raw_value:
         return None
     try:
@@ -655,14 +721,14 @@ def _decode_cooldown_entry(raw_value: Optional[str]) -> Optional[Dict[str, Any]]
     return {"statusCode": 503, "reason": "Provider cooldown active"}
 
 
-def _should_refresh_cached_maxmind_entry(raw_value: Optional[str], row: Dict[str, Any]) -> bool:
+def should_refresh_cached_maxmind_entry(raw_value: Optional[str], row: Dict[str, Any]) -> bool:
     """Invalidates stale or pre-City cached MaxMind entries when local MMDB files change."""
     cached_db_updated = getattr(row, "_db_updated_at", None)
     if isinstance(cached_db_updated, str) and cached_db_updated:
         current_updated = get_maxmind_newest_mtime_iso()
         if current_updated and current_updated != cached_db_updated:
             return True
-    if not _has_local_maxmind_city_db():
+    if not has_local_maxmind_city_db():
         return False
     if row.get("coordinates") is not None:
         return False
@@ -680,7 +746,7 @@ def _should_refresh_cached_maxmind_entry(raw_value: Optional[str], row: Dict[str
     return True
 
 
-def _should_refresh_cached_stopforumspam_entry(row: Dict[str, Any]) -> bool:
+def should_refresh_cached_stopforumspam_entry(row: Dict[str, Any]) -> bool:
     """Invalidates cached StopForumSpam entries when local database files change mtime."""
     cached_db_version = getattr(row, "_db_version", None)
     if cached_db_version is None:

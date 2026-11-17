@@ -3,46 +3,37 @@ IP canonicalisation, non-public IP classification, process memory diagnostics,
 and multi-source intelligence aggregation and arbitration.
 """
 
-import builtins
 import ipaddress
 import os
-import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from django.http import JsonResponse
-
-from .adapters import classify_rdns_hostname, compute_cidr_attribution
-from .cache_backends import _set_views_attr, _views_attr
+from .cidr_attribution import classify_rdns_hostname, compute_cidr_attribution
+from .provider_registry import COMMERCIAL_ARBITRATION_PROVIDERS
 
 _PROC_RSS_CACHE_TTL_SECONDS = 1.0
-_DEFAULT_BUILTIN_OPEN = builtins.open
+_proc_rss_lock = threading.Lock()
 _proc_rss_cache: Optional[Tuple[float, float]] = None
 
 
-def _is_builtin_open_mocked() -> bool:
-    views_mod = sys.modules.get("detector.views")
-    views_open = (
-        views_mod.__dict__.get("open", _DEFAULT_BUILTIN_OPEN) if views_mod is not None else _DEFAULT_BUILTIN_OPEN
-    )
-    return (
-        builtins.open is not _DEFAULT_BUILTIN_OPEN
-        or globals().get("open", _DEFAULT_BUILTIN_OPEN) is not _DEFAULT_BUILTIN_OPEN
-        or views_open is not _DEFAULT_BUILTIN_OPEN
-    )
+def clear_proc_rss_cache() -> None:
+    """Clears the short-lived process RSS diagnostic cache."""
+    global _proc_rss_cache
+    with _proc_rss_lock:
+        _proc_rss_cache = None
 
 
 def _read_proc_rss_mb() -> Optional[float]:
     """Reads live resident set size (RSS) from Linux procfs in megabytes when available."""
     global _proc_rss_cache
 
-    time_mod = _views_attr("time", time)
-    now_mono = time_mod.monotonic()
-    if not _is_builtin_open_mocked():
-        cached = _views_attr("_proc_rss_cache", _proc_rss_cache)
-        if cached is not None and 0.0 <= (now_mono - cached[0]) < _PROC_RSS_CACHE_TTL_SECONDS:
-            return cached[1]
+    now_mono = time.monotonic()
+    with _proc_rss_lock:
+        cached = _proc_rss_cache
+    if cached is not None and 0.0 <= (now_mono - cached[0]) < _PROC_RSS_CACHE_TTL_SECONDS:
+        return cached[1]
 
     try:
         with open("/proc/self/statm", encoding="ascii") as statm_file:
@@ -57,16 +48,14 @@ def _read_proc_rss_mb() -> Optional[float]:
     if rss_pages < 0 or page_size <= 0:
         return None
     rss_mb = round((rss_pages * page_size) / (1024.0 * 1024.0), 2)
-    updated = (now_mono, rss_mb)
-    _proc_rss_cache = updated
-    _set_views_attr("_proc_rss_cache", updated)
+    with _proc_rss_lock:
+        _proc_rss_cache = (now_mono, rss_mb)
     return rss_mb
 
 
 def get_process_memory_mb() -> Optional[float]:
     """Returns current worker RSS in megabytes, falling back to peak RSS when procfs is unavailable."""
-    read_rss_fn = _views_attr("_read_proc_rss_mb", _read_proc_rss_mb)
-    proc_rss = read_rss_fn()
+    proc_rss = _read_proc_rss_mb()
     if proc_rss is not None:
         return proc_rss
 
@@ -80,18 +69,16 @@ def get_process_memory_mb() -> Optional[float]:
         return None
 
 
-def _attach_request_diagnostics(payload: Dict[str, Any], start_time: float) -> Dict[str, Any]:
+def attach_request_diagnostics(payload: Dict[str, Any], start_time: float) -> Dict[str, Any]:
     """Returns a copy of payload annotated with execution duration in seconds and worker memory in megabytes."""
-    time_mod = _views_attr("time", time)
-    mem_fn = _views_attr("get_process_memory_mb", get_process_memory_mb)
     return {
         **payload,
-        "durationSeconds": round(time_mod.perf_counter() - start_time, 3),
-        "memoryMb": mem_fn(),
+        "durationSeconds": round(time.perf_counter() - start_time, 3),
+        "memoryMb": get_process_memory_mb(),
     }
 
 
-def _strip_raw_json_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+def strip_raw_json_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Returns a shallow copy of payload without rawJson keys on provider result rows."""
     if isinstance(payload, dict) and isinstance(payload.get("results"), list):
         return {
@@ -104,7 +91,7 @@ def _strip_raw_json_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
-def _parse_compact_flag(raw_value: Any) -> bool:
+def parse_compact_flag(raw_value: Any) -> bool:
     """Interprets boolean, integer, or string compact flags."""
     if isinstance(raw_value, bool):
         return raw_value
@@ -115,17 +102,7 @@ def _parse_compact_flag(raw_value: Any) -> bool:
     return False
 
 
-def _is_compact_request(request, body: Optional[Dict[str, Any]] = None) -> bool:
-    """Checks query parameters and optional JSON body for compact mode requests."""
-    raw_query = request.GET.get("compact")
-    if raw_query is not None and str(raw_query).strip():
-        return _parse_compact_flag(str(raw_query))
-    if isinstance(body, dict) and "compact" in body:
-        return _parse_compact_flag(body.get("compact"))
-    return False
-
-
-def _normalize_query_mode(raw_mode: Any, *, default: str = "full") -> str:
+def normalize_query_mode(raw_mode: Any, *, default: str = "full") -> str:
     """Normalises the requested detection mode to either light or full."""
     fallback = "light" if default == "light" else "full"
     cleaned = str(raw_mode or "").strip().lower()
@@ -134,37 +111,17 @@ def _normalize_query_mode(raw_mode: Any, *, default: str = "full") -> str:
     return fallback
 
 
-def _resolve_query_mode(request, body: Optional[Dict[str, Any]] = None, *, default: str = "full") -> str:
-    """Checks query parameters and optional JSON body for the detection query mode."""
-    raw_query = request.GET.get("mode")
-    if raw_query is not None and str(raw_query).strip():
-        return _normalize_query_mode(raw_query, default=default)
-    if isinstance(body, dict) and "mode" in body and body.get("mode") is not None:
-        raw_body_mode = str(body.get("mode")).strip()
-        if raw_body_mode:
-            return _normalize_query_mode(raw_body_mode, default=default)
-    return "light" if default == "light" else "full"
-
-
 MAX_BATCH_IPS = 25
 _MAX_RAW_BATCH_IPS = 50
 
 
-def _parse_batch_ips(raw_ips: Any) -> Tuple[Optional[Tuple[List[str], Dict[str, str]]], Optional[JsonResponse]]:
+def parse_batch_ip_list(raw_ips: Any) -> Tuple[Optional[Tuple[List[str], Dict[str, str]]], Optional[str]]:
+    """Validates and deduplicates a raw batch IP list, returning either (unique_ips, input_map) or an error message."""
     if not isinstance(raw_ips, list) or not raw_ips:
-        return None, JsonResponse(
-            {"error": "invalid_batch", "message": "The ips parameter must be a non-empty array of IP addresses."},
-            status=400,
-        )
+        return None, "The ips parameter must be a non-empty array of IP addresses."
 
     if len(raw_ips) > _MAX_RAW_BATCH_IPS:
-        return None, JsonResponse(
-            {
-                "error": "invalid_batch",
-                "message": f"Batch request exceeds maximum allowed raw entries ({_MAX_RAW_BATCH_IPS}).",
-            },
-            status=400,
-        )
+        return None, f"Batch request exceeds maximum allowed raw entries ({_MAX_RAW_BATCH_IPS})."
 
     unique_canonical_ips: List[str] = []
     seen_canonical: Set[str] = set()
@@ -172,16 +129,10 @@ def _parse_batch_ips(raw_ips: Any) -> Tuple[Optional[Tuple[List[str], Dict[str, 
 
     for item in raw_ips:
         if not isinstance(item, str) or not item.strip():
-            return None, JsonResponse(
-                {"error": "invalid_batch", "message": "Each entry in ips must be a non-empty IP address string."},
-                status=400,
-            )
+            return None, "Each entry in ips must be a non-empty IP address string."
         canonical = canonicalize_ip(item)
         if not canonical:
-            return None, JsonResponse(
-                {"error": "invalid_batch", "message": f"Invalid IP address format: {item.strip()[:64]}"},
-                status=400,
-            )
+            return None, f"Invalid IP address format: {item.strip()[:64]}"
         input_map[item] = canonical
         stripped_item = item.strip()
         if stripped_item != item:
@@ -191,13 +142,7 @@ def _parse_batch_ips(raw_ips: Any) -> Tuple[Optional[Tuple[List[str], Dict[str, 
             unique_canonical_ips.append(canonical)
 
     if len(unique_canonical_ips) > MAX_BATCH_IPS:
-        return None, JsonResponse(
-            {
-                "error": "invalid_batch",
-                "message": f"Batch request exceeds maximum of {MAX_BATCH_IPS} unique IP addresses.",
-            },
-            status=400,
-        )
+        return None, f"Batch request exceeds maximum of {MAX_BATCH_IPS} unique IP addresses."
     return (unique_canonical_ips, input_map), None
 
 
@@ -228,7 +173,7 @@ _DOC_NETWORKS = (
 )
 
 
-def _classify_non_public_ip(canonical_ip: str) -> Optional[Tuple[str, str]]:
+def classify_non_public_ip(canonical_ip: str) -> Optional[Tuple[str, str]]:
     """
     Returns (category_key, description) when an IP is non-public or reserved,
     or None when the address is globally routable unicast.
@@ -259,7 +204,7 @@ def _classify_non_public_ip(canonical_ip: str) -> Optional[Tuple[str, str]]:
     return "non_public", "Non-Public / Reserved Address"
 
 
-def _build_non_public_response_payload(
+def build_non_public_response_payload(
     ip: str,
     category: str,
     reason: str,
@@ -268,7 +213,7 @@ def _build_non_public_response_payload(
     query_mode: str = "full",
 ) -> Dict[str, Any]:
     """Builds a standard HTTP 200 payload for non-public or reserved IP addresses without external lookups."""
-    normalized_mode = _normalize_query_mode(query_mode)
+    normalized_mode = normalize_query_mode(query_mode)
     payload = {
         "ip": ip,
         "isNonPublic": True,
@@ -315,21 +260,12 @@ def _build_non_public_response_payload(
             "cachedAt": None,
         },
     }
-    return _attach_request_diagnostics(payload, start_time)
+    return attach_request_diagnostics(payload, start_time)
 
 
-_COMMERCIAL_PROVIDERS = frozenset(
-    {
-        "AbuseIPDB",
-        "IPData",
-        "IPRegistry",
-        "IP2Location",
-        "GetIPIntel",
-        "Proxycheck",
-        "IPHub",
-        "IPHunter",
-    }
-)
+_build_non_public_response_payload = build_non_public_response_payload
+
+
 _HOSTING_KEYWORDS = ("datacenter", "data center", "hosting", "cloud", "transit", "cdn")
 _RESIDENTIAL_KEYWORDS = ("isp", "residential", "fixed line", "mobile", "commercial", "education")
 _ANONYMIZER_KEYWORDS = ("proxy", "vpn", "tor", "relay", "abuser", "attacker", "threat", "block 1", "spam", "botnet")
@@ -412,7 +348,7 @@ def _classify_row_arbitration_signals(row: Dict[str, Any], acc: _ArbitrationAccu
     row_is_hosting = False
     row_is_anonymizer = False
 
-    if p_name in _COMMERCIAL_PROVIDERS or p_name == "MaxMind":
+    if p_name in COMMERCIAL_ARBITRATION_PROVIDERS or p_name == "MaxMind":
         if any(k in usage_str for k in _HOSTING_KEYWORDS):
             row_is_hosting = True
         elif any(k in usage_str for k in _RESIDENTIAL_KEYWORDS):
@@ -447,7 +383,7 @@ def _classify_row_arbitration_signals(row: Dict[str, Any], acc: _ArbitrationAccu
         elif not row_is_hosting and not has_row_high_risk_flag:
             acc.clean_source_count += 1
 
-    if p_name in _COMMERCIAL_PROVIDERS:
+    if p_name in COMMERCIAL_ARBITRATION_PROVIDERS:
         acc.total_commercial_responses += 1
         if any(f.get("isHighRisk") for f in flags) or row_is_hosting or row_is_anonymizer:
             acc.positive_proxy_vpn_votes += 1
@@ -464,17 +400,9 @@ def _compute_getipintel_prediction(getipintel_chance: Optional[float]) -> Tuple[
 
 
 def _resolve_arbitration_verdict(acc: _ArbitrationAccumulator, tor: _TorOverview) -> Tuple[str, str, bool]:
-    """Resolves final multi-source verdict label, tier, and majority proxy/VPN flag."""
+    """Resolves final multi-source verdict label, tier, and majority proxy or VPN flag."""
     total = acc.total_commercial_responses
     votes = acc.positive_proxy_vpn_votes
-
-    # Treat a single hosting tag as an outlier when at least five sources report clean residential usage and no behavioural threats exist.
-    is_isolated_hosting_outlier = (
-        not acc.has_anonymizer_flag
-        and acc.behavioral_threat_votes == 0
-        and acc.hosting_source_count == 1
-        and (acc.clean_source_count >= 5 or acc.residential_source_count >= 5)
-    )
 
     if total == 0:
         verdict, tier, is_majority = "Direct Connection (No Commercial Threats)", "neutral", False
@@ -485,9 +413,8 @@ def _resolve_arbitration_verdict(acc: _ArbitrationAccumulator, tor: _TorOverview
             else "Confirmed Proxy / VPN"
         )
         verdict, tier, is_majority = f"{prefix} ({votes}/{total} Sources)", "destructive", True
-    elif is_isolated_hosting_outlier or (
-        acc.behavioral_threat_votes == 0 and acc.hosting_source_count == 1 and votes <= 1
-    ):
+    elif acc.behavioral_threat_votes == 0 and acc.hosting_source_count == 1 and votes <= 1:
+        # Treat a lone hosting classification without behavioural threat votes as a minor attribute dispute.
         verdict, tier, is_majority = "Clean Residential (1 Minor Attribute Dispute)", "success", False
     elif votes > 0:
         if acc.has_anonymizer_flag:

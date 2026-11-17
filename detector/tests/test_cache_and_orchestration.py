@@ -14,7 +14,7 @@ import httpx
 import redis.exceptions
 from django.test import AsyncRequestFactory, TestCase, override_settings
 
-from detector import views
+from detector import adapters, cache_backends, detection_service, http_client, providers, views
 from detector.oauth import (
     fetch_project_user_rights,
     fetch_user_rights_from_meta,
@@ -31,6 +31,7 @@ from .helpers import (
     _mock_response,
     _patch_async_client,
     _ptr_or_clean_dns_side_effect,
+    patch_non_dnsbl_providers,
 )
 
 
@@ -48,12 +49,12 @@ class ConnectionAndReaderReuseTests(TestCase):
 
     def test_http_client_reused_in_same_loop_and_rebuilt_across_closed_loops(self):
         async def _acquire_twice():
-            first = await views._get_shared_http_client()
-            second = await views._get_shared_http_client()
+            first = await http_client.get_shared_http_client()
+            second = await http_client.get_shared_http_client()
             self.assertIs(first, second)
             return first
 
-        with patch("detector.views.httpx.AsyncClient", wraps=httpx.AsyncClient) as spy_cls:
+        with patch("detector.http_client.httpx.AsyncClient", wraps=httpx.AsyncClient) as spy_cls:
             client_loop_one = asyncio.run(_acquire_twice())
             self.assertEqual(spy_cls.call_count, 1)
 
@@ -62,8 +63,8 @@ class ConnectionAndReaderReuseTests(TestCase):
             self.assertEqual(spy_cls.call_count, 2)
             self.assertIsNot(client_loop_one, client_loop_two)
 
-    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
-    @patch("detector.views.httpx.AsyncClient")
+    @patch("detector.dns_providers.query_maxmind", new_callable=AsyncMock)
+    @patch("detector.http_client.httpx.AsyncClient")
     def test_sequential_async_requests_do_not_raise_closed_event_loop_error(self, mock_async_client_cls, mock_mm):
         mock_mm.return_value = dict(MAXMIND_STUB)
 
@@ -76,7 +77,7 @@ class ConnectionAndReaderReuseTests(TestCase):
         with (
             override_settings(**EMPTY_UPSTREAM_SECRETS),
             patch.dict(os.environ, EMPTY_UPSTREAM_SECRETS),
-            patch("detector.views.redis_client", None),
+            patch("detector.cache_backends.redis_client", None),
         ):
             first_resp = self.client.get("/api/v1/detect?ip=8.8.8.8")
             second_resp = self.client.get("/api/v1/detect?ip=1.1.1.1")
@@ -92,8 +93,8 @@ class NonPublicIpInterceptionTests(TestCase):
         _login_authorised(self)
 
     @patch("dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock)
-    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
-    @patch("detector.views.httpx.AsyncClient")
+    @patch("detector.dns_providers.query_maxmind", new_callable=AsyncMock)
+    @patch("detector.http_client.httpx.AsyncClient")
     def test_non_public_ips_return_200_with_zero_external_or_redis_calls(
         self, mock_async_client_cls, mock_mm, mock_dns
     ):
@@ -119,7 +120,7 @@ class NonPublicIpInterceptionTests(TestCase):
             ("::ffff:127.0.0.1", "::ffff:127.0.0.1"),
         )
 
-        with patch("detector.views.redis_client", mock_redis):
+        with patch("detector.cache_backends.redis_client", mock_redis):
             for raw_ip, expected_canonical in non_public_samples:
                 with self.subTest(raw_ip=raw_ip):
                     resp = self.client.get(f"/api/v1/detect?ip={raw_ip}")
@@ -155,7 +156,7 @@ class SingleflightCoalescingTests(TestCase):
     """Tests singleflight coalescing of concurrent uncached IP detection requests."""
 
     def tearDown(self):
-        views._ip_detect_inflight.clear()
+        detection_service._ip_detect_inflight.clear()
 
     async def test_five_concurrent_requests_for_uncached_ip_call_upstream_once(self):
         provider_calls = {"count": 0}
@@ -192,27 +193,18 @@ class SingleflightCoalescingTests(TestCase):
         factory = AsyncRequestFactory()
         requests = [factory.get("/api/v1/detect?ip=8.8.4.4", headers=auth_headers) for _ in range(5)]
 
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
         with (
-            patch("detector.views.redis_client", fake_redis),
-            patch("detector.views.query_maxmind", AsyncMock(return_value=dict(MAXMIND_STUB))),
-            patch("detector.views.query_rdns_ptr", side_effect=_fake_dns),
-            patch("detector.views.query_cloudflare_radar", side_effect=_make_slow_ok("Cloudflare Radar")),
-            patch("detector.views.query_abuseipdb", side_effect=_make_slow_ok("AbuseIPDB")),
-            patch("detector.views.query_ipdata", side_effect=_make_slow_ok("IPData")),
-            patch("detector.views.query_ipregistry", side_effect=_make_slow_ok("IPRegistry")),
-            patch("detector.views.query_ip2location", side_effect=_make_slow_ok("IP2Location")),
-            patch("detector.views.query_getipintel", side_effect=_make_slow_ok("GetIPIntel")),
-            patch("detector.views.query_proxycheck", side_effect=_make_slow_ok("Proxycheck")),
-            patch("detector.views.query_iphub", side_effect=_make_slow_ok("IPHub")),
-            patch("detector.views.query_iphunter", side_effect=_make_slow_ok("IPHunter")),
-            patch("detector.views.query_tor_onionoo", side_effect=_make_slow_ok("Tor Onionoo")),
-            patch("detector.views.query_stopforumspam", side_effect=_make_slow_ok("StopForumSpam")),
-            patch("detector.views.query_dshield", side_effect=_make_slow_ok("DShield")),
+            patch("detector.cache_backends.redis_client", fake_redis),
+            patch("detector.dns_providers.query_rdns_ptr", side_effect=_fake_dns),
+            patch("detector.http_client.get_shared_http_client", AsyncMock(return_value=mock_client)),
+            patch_non_dnsbl_providers(
+                _make_slow_ok,
+                overrides={"maxmind": AsyncMock(return_value=dict(MAXMIND_STUB))},
+            ),
         ):
-            mock_client = AsyncMock()
-            mock_client.is_closed = False
-            with patch("detector.views._get_shared_http_client", AsyncMock(return_value=mock_client)):
-                responses = await asyncio.gather(*(views.detect_ip(req) for req in requests))
+            responses = await asyncio.gather(*(views.detect_ip(req) for req in requests))
 
         self.assertEqual(len(responses), 5)
         for resp in responses:
@@ -224,8 +216,8 @@ class SingleflightCoalescingTests(TestCase):
         self.assertEqual(provider_calls["count"], 1)
         self.assertEqual(dns_calls["count"], 1)
         self.assertEqual(len(fake_redis.mget_calls), 2)
-        self.assertEqual(len(fake_redis.mget_calls[0]), len(views._PROVIDER_SPECS) + 1)
-        self.assertEqual(len(views._ip_detect_inflight), 0)
+        self.assertEqual(len(fake_redis.mget_calls[0]), len(providers._PROVIDER_SPECS) + 1)
+        self.assertEqual(len(detection_service._ip_detect_inflight), 0)
 
     async def test_shield_protects_shared_inflight_task_when_one_waiter_cancels(self):
         started = asyncio.Event()
@@ -262,22 +254,13 @@ class SingleflightCoalescingTests(TestCase):
         req_two = factory.get("/api/v1/detect?ip=8.8.4.4", headers=auth_headers)
 
         with (
-            patch("detector.views.redis_client", None),
-            patch("detector.views._get_shared_http_client", AsyncMock(return_value=mock_client)),
-            patch("detector.views.query_maxmind", AsyncMock(return_value=dict(MAXMIND_STUB))),
-            patch("detector.views.query_rdns_ptr", AsyncMock(return_value=None)),
-            patch("detector.views.query_cloudflare_radar", side_effect=_make_gated_provider("Cloudflare Radar")),
-            patch("detector.views.query_abuseipdb", side_effect=_make_gated_provider("AbuseIPDB")),
-            patch("detector.views.query_ipdata", side_effect=_make_gated_provider("IPData")),
-            patch("detector.views.query_ipregistry", side_effect=_make_gated_provider("IPRegistry")),
-            patch("detector.views.query_ip2location", side_effect=_make_gated_provider("IP2Location")),
-            patch("detector.views.query_getipintel", side_effect=_make_gated_provider("GetIPIntel")),
-            patch("detector.views.query_proxycheck", side_effect=_make_gated_provider("Proxycheck")),
-            patch("detector.views.query_iphub", side_effect=_make_gated_provider("IPHub")),
-            patch("detector.views.query_iphunter", side_effect=_make_gated_provider("IPHunter")),
-            patch("detector.views.query_tor_onionoo", side_effect=_make_gated_provider("Tor Onionoo")),
-            patch("detector.views.query_stopforumspam", side_effect=_make_gated_provider("StopForumSpam")),
-            patch("detector.views.query_dshield", side_effect=_make_gated_provider("DShield")),
+            patch("detector.cache_backends.redis_client", None),
+            patch("detector.http_client.get_shared_http_client", AsyncMock(return_value=mock_client)),
+            patch("detector.dns_providers.query_rdns_ptr", AsyncMock(return_value=None)),
+            patch_non_dnsbl_providers(
+                _make_gated_provider,
+                overrides={"maxmind": AsyncMock(return_value=dict(MAXMIND_STUB))},
+            ),
         ):
             first_task = asyncio.create_task(views.detect_ip(req_one))
             await started.wait()
@@ -294,19 +277,21 @@ class SingleflightCoalescingTests(TestCase):
         self.assertEqual(second_resp.status_code, 200)
         self.assertEqual(json.loads(second_resp.content)["ip"], "8.8.4.4")
         self.assertEqual(provider_calls["count"], 1)
-        self.assertEqual(len(views._ip_detect_inflight), 0)
+        self.assertEqual(len(detection_service._ip_detect_inflight), 0)
 
     async def test_inflight_map_cleaned_up_on_unexpected_exception(self):
         auth_headers = {"Authorization": f"Bearer {views.issue_gadget_token('SysopUser')}"}
 
         with (
-            patch("detector.views.redis_client", None),
-            patch("detector.views._execute_detection_with_cache", AsyncMock(side_effect=RuntimeError("boom"))),
+            patch("detector.cache_backends.redis_client", None),
+            patch(
+                "detector.detection_service._execute_detection_with_cache", AsyncMock(side_effect=RuntimeError("boom"))
+            ),
             self.assertRaises(RuntimeError),
         ):
             await self.async_client.get("/api/v1/detect?ip=8.8.4.4", headers=auth_headers)
 
-        self.assertEqual(len(views._ip_detect_inflight), 0)
+        self.assertEqual(len(detection_service._ip_detect_inflight), 0)
 
     async def test_concurrent_waiters_receive_independent_payload_copies(self):
         shared_payload = {"ip": "8.8.4.4", "results": [], "cacheMeta": {"status": "miss"}}
@@ -316,12 +301,15 @@ class SingleflightCoalescingTests(TestCase):
             return {}, None
 
         with (
-            patch("detector.views._read_provider_caches", side_effect=_slow_cache_read),
-            patch("detector.views._execute_detection_with_cache", AsyncMock(return_value=shared_payload)),
-            patch("detector.views.record_global_request_telemetry", AsyncMock()),
+            patch("detector.detection_service._read_provider_caches", side_effect=_slow_cache_read),
+            patch("detector.detection_service._execute_detection_with_cache", AsyncMock(return_value=shared_payload)),
+            patch("detector.quota_telemetry.record_global_request_telemetry", AsyncMock()),
         ):
             payloads = await asyncio.gather(
-                *(views._detect_single_canonical_ip("8.8.4.4", "gadget", time.perf_counter()) for _ in range(5))
+                *(
+                    detection_service._detect_single_canonical_ip("8.8.4.4", "gadget", time.perf_counter())
+                    for _ in range(5)
+                )
             )
 
         self.assertEqual(len({id(payload) for payload in payloads}), 5)
@@ -329,7 +317,7 @@ class SingleflightCoalescingTests(TestCase):
             self.assertIsNot(payload, shared_payload)
             self.assertIn("durationSeconds", payload)
         self.assertNotIn("durationSeconds", shared_payload)
-        self.assertEqual(len(views._ip_detect_inflight), 0)
+        self.assertEqual(len(detection_service._ip_detect_inflight), 0)
 
 
 class PerProviderCacheAndCircuitBreakerTests(TestCase):
@@ -339,11 +327,11 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
         _login_authorised(self)
 
     def test_retry_after_header_parsed_and_clamped_within_cooldown_bounds(self):
-        self.assertEqual(views._parse_retry_after_seconds("15"), 60)
-        self.assertEqual(views._parse_retry_after_seconds("180"), 180)
-        self.assertEqual(views._parse_retry_after_seconds("999"), 300)
-        self.assertEqual(views._parse_retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT"), 120)
-        self.assertEqual(views._parse_retry_after_seconds(None), 120)
+        self.assertEqual(providers._parse_retry_after_seconds("15"), 60)
+        self.assertEqual(providers._parse_retry_after_seconds("180"), 180)
+        self.assertEqual(providers._parse_retry_after_seconds("999"), 300)
+        self.assertEqual(providers._parse_retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT"), 120)
+        self.assertEqual(providers._parse_retry_after_seconds(None), 120)
 
     def _ok_upstream_response(self, url, ip="8.8.8.8"):
         if "ipregistry.co" in url:
@@ -428,8 +416,8 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
         new_callable=AsyncMock,
         side_effect=_ptr_or_clean_dns_side_effect(ptr_hostname="dns.google."),
     )
-    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
-    @patch("detector.views.httpx.AsyncClient")
+    @patch("detector.dns_providers.query_maxmind", new_callable=AsyncMock)
+    @patch("detector.http_client.httpx.AsyncClient")
     def test_provider_429_triggers_cooldown_skip_without_overwriting_valid_caches(
         self, mock_async_client_cls, mock_mm, _mock_dns
     ):
@@ -483,7 +471,7 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
         with (
             override_settings(**TEST_UPSTREAM_SECRETS),
             patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-            patch("detector.views.redis_client", mock_redis),
+            patch("detector.cache_backends.redis_client", mock_redis),
         ):
             first_resp = self.client.get("/api/v1/detect?ip=8.8.8.8")
 
@@ -515,7 +503,7 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
         with (
             override_settings(**TEST_UPSTREAM_SECRETS),
             patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-            patch("detector.views.redis_client", mock_redis),
+            patch("detector.cache_backends.redis_client", mock_redis),
         ):
             second_resp = self.client.get("/api/v1/detect?ip=9.9.9.9")
 
@@ -530,7 +518,7 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
         with (
             override_settings(**TEST_UPSTREAM_SECRETS),
             patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-            patch("detector.views.redis_client", mock_redis),
+            patch("detector.cache_backends.redis_client", mock_redis),
         ):
             historical_resp = self.client.get("/api/v1/detect?ip=1.1.1.1")
 
@@ -545,8 +533,8 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
         new_callable=AsyncMock,
         side_effect=_ptr_or_clean_dns_side_effect(ptr_hostname="dns.google."),
     )
-    @patch("detector.views.query_maxmind", new_callable=AsyncMock)
-    @patch("detector.views.httpx.AsyncClient")
+    @patch("detector.dns_providers.query_maxmind", new_callable=AsyncMock)
+    @patch("detector.http_client.httpx.AsyncClient")
     def test_timeout_triggers_default_cooldown_and_respects_ttl_settings(
         self, mock_async_client_cls, mock_mm, _mock_dns
     ):
@@ -579,10 +567,10 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
                 PROVIDER_DYNAMIC_CACHE_TTL_SECONDS=1800,
             ),
             patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
-            patch("detector.views.redis_client", mock_redis),
+            patch("detector.cache_backends.redis_client", mock_redis),
         ):
             resp = self.client.get("/api/v1/detect?ip=8.8.8.8")
-            self.assertEqual(views._get_provider_cache_ttl("dnsbl"), 1800)
+            self.assertEqual(cache_backends._get_provider_cache_ttl("dnsbl"), 1800)
 
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(written_ttls.get("proxycheck:v1:cooldown:proxycheck"), 120)
@@ -591,18 +579,18 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
         self.assertEqual(written_ttls.get("proxycheck:v1:prov:cloudflare_radar:8.8.8.8"), 43200)
 
     def test_getipintel_stable_scores_extend_cache_ttl(self):
-        stable_low_row = views.adapt_getipintel({"status": "success", "result": "0.05"}, True, 200)
-        stable_high_row = views.adapt_getipintel({"status": "success", "result": "0.95"}, True, 200)
-        uncertain_row = views.adapt_getipintel({"status": "success", "result": "0.50"}, True, 200)
+        stable_low_row = adapters.adapt_getipintel({"status": "success", "result": "0.05"}, True, 200)
+        stable_high_row = adapters.adapt_getipintel({"status": "success", "result": "0.95"}, True, 200)
+        uncertain_row = adapters.adapt_getipintel({"status": "success", "result": "0.50"}, True, 200)
 
-        self.assertEqual(views._get_provider_cache_ttl("getipintel", stable_low_row), 259200)
-        self.assertEqual(views._get_provider_cache_ttl("getipintel", stable_high_row), 259200)
-        self.assertEqual(views._get_provider_cache_ttl("getipintel", uncertain_row), 86400)
-        self.assertEqual(views._get_provider_cache_ttl("getipintel"), 86400)
+        self.assertEqual(cache_backends._get_provider_cache_ttl("getipintel", stable_low_row), 259200)
+        self.assertEqual(cache_backends._get_provider_cache_ttl("getipintel", stable_high_row), 259200)
+        self.assertEqual(cache_backends._get_provider_cache_ttl("getipintel", uncertain_row), 86400)
+        self.assertEqual(cache_backends._get_provider_cache_ttl("getipintel"), 86400)
 
         with override_settings(PROVIDER_STATIC_CACHE_TTL_SECONDS=86400, GETIPINTEL_STABLE_CACHE_TTL_SECONDS=604800):
-            self.assertEqual(views._get_provider_cache_ttl("getipintel", stable_low_row), 604800)
-            self.assertEqual(views._get_provider_cache_ttl("getipintel", uncertain_row), 86400)
+            self.assertEqual(cache_backends._get_provider_cache_ttl("getipintel", stable_low_row), 604800)
+            self.assertEqual(cache_backends._get_provider_cache_ttl("getipintel", uncertain_row), 86400)
 
 
 class HttpClientLifecycleTests(TestCase):
@@ -628,7 +616,7 @@ class HttpClientLifecycleTests(TestCase):
                 json=payload,
             )
 
-        client = views._build_cookieless_http_client()
+        client = http_client.build_cookieless_http_client()
         try:
             client._transport = httpx.MockTransport(_handler)
             await client.get("https://zh.wikipedia.org/w/api.php", headers={"Cookie": "injected=1"})
@@ -648,7 +636,7 @@ class HttpClientLifecycleTests(TestCase):
                 if "meta=" in url or "list=users" in url:
                     self.assertIn("ProxyCheck/1.0", ua_hdr or "")
         finally:
-            await views._close_http_client_safely(client)
+            await http_client.close_http_client_safely(client)
 
 
 class RedisBatchingAndCacheCompletenessTests(TestCase):
@@ -682,19 +670,19 @@ class RedisBatchingAndCacheCompletenessTests(TestCase):
         fake_batch_redis = _BatchingFakeRedis()
         fake_batch_redis.strings["proxycheck:v1:prov:ipdata:8.8.8.8"] = self._cached_row_entry("IPData")
 
-        with patch("detector.views.redis_client", fake_batch_redis):
-            cached_providers, cached_ptr = await views._read_provider_caches("8.8.8.8")
+        with patch("detector.cache_backends.redis_client", fake_batch_redis):
+            cached_providers, cached_ptr = await detection_service._read_provider_caches("8.8.8.8")
 
         self.assertEqual(list(cached_providers), ["ipdata"])
         self.assertIsNone(cached_ptr)
         self.assertEqual(len(fake_batch_redis.mget_calls), 1)
-        self.assertEqual(len(fake_batch_redis.mget_calls[0]), len(views._PROVIDER_SPECS) + 1)
+        self.assertEqual(len(fake_batch_redis.mget_calls[0]), len(providers._PROVIDER_SPECS) + 1)
         self.assertEqual(fake_batch_redis.get_calls, [])
 
         fake_no_mget_redis = FakeAsyncRedis()
         fake_no_mget_redis.strings["proxycheck:v1:prov:ipdata:8.8.8.8"] = "cached-ipdata"
-        with patch("detector.views.redis_client", fake_no_mget_redis):
-            values = await views._safe_redis_mget(
+        with patch("detector.cache_backends.redis_client", fake_no_mget_redis):
+            values = await cache_backends._safe_redis_mget(
                 ["proxycheck:v1:prov:ipdata:8.8.8.8", "proxycheck:v1:prov:iphub:8.8.8.8"]
             )
         self.assertEqual(values, ["cached-ipdata", None])
@@ -706,19 +694,19 @@ class RedisBatchingAndCacheCompletenessTests(TestCase):
         keys = ["proxycheck:v1:prov:ipdata:8.8.8.8", "proxycheck:v1:prov:iphub:8.8.8.8"]
 
         with (
-            patch("detector.views.redis_client", mock_redis),
+            patch("detector.cache_backends.redis_client", mock_redis),
             self.assertLogs("detector.views", level="WARNING") as logs,
         ):
-            values = await views._safe_redis_mget(keys)
+            values = await cache_backends._safe_redis_mget(keys)
 
         self.assertEqual(values, [None, None])
         mock_redis.get.assert_not_awaited()
         self.assertTrue(any("redis offline" in line for line in logs.output))
 
-        with patch("detector.views.redis_client", None):
-            self.assertEqual(await views._safe_redis_mget(["a", "b"]), [None, None])
-        with patch("detector.views.redis_client", _BatchingFakeRedis()):
-            self.assertEqual(await views._safe_redis_mget([]), [])
+        with patch("detector.cache_backends.redis_client", None):
+            self.assertEqual(await cache_backends._safe_redis_mget(["a", "b"]), [None, None])
+        with patch("detector.cache_backends.redis_client", _BatchingFakeRedis()):
+            self.assertEqual(await cache_backends._safe_redis_mget([]), [])
 
     async def test_set_many_flushes_entries_through_one_pipeline(self):
         fake_redis = _BatchingFakeRedis()
@@ -727,8 +715,8 @@ class RedisBatchingAndCacheCompletenessTests(TestCase):
             ("proxycheck:v1:cooldown:iphub", "cooldown-b", 120),
         ]
 
-        with patch("detector.views.redis_client", fake_redis):
-            await views._safe_redis_set_many(entries)
+        with patch("detector.cache_backends.redis_client", fake_redis):
+            await cache_backends._safe_redis_set_many(entries)
 
         self.assertEqual(fake_redis.pipeline_calls, [False])
         self.assertEqual(fake_redis.strings["proxycheck:v1:prov:ipdata:8.8.8.8"], "row-a")
@@ -744,10 +732,10 @@ class RedisBatchingAndCacheCompletenessTests(TestCase):
         mock_redis.set = AsyncMock()
 
         with (
-            patch("detector.views.redis_client", mock_redis),
+            patch("detector.cache_backends.redis_client", mock_redis),
             self.assertLogs("detector.views", level="WARNING") as logs,
         ):
-            await views._safe_redis_set_many([("proxycheck:v1:prov:ipdata:8.8.8.8", "row-a", 3600)])
+            await cache_backends._safe_redis_set_many([("proxycheck:v1:prov:ipdata:8.8.8.8", "row-a", 3600)])
 
         mock_redis.set.assert_not_awaited()
         self.assertTrue(any("redis timed out" in line for line in logs.output))
@@ -758,10 +746,12 @@ class RedisBatchingAndCacheCompletenessTests(TestCase):
         target_ip = views.canonicalize_ip(self.IPV6_TARGET)
         uncached_keys = {"spamhaus_zen", "spamcop", "iphunter", "maxmind"}
         cache_store = {}
-        for provider_key, provider_name, _, _, _ in views._PROVIDER_SPECS:
+        for provider_key, provider_name, _, _, _ in providers._PROVIDER_SPECS:
             if provider_key not in uncached_keys:
-                cache_store[views._provider_cache_key(provider_key, target_ip)] = self._cached_row_entry(provider_name)
-        cache_store[views._provider_cache_key("ptr", target_ip)] = json.dumps(
+                cache_store[cache_backends._provider_cache_key(provider_key, target_ip)] = self._cached_row_entry(
+                    provider_name
+                )
+        cache_store[cache_backends._provider_cache_key("ptr", target_ip)] = json.dumps(
             {"hostname": "dns.google", "status": "ok", "cachedAt": "2026-11-13T08:30:00+00:00"}
         )
 
@@ -772,10 +762,10 @@ class RedisBatchingAndCacheCompletenessTests(TestCase):
         _login_authorised(self)
 
         with (
-            patch("detector.views.redis_client", mock_redis),
-            patch("detector.views._has_any_local_maxmind_db", return_value=False),
-            patch("detector.views.query_maxmind", AsyncMock(return_value=dict(MAXMIND_STUB))),
-            patch("detector.views._get_shared_http_client", shared_client),
+            patch("detector.cache_backends.redis_client", mock_redis),
+            patch("detector.cache_backends._has_any_local_maxmind_db", return_value=False),
+            patch("detector.dns_providers.query_maxmind", AsyncMock(return_value=dict(MAXMIND_STUB))),
+            patch("detector.http_client.get_shared_http_client", shared_client),
         ):
             response = self.client.get(f"/api/v1/detect?ip={self.IPV6_TARGET}")
 
@@ -786,7 +776,7 @@ class RedisBatchingAndCacheCompletenessTests(TestCase):
         self.assertFalse(payload["cacheMeta"]["isPartial"])
         self.assertEqual(payload["cacheMeta"]["missCount"], 0)
         self.assertEqual(payload["cacheMeta"]["cooldownCount"], 0)
-        expected_hits = len(views._PROVIDER_SPECS) - len(uncached_keys) + 1
+        expected_hits = len(providers._PROVIDER_SPECS) - len(uncached_keys) + 1
         self.assertEqual(payload["cacheMeta"]["hitCount"], expected_hits)
         self.assertEqual(payload["ptrHostname"], "dns.google")
 

@@ -233,7 +233,7 @@ def adapt_cloudflare_radar(
 
 
 def adapt_abuseipdb(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_code: int = 200) -> Dict[str, Any]:
-    extra = {"totalReports": None, "numDistinctUsers": None, "lastSeen": None}
+    extra = {"abuseConfidenceScore": None, "totalReports": None, "numDistinctUsers": None, "lastSeen": None}
     if not has_api_key:
         return _build_error_row("AbuseIPDB", extra=extra)
 
@@ -253,6 +253,7 @@ def adapt_abuseipdb(raw_data: Optional[Dict[str, Any]], has_api_key: bool, statu
     )
     location, _ = _format_location_with_coords((data.get("countryName"), data.get("countryCode")))
 
+    raw_abuse_score = _safe_int(data.get("abuseConfidenceScore"), default=None)
     raw_total_reports = _safe_int(data.get("totalReports"), default=None)
     raw_distinct_users = _safe_int(data.get("numDistinctUsers"), default=None)
 
@@ -264,6 +265,7 @@ def adapt_abuseipdb(raw_data: Optional[Dict[str, Any]], has_api_key: bool, statu
         usage_type=usage_type,
         security_flags=flags,
         extra={
+            "abuseConfidenceScore": max(0, min(100, raw_abuse_score)) if raw_abuse_score is not None else None,
             "totalReports": max(0, raw_total_reports) if raw_total_reports is not None else None,
             "numDistinctUsers": max(0, raw_distinct_users) if raw_distinct_users is not None else None,
             "lastSeen": _normalize_timestamp_or_text(data.get("lastReportedAt")),
@@ -590,13 +592,14 @@ def adapt_maxmind(
 def adapt_getipintel(
     raw_data: Optional[Dict[str, Any]], has_contact_email: bool, status_code: int = 200
 ) -> Dict[str, Any]:
-    """Normalises GetIPIntel probability scores from a unit float to a percentage."""
+    """Normalises GetIPIntel probability scores and assigns confidence-tiered arbitration weights."""
+    error_extra = {"chance": None, "arbitrationWeight": 0.0}
     if not has_contact_email:
         return _build_error_row(
             "GetIPIntel",
             usage_type="ML Prediction",
             raw_message="GETIPINTEL_CONTACT_EMAIL not configured",
-            extra={"chance": None},
+            extra=error_extra,
         )
 
     raw_data, status_code = _guard_payload(raw_data, status_code)
@@ -606,7 +609,7 @@ def adapt_getipintel(
             status_code,
             raw_data,
             usage_type="ML Prediction",
-            extra={"chance": None},
+            extra=error_extra,
         )
 
     try:
@@ -623,20 +626,29 @@ def adapt_getipintel(
             400,
             raw_data,
             usage_type="ML Prediction",
-            extra={"chance": None},
+            extra=error_extra,
         )
 
     chance = round(raw_result * 100.0, 3)
-    flags = _build_risk_flags(
-        ("High-Probability Proxy/VPN", chance > 90.0),
-        ("Moderate Prediction", 20.0 <= chance <= 90.0),
-    )
+    if raw_result >= 0.90:
+        arbitration_weight = 1.0
+        flags: List[Dict[str, Any]] = [{"label": "High-Probability Proxy/VPN", "isHighRisk": True}]
+    elif raw_result >= 0.75:
+        arbitration_weight = 0.5
+        flags = [{"label": "Moderate Prediction", "isHighRisk": False}]
+    elif chance >= 20.0:
+        arbitration_weight = 0.0
+        flags = [{"label": "Moderate Prediction", "isHighRisk": False}]
+    else:
+        arbitration_weight = 0.0
+        flags = _default_no_flags()
+
     return _build_ok_row(
         "GetIPIntel",
         raw_data,
         usage_type="ML Prediction",
         security_flags=flags,
-        extra={"chance": chance},
+        extra={"chance": chance, "arbitrationWeight": arbitration_weight},
     )
 
 
@@ -1450,7 +1462,316 @@ def adapt_dshield(raw_data: Optional[Dict[str, Any]], status_code: int = 200) ->
     )
 
 
+SHODAN_HIGH_RISK_PROXY_PORTS: frozenset[int] = frozenset({1080, 1081, 3128, 8080, 8118, 8888, 9050})
+_SHODAN_HIGH_RISK_TAGS: frozenset[str] = frozenset(
+    {"proxy", "vpn", "tor", "compromised", "malware", "botnet", "c2"}
+)
+
+
+def adapt_ipsum_drop(
+    raw_data: Optional[Dict[str, Any]],
+    status_code: int = 200,
+    *,
+    has_db: bool = True,
+) -> Dict[str, Any]:
+    """Normalises offline IPsum multi-blacklist scores and Spamhaus DROP prefix hits."""
+    extra: Dict[str, Any] = {
+        "isListed": False,
+        "ipsumScore": 0,
+        "isIpsumListed": False,
+        "inSpamhausDrop": False,
+        "dropSblId": None,
+        "dropCidr": None,
+        "matchedCidr": None,
+    }
+    if not has_db:
+        return _build_error_row(
+            "IPsum / DROP",
+            status="Offline DB Missing",
+            usage_type="Offline DB Missing",
+            raw_data={"status": "unconfigured", "message": "IPsum and Spamhaus DROP offline index not found"},
+            extra=extra,
+        )
+
+    raw_data, status_code = _guard_payload(raw_data, status_code)
+    if status_code != 200 or not raw_data or "error" in raw_data or raw_data.get("status") == "error":
+        if status_code == 200:
+            status_code = 502
+        return _build_error_row("IPsum / DROP", status_code, raw_data, extra=extra)
+
+    in_drop = bool(raw_data.get("inSpamhausDrop"))
+    ipsum_score = max(0, _safe_int(raw_data.get("ipsumScore"), default=0) or 0)
+    is_ipsum_listed = bool(raw_data.get("isIpsumListed")) or ipsum_score >= 2
+    is_listed = in_drop or is_ipsum_listed
+
+    raw_sbl = raw_data.get("dropSblId")
+    drop_sbl_id = raw_sbl.strip() if isinstance(raw_sbl, str) and raw_sbl.strip() else None
+    raw_drop_cidr = raw_data.get("dropCidr")
+    drop_cidr = raw_drop_cidr.strip() if isinstance(raw_drop_cidr, str) and raw_drop_cidr.strip() else None
+    raw_matched = raw_data.get("matchedCidr")
+    matched_cidr = raw_matched.strip() if isinstance(raw_matched, str) and raw_matched.strip() else None
+
+    flags: List[Dict[str, Any]] = []
+    if in_drop:
+        drop_label = f"Spamhaus DROP ({drop_sbl_id})" if drop_sbl_id else "Spamhaus DROP"
+        flags.append({"label": drop_label, "isHighRisk": True})
+    if ipsum_score >= 3:
+        flags.append({"label": f"IPsum Threat Feed ({ipsum_score} lists)", "isHighRisk": True})
+    elif ipsum_score == 2:
+        flags.append({"label": "IPsum Moderate (2 lists)", "isHighRisk": False})
+
+    if in_drop and ipsum_score >= 2:
+        usage_type = "Spamhaus DROP / IPsum Listed"
+    elif in_drop:
+        usage_type = "Spamhaus DROP Listed"
+    elif ipsum_score >= 3:
+        usage_type = f"IPsum High-Confidence ({ipsum_score} lists)"
+    elif ipsum_score == 2:
+        usage_type = "IPsum Moderate (2 lists)"
+    else:
+        usage_type = "Clean (Not Listed)"
+
+    row_extra: Dict[str, Any] = {
+        "isListed": is_listed,
+        "ipsumScore": ipsum_score,
+        "isIpsumListed": is_ipsum_listed,
+        "inSpamhausDrop": in_drop,
+        "dropSblId": drop_sbl_id,
+        "dropCidr": drop_cidr,
+        "matchedCidr": matched_cidr,
+    }
+    offline_updated = raw_data.get("offlineDbUpdatedAt")
+    if isinstance(offline_updated, str) and offline_updated.strip():
+        row_extra["offlineDbUpdatedAt"] = offline_updated.strip()
+
+    return _build_ok_row(
+        "IPsum / DROP",
+        raw_data,
+        usage_type=usage_type,
+        security_flags=flags or _default_no_flags(),
+        extra=row_extra,
+    )
+
+
+def adapt_x4bnet_vpn(
+    raw_data: Optional[Dict[str, Any]],
+    status_code: int = 200,
+    *,
+    has_db: bool = True,
+) -> Dict[str, Any]:
+    """Normalises offline X4BNet VPN and hosting CIDR index lookups."""
+    extra: Dict[str, Any] = {
+        "isListed": False,
+        "isVpn": False,
+        "isDatacenter": False,
+        "isHosting": False,
+        "matchedCidr": None,
+        "category": None,
+        "sources": [],
+    }
+    if not has_db:
+        return _build_error_row(
+            "X4BNet VPN",
+            status="Offline DB Missing",
+            usage_type="Offline DB Missing",
+            raw_data={"status": "unconfigured", "message": "X4BNet VPN offline index not found"},
+            extra=extra,
+        )
+
+    raw_data, status_code = _guard_payload(raw_data, status_code)
+    if status_code != 200 or not raw_data or "error" in raw_data or raw_data.get("status") == "error":
+        if status_code == 200:
+            status_code = 502
+        return _build_error_row("X4BNet VPN", status_code, raw_data, extra=extra)
+
+    is_vpn = bool(raw_data.get("isVpn"))
+    is_datacenter = bool(raw_data.get("isDatacenter"))
+    is_hosting = bool(raw_data.get("isHosting")) or is_datacenter
+    is_listed = bool(raw_data.get("isListed")) or is_vpn or is_hosting
+    raw_matched = raw_data.get("matchedCidr")
+    matched_cidr = raw_matched.strip() if isinstance(raw_matched, str) and raw_matched.strip() else None
+    raw_sources = raw_data.get("sources")
+    sources = (
+        [str(src).strip() for src in raw_sources if isinstance(src, str) and str(src).strip()]
+        if isinstance(raw_sources, list)
+        else []
+    )
+    category = "vpn" if is_vpn else ("datacenter" if is_datacenter else ("hosting" if is_hosting else None))
+
+    flags: List[Dict[str, Any]] = []
+    if is_vpn:
+        flags.append({"label": "High-Risk VPN", "isHighRisk": True})
+    if is_hosting:
+        flags.append({"label": "Hosting / Datacentre", "isHighRisk": False})
+
+    usage_type = (
+        "vpn"
+        if is_vpn
+        else ("datacenter" if is_datacenter else ("hosting" if is_hosting else "Clean (Not Listed)"))
+    )
+    row_extra: Dict[str, Any] = {
+        "isListed": is_listed,
+        "isVpn": is_vpn,
+        "isDatacenter": is_datacenter,
+        "isHosting": is_hosting,
+        "matchedCidr": matched_cidr,
+        "category": category,
+        "sources": sources,
+    }
+    offline_updated = raw_data.get("offlineDbUpdatedAt")
+    if isinstance(offline_updated, str) and offline_updated.strip():
+        row_extra["offlineDbUpdatedAt"] = offline_updated.strip()
+
+    return _build_ok_row(
+        "X4BNet VPN",
+        raw_data,
+        usage_type=usage_type,
+        security_flags=flags or _default_no_flags(),
+        extra=row_extra,
+    )
+
+
+def _extract_shodan_ports_and_lists(
+    raw_data: Dict[str, Any],
+) -> Tuple[List[int], List[int], List[str], List[str]]:
+    ports_set: set[int] = set()
+    raw_ports = raw_data.get("ports")
+    if isinstance(raw_ports, list):
+        for item in raw_ports:
+            parsed = _safe_int(item, default=None)
+            if parsed is not None and 1 <= parsed <= 65535:
+                ports_set.add(parsed)
+    raw_proxy_ports = raw_data.get("openProxyPorts")
+    if isinstance(raw_proxy_ports, list):
+        for item in raw_proxy_ports:
+            parsed = _safe_int(item, default=None)
+            if parsed is not None and parsed in SHODAN_HIGH_RISK_PROXY_PORTS:
+                ports_set.add(parsed)
+
+    ports = sorted(ports_set)
+    open_proxy_ports = sorted(p for p in ports if p in SHODAN_HIGH_RISK_PROXY_PORTS)
+
+    tags: List[str] = []
+    seen_tags: set[str] = set()
+    raw_tags = raw_data.get("tags")
+    if isinstance(raw_tags, list):
+        for tag in raw_tags:
+            if isinstance(tag, str) and tag.strip():
+                cleaned = tag.strip()
+                lowered = cleaned.lower()
+                if not lowered.startswith("cve-") and lowered not in seen_tags:
+                    seen_tags.add(lowered)
+                    tags.append(cleaned)
+
+    hostnames: List[str] = []
+    seen_hosts: set[str] = set()
+    raw_hosts = raw_data.get("hostnames")
+    if isinstance(raw_hosts, list):
+        for host in raw_hosts:
+            if isinstance(host, str) and host.strip():
+                cleaned_host = host.strip().rstrip(".")
+                if cleaned_host and cleaned_host.lower() not in seen_hosts:
+                    seen_hosts.add(cleaned_host.lower())
+                    hostnames.append(cleaned_host)
+
+    return ports, open_proxy_ports, tags, hostnames
+
+
+def adapt_shodan_internetdb(raw_data: Optional[Dict[str, Any]], status_code: int = 200) -> Dict[str, Any]:
+    """Normalises Shodan InternetDB responses, treating HTTP 404 as an empty clean record."""
+    empty_extra: Dict[str, Any] = {
+        "ports": [],
+        "openProxyPorts": [],
+        "tags": [],
+        "hostnames": [],
+    }
+    if isinstance(raw_data, dict) and str(raw_data.get("status") or "").strip().lower() == "skipped_ipv6":
+        return _build_error_row(
+            "Shodan InternetDB",
+            None,
+            raw_data,
+            status="Skipped (IPv6)",
+            usage_type="IPv4 Only (Skipped for IPv6)",
+            extra={**empty_extra, "isSkippedIpv6": True},
+        )
+
+    if status_code == 404:
+        clean_raw = (
+            raw_data
+            if isinstance(raw_data, dict) and raw_data.get("status") != "error" and "error" not in raw_data
+            else {"detail": "No information available"}
+        )
+        return _build_ok_row(
+            "Shodan InternetDB",
+            clean_raw,
+            usage_type="Clean (No Open Ports)",
+            extra=dict(empty_extra),
+        )
+
+    raw_data, status_code = _guard_payload(raw_data, status_code)
+    if status_code != 200 or not raw_data or "error" in raw_data or raw_data.get("status") == "error":
+        return _build_error_row("Shodan InternetDB", status_code, raw_data, extra=empty_extra)
+
+    ports, open_proxy_ports, tags, hostnames = _extract_shodan_ports_and_lists(raw_data)
+
+    flags: List[Dict[str, Any]] = []
+    if open_proxy_ports:
+        port_list_text = ", ".join(str(p) for p in open_proxy_ports)
+        flags.append({"label": f"Open Proxy Ports ({port_list_text})", "isHighRisk": True})
+    for tag in tags:
+        if tag.lower() in _SHODAN_HIGH_RISK_TAGS:
+            flags.append({"label": f"Shodan Tag: {tag}", "isHighRisk": True})
+        else:
+            flags.append({"label": f"Shodan Tag: {tag}", "isHighRisk": False})
+
+    if open_proxy_ports:
+        usage_type = f"Open Proxy Ports ({', '.join(str(p) for p in open_proxy_ports)})"
+    elif tags:
+        usage_type = f"Tags: {', '.join(tags[:4])}"
+    elif ports:
+        usage_type = f"Indexed Ports ({len(ports)})"
+    else:
+        usage_type = "Clean (No Open Ports)"
+
+    return _build_ok_row(
+        "Shodan InternetDB",
+        raw_data,
+        usage_type=usage_type,
+        security_flags=flags or _default_no_flags(),
+        extra={
+            "ports": ports,
+            "openProxyPorts": open_proxy_ports,
+            "tags": tags,
+            "hostnames": hostnames,
+        },
+    )
+
+
+ADAPTER_DISPATCH_TABLE: Dict[str, Any] = {
+    "cloudflare_radar": adapt_cloudflare_radar,
+    "abuseipdb": adapt_abuseipdb,
+    "ipdata": adapt_ipdata,
+    "ipregistry": adapt_ipregistry,
+    "ip2location": adapt_ip2location,
+    "maxmind": adapt_maxmind,
+    "getipintel": adapt_getipintel,
+    "proxycheck": adapt_proxycheck,
+    "iphub": adapt_iphub,
+    "iphunter": adapt_iphunter,
+    "spamhaus_zen": adapt_spamhaus_zen,
+    "spamcop": adapt_spamcop,
+    "tor_onionoo": adapt_tor_onionoo,
+    "stopforumspam": adapt_stopforumspam,
+    "dshield": adapt_dshield,
+    "ipsum_drop": adapt_ipsum_drop,
+    "x4bnet_vpn": adapt_x4bnet_vpn,
+    "shodan_internetdb": adapt_shodan_internetdb,
+}
+
+
 __all__ = [
+    "ADAPTER_DISPATCH_TABLE",
+    "SHODAN_HIGH_RISK_PROXY_PORTS",
     "_parse_cloud_cidr_payload",
     "_safe_int",
     "adapt_abuseipdb",
@@ -1462,12 +1783,15 @@ __all__ = [
     "adapt_iphub",
     "adapt_iphunter",
     "adapt_ipregistry",
+    "adapt_ipsum_drop",
     "adapt_maxmind",
     "adapt_proxycheck",
+    "adapt_shodan_internetdb",
     "adapt_spamcop",
     "adapt_spamhaus_zen",
     "adapt_stopforumspam",
     "adapt_tor_onionoo",
+    "adapt_x4bnet_vpn",
     "are_offline_intelligence_caches_warm",
     "classify_rdns_hostname",
     "clear_offline_intelligence_caches",

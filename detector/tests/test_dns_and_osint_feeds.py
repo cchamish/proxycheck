@@ -16,7 +16,7 @@ import dns.reversename
 import httpx
 from django.test import TestCase, override_settings
 
-from detector import dns_providers, http_client, providers
+from detector import cache_backends, dns_providers, http_client, providers
 from detector.adapters import (
     adapt_dshield,
     adapt_proxycheck,
@@ -202,12 +202,15 @@ class AsyncDnsAndDnsblTests(TestCase):
                 resp = self.client.get("/api/v1/detect?ip=2001:4860:4860::8888")
 
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(len(dns_queries), 1)
-        self.assertEqual(dns_queries[0][1], "PTR")
-        self.assertTrue(dns_queries[0][0].endswith("ip6.arpa."))
+        self.assertFalse(any(rdtype == "A" for _, rdtype in dns_queries))
+        self.assertEqual({rdtype for _, rdtype in dns_queries}, {"PTR", "TXT"})
+        self.assertTrue(any(qname.endswith("ip6.arpa.") and rdtype == "PTR" for qname, rdtype in dns_queries))
+        self.assertTrue(
+            any(qname.endswith("origin6.asn.cymru.com") and rdtype == "TXT" for qname, rdtype in dns_queries)
+        )
 
         rows_by_provider = {row["provider"]: row for row in resp.json()["results"]}
-        for dnsbl_name in ("Spamhaus ZEN", "SpamCop"):
+        for dnsbl_name in ("Spamhaus ZEN", "SpamCop", "Shodan InternetDB"):
             self.assertEqual(rows_by_provider[dnsbl_name]["status"], "Skipped (IPv6)")
             self.assertIsNone(rows_by_provider[dnsbl_name]["statusCode"])
             self.assertTrue(rows_by_provider[dnsbl_name].get("isSkippedIpv6"))
@@ -248,9 +251,12 @@ class AsyncDnsAndDnsblTests(TestCase):
         async def _fake_get(key):
             return cache_store.get(key)
 
-        async def _fake_set(key, val, ex=None):
+        async def _fake_set(key, val, ex=None, nx=False):
+            if nx and key in cache_store:
+                return False
             cache_store[key] = val
             written_ttls[key] = ex
+            return True
 
         mock_redis = MagicMock()
         mock_redis.get = AsyncMock(side_effect=_fake_get)
@@ -274,16 +280,16 @@ class AsyncDnsAndDnsblTests(TestCase):
 
         self.assertEqual(resp.status_code, 200)
         payload = resp.json()
-        self.assertEqual(payload["arbitrationVerdict"], "Clean Residential / Direct (0/8 Sources)")
-        self.assertEqual(payload["arbitrationTier"], "success")
+        self.assertEqual(payload["arbitrationVerdict"], "Disputed Proxy / VPN (1/9 Sources)")
+        self.assertEqual(payload["arbitrationTier"], "warning")
 
         rows = {row["provider"]: row for row in payload["results"]}
         self.assertTrue(rows["Spamhaus ZEN"]["isListed"])
         self.assertIn("SBL (127.0.0.2)", rows["Spamhaus ZEN"]["usageType"])
         self.assertTrue(rows["SpamCop"]["isListed"])
 
-        self.assertEqual(written_ttls.get("proxycheck:v1:prov:spamhaus_zen:1.2.3.4"), 7200)
-        self.assertEqual(written_ttls.get("proxycheck:v1:prov:spamcop:1.2.3.4"), 7200)
+        self.assertEqual(written_ttls.get(cache_backends.provider_cache_key("spamhaus_zen", "1.2.3.4")), 7200)
+        self.assertEqual(written_ttls.get(cache_backends.provider_cache_key("spamcop", "1.2.3.4")), 7200)
 
         cache_store.clear()
         written_ttls.clear()
@@ -308,9 +314,9 @@ class AsyncDnsAndDnsblTests(TestCase):
         blocked_rows = {row["provider"]: row for row in blocked_resp.json()["results"]}
         self.assertEqual(blocked_rows["Spamhaus ZEN"]["status"], "429 Query Blocked")
         self.assertFalse(blocked_rows["Spamhaus ZEN"]["isListed"])
-        self.assertNotIn("proxycheck:v1:prov:spamhaus_zen:8.7.6.5", cache_store)
-        self.assertEqual(written_ttls.get("proxycheck:v1:cooldown:spamhaus_zen"), 120)
-        self.assertEqual(written_ttls.get("proxycheck:v1:prov:spamcop:8.7.6.5"), 7200)
+        self.assertNotIn(cache_backends.provider_cache_key("spamhaus_zen", "8.7.6.5"), cache_store)
+        self.assertEqual(written_ttls.get(cache_backends.provider_cooldown_key("spamhaus_zen")), 120)
+        self.assertEqual(written_ttls.get(cache_backends.provider_cache_key("spamcop", "8.7.6.5")), 7200)
 
 
 _MIXED_OSINT_STATIC_RESPONSES = (
@@ -897,9 +903,12 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         async def _fake_get(key):
             return cache_store.get(key)
 
-        async def _fake_set(key, val, ex=None):
+        async def _fake_set(key, val, ex=None, nx=False):
+            if nx and key in cache_store:
+                return False
             cache_store[key] = val
             written_ttls[key] = ex
+            return True
 
         mock_redis = MagicMock()
         mock_redis.get = AsyncMock(side_effect=_fake_get)
@@ -910,14 +919,27 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         with tempfile.TemporaryDirectory() as sfs_tmp_dir:
             sfs_data_dir = Path(sfs_tmp_dir) / "data"
             sfs_data_dir.mkdir()
-            (sfs_data_dir / "listed_ip_90_ipv46_all.txt").write_text(
+            ephemeral_dir = Path(sfs_tmp_dir) / "ephemeral"
+            ephemeral_dir.mkdir()
+            listed_90_path = sfs_data_dir / "listed_ip_90_ipv46_all.txt"
+            listed_90_path.write_text(
                 '"185.220.101.4","25","2026-11-12 09:00:00"\n',
                 encoding="utf-8",
             )
+            offline_dbs.build_stopforumspam_sqlite_index(
+                sfs_data_dir / "stopforumspam.sqlite3",
+                listed_90_path,
+                None,
+            )
             offline_dbs.clear_stopforumspam_caches()
 
+            test_settings = {
+                **TEST_UPSTREAM_SECRETS,
+                "TOOL_DATA_DIR": sfs_tmp_dir,
+                "LOCAL_EPHEMERAL_CACHE_DIR": str(ephemeral_dir),
+            }
             with (
-                override_settings(**{**TEST_UPSTREAM_SECRETS, "TOOL_DATA_DIR": sfs_tmp_dir}),
+                override_settings(**test_settings),
                 patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
                 patch("detector.cache_backends.redis_client", mock_redis),
             ):
@@ -939,13 +961,17 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
             self.assertEqual(rows["StopForumSpam"]["lastSeen"], "2026-11-12 09:00:00")
             self.assertEqual(rows["DShield"]["attacks"], 80)
             self.assertEqual(rows["DShield"]["threatfeeds"], ["scanner"])
-            self.assertEqual(written_ttls.get("proxycheck:v1:prov:tor_onionoo:185.220.101.4"), 7200)
-            self.assertEqual(written_ttls.get("proxycheck:v1:prov:stopforumspam:185.220.101.4"), 7200)
-            self.assertEqual(written_ttls.get("proxycheck:v1:prov:dshield:185.220.101.4"), 7200)
+            self.assertEqual(
+                written_ttls.get(cache_backends.provider_cache_key("tor_onionoo", "185.220.101.4")), 7200
+            )
+            self.assertEqual(
+                written_ttls.get(cache_backends.provider_cache_key("stopforumspam", "185.220.101.4")), 7200
+            )
+            self.assertEqual(written_ttls.get(cache_backends.provider_cache_key("dshield", "185.220.101.4")), 7200)
 
             tor_active_mode["enabled"] = True
             with (
-                override_settings(**{**TEST_UPSTREAM_SECRETS, "TOOL_DATA_DIR": sfs_tmp_dir}),
+                override_settings(**test_settings),
                 patch.dict(os.environ, TEST_UPSTREAM_SECRETS),
                 patch("detector.cache_backends.redis_client", mock_redis),
             ):
@@ -962,3 +988,69 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
         self.assertEqual(tor_payload["arbitrationTier"], "destructive")
         self.assertIn("Tor Exit", tor_payload["arbitrationVerdict"])
         self.assertNotIn("Tor Onionoo", {row["provider"] for row in tor_payload["results"]})
+
+
+class CymruBgpAndOfflineProviderWrapperTests(TestCase):
+    """Tests Team Cymru DNS TXT BGP fallback resolution and async offline index wrappers."""
+
+    async def test_cymru_bgp_prefix_prefers_offline_index_and_falls_back_to_dns_txt(self):
+        with (
+            patch(
+                "detector.dns_providers.lookup_bgp_tools_offline",
+                return_value={"bgpPrefix": "198.51.100.0/24", "asn": 64496, "tags": []},
+            ),
+            patch("dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock) as mock_dns,
+        ):
+            offline_res = await dns_providers.query_cymru_bgp_prefix("198.51.100.42")
+        self.assertEqual(offline_res, {"bgpPrefix": "198.51.100.0/24", "asn": 64496})
+        mock_dns.assert_not_awaited()
+
+        txt_v4_answer = [
+            SimpleNamespace(strings=(b"15169 | 8.8.0.0/16 | US | arin | 2023-12-28",)),
+            SimpleNamespace(strings=(b"15169 | 8.8.8.0/24 | US | arin | 2023-12-28",)),
+        ]
+        with (
+            patch("detector.dns_providers.lookup_bgp_tools_offline", return_value=None),
+            patch("dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock, return_value=txt_v4_answer) as mock_v4,
+        ):
+            v4_res = await dns_providers.query_cymru_bgp_prefix("8.8.8.8")
+        mock_v4.assert_awaited_once_with("8.8.8.8.origin.asn.cymru.com", "TXT")
+        self.assertEqual(v4_res, {"bgpPrefix": "8.8.8.0/24", "asn": 15169})
+
+        txt_v6_answer = [SimpleNamespace(strings=(b"15169 | 2001:4860:4860::/48 | US | arin | 2012-05-01",))]
+        with (
+            patch("detector.dns_providers.lookup_bgp_tools_offline", return_value=None),
+            patch("dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock, return_value=txt_v6_answer) as mock_v6,
+        ):
+            v6_res = await dns_providers.query_cymru_bgp_prefix("2001:4860:4860::8888")
+        self.assertTrue(mock_v6.await_args.args[0].endswith(".origin6.asn.cymru.com"))
+        self.assertEqual(mock_v6.await_args.args[1], "TXT")
+        self.assertEqual(v6_res, {"bgpPrefix": "2001:4860:4860::/48", "asn": 15169})
+
+        for exc in (dns.resolver.NXDOMAIN(), dns.exception.Timeout("timed out")):
+            with (
+                self.subTest(exc=type(exc).__name__),
+                patch("detector.dns_providers.lookup_bgp_tools_offline", return_value=None),
+                patch("dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock, side_effect=exc),
+            ):
+                self.assertIsNone(await dns_providers.query_cymru_bgp_prefix("8.8.8.8"))
+
+    async def test_ipsum_drop_and_x4bnet_async_wrappers_normalise_offline_results(self):
+        with patch(
+            "detector.dns_providers.query_ipsum_drop_offline",
+            return_value={"has_db": True, "ipsumScore": 4, "inSpamhausDrop": True, "dropSblId": "SBL99"},
+        ):
+            ipsum_row = await dns_providers.query_ipsum_drop(None, "198.51.100.9")
+        self.assertEqual(ipsum_row["provider"], "IPsum / DROP")
+        self.assertEqual(ipsum_row["status"], "200 OK")
+        self.assertTrue(ipsum_row["inSpamhausDrop"])
+        self.assertEqual(ipsum_row["ipsumScore"], 4)
+
+        with patch(
+            "detector.dns_providers.query_x4bnet_vpn_offline",
+            return_value={"has_db": True, "isListed": True, "isVpn": True, "matchedCidr": "198.51.100.0/24"},
+        ):
+            x4b_row = await dns_providers.query_x4bnet_vpn(None, "198.51.100.9")
+        self.assertEqual(x4b_row["provider"], "X4BNet VPN")
+        self.assertEqual(x4b_row["status"], "200 OK")
+        self.assertTrue(x4b_row["isVpn"])

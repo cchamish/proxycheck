@@ -21,6 +21,7 @@ from .detection_service import (
     detect_canonical_ip_batch,
     detect_single_canonical_ip,
     is_compact_request,
+    refresh_single_canonical_ip,
     resolve_query_mode,
 )
 from .intelligence import (
@@ -49,6 +50,7 @@ from .session_auth import (
     GADGET_TOKEN_SALT,
     SESSION_UNAVAILABLE_ERROR,
     TEST_ROLE_PROFILES,
+    _verify_gadget_bearer_token,
     apply_detect_cors_headers,
     authenticate_detect_request,
     authorize_admin_session_request,
@@ -78,6 +80,7 @@ __all__ = [
     "oauth_callback",
     "oauth_login",
     "oauth_logout",
+    "refresh_ip_detection",
     "switch_test_role",
     "system_status",
 ]
@@ -240,7 +243,86 @@ async def _detect_ip_get(request):
         query_mode=resolve_query_mode(request),
     )
     response = JsonResponse(payload)
-    response["Cache-Control"] = "private, max-age=300"
+    response["Cache-Control"] = "private, no-cache"
+    return response
+
+
+@csrf_exempt
+async def refresh_ip_detection(request):
+    """
+    Executes an authenticated manual or stale-while-revalidate IP intelligence refresh
+    with per-user and global rate guards and non-degrading ToolsDB L2 merge protection.
+    """
+    return await _dispatch_cors_endpoint(request, "POST", _refresh_ip_detection_post)
+
+
+async def _resolve_authenticated_identity(request, auth_mode: str) -> tuple[str, bool]:
+    if auth_mode == "gadget":
+        token_user, _ = _verify_gadget_bearer_token(str(request.headers.get("Authorization") or ""))
+        cleaned = str(token_user or "").strip()
+        return cleaned, bool(cleaned and oauth.is_allowlisted_wiki_user(cleaned))
+    session_user = await get_session_user(request)
+    if not isinstance(session_user, dict):
+        return "", False
+    cleaned = str(session_user.get("username") or "").strip()
+    return cleaned, is_admin_user(session_user)
+
+
+async def _refresh_ip_detection_post(request):
+    start_time = time.perf_counter()
+
+    auth_mode, auth_error_response = await authenticate_detect_request(request)
+    if auth_error_response is not None or auth_mode is None:
+        return auth_error_response
+
+    body: Dict[str, Any] = {}
+    if request.body:
+        try:
+            raw_body = request.body.decode("utf-8-sig")
+            parsed_body = json.loads(raw_body) if raw_body.strip() else {}
+        except UnicodeDecodeError, ValueError:
+            return JsonResponse({"error": "invalid_refresh", "message": "Invalid JSON request body."}, status=400)
+        if not isinstance(parsed_body, dict):
+            return JsonResponse(
+                {"error": "invalid_refresh", "message": "Request body must be a JSON object."},
+                status=400,
+            )
+        body = parsed_body
+
+    raw_ip = body.get("ip") if "ip" in body else request.GET.get("ip")
+    if raw_ip is None or not isinstance(raw_ip, str) or not raw_ip.strip():
+        return JsonResponse(
+            {
+                "error": "invalid_ip",
+                "message": "Missing required ip parameter. Please provide a valid IPv4 or IPv6 address.",
+            },
+            status=400,
+        )
+
+    ip = canonicalize_ip(raw_ip)
+    if not ip:
+        return JsonResponse(
+            {
+                "error": "invalid_ip",
+                "message": "Invalid IP address format. Please provide a valid IPv4 or IPv6 address.",
+            },
+            status=400,
+        )
+
+    username, admin_flag = await _resolve_authenticated_identity(request, auth_mode)
+    payload, status_code, extra_headers = await refresh_single_canonical_ip(
+        ip,
+        auth_mode,
+        start_time,
+        username=username,
+        is_admin=admin_flag,
+        compact=is_compact_request(request, body),
+        query_mode=resolve_query_mode(request, body, default="full"),
+    )
+    response = JsonResponse(payload, status=status_code)
+    response["Cache-Control"] = "private, no-cache"
+    for hdr_name, hdr_val in extra_headers.items():
+        response[hdr_name] = hdr_val
     return response
 
 

@@ -16,7 +16,7 @@ import dns.reversename
 import httpx
 from django.test import SimpleTestCase, TestCase, override_settings
 
-from detector import detection_service, providers, views
+from detector import cache_backends, detection_service, providers, views
 from detector.adapters import (
     adapt_dshield,
     adapt_stopforumspam,
@@ -91,7 +91,7 @@ class DetectorAuthTests(TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["ip"], "8.8.8.8")
-        self.assertEqual(len(payload["results"]), 14)
+        self.assertEqual(len(payload["results"]), 17)
         result_providers = {row["provider"] for row in payload["results"]}
         self.assertNotIn("Tor Onionoo", result_providers)
         self.assertIn("StopForumSpam", result_providers)
@@ -598,12 +598,16 @@ class IpCanonicalizationAndSecurityBaselineTests(TestCase):
         async def _fake_get(key):
             return cache_store.get(key)
 
-        async def _fake_set(key, val, ex=None):
+        async def _fake_set(key, val, ex=None, nx=False):
+            if nx and key in cache_store:
+                return False
             cache_store[key] = val
+            return True
 
         mock_redis = MagicMock()
         mock_redis.get = AsyncMock(side_effect=_fake_get)
         mock_redis.set = AsyncMock(side_effect=_fake_set)
+        mock_redis.delete = AsyncMock(side_effect=lambda *keys: sum(1 for k in keys if cache_store.pop(k, None) is not None))
 
         with patch("detector.cache_backends.redis_client", mock_redis):
             first_resp = self.client.get("/api/v1/detect?ip=2001:0486:4860:0:0::8888")
@@ -618,19 +622,18 @@ class IpCanonicalizationAndSecurityBaselineTests(TestCase):
         second_payload = second_resp.json()
         third_payload = third_resp.json()
 
-        self.assertEqual(first_payload["ip"], "2001:486:4860::8888")
+        canonical_v6 = "2001:486:4860::8888"
+        self.assertEqual(first_payload["ip"], canonical_v6)
         self.assertFalse(first_payload["isCached"])
-        self.assertEqual(second_payload["ip"], "2001:486:4860::8888")
+        self.assertEqual(second_payload["ip"], canonical_v6)
         self.assertTrue(second_payload["isCached"])
         self.assertEqual(second_payload["cacheMeta"]["status"], "hit")
-        self.assertEqual(third_payload["ip"], "2001:486:4860::8888")
+        self.assertEqual(second_payload["cacheMeta"]["layer"], "L1")
+        self.assertEqual(third_payload["ip"], canonical_v6)
         self.assertTrue(third_payload["isCached"])
-        self.assertEqual(mock_redis.set.call_count, 13)
-        self.assertIn("proxycheck:v1:prov:proxycheck:2001:486:4860::8888", cache_store)
-        self.assertIn("proxycheck:v1:prov:tor_onionoo:2001:486:4860::8888", cache_store)
-        self.assertIn("proxycheck:v1:prov:stopforumspam:2001:486:4860::8888", cache_store)
-        self.assertIn("proxycheck:v1:prov:dshield:2001:486:4860::8888", cache_store)
-        self.assertIn("proxycheck:v1:prov:ptr:2001:486:4860::8888", cache_store)
+        self.assertIn(cache_backends.snapshot_cache_key(canonical_v6, mode="full"), cache_store)
+        for pkey in ("proxycheck", "tor_onionoo", "stopforumspam", "dshield", "ptr"):
+            self.assertIn(cache_backends.provider_cache_key(pkey, canonical_v6), cache_store)
 
 
 class DetectEndpointValidationTests(TestCase):

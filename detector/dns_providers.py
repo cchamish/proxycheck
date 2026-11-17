@@ -20,10 +20,12 @@ from django.conf import settings
 
 from . import cache_backends, cidr_attribution
 from .adapters import (
+    adapt_ipsum_drop,
     adapt_maxmind,
     adapt_spamcop,
     adapt_spamhaus_zen,
     adapt_stopforumspam,
+    adapt_x4bnet_vpn,
 )
 from .cache_backends import (
     MAXMIND_DB_SPECS,
@@ -33,7 +35,13 @@ from .cache_backends import (
     get_maxmind_reader,
     record_city_db_presence,
 )
-from .offline_dbs import get_maxmind_newest_mtime_iso, query_stopforumspam_offline
+from .offline_dbs import (
+    get_maxmind_newest_mtime_iso,
+    lookup_bgp_tools_offline,
+    query_ipsum_drop_offline,
+    query_stopforumspam_offline,
+    query_x4bnet_vpn_offline,
+)
 from .sanitization import sanitize_error_message
 
 logger = logging.getLogger("detector.views")
@@ -254,6 +262,42 @@ def _read_stopforumspam_sync(ip: str) -> Dict[str, Any]:
 async def query_stopforumspam(ip_or_client: Any, ip: Optional[str] = None) -> Dict[str, Any]:
     target_ip = ip if isinstance(ip, str) and ip.strip() else str(ip_or_client)
     return await asyncio.to_thread(_read_stopforumspam_sync, target_ip)
+
+
+def _read_ipsum_drop_sync(ip: str) -> Dict[str, Any]:
+    try:
+        lookup = query_ipsum_drop_offline(ip)
+    except (OSError, ValueError, RuntimeError) as exc:
+        safe_message = sanitize_error_message(str(exc))
+        logger.error("Error querying IPsum and Spamhaus DROP offline index: %s", safe_message)
+        return adapt_ipsum_drop({"status": "error", "error": safe_message}, status_code=500, has_db=True)
+
+    if not lookup.get("has_db"):
+        return adapt_ipsum_drop(None, has_db=False)
+    return adapt_ipsum_drop(lookup, status_code=200, has_db=True)
+
+
+async def query_ipsum_drop(ip_or_client: Any, ip: Optional[str] = None) -> Dict[str, Any]:
+    target_ip = ip if isinstance(ip, str) and ip.strip() else str(ip_or_client)
+    return await asyncio.to_thread(_read_ipsum_drop_sync, target_ip)
+
+
+def _read_x4bnet_vpn_sync(ip: str) -> Dict[str, Any]:
+    try:
+        lookup = query_x4bnet_vpn_offline(ip)
+    except (OSError, ValueError, RuntimeError) as exc:
+        safe_message = sanitize_error_message(str(exc))
+        logger.error("Error querying X4BNet VPN offline index: %s", safe_message)
+        return adapt_x4bnet_vpn({"status": "error", "error": safe_message}, status_code=500, has_db=True)
+
+    if not lookup.get("has_db"):
+        return adapt_x4bnet_vpn(None, has_db=False)
+    return adapt_x4bnet_vpn(lookup, status_code=200, has_db=True)
+
+
+async def query_x4bnet_vpn(ip_or_client: Any, ip: Optional[str] = None) -> Dict[str, Any]:
+    target_ip = ip if isinstance(ip, str) and ip.strip() else str(ip_or_client)
+    return await asyncio.to_thread(_read_x4bnet_vpn_sync, target_ip)
 
 
 def _get_positive_float_setting(name: str, default: float) -> float:
@@ -499,3 +543,120 @@ async def query_spamhaus_zen(ip: str) -> Dict[str, Any]:
 async def query_spamcop(ip: str) -> Dict[str, Any]:
     raw_data, status_code = await _query_dnsbl_zone(ip, "bl.spamcop.net", "spamcop", "SpamCop")
     return adapt_spamcop(raw_data, status_code)
+
+
+def _extract_txt_record_strings(answer: Any) -> List[str]:
+    if answer is None:
+        return []
+    if isinstance(answer, str):
+        return [answer.strip().strip('"')] if answer.strip() else []
+    records: List[str] = []
+    for rdata in answer:
+        if isinstance(rdata, str):
+            cleaned = rdata.strip().strip('"')
+            if cleaned:
+                records.append(cleaned)
+            continue
+        raw_strings = getattr(rdata, "strings", None)
+        if isinstance(raw_strings, (list, tuple)) and raw_strings:
+            joined = "".join(
+                chunk.decode("utf-8", errors="ignore") if isinstance(chunk, (bytes, bytearray)) else str(chunk)
+                for chunk in raw_strings
+            ).strip()
+            if joined:
+                records.append(joined)
+                continue
+        to_text = getattr(rdata, "to_text", None)
+        raw_text = to_text() if callable(to_text) else str(rdata)
+        if isinstance(raw_text, str) and raw_text.strip():
+            records.append(raw_text.strip().strip('"'))
+    return records
+
+
+def _parse_cymru_txt_origin(
+    records: List[str],
+    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> Optional[Dict[str, Any]]:
+    best_prefix: Optional[ipaddress.IPv4Network | ipaddress.IPv6Network] = None
+    best_asn: Optional[int] = None
+    for record in records:
+        parts = [part.strip() for part in record.split("|")]
+        if len(parts) < 2:
+            continue
+        raw_asn_tokens = parts[0].split()
+        raw_prefix = parts[1]
+        if not raw_prefix:
+            continue
+        try:
+            net = ipaddress.ip_network(raw_prefix, strict=False)
+        except ValueError:
+            continue
+        if net.version != addr.version or addr not in net or not (0 < net.prefixlen <= addr.max_prefixlen):
+            continue
+
+        asn_num: Optional[int] = None
+        if raw_asn_tokens:
+            first_token = raw_asn_tokens[0].upper()
+            if first_token.startswith("AS"):
+                first_token = first_token[2:]
+            if first_token.isdigit() and int(first_token) > 0:
+                asn_num = int(first_token)
+
+        if best_prefix is None or net.prefixlen > best_prefix.prefixlen:
+            best_prefix = net
+            best_asn = asn_num
+
+    if best_prefix is None:
+        return None
+    return {"bgpPrefix": str(best_prefix), "asn": best_asn}
+
+
+async def query_cymru_bgp_prefix(ip: str) -> Optional[Dict[str, Any]]:
+    """
+    Resolves the BGP origin prefix and ASN via Team Cymru DNS TXT records when the local
+    offline bgp.tools index is absent or misses.
+    """
+    if not isinstance(ip, str) or not ip.strip():
+        return None
+    try:
+        addr = ipaddress.ip_address(ip.strip())
+    except ValueError:
+        return None
+
+    offline_hit = lookup_bgp_tools_offline(addr.compressed)
+    if isinstance(offline_hit, dict) and offline_hit.get("bgpPrefix"):
+        return {
+            "bgpPrefix": str(offline_hit["bgpPrefix"]),
+            "asn": offline_hit.get("asn"),
+        }
+
+    if addr.version == 4:
+        reversed_v4 = reverse_ipv4_octets(addr.compressed)
+        if reversed_v4 is None:
+            return None
+        qname = f"{reversed_v4}.origin.asn.cymru.com"
+    else:
+        nibble_reversed_v6 = ".".join(reversed(addr.exploded.replace(":", "")))
+        qname = f"{nibble_reversed_v6}.origin6.asn.cymru.com"
+
+    try:
+        resolver = _create_async_resolver()
+        answer = await asyncio.wait_for(
+            resolver.resolve(qname, "TXT"),
+            timeout=DEFAULT_DNS_TIMEOUT_SECONDS,
+        )
+    except (
+        dns.resolver.NXDOMAIN,
+        dns.resolver.NoAnswer,
+        dns.resolver.YXDOMAIN,
+        dns.exception.Timeout,
+        dns.resolver.LifetimeTimeout,
+        dns.resolver.NoNameservers,
+        dns.exception.DNSException,
+        asyncio.TimeoutError,
+        TimeoutError,
+        OSError,
+    ):
+        return None
+
+    return _parse_cymru_txt_origin(_extract_txt_record_strings(answer), addr)

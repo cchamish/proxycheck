@@ -162,11 +162,18 @@ class RedisDegradationAndOAuthFallbackTests(TestCase):
             ("connection_error", redis.exceptions.ConnectionError("Redis unreachable")),
             ("timeout_error", redis.exceptions.TimeoutError("Redis read timed out")),
         )
+        sample_ips = {
+            ("connection_error", "session"): "8.8.8.8",
+            ("connection_error", "bearer"): "8.8.4.4",
+            ("timeout_error", "session"): "1.1.1.1",
+            ("timeout_error", "bearer"): "9.9.9.9",
+        }
         for label, exc in failures:
             for auth_mode, headers in (
                 ("session", {}),
                 ("bearer", {"HTTP_AUTHORIZATION": f"Bearer {bearer_token}"}),
             ):
+                target_ip = sample_ips[(label, auth_mode)]
                 with self.subTest(failure=label, auth_mode=auth_mode):
                     mock_redis = MagicMock()
                     mock_redis.get = AsyncMock(side_effect=exc)
@@ -176,11 +183,11 @@ class RedisDegradationAndOAuthFallbackTests(TestCase):
                         patch("detector.cache_backends.redis_client", mock_redis),
                         self.assertLogs("detector.views", level="WARNING") as captured_logs,
                     ):
-                        resp = self.client.get("/api/v1/detect?ip=8.8.8.8", **headers)
+                        resp = self.client.get(f"/api/v1/detect?ip={target_ip}", **headers)
 
                     self.assertEqual(resp.status_code, 200)
                     payload = resp.json()
-                    self.assertEqual(payload["ip"], "8.8.8.8")
+                    self.assertEqual(payload["ip"], target_ip)
                     self.assertFalse(payload["isCached"])
                     self.assertEqual(payload["cacheMeta"]["status"], "miss")
                     self.assertTrue(any("Redis cache" in line for line in captured_logs.output))
@@ -276,9 +283,9 @@ class RedisDegradationAndOAuthFallbackTests(TestCase):
             )
             self.assertEqual(resp.status_code, 200)
             self.assertTrue(cache_backends.is_redis_circuit_open())
-            # Only the first cache-read stage contacts Redis; cooldown, quota, cache write, and telemetry fail open cleanly
-            self.assertEqual(loop_client.mget.await_count, 1)
-            self.assertEqual(loop_client.get.await_count, 0)
+            # Only the first cache-read stage contacts Redis; provider reads, cooldown, quota, writes, and telemetry fail open cleanly
+            self.assertEqual(loop_client.get.await_count, 1)
+            self.assertEqual(loop_client.mget.await_count, 0)
             self.assertEqual(loop_client.set.await_count, 0)
             self.assertEqual(loop_client.eval.await_count, 0)
             self.assertEqual(loop_client.pipeline.call_count, 0)

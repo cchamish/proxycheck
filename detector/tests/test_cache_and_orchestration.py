@@ -441,8 +441,9 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
                 "cachedAt": "2026-11-13T07:00:00+00:00",
             }
         )
+        proxycheck_1111_key = cache_backends.provider_cache_key("proxycheck", "1.1.1.1")
         cache_store = {
-            "proxycheck:v1:prov:proxycheck:1.1.1.1": historical_proxycheck_1111,
+            proxycheck_1111_key: historical_proxycheck_1111,
         }
         written_ttls = {}
         requested_urls = []
@@ -450,9 +451,12 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
         async def _fake_get(key):
             return cache_store.get(key)
 
-        async def _fake_set(key, val, ex=None):
+        async def _fake_set(key, val, ex=None, nx=False):
+            if nx and key in cache_store:
+                return False
             cache_store[key] = val
             written_ttls[key] = ex
+            return True
 
         mock_redis = MagicMock()
         mock_redis.get = AsyncMock(side_effect=_fake_get)
@@ -479,10 +483,11 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
         first_payload = first_resp.json()
         first_rows = {row["provider"]: row for row in first_payload["results"]}
         self.assertEqual(first_rows["Proxycheck"]["statusCode"], 429)
-        self.assertIn("proxycheck:v1:cooldown:proxycheck", cache_store)
-        self.assertEqual(written_ttls["proxycheck:v1:cooldown:proxycheck"], 180)
-        self.assertNotIn("proxycheck:v1:prov:proxycheck:8.8.8.8", cache_store)
-        self.assertEqual(cache_store["proxycheck:v1:prov:proxycheck:1.1.1.1"], historical_proxycheck_1111)
+        proxycheck_cd_key = cache_backends.provider_cooldown_key("proxycheck")
+        self.assertIn(proxycheck_cd_key, cache_store)
+        self.assertEqual(written_ttls[proxycheck_cd_key], 180)
+        self.assertNotIn(cache_backends.provider_cache_key("proxycheck", "8.8.8.8"), cache_store)
+        self.assertEqual(cache_store[proxycheck_1111_key], historical_proxycheck_1111)
 
         for healthy_key in (
             "cloudflare_radar",
@@ -492,12 +497,15 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
             "ip2location",
             "iphub",
             "iphunter",
+            "shodan_internetdb",
         ):
-            self.assertIn(f"proxycheck:v1:prov:{healthy_key}:8.8.8.8", cache_store)
-            self.assertEqual(written_ttls[f"proxycheck:v1:prov:{healthy_key}:8.8.8.8"], 86400)
-        self.assertIn("proxycheck:v1:prov:getipintel:8.8.8.8", cache_store)
-        self.assertEqual(written_ttls["proxycheck:v1:prov:getipintel:8.8.8.8"], 259200)
-        self.assertEqual(written_ttls["proxycheck:v1:prov:ptr:8.8.8.8"], 7200)
+            healthy_cache_key = cache_backends.provider_cache_key(healthy_key, "8.8.8.8")
+            self.assertIn(healthy_cache_key, cache_store)
+            self.assertEqual(written_ttls[healthy_cache_key], 86400)
+        gii_key = cache_backends.provider_cache_key("getipintel", "8.8.8.8")
+        self.assertIn(gii_key, cache_store)
+        self.assertEqual(written_ttls[gii_key], 259200)
+        self.assertEqual(written_ttls[cache_backends.provider_cache_key("ptr", "8.8.8.8")], 7200)
 
         requested_urls.clear()
         with (
@@ -512,7 +520,7 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
         second_rows = {row["provider"]: row for row in second_resp.json()["results"]}
         self.assertTrue(second_rows["Proxycheck"].get("isCooldown"))
         self.assertIn("429 Cooldown", second_rows["Proxycheck"]["status"])
-        self.assertIn("proxycheck:v1:prov:cloudflare_radar:9.9.9.9", cache_store)
+        self.assertIn(cache_backends.provider_cache_key("cloudflare_radar", "9.9.9.9"), cache_store)
 
         requested_urls.clear()
         with (
@@ -545,9 +553,12 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
         async def _fake_get(key):
             return cache_store.get(key)
 
-        async def _fake_set(key, val, ex=None):
+        async def _fake_set(key, val, ex=None, nx=False):
+            if nx and key in cache_store:
+                return False
             cache_store[key] = val
             written_ttls[key] = ex
+            return True
 
         mock_redis = MagicMock()
         mock_redis.get = AsyncMock(side_effect=_fake_get)
@@ -573,10 +584,10 @@ class PerProviderCacheAndCircuitBreakerTests(TestCase):
             self.assertEqual(cache_backends._get_provider_cache_ttl("dnsbl"), 1800)
 
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(written_ttls.get("proxycheck:v1:cooldown:proxycheck"), 120)
-        self.assertNotIn("proxycheck:v1:prov:proxycheck:8.8.8.8", cache_store)
-        self.assertEqual(written_ttls.get("proxycheck:v1:prov:ptr:8.8.8.8"), 1800)
-        self.assertEqual(written_ttls.get("proxycheck:v1:prov:cloudflare_radar:8.8.8.8"), 43200)
+        self.assertEqual(written_ttls.get(cache_backends.provider_cooldown_key("proxycheck")), 120)
+        self.assertNotIn(cache_backends.provider_cache_key("proxycheck", "8.8.8.8"), cache_store)
+        self.assertEqual(written_ttls.get(cache_backends.provider_cache_key("ptr", "8.8.8.8")), 1800)
+        self.assertEqual(written_ttls.get(cache_backends.provider_cache_key("cloudflare_radar", "8.8.8.8")), 43200)
 
     def test_getipintel_stable_scores_extend_cache_ttl(self):
         stable_low_row = adapters.adapt_getipintel({"status": "success", "result": "0.05"}, True, 200)
@@ -668,7 +679,9 @@ class RedisBatchingAndCacheCompletenessTests(TestCase):
 
     async def test_mget_reads_provider_caches_in_one_round_trip_and_falls_back_without_mget(self):
         fake_batch_redis = _BatchingFakeRedis()
-        fake_batch_redis.strings["proxycheck:v1:prov:ipdata:8.8.8.8"] = self._cached_row_entry("IPData")
+        ipdata_key = cache_backends.provider_cache_key("ipdata", "8.8.8.8")
+        iphub_key = cache_backends.provider_cache_key("iphub", "8.8.8.8")
+        fake_batch_redis.strings[ipdata_key] = self._cached_row_entry("IPData")
 
         with patch("detector.cache_backends.redis_client", fake_batch_redis):
             cached_providers, cached_ptr = await detection_service._read_provider_caches("8.8.8.8")
@@ -680,11 +693,9 @@ class RedisBatchingAndCacheCompletenessTests(TestCase):
         self.assertEqual(fake_batch_redis.get_calls, [])
 
         fake_no_mget_redis = FakeAsyncRedis()
-        fake_no_mget_redis.strings["proxycheck:v1:prov:ipdata:8.8.8.8"] = "cached-ipdata"
+        fake_no_mget_redis.strings[ipdata_key] = "cached-ipdata"
         with patch("detector.cache_backends.redis_client", fake_no_mget_redis):
-            values = await cache_backends._safe_redis_mget(
-                ["proxycheck:v1:prov:ipdata:8.8.8.8", "proxycheck:v1:prov:iphub:8.8.8.8"]
-            )
+            values = await cache_backends._safe_redis_mget([ipdata_key, iphub_key])
         self.assertEqual(values, ["cached-ipdata", None])
 
     async def test_mget_degrades_to_empty_values_on_connection_errors_and_empty_inputs(self):

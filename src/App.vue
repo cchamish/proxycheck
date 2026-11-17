@@ -304,6 +304,7 @@
                     <span
                       class="cdx-badge"
                       :class="getStatusBadgeClass(row.status)"
+                      :title="row.status === 'Offline DB Missing' ? 'Local offline database file not yet downloaded' : undefined"
                     >
                       {{ row.status }}
                     </span>
@@ -430,6 +431,7 @@ import {
   REQUIRED_USER_RIGHTS,
   buildOAuthLoginUrl,
   buildPageUrlWithIp,
+  createLoggedOutUserState,
   isAuthorisedAdminUser,
   isValidIpAddress,
   filterComparisonResults,
@@ -439,13 +441,19 @@ import {
   formatCommitVersionLabel,
   resolveProviderUpdatedLabel,
   formatOfflineDbTimestamp,
+  getProviderMetaItems as buildProviderMetaItems,
+  getStatusBadgeClass,
+  getPredictionScoreTierClass,
+  getArbitrationBadgeClass,
+  getPtrBadgeClass,
+  formatChance,
   buildDiagnosticMetrics,
   formatDiagnosticSummary,
   measureInitialLoadDurationSeconds,
   measureElapsedSeconds,
   type DiagnosticMetrics,
   type DetectionCoordinatorState,
-  type DetectionResponse,
+  type ProviderDisplayRow,
   type ProviderRawResult,
 } from './utils/ip-detector-logic';
 
@@ -516,15 +524,7 @@ const uiState = reactive<DetectionCoordinatorState>({
   sessionExpiredMessage: '',
   detectionData: null,
   diagnostic: null,
-  user: {
-    isLoggedIn: false,
-    username: '',
-    role: '',
-    hasAccess: false,
-    isAdmin: false,
-    localGroups: [],
-    globalGroups: [],
-  },
+  user: createLoggedOutUserState(),
   ipHistory: loadStoredHistory(),
 });
 
@@ -599,11 +599,6 @@ function queryFromHistory(ip: string): void {
   executeDetection(ip);
 }
 
-type ProviderDisplayRow = Omit<Partial<ProviderRawResult>, 'port'> & {
-  port?: number | string | null;
-  last_seen?: string | null;
-};
-
 const nowTimestampMs = ref(Date.now());
 
 watch(detectionData, () => {
@@ -615,122 +610,19 @@ function getProviderUpdatedLabel(row: ProviderDisplayRow | null | undefined): st
 }
 
 function getProviderMetaItems(row: ProviderDisplayRow | null | undefined): string[] {
-  if (!row || typeof row !== 'object') return [];
-  const items: string[] = [];
-  if (row.port !== undefined && row.port !== null && row.port !== '') {
-    items.push(`Port: ${row.port}`);
-  }
-  if (row.provider === 'StopForumSpam' || row.frequency !== undefined || row.confidence !== undefined) {
-    if (row.frequency !== undefined && row.frequency !== null) {
-      items.push(`Frequency: ${row.frequency}`);
-    }
-    if (row.confidence !== undefined && row.confidence !== null) {
-      items.push(`Confidence: ${row.confidence}%`);
-    }
-  }
-  if (row.provider === 'DShield' || row.attacks !== undefined || row.count !== undefined) {
-    if (row.attacks !== undefined && row.attacks !== null) {
-      items.push(`Attacks: ${row.attacks}`);
-    }
-    if (row.count !== undefined && row.count !== null) {
-      items.push(`Targets: ${row.count}`);
-    }
-    if (Array.isArray(row.threatfeeds) && row.threatfeeds.length > 0) {
-      items.push(`Feeds: ${row.threatfeeds.join(', ')}`);
-    }
-  }
-  if (row.carrier) {
-    items.push(`Carrier: ${row.carrier}`);
-  }
-  if (row.mobileBrand) {
-    items.push(`Mobile brand: ${row.mobileBrand}`);
-  }
-  if (row.cloudProvider) {
-    items.push(`Cloud: ${row.cloudProvider}`);
-  }
-  if (row.provider === 'AbuseIPDB' || row.totalReports !== undefined || row.numDistinctUsers !== undefined) {
-    if (row.totalReports !== undefined && row.totalReports !== null) {
-      items.push(`Reports: ${row.totalReports}`);
-    }
-    if (row.numDistinctUsers !== undefined && row.numDistinctUsers !== null) {
-      items.push(`Distinct users: ${row.numDistinctUsers}`);
-    }
-  }
-  const lastSeenValue = row.lastSeen || row.last_seen || row.maxDate;
-  if (lastSeenValue) {
-    items.push(`Last seen: ${lastSeenValue}`);
-  }
-  if (row.offlineDbUpdatedAt) {
-    items.push(`Offline DB: ${formatOfflineDbTimestamp(row.offlineDbUpdatedAt, nowTimestampMs.value)}`);
-  }
-  return items;
-}
-
-function getStatusBadgeClass(status?: string | null): string {
-  if (!status) return 'badge-neutral';
-  if (status === '200 OK') return 'badge-success';
-  if (
-    status === 'No API Key' ||
-    status === 'Database Missing' ||
-    status === 'Offline DB Missing' ||
-    status === 'Skipped (IPv6)'
-  ) {
-    return 'badge-neutral';
-  }
-  if (status.includes('429') || status.includes('Cooldown') || status.includes('Quota Guard')) {
-    return 'badge-warning';
-  }
-  return 'badge-destructive';
-}
-
-function getPredictionScoreTierClass(data: DetectionResponse | null | undefined): string {
-  if (!data) return 'score-tier-low';
-  if (data.predictionTier === 'destructive') return 'score-tier-high';
-  if (data.predictionTier === 'warning') return 'score-tier-moderate';
-  if (data.predictionTier === 'success') return 'score-tier-low';
-  const score = Number(data.prediction_score ?? 0);
-  if (score >= 70) return 'score-tier-high';
-  if (score >= 30) return 'score-tier-moderate';
-  return 'score-tier-low';
-}
-
-function getArbitrationBadgeClass(data: DetectionResponse | null | undefined): string {
-  if (!data) return 'badge-neutral';
-  if (data.arbitrationTier === 'destructive' || data.isMajorityProxyVpn) {
-    return 'badge-destructive';
-  }
-  if (data.arbitrationTier === 'warning' || String(data.arbitrationVerdict || '').startsWith('Disputed')) {
-    return 'badge-warning';
-  }
-  if (data.arbitrationTier === 'neutral') {
-    return 'badge-neutral';
-  }
-  return 'badge-success';
-}
-
-function getPtrBadgeClass(data: DetectionResponse | null | undefined): string {
-  if (!data || !data.ptrCategory) return 'badge-neutral';
-  if (data.ptrCategory === 'hosting_or_gateway' || data.ptrIsHighRisk) {
-    return 'badge-destructive';
-  }
-  if (data.ptrCategory === 'dynamic_residential') {
-    return 'badge-success';
-  }
-  return 'badge-neutral';
+  return buildProviderMetaItems(row, nowTimestampMs.value, formatOfflineDbTimestamp);
 }
 
 function getSimplifiedFlags(flags?: ProviderRawResult['securityFlags'] | null) {
   return simplifySecurityFlags(flags ?? []);
 }
 
-function formatChance(score?: number | string | null): number {
-  const num = Number(score ?? 0);
-  if (Number.isNaN(num)) return 0;
-  return Number(num.toFixed(3));
+function nowPerfMs(): number {
+  return typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : 0;
 }
 
 async function fetchUserStatus() {
-  const requestStart = typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : 0;
+  const requestStart = nowPerfMs();
   try {
     const res = await fetch('/api/v1/auth/user/');
     const fallbackDuration = measureElapsedSeconds(requestStart);
@@ -767,7 +659,7 @@ function handleLogin() {
 }
 
 async function handleLogout() {
-  const requestStart = typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : 0;
+  const requestStart = nowPerfMs();
   try {
     const res = await fetch('/api/v1/auth/logout/');
     const fallbackDuration = measureElapsedSeconds(requestStart);
@@ -776,15 +668,7 @@ async function handleLogout() {
       return;
     }
     const data = await res.json().catch(() => null);
-    user.value = {
-      isLoggedIn: false,
-      username: '',
-      role: '',
-      hasAccess: false,
-      isAdmin: false,
-      localGroups: [],
-      globalGroups: [],
-    };
+    user.value = createLoggedOutUserState();
     isDashboardOpen.value = false;
     inputIp.value = '';
     detectionData.value = null;

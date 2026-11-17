@@ -1,4 +1,4 @@
-"""Tests for offline MaxMind/StopForumSpam engines, cloud CIDR matching, and DB updates."""
+"""Tests for offline MaxMind and StopForumSpam engines, cloud CIDR matching, and DB updates."""
 
 import asyncio
 import json
@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 from django.test import SimpleTestCase, TestCase, override_settings
 
-from detector import views
+from detector import cache_backends, detection_service, dns_providers, intelligence, providers, views
 from detector.adapters import (
     adapt_abuseipdb,
     adapt_ipdata,
@@ -258,8 +258,8 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
                 self.assertEqual(mmdb_wins["cloudCidr"], "54.239.28.64/26")
 
     def test_views_read_maxmind_sync_and_aggregate_intelligence_integration(self):
-        views._maxmind_readers.clear()
-        self.addCleanup(views._maxmind_readers.clear)
+        cache_backends._maxmind_readers.clear()
+        self.addCleanup(cache_backends._maxmind_readers.clear)
         with tempfile.TemporaryDirectory() as tmpdir:
             data_dir = Path(tmpdir) / "data"
             data_dir.mkdir()
@@ -300,7 +300,7 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
                 ),
                 patch.dict("sys.modules", {"maxminddb": fake_maxmind_module}),
             ):
-                maxmind_row = views._read_maxmind_sync("54.239.28.85")
+                maxmind_row = dns_providers._read_maxmind_sync("54.239.28.85")
                 self.assertEqual(maxmind_row["usageType"], "hosting")
                 self.assertEqual(maxmind_row["cloudCidr"], "54.239.28.64/26")
                 self.assertEqual(maxmind_row["cloudProvider"], "Amazon AWS")
@@ -320,7 +320,9 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
                 self.assertEqual(aggregated["arbitrationVerdict"], "Confirmed Proxy / VPN (1/1 Sources)")
                 self.assertEqual(aggregated["arbitrationTier"], "destructive")
 
-        non_public = views._build_non_public_response_payload("127.0.0.1", "loopback", "Loopback IP", time.monotonic())
+        non_public = intelligence._build_non_public_response_payload(
+            "127.0.0.1", "loopback", "Loopback IP", time.monotonic()
+        )
         self.assertIsNone(non_public["cloudCidr"])
         self.assertIsNone(non_public["cloudProvider"])
 
@@ -329,9 +331,9 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         ip: str,
         db_records: dict[str, tuple[dict, int | None]],
     ) -> dict:
-        """Creates stub MMDB files in one TOOL_DATA_DIR/data directory and runs _read_maxmind_sync."""
-        views._maxmind_readers.clear()
-        self.addCleanup(views._maxmind_readers.clear)
+        """Creates stub MMDB files in one configured data directory and runs _read_maxmind_sync."""
+        cache_backends._maxmind_readers.clear()
+        self.addCleanup(cache_backends._maxmind_readers.clear)
         filename_map = {
             "country": "GeoLite2-Country.mmdb",
             "city": "GeoLite2-City.mmdb",
@@ -362,7 +364,7 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
                 ),
                 patch.dict("sys.modules", {"maxminddb": fake_maxmind_module}),
             ):
-                return views._read_maxmind_sync(ip)
+                return dns_providers._read_maxmind_sync(ip)
 
     def test_adapt_maxmind_city_subdivision_coordinates_and_deduplication(self):
         us_row = adapt_maxmind(
@@ -502,16 +504,16 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
                 override_settings(TOOL_DATA_DIR=str(empty_tool)),
                 patch("pathlib.Path.home", return_value=unrelated_home),
             ):
-                missing_row = views._read_maxmind_sync("1.1.1.1")
+                missing_row = dns_providers._read_maxmind_sync("1.1.1.1")
             self.assertEqual(missing_row["status"], "Database Missing")
 
     def test_maxmind_resolver_expands_env_nested_subdirs_and_reloads_updated_file(self):
         from proxycheck.settings import resolve_mmdb_file
 
-        views._maxmind_readers.clear()
-        views._maxmind_reader_stats.clear()
-        self.addCleanup(views._maxmind_readers.clear)
-        self.addCleanup(views._maxmind_reader_stats.clear)
+        cache_backends._maxmind_readers.clear()
+        cache_backends._maxmind_reader_stats.clear()
+        self.addCleanup(cache_backends._maxmind_readers.clear)
+        self.addCleanup(cache_backends._maxmind_reader_stats.clear)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tool_root = Path(tmpdir) / "tool"
@@ -574,12 +576,12 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
                 ),
                 patch.dict("sys.modules", {"maxminddb": fake_maxmind_module}),
             ):
-                row_before_update = views._read_maxmind_sync("1.2.3.4")
+                row_before_update = dns_providers._read_maxmind_sync("1.2.3.4")
                 self.assertEqual(row_before_update["location"], "China")
 
                 # Replace the file on disk with a different size so the cached reader reopens cleanly
                 city_file.write_bytes(b"city-v2-updated-bytes")
-                row_after_update = views._read_maxmind_sync("1.2.3.4")
+                row_after_update = dns_providers._read_maxmind_sync("1.2.3.4")
                 self.assertEqual(row_after_update["location"], "Beijing, China (39.9075, 116.3971)")
                 self.assertEqual(row_after_update["coordinates"], "39.9075, 116.3971")
                 self.assertEqual(len(country_open_paths), 1)
@@ -587,16 +589,16 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
                 city_v1_reader.close.assert_called_once()
 
     @patch("dns.asyncresolver.Resolver.resolve", new_callable=AsyncMock)
-    @patch("detector.views.httpx.AsyncClient")
+    @patch("detector.http_client.httpx.AsyncClient")
     def test_stale_pre_city_maxmind_cache_refreshes_when_city_db_exists(self, mock_async_client_cls, mock_dns_resolve):
-        views._maxmind_readers.clear()
-        views._maxmind_reader_stats.clear()
-        self.addCleanup(views._maxmind_readers.clear)
-        self.addCleanup(views._maxmind_reader_stats.clear)
+        cache_backends._maxmind_readers.clear()
+        cache_backends._maxmind_reader_stats.clear()
+        self.addCleanup(cache_backends._maxmind_readers.clear)
+        self.addCleanup(cache_backends._maxmind_reader_stats.clear)
 
         target_ip = "1.2.3.4"
         cache_store = {}
-        for provider_key, provider_name, _uses_http, _cooldown, _fn in views._PROVIDER_SPECS:
+        for provider_key, provider_name, _uses_http, _cooldown, _fn in providers._PROVIDER_SPECS:
             row_payload = {
                 "provider": provider_name,
                 "status": "200 OK",
@@ -659,7 +661,7 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
                     HOSTING_ASN_RULES_PATH="",
                 ),
                 patch.dict("sys.modules", {"maxminddb": fake_maxmind_module}),
-                patch("detector.views.redis_client", mock_redis),
+                patch("detector.cache_backends.redis_client", mock_redis),
             ):
                 first_resp = self.client.get(f"/api/v1/detect?ip={target_ip}")
                 second_resp = self.client.get(f"/api/v1/detect?ip={target_ip}")
@@ -690,8 +692,8 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         target_ip = "54.239.28.85"
         is_ipv4 = True
         cached_providers = {}
-        for provider_key, provider_name, _uses_http, _cooldown, _fn in views._PROVIDER_SPECS:
-            if not views._is_provider_cache_expected(provider_key, is_ipv4):
+        for provider_key, provider_name, _uses_http, _cooldown, _fn in providers._PROVIDER_SPECS:
+            if not detection_service._is_provider_cache_expected(provider_key, is_ipv4):
                 continue
             cached_providers[provider_key] = (
                 {
@@ -730,11 +732,11 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
             async def _run():
                 nonlocal event_loop_thread_id
                 event_loop_thread_id = threading.get_ident()
-                first_payload = await views._execute_detection_with_cache(
+                first_payload = await detection_service._execute_detection_with_cache(
                     target_ip,
                     initial_cache=initial_cache,
                 )
-                second_payload = await views._execute_detection_with_cache(
+                second_payload = await detection_service._execute_detection_with_cache(
                     target_ip,
                     initial_cache=initial_cache,
                 )
@@ -747,8 +749,8 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
                     HOSTING_ASNS=(),
                     HOSTING_ORG_KEYWORDS=(),
                 ),
-                patch("detector.views.redis_client", None),
-                patch("detector.views.warm_offline_intelligence_caches", side_effect=_tracked_warm),
+                patch("detector.cache_backends.redis_client", None),
+                patch("detector.cidr_attribution.warm_offline_intelligence_caches", side_effect=_tracked_warm),
             ):
                 first_payload, second_payload = asyncio.run(_run())
 
@@ -800,13 +802,13 @@ class OfflineStopForumSpamEngineTests(TestCase):
 
             with (
                 override_settings(TOOL_DATA_DIR=tmp_dir),
-                patch("detector.views.httpx.AsyncClient") as mock_client,
+                patch("detector.http_client.httpx.AsyncClient") as mock_client,
             ):
-                toxic_row = asyncio.run(views.query_stopforumspam("192.0.2.77"))
-                toxic_v6_row = asyncio.run(views.query_stopforumspam("2001:db8:dead::5"))
-                merged_row = asyncio.run(views.query_stopforumspam("198.51.100.42"))
-                canonical_v6_row = asyncio.run(views.query_stopforumspam("2001:db8:cafe::1"))
-                clean_row = asyncio.run(views.query_stopforumspam("203.0.113.99"))
+                toxic_row = asyncio.run(dns_providers.query_stopforumspam("192.0.2.77"))
+                toxic_v6_row = asyncio.run(dns_providers.query_stopforumspam("2001:db8:dead::5"))
+                merged_row = asyncio.run(dns_providers.query_stopforumspam("198.51.100.42"))
+                canonical_v6_row = asyncio.run(dns_providers.query_stopforumspam("2001:db8:cafe::1"))
+                clean_row = asyncio.run(dns_providers.query_stopforumspam("203.0.113.99"))
 
             mock_client.assert_not_called()
 
@@ -859,13 +861,13 @@ class OfflineStopForumSpamEngineTests(TestCase):
 
             with (
                 override_settings(TOOL_DATA_DIR=tmp_dir),
-                patch("detector.views.redis_client", mock_redis),
+                patch("detector.cache_backends.redis_client", mock_redis),
             ):
                 initial_lookup = offline_dbs.query_stopforumspam_offline("198.51.100.88")
                 self.assertFalse(initial_lookup["appears"])
 
-                first_row = asyncio.run(views.query_stopforumspam("198.51.100.88"))
-                cache_key = views._provider_cache_key("stopforumspam", "198.51.100.88")
+                first_row = asyncio.run(dns_providers.query_stopforumspam("198.51.100.88"))
+                cache_key = cache_backends._provider_cache_key("stopforumspam", "198.51.100.88")
                 cache_store[cache_key] = json.dumps(
                     {
                         "row": first_row,
@@ -875,7 +877,7 @@ class OfflineStopForumSpamEngineTests(TestCase):
                     }
                 )
 
-                cached_hit, _ = asyncio.run(views._read_provider_caches("198.51.100.88"))
+                cached_hit, _ = asyncio.run(detection_service._read_provider_caches("198.51.100.88"))
                 self.assertIn("stopforumspam", cached_hit)
 
                 # Advance timestamps beyond integer second boundaries so file mtime visibly changes
@@ -887,7 +889,7 @@ class OfflineStopForumSpamEngineTests(TestCase):
                 os.utime(listed_path, (future_ts, future_ts))
 
                 reloaded_lookup = offline_dbs.query_stopforumspam_offline("198.51.100.88")
-                cached_after_update, _ = asyncio.run(views._read_provider_caches("198.51.100.88"))
+                cached_after_update, _ = asyncio.run(detection_service._read_provider_caches("198.51.100.88"))
 
             self.assertTrue(reloaded_lookup["appears"])
             self.assertEqual(reloaded_lookup["frequency"], 42)

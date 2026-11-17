@@ -1,5 +1,5 @@
 """
-Local MaxMind MMDB, StopForumSpam SQLite, and asynchronous DNS/DNSBL provider queries.
+Local MaxMind MMDB, StopForumSpam SQLite, and asynchronous DNS and DNSBL provider queries.
 """
 
 import asyncio
@@ -18,36 +18,34 @@ import dns.resolver
 import dns.reversename
 from django.conf import settings
 
+from . import cache_backends, cidr_attribution
 from .adapters import (
     adapt_maxmind,
     adapt_spamcop,
     adapt_spamhaus_zen,
     adapt_stopforumspam,
-    are_offline_intelligence_caches_warm,
-    warm_offline_intelligence_caches,
 )
 from .cache_backends import (
-    _UNSET_MOCK_ATTR,
-    _evict_maxmind_reader,
-    _evict_missing_maxmind_readers,
-    _get_cooldown_bounds,
-    _get_maxmind_reader,
-    _maxmind_lock,
-    _missing_city_db_logged_paths,
-    _resolve_maxmind_db_paths,
-    _views_attr,
+    MAXMIND_DB_SPECS,
+    evict_maxmind_reader,
+    evict_missing_maxmind_readers,
+    get_cooldown_bounds,
+    get_maxmind_reader,
+    record_city_db_presence,
 )
 from .offline_dbs import get_maxmind_newest_mtime_iso, query_stopforumspam_offline
-from .sanitization import _sanitize_error_message
+from .sanitization import sanitize_error_message
 
 logger = logging.getLogger("detector.views")
 
-_provider_upstream_events: contextvars.ContextVar[Optional[Dict[str, Dict[str, Any]]]] = contextvars.ContextVar(
-    "_provider_upstream_events", default=None
+provider_upstream_events: contextvars.ContextVar[Optional[Dict[str, Dict[str, Any]]]] = contextvars.ContextVar(
+    "provider_upstream_events", default=None
 )
-_rdns_context_state: contextvars.ContextVar[Optional[Dict[str, str]]] = contextvars.ContextVar(
-    "_rdns_context_state", default=None
+_provider_upstream_events = provider_upstream_events
+rdns_context_state: contextvars.ContextVar[Optional[Dict[str, str]]] = contextvars.ContextVar(
+    "rdns_context_state", default=None
 )
+_rdns_context_state = rdns_context_state
 
 DEFAULT_DNS_TIMEOUT_SECONDS = 2.0
 _DEFAULT_ASYNC_RESOLVER_CLS = dns.asyncresolver.Resolver
@@ -56,7 +54,15 @@ _cached_base_nameservers: Optional[List[Any]] = None
 _cached_async_resolvers: Dict[Tuple[float, float], dns.asyncresolver.Resolver] = {}
 
 
-def _record_upstream_event(
+def clear_dns_resolver_cache() -> None:
+    """Clears cached async DNS resolvers and base nameserver discovery state."""
+    global _cached_base_nameservers
+    with _async_resolver_lock:
+        _cached_base_nameservers = None
+        _cached_async_resolvers.clear()
+
+
+def record_upstream_event(
     provider_key: str,
     *,
     trigger_cooldown: bool,
@@ -69,7 +75,7 @@ def _record_upstream_event(
     upstream_limit: Optional[int] = None,
     upstream_used: Optional[int] = None,
 ) -> None:
-    events = _provider_upstream_events.get()
+    events = provider_upstream_events.get()
     if isinstance(events, dict):
         events[provider_key] = {
             "trigger": trigger_cooldown,
@@ -95,23 +101,6 @@ def _is_valid_mmdb_prefix_tuple(result: Any) -> bool:
     )
 
 
-def _should_use_custom_mmdb_get(reader: Any, mmdb_record: Any) -> bool:
-    """Returns True when reader.get is a mock configured with custom behaviour or a distinct record."""
-    get_method = getattr(reader, "get", None)
-    if get_method is None:
-        return False
-    if getattr(get_method, "_mock_side_effect", None) is not None:
-        return True
-    mock_return_value = getattr(get_method, "_mock_return_value", _UNSET_MOCK_ATTR)
-    if mock_return_value is _UNSET_MOCK_ATTR:
-        return False
-    from unittest.mock import DEFAULT as MOCK_DEFAULT
-
-    if mock_return_value is MOCK_DEFAULT:
-        return False
-    return mock_return_value != mmdb_record
-
-
 def _lookup_mmdb_record_and_prefix(reader: Any, ip: str) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
     """
     Retrieves the MMDB record and routing prefix length in one lookup via get_with_prefix_len
@@ -125,8 +114,6 @@ def _lookup_mmdb_record_and_prefix(reader: Any, ip: str) -> Tuple[Optional[Dict[
             result = None
         if _is_valid_mmdb_prefix_tuple(result):
             raw_rec, prefix_len = result
-            if _should_use_custom_mmdb_get(reader, raw_rec):
-                raw_rec = reader.get(ip)
             return (raw_rec if isinstance(raw_rec, dict) else None, prefix_len)
 
     rec = reader.get(ip)
@@ -175,40 +162,27 @@ def _merge_maxmind_records(
 def _read_maxmind_sync(ip: str) -> Dict[str, Any]:
     """
     Reads local GeoLite2 and GeoIP2 Country, City, and ASN MMDB files synchronously.
-    Offloaded via `asyncio.to_thread` to avoid blocking the ASGI event loop on disk I/O.
+    Offloaded via `asyncio.to_thread` to avoid blocking the ASGI event loop on disk reads.
     """
-    if not are_offline_intelligence_caches_warm():
-        _views_attr("warm_offline_intelligence_caches", warm_offline_intelligence_caches)()
+    if not cidr_attribution.are_offline_intelligence_caches_warm():
+        cidr_attribution.warm_offline_intelligence_caches()
 
-    db_paths = _views_attr("_resolve_maxmind_db_paths", _resolve_maxmind_db_paths)()
+    db_paths = cache_backends._resolve_maxmind_db_paths()
     available_paths = {key: path for key, path in db_paths.items() if os.path.exists(path)}
 
-    for key, filename in (
-        ("country", "GeoLite2-Country.mmdb"),
-        ("city", "GeoLite2-City.mmdb"),
-        ("asn", "GeoLite2-ASN.mmdb"),
-    ):
+    for key, filename in MAXMIND_DB_SPECS:
         if key not in available_paths:
-            _evict_missing_maxmind_readers(filename, db_paths[key])
+            evict_missing_maxmind_readers(filename, db_paths[key])
 
     if not available_paths:
         return adapt_maxmind(None, has_db=False)
 
     city_path = db_paths["city"]
-    if "city" in available_paths:
-        with _maxmind_lock:
-            _missing_city_db_logged_paths.discard(city_path)
-    else:
-        should_log_missing_city = False
-        with _maxmind_lock:
-            if city_path not in _missing_city_db_logged_paths:
-                _missing_city_db_logged_paths.add(city_path)
-                should_log_missing_city = True
-        if should_log_missing_city:
-            logger.warning(
-                "GeoLite2-City.mmdb was not found at %s; MaxMind lookups will omit city and coordinates",
-                city_path,
-            )
+    if record_city_db_presence(city_path, is_present="city" in available_paths):
+        logger.warning(
+            "GeoLite2-City.mmdb was not found at %s; MaxMind lookups will omit city and coordinates",
+            city_path,
+        )
 
     try:
         import maxminddb
@@ -220,7 +194,7 @@ def _read_maxmind_sync(ip: str) -> Dict[str, Any]:
         records: Dict[str, Optional[Dict[str, Any]]] = {}
         prefix_lens: Dict[str, Optional[int]] = {}
         for key, path in available_paths.items():
-            reader = _get_maxmind_reader(path, maxminddb)
+            reader = get_maxmind_reader(path, maxminddb)
             rec, prefix_len = _lookup_mmdb_record_and_prefix(reader, ip)
             records[key] = rec
             prefix_lens[key] = prefix_len
@@ -239,8 +213,8 @@ def _read_maxmind_sync(ip: str) -> Dict[str, Any]:
         return adapt_maxmind(combined_record, has_db=True, status_code=200, ip=ip)
     except (OSError, ValueError, RuntimeError) as exc:
         for path in db_paths.values():
-            _evict_maxmind_reader(path)
-        safe_message = _sanitize_error_message(str(exc))
+            evict_maxmind_reader(path)
+        safe_message = sanitize_error_message(str(exc))
         logger.error(f"Error querying MaxMind local database: {safe_message}")
         return adapt_maxmind({"error": safe_message}, has_db=True, status_code=500)
 
@@ -253,7 +227,7 @@ def _read_stopforumspam_sync(ip: str) -> Dict[str, Any]:
     try:
         lookup = query_stopforumspam_offline(ip)
     except (OSError, sqlite3.Error, ValueError) as exc:
-        safe_message = _sanitize_error_message(str(exc))
+        safe_message = sanitize_error_message(str(exc))
         logger.error("Error querying StopForumSpam offline database: %s", safe_message)
         return adapt_stopforumspam({"success": 0, "error": safe_message}, status_code=500, has_db=True)
 
@@ -296,16 +270,7 @@ def _get_positive_float_setting(name: str, default: float) -> float:
 
 def _get_dns_timeouts() -> Tuple[float, float]:
     timeout_s = _get_positive_float_setting("DNS_QUERY_TIMEOUT_SECONDS", DEFAULT_DNS_TIMEOUT_SECONDS)
-    raw_lifetime = getattr(settings, "DNS_QUERY_LIFETIME_SECONDS", timeout_s)
-    if (
-        isinstance(raw_lifetime, bool)
-        or not isinstance(raw_lifetime, (int, float))
-        or not math.isfinite(float(raw_lifetime))
-        or float(raw_lifetime) <= 0
-    ):
-        lifetime_s = timeout_s
-    else:
-        lifetime_s = float(raw_lifetime)
+    lifetime_s = _get_positive_float_setting("DNS_QUERY_LIFETIME_SECONDS", timeout_s)
     return timeout_s, lifetime_s
 
 
@@ -313,8 +278,7 @@ def _create_async_resolver() -> dns.asyncresolver.Resolver:
     global _cached_base_nameservers
 
     timeout_s, lifetime_s = _get_dns_timeouts()
-    dns_mod = _views_attr("dns", dns)
-    resolver_cls = dns_mod.asyncresolver.Resolver
+    resolver_cls = dns.asyncresolver.Resolver
     if resolver_cls is not _DEFAULT_ASYNC_RESOLVER_CLS:
         try:
             resolver = resolver_cls()
@@ -390,7 +354,7 @@ async def query_rdns_ptr(ip: str) -> Optional[str]:
     Resolves the reverse DNS PTR hostname asynchronously via dnspython without
     blocking threads, distinguishing normal NXDOMAIN or NoAnswer from timeouts or errors.
     """
-    state = _rdns_context_state.get()
+    state = rdns_context_state.get()
     try:
         qname = dns.reversename.from_address(ip)
     except ValueError, dns.exception.DNSException:
@@ -406,7 +370,7 @@ async def query_rdns_ptr(ip: str) -> Optional[str]:
             if isinstance(state, dict):
                 state["status"] = "nxdomain"
             return None
-        cleaned = _sanitize_error_message(raw_host.strip().rstrip(".").lower())
+        cleaned = sanitize_error_message(raw_host.strip().rstrip(".").lower())
         if not cleaned:
             if isinstance(state, dict):
                 state["status"] = "nxdomain"
@@ -428,7 +392,7 @@ async def query_rdns_ptr(ip: str) -> Optional[str]:
         return None
 
 
-def _reverse_ipv4_octets(ip: str) -> Optional[str]:
+def reverse_ipv4_octets(ip: str) -> Optional[str]:
     """Reverses IPv4 dotted octets for DNSBL lookups and returns None for non-IPv4 addresses."""
     try:
         addr = ipaddress.ip_address(ip.strip())
@@ -474,12 +438,12 @@ async def _query_dnsbl_zone(
     provider_label: str,
 ) -> Tuple[Dict[str, Any], int]:
     """Queries an IPv4 DNSBL zone asynchronously, skipping IPv6 targets and recording timeouts."""
-    reversed_ip = _reverse_ipv4_octets(ip)
+    reversed_ip = reverse_ipv4_octets(ip)
     if reversed_ip is None:
         return {"status": "skipped_ipv6", "query": None, "reversedIp": None, "codes": []}, 200
 
     qname = f"{reversed_ip}.{zone}"
-    default_cooldown, _, _ = _get_cooldown_bounds()
+    default_cooldown, _, _ = get_cooldown_bounds()
     try:
         resolver = _create_async_resolver()
         answer = await resolver.resolve(qname, "A")
@@ -493,9 +457,9 @@ async def _query_dnsbl_zone(
     except dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.YXDOMAIN:
         return {"status": "clean", "query": qname, "reversedIp": reversed_ip, "codes": []}, 200
     except (dns.exception.Timeout, dns.resolver.LifetimeTimeout, asyncio.TimeoutError, TimeoutError) as exc:
-        safe_message = _sanitize_error_message(str(exc) or "DNS timeout")
+        safe_message = sanitize_error_message(str(exc) or "DNS timeout")
         logger.warning(f"{provider_label} DNS query timed out for {qname}: {safe_message}")
-        _record_upstream_event(
+        record_upstream_event(
             provider_key,
             trigger_cooldown=True,
             status_code=504,
@@ -505,9 +469,9 @@ async def _query_dnsbl_zone(
         )
         return {"status": "timeout", "query": qname, "reversedIp": reversed_ip, "codes": [], "error": safe_message}, 504
     except (dns.resolver.NoNameservers, dns.exception.DNSException, OSError) as exc:
-        safe_message = _sanitize_error_message(str(exc) or "DNS resolution failed")
+        safe_message = sanitize_error_message(str(exc) or "DNS resolution failed")
         logger.warning(f"{provider_label} DNS query failed for {qname}: {safe_message}")
-        _record_upstream_event(
+        record_upstream_event(
             provider_key,
             trigger_cooldown=True,
             status_code=502,
@@ -521,8 +485,8 @@ async def query_spamhaus_zen(ip: str) -> Dict[str, Any]:
     raw_data, status_code = await _query_dnsbl_zone(ip, "zen.spamhaus.org", "spamhaus_zen", "Spamhaus ZEN")
     row = adapt_spamhaus_zen(raw_data, status_code)
     if row.get("isQueryRestricted"):
-        default_cooldown, _, _ = _get_cooldown_bounds()
-        _record_upstream_event(
+        default_cooldown, _, _ = get_cooldown_bounds()
+        record_upstream_event(
             "spamhaus_zen",
             trigger_cooldown=True,
             status_code=429,

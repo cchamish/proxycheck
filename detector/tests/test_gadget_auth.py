@@ -13,7 +13,7 @@ import httpx
 from django.core import signing
 from django.test import TestCase, override_settings
 
-from detector import views
+from detector import session_auth, views
 from detector.oauth import (
     CentralAuthVerificationError,
     InvalidCentralAuthTokenError,
@@ -22,6 +22,8 @@ from detector.oauth import (
     normalize_and_validate_wikimedia_domain,
     verify_centralauth_userinfo,
 )
+
+from .helpers import start_non_dnsbl_provider_stubs
 
 
 class GadgetTokenAndCorsAuthTests(TestCase):
@@ -36,44 +38,8 @@ class GadgetTokenAndCorsAuthTests(TestCase):
         dns_patcher.start()
         self.addCleanup(dns_patcher.stop)
 
-    @staticmethod
-    def _stub_provider(name):
-        return {
-            "provider": name,
-            "status": "No API Key",
-            "statusCode": None,
-            "asn": "-",
-            "isp": "-",
-            "organisation": "-",
-            "location": "-",
-            "usageType": "-",
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "rawJson": {"status": "error", "message": "API key not configured"},
-        }
-
     def _patch_all_providers(self):
-        patchers = []
-        provider_map = (
-            ("detector.views.query_cloudflare_radar", "Cloudflare Radar"),
-            ("detector.views.query_abuseipdb", "AbuseIPDB"),
-            ("detector.views.query_ipdata", "IPData"),
-            ("detector.views.query_ipregistry", "IPRegistry"),
-            ("detector.views.query_ip2location", "IP2Location"),
-            ("detector.views.query_getipintel", "GetIPIntel"),
-            ("detector.views.query_proxycheck", "Proxycheck"),
-            ("detector.views.query_iphub", "IPHub"),
-            ("detector.views.query_iphunter", "IPHunter"),
-            ("detector.views.query_maxmind", "MaxMind"),
-            ("detector.views.query_tor_onionoo", "Tor Onionoo"),
-            ("detector.views.query_stopforumspam", "StopForumSpam"),
-            ("detector.views.query_dshield", "DShield"),
-        )
-        for target, name in provider_map:
-            p = patch(target, new_callable=AsyncMock, return_value=self._stub_provider(name))
-            p.start()
-            self.addCleanup(p.stop)
-            patchers.append(p)
-        return patchers
+        return start_non_dnsbl_provider_stubs(self)
 
     def test_options_preflight_allows_wikimedia_origins_and_bearer_header(self):
         allowed_origins = (
@@ -114,7 +80,7 @@ class GadgetTokenAndCorsAuthTests(TestCase):
         self._patch_all_providers()
         with (
             override_settings(ALLOWED_WIKI_USERS="AllowlistedUser"),
-            patch("detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock) as mock_fetch,
+            patch("detector.oauth.fetch_user_rights_from_meta", new_callable=AsyncMock) as mock_fetch,
         ):
             for spoofed_user in ("GlobalSteward", "AllowlistedUser"):
                 with self.subTest(spoofed_user=spoofed_user):
@@ -271,7 +237,7 @@ class GadgetTokenAndCorsAuthTests(TestCase):
             json.dumps({"centralauthtoken": "valid-cat", "domain": "evil.example.com"}),
             json.dumps({"centralauthtoken": "valid-cat", "domain": "https://zh.wikipedia.org"}),
         )
-        with patch("detector.views.verify_centralauth_userinfo", new_callable=AsyncMock) as mock_verify:
+        with patch("detector.oauth.verify_centralauth_userinfo", new_callable=AsyncMock) as mock_verify:
             for body in invalid_bodies:
                 with self.subTest(body=body[:50]):
                     resp = self.client.post(
@@ -291,7 +257,7 @@ class GadgetTokenAndCorsAuthTests(TestCase):
         long_jwt_token = "header." + ("a" * 500) + "." + ("b" * 500)
         with (
             patch(
-                "detector.views.verify_centralauth_userinfo",
+                "detector.oauth.verify_centralauth_userinfo",
                 new_callable=AsyncMock,
                 return_value={
                     "username": "ZhWikiSysop",
@@ -302,7 +268,7 @@ class GadgetTokenAndCorsAuthTests(TestCase):
                 },
             ) as mock_verify,
             patch(
-                "detector.views.fetch_user_rights_from_meta",
+                "detector.oauth.fetch_user_rights_from_meta",
                 new_callable=AsyncMock,
                 return_value={"global_groups": [], "global_rights": [], "merged_projects": []},
             ),
@@ -320,7 +286,7 @@ class GadgetTokenAndCorsAuthTests(TestCase):
     def test_exchange_gadget_token_error_mapping_and_subwiki_local_groups(self):
         with (
             patch(
-                "detector.views.verify_centralauth_userinfo",
+                "detector.oauth.verify_centralauth_userinfo",
                 new_callable=AsyncMock,
                 side_effect=InvalidCentralAuthTokenError(
                     "MediaWiki rejected CentralAuth token (badtoken: Invalid token).",
@@ -344,7 +310,7 @@ class GadgetTokenAndCorsAuthTests(TestCase):
 
         with (
             patch(
-                "detector.views.verify_centralauth_userinfo",
+                "detector.oauth.verify_centralauth_userinfo",
                 new_callable=AsyncMock,
                 side_effect=CentralAuthVerificationError(
                     "zh.wikipedia.org returned HTTP 503.",
@@ -371,7 +337,7 @@ class GadgetTokenAndCorsAuthTests(TestCase):
 
         with (
             patch(
-                "detector.views.verify_centralauth_userinfo",
+                "detector.oauth.verify_centralauth_userinfo",
                 new_callable=AsyncMock,
                 return_value={
                     "username": "RegularUser",
@@ -382,7 +348,7 @@ class GadgetTokenAndCorsAuthTests(TestCase):
                 },
             ),
             patch(
-                "detector.views.fetch_user_rights_from_meta",
+                "detector.oauth.fetch_user_rights_from_meta",
                 new_callable=AsyncMock,
                 return_value={"global_groups": [], "merged_projects": [{"wiki": "enwiki", "groups": ["*", "user"]}]},
             ),
@@ -398,7 +364,7 @@ class GadgetTokenAndCorsAuthTests(TestCase):
 
         with (
             patch(
-                "detector.views.verify_centralauth_userinfo",
+                "detector.oauth.verify_centralauth_userinfo",
                 new_callable=AsyncMock,
                 return_value={
                     "username": "MissingUser",
@@ -409,7 +375,7 @@ class GadgetTokenAndCorsAuthTests(TestCase):
                 },
             ),
             patch(
-                "detector.views.fetch_user_rights_from_meta",
+                "detector.oauth.fetch_user_rights_from_meta",
                 new_callable=AsyncMock,
                 side_effect=MetaWikiRightsFetchError("Meta-Wiki globaluserinfo missing from response"),
             ),
@@ -424,7 +390,7 @@ class GadgetTokenAndCorsAuthTests(TestCase):
 
         with (
             patch(
-                "detector.views.verify_centralauth_userinfo",
+                "detector.oauth.verify_centralauth_userinfo",
                 new_callable=AsyncMock,
                 return_value={
                     "username": "TransientUser",
@@ -435,7 +401,7 @@ class GadgetTokenAndCorsAuthTests(TestCase):
                 },
             ),
             patch(
-                "detector.views.fetch_user_rights_from_meta",
+                "detector.oauth.fetch_user_rights_from_meta",
                 new_callable=AsyncMock,
                 side_effect=MetaWikiRightsFetchError("Meta-Wiki returned HTTP 503"),
             ),
@@ -451,7 +417,7 @@ class GadgetTokenAndCorsAuthTests(TestCase):
         # Verify local sub-wiki privileges still grant access even if globaluserinfo lookup degrades
         with (
             patch(
-                "detector.views.verify_centralauth_userinfo",
+                "detector.oauth.verify_centralauth_userinfo",
                 new_callable=AsyncMock,
                 return_value={
                     "username": "LocalZhCheckUser",
@@ -462,7 +428,7 @@ class GadgetTokenAndCorsAuthTests(TestCase):
                 },
             ),
             patch(
-                "detector.views.fetch_user_rights_from_meta",
+                "detector.oauth.fetch_user_rights_from_meta",
                 new_callable=AsyncMock,
                 side_effect=MetaWikiRightsFetchError("Meta-Wiki returned HTTP 503"),
             ),
@@ -491,9 +457,9 @@ class GadgetTokenAndCorsAuthTests(TestCase):
             queried_domains.append(domain)
             return []
 
-        with patch("detector.views.fetch_project_user_rights", side_effect=record_lookup):
+        with patch("detector.oauth.fetch_project_user_rights", side_effect=record_lookup):
             enriched = asyncio.run(
-                views._populate_merged_project_rights(
+                session_auth._populate_merged_project_rights(
                     MagicMock(),
                     "ExampleUser",
                     merged_projects,
@@ -516,7 +482,7 @@ class GadgetTokenAndCorsAuthTests(TestCase):
 
     def test_detect_ip_bearer_token_authentication_and_tamper_resistance(self):
         self._patch_all_providers()
-        with patch("detector.views.redis_client", None):
+        with patch("detector.cache_backends.redis_client", None):
             steward_userinfo = {
                 "username": "Steward",
                 "local_groups": ["*", "user"],
@@ -526,10 +492,10 @@ class GadgetTokenAndCorsAuthTests(TestCase):
             }
             with (
                 patch(
-                    "detector.views.verify_centralauth_userinfo", new_callable=AsyncMock, return_value=steward_userinfo
+                    "detector.oauth.verify_centralauth_userinfo", new_callable=AsyncMock, return_value=steward_userinfo
                 ),
                 patch(
-                    "detector.views.fetch_user_rights_from_meta",
+                    "detector.oauth.fetch_user_rights_from_meta",
                     new_callable=AsyncMock,
                     return_value={
                         "global_groups": ["steward"],
@@ -585,7 +551,7 @@ class GadgetTokenAndCorsAuthTests(TestCase):
 
             with (
                 override_settings(GADGET_TOKEN_TTL_SECONDS=10),
-                patch("detector.views.signing.loads", side_effect=signing.SignatureExpired("Signature expired")),
+                patch("detector.session_auth.signing.loads", side_effect=signing.SignatureExpired("Signature expired")),
             ):
                 expired_resp = self.client.get(
                     "/api/v1/detect?ip=8.8.8.8",
@@ -598,10 +564,10 @@ class GadgetTokenAndCorsAuthTests(TestCase):
     def test_gadget_bearer_token_rejects_temporary_accounts_and_enforces_restricted_allowlist(self):
         self._patch_all_providers()
 
-        with patch("detector.views.redis_client", None):
+        with patch("detector.cache_backends.redis_client", None):
             for temp_username in ("~2026-12345", " ~2026-99999 "):
                 temp_token = views.issue_gadget_token(temp_username)
-                verified_user, verified_err = views._verify_gadget_bearer_token(f"Bearer {temp_token}")
+                verified_user, verified_err = session_auth._verify_gadget_bearer_token(f"Bearer {temp_token}")
                 self.assertIsNone(verified_user)
                 self.assertEqual(verified_err, "Invalid authentication token.")
 
@@ -625,12 +591,12 @@ class GadgetTokenAndCorsAuthTests(TestCase):
             }
             with (
                 patch(
-                    "detector.views.verify_centralauth_userinfo",
+                    "detector.oauth.verify_centralauth_userinfo",
                     new_callable=AsyncMock,
                     return_value=steward_userinfo,
                 ),
                 patch(
-                    "detector.views.fetch_user_rights_from_meta",
+                    "detector.oauth.fetch_user_rights_from_meta",
                     new_callable=AsyncMock,
                     return_value={
                         "global_groups": ["steward"],
@@ -848,9 +814,9 @@ class GadgetTokenAndCorsAuthTests(TestCase):
                 }
 
                 with (
-                    patch("detector.views.httpx.AsyncClient", return_value=mock_client),
+                    patch("detector.http_client.httpx.AsyncClient", return_value=mock_client),
                     patch(
-                        "detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock, return_value=meta_rights
+                        "detector.oauth.fetch_user_rights_from_meta", new_callable=AsyncMock, return_value=meta_rights
                     ),
                 ):
                     oauth_resp = self.client.get(f"/api/v1/auth/callback?code=code1&state=state-{username}")
@@ -870,13 +836,13 @@ class GadgetTokenAndCorsAuthTests(TestCase):
                 }
                 with (
                     patch(
-                        "detector.views.verify_centralauth_userinfo", new_callable=AsyncMock, return_value=userinfo_stub
+                        "detector.oauth.verify_centralauth_userinfo", new_callable=AsyncMock, return_value=userinfo_stub
                     ),
                     patch(
-                        "detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock, return_value=meta_rights
+                        "detector.oauth.fetch_user_rights_from_meta", new_callable=AsyncMock, return_value=meta_rights
                     ),
                     patch(
-                        "detector.views.fetch_project_user_rights",
+                        "detector.oauth.fetch_project_user_rights",
                         new_callable=AsyncMock,
                         return_value=["read", granted_right],
                     ),
@@ -916,9 +882,9 @@ class GadgetTokenAndCorsAuthTests(TestCase):
         mock_client.get = AsyncMock(return_value=profile_resp)
 
         with (
-            patch("detector.views.httpx.AsyncClient", return_value=mock_client),
+            patch("detector.http_client.httpx.AsyncClient", return_value=mock_client),
             patch(
-                "detector.views.fetch_user_rights_from_meta",
+                "detector.oauth.fetch_user_rights_from_meta",
                 new_callable=AsyncMock,
                 side_effect=MetaWikiRightsFetchError("Meta-Wiki HTTP 503"),
             ),
@@ -950,11 +916,11 @@ class GadgetTokenAndCorsAuthTests(TestCase):
             "merged_projects": [{"wiki": "zhwiki", "url": "https://zh.wikipedia.org", "groups": ["sysop"]}],
         }
         with (
-            patch("detector.views.httpx.AsyncClient", return_value=mock_client),
+            patch("detector.http_client.httpx.AsyncClient", return_value=mock_client),
             patch(
-                "detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock, return_value=denied_meta_rights
+                "detector.oauth.fetch_user_rights_from_meta", new_callable=AsyncMock, return_value=denied_meta_rights
             ),
-            patch("detector.views.fetch_project_user_rights", new_callable=AsyncMock, return_value=["read", "delete"]),
+            patch("detector.oauth.fetch_project_user_rights", new_callable=AsyncMock, return_value=["read", "delete"]),
         ):
             denied_oauth_resp = self.client.get("/api/v1/auth/callback?code=code2b&state=state-group-only-denied")
 
@@ -971,11 +937,11 @@ class GadgetTokenAndCorsAuthTests(TestCase):
             "domain": "zh.wikipedia.org",
         }
         with (
-            patch("detector.views.verify_centralauth_userinfo", new_callable=AsyncMock, return_value=denied_userinfo),
+            patch("detector.oauth.verify_centralauth_userinfo", new_callable=AsyncMock, return_value=denied_userinfo),
             patch(
-                "detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock, return_value=denied_meta_rights
+                "detector.oauth.fetch_user_rights_from_meta", new_callable=AsyncMock, return_value=denied_meta_rights
             ),
-            patch("detector.views.fetch_project_user_rights", new_callable=AsyncMock, return_value=["read", "delete"]),
+            patch("detector.oauth.fetch_project_user_rights", new_callable=AsyncMock, return_value=["read", "delete"]),
         ):
             denied_gadget_resp = self.client.post(
                 "/api/v1/auth/gadget-token",
@@ -996,8 +962,8 @@ class GadgetTokenAndCorsAuthTests(TestCase):
         mock_client.get = AsyncMock(return_value=allow_profile_resp)
         with (
             override_settings(ALLOWED_WIKI_USERS="Allowlisted_Operator"),
-            patch("detector.views.httpx.AsyncClient", return_value=mock_client),
-            patch("detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock) as mock_allow_meta,
+            patch("detector.http_client.httpx.AsyncClient", return_value=mock_client),
+            patch("detector.oauth.fetch_user_rights_from_meta", new_callable=AsyncMock) as mock_allow_meta,
         ):
             allow_oauth_resp = self.client.get("/api/v1/auth/callback?code=code_allow&state=state-allowlist")
         self.assertEqual(allow_oauth_resp.status_code, 302)
@@ -1015,8 +981,8 @@ class GadgetTokenAndCorsAuthTests(TestCase):
 
         with (
             override_settings(ALLOWED_WIKI_USERS="~2026-12345"),
-            patch("detector.views.httpx.AsyncClient", return_value=mock_client),
-            patch("detector.views.fetch_user_rights_from_meta", new_callable=AsyncMock) as mock_temp_meta,
+            patch("detector.http_client.httpx.AsyncClient", return_value=mock_client),
+            patch("detector.oauth.fetch_user_rights_from_meta", new_callable=AsyncMock) as mock_temp_meta,
         ):
             temp_resp = self.client.get("/api/v1/auth/callback?code=code3&state=state-temp-acct")
 

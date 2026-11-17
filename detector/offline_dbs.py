@@ -1,4 +1,4 @@
-"""Offline threat intelligence stores and local database freshness metadata."""
+"""Offline threat intelligence stores, thread-safe file caches, and database freshness metadata."""
 
 from __future__ import annotations
 
@@ -19,20 +19,27 @@ import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Generic, Iterable, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, Generic, Iterable, List, Mapping, Optional, Sequence, Tuple, TypeVar
 
 from proxycheck.settings import (
     MAXMIND_ASN_DB_FILENAME,
     MAXMIND_CITY_DB_FILENAME,
     MAXMIND_COUNTRY_DB_FILENAME,
+    expand_configured_path,
+    find_mmdb_in_directory,
+    resolve_data_file,
+    resolve_mmdb_file,
     resolve_tool_data_subdir,
+    standard_data_directories,
 )
 
 logger = logging.getLogger(__name__)
 
 SFS_TOXIC_CIDR_FILENAME = "toxic_ip_cidr.txt"
+SFS_LISTED_90_ZIP_NAME = "listed_ip_90_ipv46_all.zip"
+SFS_LISTED_1_ZIP_NAME = "listed_ip_1_ipv46_all.zip"
 SFS_LISTED_90_FILENAMES = (
-    "listed_ip_90_ipv46_all.zip",
+    SFS_LISTED_90_ZIP_NAME,
     "listed_ip_90_ipv46_all.txt",
     "listed_ip_90_ipv46_all.csv",
     "listed_ip_90_ipv46_all.gz",
@@ -40,7 +47,7 @@ SFS_LISTED_90_FILENAMES = (
     "listed_ip_90_ipv46_all.csv.gz",
 )
 SFS_LISTED_1_FILENAMES = (
-    "listed_ip_1_ipv46_all.zip",
+    SFS_LISTED_1_ZIP_NAME,
     "listed_ip_1_ipv46_all.txt",
     "listed_ip_1_ipv46_all.csv",
     "listed_ip_1_ipv46_all.gz",
@@ -49,28 +56,110 @@ SFS_LISTED_1_FILENAMES = (
 )
 SFS_SQLITE_FILENAME = "stopforumspam.sqlite3"
 
+CLOUD_CIDRS_FILENAME = "cloud_cidrs.json"
+CLOUD_CIDR_FILENAMES = (CLOUD_CIDRS_FILENAME, "computehosts.json")
+HOSTING_RULES_FILENAME = "hosting_asn_rules.json"
+
+MAXMIND_EDITION_SPECS: Tuple[Tuple[str, str], ...] = (
+    ("GeoLite2-Country", MAXMIND_COUNTRY_DB_FILENAME),
+    ("GeoLite2-City", MAXMIND_CITY_DB_FILENAME),
+    ("GeoLite2-ASN", MAXMIND_ASN_DB_FILENAME),
+)
+
 _SOURCE_MASK_90 = 1
 _SOURCE_MASK_1 = 2
 
-_DEFAULT_STALE_MAXMIND_SECONDS = 14 * 86400
-_DEFAULT_STALE_SFS_TOXIC_SECONDS = 7 * 86400
-_DEFAULT_STALE_SFS_90_SECONDS = 2 * 86400
-_DEFAULT_STALE_SFS_1_SECONDS = 6 * 3600
-_DEFAULT_STALE_CLOUD_CIDRS_SECONDS = 7 * 86400
-_DEFAULT_STALE_RULES_SECONDS = 90 * 86400
+DEFAULT_STALE_MAXMIND_SECONDS = 14 * 86400
+DEFAULT_STALE_SFS_TOXIC_SECONDS = 7 * 86400
+DEFAULT_STALE_SFS_90_SECONDS = 2 * 86400
+DEFAULT_STALE_SFS_1_SECONDS = 6 * 3600
+DEFAULT_STALE_CLOUD_CIDRS_SECONDS = 7 * 86400
+DEFAULT_STALE_RULES_SECONDS = 90 * 86400
 
-_sfs_cache_lock = threading.Lock()
-_sfs_toxic_cache_key: Optional[Tuple[str, int, int]] = None
-_sfs_toxic_cache_index: Optional["_StopForumSpamCidrIndex"] = None
-_sfs_sqlite_validated_state: Optional[Tuple[Optional[str], str, Optional[Tuple[int, int]]]] = None
-_sfs_cache_warmed = False
+_K = TypeVar("_K")
+_V = TypeVar("_V")
+_T = TypeVar("_T")
 
 
 class StopForumSpamCorruptDataError(ValueError):
     """Raised when a local StopForumSpam offline database archive cannot be parsed."""
 
 
-def _get_setting(name: str, default: Any = None) -> Any:
+class FileStatCache(Generic[_K, _V]):
+    """
+    Thread-safe per-resource cache keyed by file stat signature or configuration tuple.
+    Uses an independent fine-grained lock and a monotonic generation counter so slow
+    disk parsing runs outside the lock without risking stale overwrite races.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._key: Optional[_K] = None
+        self._value: Optional[_V] = None
+        self._has_value = False
+        self._generation = 0
+
+    def get_or_load(self, key: _K, loader: Callable[[], _V], *, cache_result: bool = True) -> _V:
+        with self._lock:
+            if self._has_value and self._key == key:
+                return self._value  # type: ignore[return-value]
+            gen_before = self._generation
+
+        loaded = loader()
+        if not cache_result:
+            return loaded
+
+        with self._lock:
+            if self._generation == gen_before:
+                self._key = key
+                self._value = loaded
+                self._has_value = True
+                self._generation += 1
+            elif self._has_value and self._key == key:
+                return self._value  # type: ignore[return-value]
+        return loaded
+
+    def set_constant(self, key: _K, value: _V) -> _V:
+        with self._lock:
+            if not self._has_value or self._key != key:
+                self._key = key
+                self._value = value
+                self._has_value = True
+                self._generation += 1
+        return value
+
+    def peek_matching(self, predicate: Callable[[_K, _V], bool]) -> Optional[_V]:
+        with self._lock:
+            if (
+                self._has_value
+                and self._key is not None
+                and self._value is not None
+                and predicate(self._key, self._value)
+            ):
+                return self._value
+            return None
+
+    def store(self, key: _K, value: _V) -> None:
+        with self._lock:
+            self._key = key
+            self._value = value
+            self._has_value = True
+            self._generation += 1
+
+    def is_populated(self) -> bool:
+        with self._lock:
+            return self._has_value
+
+    def clear(self) -> None:
+        with self._lock:
+            self._key = None
+            self._value = None
+            self._has_value = False
+            self._generation += 1
+
+
+def get_setting(name: str, default: Any = None) -> Any:
+    """Reads a Django setting when configured, returning default otherwise."""
     try:
         from django.conf import settings as django_settings
 
@@ -81,44 +170,66 @@ def _get_setting(name: str, default: Any = None) -> Any:
     return default
 
 
-def _get_setting_or_env(name: str, default: str = "") -> str:
-    setting_val = _get_setting(name, None)
+def _lookup_config_value(
+    name: str,
+    *,
+    env_overrides: Optional[Mapping[str, str]] = None,
+    default: str = "",
+) -> str:
+    if env_overrides is not None:
+        raw_override = env_overrides.get(name, "")
+        return str(raw_override).strip() if raw_override else default
+    setting_val = get_setting(name, None)
     if isinstance(setting_val, str) and setting_val.strip():
         return setting_val.strip()
     env_val = os.environ.get(name, "").strip()
-    if env_val:
-        return env_val
-    return default
+    return env_val if env_val else default
 
 
-def _get_positive_int_setting(name: str, default: int) -> int:
-    raw = _get_setting(name, default)
+def get_positive_int_setting(
+    name: str,
+    default: int,
+    *,
+    env_overrides: Optional[Mapping[str, str]] = None,
+) -> int:
+    """Resolves a positive integer setting from an explicit mapping or Django settings."""
+    if env_overrides is not None:
+        raw_text = str(env_overrides.get(name, "") or "").strip()
+        if not raw_text:
+            return default
+        try:
+            parsed = int(raw_text)
+        except ValueError:
+            return default
+        return parsed if parsed > 0 else default
+    raw = get_setting(name, default)
     if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
         return default
     return raw
 
 
-def _expand_path(raw_path: str) -> str:
-    cleaned = str(raw_path or "").strip()
-    if not cleaned:
-        return ""
-    return os.path.expanduser(os.path.expandvars(cleaned))
-
-
-def _base_dir() -> Path:
-    configured = _get_setting("BASE_DIR", None)
+def _effective_base_dir(base_dir: Optional[Path] = None) -> Path:
+    if base_dir is not None:
+        return Path(str(base_dir))
+    configured = get_setting("BASE_DIR", None)
     if configured:
         return Path(str(configured))
     return Path(__file__).resolve().parent.parent
 
 
-def _standard_data_directories() -> List[Path]:
-    from proxycheck.settings import _standard_data_directories as settings_data_dirs
+def _effective_standard_dirs(
+    *,
+    env_overrides: Optional[Mapping[str, str]] = None,
+    base_dir: Optional[Path] = None,
+) -> List[Path]:
+    resolved_base = _effective_base_dir(base_dir)
+    if env_overrides is not None:
+        return list(standard_data_directories(resolved_base, tool_data_dir=env_overrides.get("TOOL_DATA_DIR", "")))
+    return list(standard_data_directories(resolved_base))
 
-    return list(settings_data_dirs(_base_dir()))
 
-
-def _get_file_stat_signature(file_path: str | Path) -> Optional[Tuple[int, int]]:
+def get_file_stat_signature(file_path: str | Path) -> Optional[Tuple[int, int]]:
+    """Returns nanosecond modification time and byte size for an existing file, or None."""
     try:
         stat_res = os.stat(file_path)
     except OSError:
@@ -126,7 +237,8 @@ def _get_file_stat_signature(file_path: str | Path) -> Optional[Tuple[int, int]]
     return (stat_res.st_mtime_ns, stat_res.st_size)
 
 
-def _find_in_directory(directory: Path, filenames: Tuple[str, ...]) -> Optional[Path]:
+def find_sfs_in_directory(directory: Path, filenames: Tuple[str, ...]) -> Optional[Path]:
+    """Locates a StopForumSpam data file in directory or its nested stopforumspam subfolder."""
     for fname in filenames:
         direct = directory / fname
         if direct.is_file():
@@ -140,28 +252,39 @@ def _find_in_directory(directory: Path, filenames: Tuple[str, ...]) -> Optional[
     return None
 
 
+def resolve_configured_data_dir(*, env_overrides: Optional[Mapping[str, str]] = None) -> str:
+    """Returns the resolved TOOL_DATA_DIR offline data subdirectory, or empty string when unset."""
+    tool_data_dir = expand_configured_path(_lookup_config_value("TOOL_DATA_DIR", env_overrides=env_overrides))
+    if not tool_data_dir:
+        return ""
+    return str(resolve_tool_data_subdir(tool_data_dir))
+
+
 def _resolve_sfs_component_path(
     override_setting: str,
     configured_dir: str,
     filenames: Tuple[str, ...],
+    standard_dirs: Sequence[Path],
+    *,
+    env_overrides: Optional[Mapping[str, str]] = None,
 ) -> Optional[Path]:
-    explicit_raw = _expand_path(_get_setting_or_env(override_setting))
+    explicit_raw = expand_configured_path(_lookup_config_value(override_setting, env_overrides=env_overrides))
     if explicit_raw:
         explicit = Path(explicit_raw)
         if explicit.is_file():
             return explicit
         if explicit.is_dir():
-            return _find_in_directory(explicit, filenames)
+            return find_sfs_in_directory(explicit, filenames)
         return None
 
     if configured_dir:
-        base = Path(_expand_path(configured_dir))
+        base = Path(expand_configured_path(configured_dir))
         if base.is_dir():
-            return _find_in_directory(base, filenames)
+            return find_sfs_in_directory(base, filenames)
         return None
 
-    for directory in _standard_data_directories():
-        matched = _find_in_directory(directory, filenames)
+    for directory in standard_dirs:
+        matched = find_sfs_in_directory(directory, filenames)
         if matched is not None:
             return matched
     return None
@@ -172,8 +295,14 @@ def _resolve_sfs_sqlite_path(
     listed_90: Optional[Path],
     listed_1: Optional[Path],
     toxic_cidr: Optional[Path],
+    standard_dirs: Sequence[Path],
+    resolved_base: Path,
+    *,
+    env_overrides: Optional[Mapping[str, str]] = None,
 ) -> Optional[Path]:
-    explicit_raw = _expand_path(_get_setting_or_env("STOPFORUMSPAM_SQLITE_PATH"))
+    explicit_raw = expand_configured_path(
+        _lookup_config_value("STOPFORUMSPAM_SQLITE_PATH", env_overrides=env_overrides)
+    )
     if explicit_raw:
         explicit = Path(explicit_raw)
         if explicit.is_dir():
@@ -181,47 +310,60 @@ def _resolve_sfs_sqlite_path(
         return explicit
 
     if configured_dir:
-        return Path(_expand_path(configured_dir)) / SFS_SQLITE_FILENAME
+        return Path(expand_configured_path(configured_dir)) / SFS_SQLITE_FILENAME
 
     for anchor in (listed_90, listed_1, toxic_cidr):
         if anchor is not None:
             return anchor.parent / SFS_SQLITE_FILENAME
 
-    for directory in _standard_data_directories():
-        existing = _find_in_directory(directory, (SFS_SQLITE_FILENAME,))
+    for directory in standard_dirs:
+        existing = find_sfs_in_directory(directory, (SFS_SQLITE_FILENAME,))
         if existing is not None:
             return existing
 
-    return _base_dir().parent / "data" / SFS_SQLITE_FILENAME
+    return resolved_base.parent / "data" / SFS_SQLITE_FILENAME
 
 
-def resolve_configured_data_dir() -> str:
-    """Returns the resolved TOOL_DATA_DIR offline data subdirectory, or empty string when unset."""
-    tool_data_dir = _expand_path(_get_setting_or_env("TOOL_DATA_DIR"))
-    if not tool_data_dir:
-        return ""
-    return str(resolve_tool_data_subdir(tool_data_dir))
+def resolve_stopforumspam_paths(
+    *,
+    env_overrides: Optional[Mapping[str, str]] = None,
+    base_dir: Optional[Path] = None,
+) -> Dict[str, Optional[Path]]:
+    """Resolves local StopForumSpam database file paths using TOOL_DATA_DIR, overrides, or fallbacks."""
+    resolved_base = _effective_base_dir(base_dir)
+    standard_dirs = _effective_standard_dirs(env_overrides=env_overrides, base_dir=resolved_base)
+    configured_dir = resolve_configured_data_dir(env_overrides=env_overrides)
 
-
-def resolve_stopforumspam_paths() -> Dict[str, Optional[Path]]:
-    """Resolves local StopForumSpam database file paths using TOOL_DATA_DIR, per-file overrides, or fallbacks."""
-    configured_dir = resolve_configured_data_dir()
     toxic_cidr = _resolve_sfs_component_path(
         "STOPFORUMSPAM_TOXIC_CIDR_PATH",
         configured_dir,
         (SFS_TOXIC_CIDR_FILENAME,),
+        standard_dirs,
+        env_overrides=env_overrides,
     )
     listed_90 = _resolve_sfs_component_path(
         "STOPFORUMSPAM_LISTED_90_PATH",
         configured_dir,
         SFS_LISTED_90_FILENAMES,
+        standard_dirs,
+        env_overrides=env_overrides,
     )
     listed_1 = _resolve_sfs_component_path(
         "STOPFORUMSPAM_LISTED_1_PATH",
         configured_dir,
         SFS_LISTED_1_FILENAMES,
+        standard_dirs,
+        env_overrides=env_overrides,
     )
-    sqlite_index = _resolve_sfs_sqlite_path(configured_dir, listed_90, listed_1, toxic_cidr)
+    sqlite_index = _resolve_sfs_sqlite_path(
+        configured_dir,
+        listed_90,
+        listed_1,
+        toxic_cidr,
+        standard_dirs,
+        resolved_base,
+        env_overrides=env_overrides,
+    )
     return {
         "toxic_cidr": toxic_cidr,
         "listed_90": listed_90,
@@ -230,41 +372,40 @@ def resolve_stopforumspam_paths() -> Dict[str, Optional[Path]]:
     }
 
 
-def resolve_writable_data_dir(explicit_dir: str = "") -> Path:
+def resolve_writable_data_dir(
+    explicit_dir: str = "",
+    *,
+    env_overrides: Optional[Mapping[str, str]] = None,
+    base_dir: Optional[Path] = None,
+) -> Path:
     """Resolves the target directory for downloading and updating offline database files."""
     if explicit_dir.strip():
-        return Path(_expand_path(explicit_dir))
+        return Path(expand_configured_path(explicit_dir))
 
-    configured_dir = resolve_configured_data_dir()
+    configured_dir = resolve_configured_data_dir(env_overrides=env_overrides)
     if configured_dir:
         return Path(configured_dir)
 
-    base_dir = _base_dir()
-    if base_dir.parent == Path(base_dir.anchor):
+    resolved_base = _effective_base_dir(base_dir)
+    if resolved_base.parent == Path(resolved_base.anchor):
         return Path.home() / "data"
-    return base_dir.parent / "data"
+    return resolved_base.parent / "data"
 
 
 def has_any_local_stopforumspam_db() -> bool:
     """Returns True when at least one StopForumSpam offline dataset or index exists on disk."""
     paths = resolve_stopforumspam_paths()
-    for key in ("toxic_cidr", "listed_90", "listed_1"):
-        candidate = paths.get(key)
-        if candidate is not None and candidate.is_file():
-            return True
-    sqlite_path = paths.get("sqlite_index")
-    return bool(sqlite_path is not None and sqlite_path.is_file())
+    return any(candidate is not None and candidate.is_file() for candidate in paths.values())
 
 
 def get_stopforumspam_db_version() -> int:
     """Returns the newest nanosecond mtime across active StopForumSpam files, or zero when absent."""
     paths = resolve_stopforumspam_paths()
     newest = 0
-    for key in ("toxic_cidr", "listed_90", "listed_1", "sqlite_index"):
-        candidate = paths.get(key)
+    for candidate in paths.values():
         if candidate is None:
             continue
-        sig = _get_file_stat_signature(candidate)
+        sig = get_file_stat_signature(candidate)
         if sig is not None and sig[0] > newest:
             newest = sig[0]
     return newest
@@ -317,9 +458,6 @@ def _resolve_lookup_byte_keys(ip: str) -> Tuple[Optional[bytes], Optional[bytes]
     primary = addr.packed
     mapped = addr.ipv4_mapped.packed if getattr(addr, "ipv4_mapped", None) is not None else None
     return primary, mapped
-
-
-_T = TypeVar("_T")
 
 
 class PrefixCidrIndex(Generic[_T]):
@@ -415,33 +553,25 @@ class _StopForumSpamCidrIndex(PrefixCidrIndex[None]):
 
 
 _EMPTY_SFS_CIDR_INDEX = _StopForumSpamCidrIndex(())
+_toxic_cidr_cache: FileStatCache[Tuple[str, int, int], _StopForumSpamCidrIndex] = FileStatCache()
+_sfs_sqlite_state_cache: FileStatCache[str, Tuple[str, Optional[Tuple[int, int]]]] = FileStatCache()
+_sfs_warm_lock = threading.Lock()
+_sfs_cache_warmed = False
 
 
 def _get_toxic_cidr_index(toxic_path: Optional[Path]) -> _StopForumSpamCidrIndex:
-    global _sfs_toxic_cache_key, _sfs_toxic_cache_index
-
     if toxic_path is None or not toxic_path.is_file():
-        with _sfs_cache_lock:
-            _sfs_toxic_cache_key = None
-            _sfs_toxic_cache_index = _EMPTY_SFS_CIDR_INDEX
-        return _EMPTY_SFS_CIDR_INDEX
+        return _toxic_cidr_cache.set_constant(("__missing__", -1, -1), _EMPTY_SFS_CIDR_INDEX)
 
-    sig = _get_file_stat_signature(toxic_path)
+    sig = get_file_stat_signature(toxic_path)
     if sig is None:
         return _EMPTY_SFS_CIDR_INDEX
-    cache_key = (str(toxic_path), sig[0], sig[1])
 
-    with _sfs_cache_lock:
-        if _sfs_toxic_cache_key == cache_key and _sfs_toxic_cache_index is not None:
-            return _sfs_toxic_cache_index
+    def _load() -> _StopForumSpamCidrIndex:
+        with toxic_path.open("r", encoding="utf-8", errors="replace") as handle:
+            return _StopForumSpamCidrIndex(handle)
 
-    with toxic_path.open("r", encoding="utf-8", errors="replace") as handle:
-        index = _StopForumSpamCidrIndex(handle)
-
-    with _sfs_cache_lock:
-        _sfs_toxic_cache_key = cache_key
-        _sfs_toxic_cache_index = index
-    return index
+    return _toxic_cidr_cache.get_or_load((str(toxic_path), sig[0], sig[1]), _load)
 
 
 def _compute_listed_source_signature(listed_90: Optional[Path], listed_1: Optional[Path]) -> Optional[str]:
@@ -449,7 +579,7 @@ def _compute_listed_source_signature(listed_90: Optional[Path], listed_1: Option
     for role, path in (("90d", listed_90), ("1d", listed_1)):
         if path is None:
             continue
-        sig = _get_file_stat_signature(path)
+        sig = get_file_stat_signature(path)
         if sig is not None:
             entries.append([role, str(path), sig[0], sig[1]])
     if not entries:
@@ -497,8 +627,7 @@ def _parse_sfs_listed_line(raw_line: str) -> Optional[Tuple[bytes, int, str]]:
                 frequency = max(0, int(parts[1].strip()))
             except ValueError:
                 frequency = 1
-            last_seen = parts[2].strip()
-            return ip_bytes, frequency, last_seen
+            return ip_bytes, frequency, parts[2].strip()
 
     row = next(csv.reader([stripped]))
     if not row:
@@ -507,14 +636,12 @@ def _parse_sfs_listed_line(raw_line: str) -> Optional[Tuple[bytes, int, str]]:
     if ip_bytes is None:
         return None
     frequency = 1
-    last_seen = ""
     if len(row) >= 2 and row[1].strip():
         try:
             frequency = max(0, int(row[1].strip()))
         except ValueError:
             frequency = 1
-    if len(row) >= 3:
-        last_seen = row[2].strip()
+    last_seen = row[2].strip() if len(row) >= 3 else ""
     return ip_bytes, frequency, last_seen
 
 
@@ -538,7 +665,7 @@ def _read_sqlite_source_signature(sqlite_path: Path) -> Optional[str]:
         return None
 
 
-def _atomic_replace_with_retry(src_path: Path, dst_path: Path) -> None:
+def atomic_replace_with_retry(src_path: Path, dst_path: Path) -> None:
     """Replaces dst_path atomically, retrying briefly on Windows transient reader collisions."""
     for attempt in range(6):
         try:
@@ -550,7 +677,98 @@ def _atomic_replace_with_retry(src_path: Path, dst_path: Path) -> None:
             time.sleep(0.05 * (attempt + 1))
 
 
-atomic_replace_with_retry = _atomic_replace_with_retry
+def replace_temp_file_atomically(tmp_path: Path, target_path: Path, *, mode: int = 0o644) -> None:
+    """Applies permissions and swaps an existing temporary file into target_path, cleaning up on failure."""
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with contextlib.suppress(OSError):
+            os.chmod(tmp_path, mode)
+        atomic_replace_with_retry(tmp_path, target_path)
+    finally:
+        if tmp_path.exists():
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
+
+
+@contextlib.contextmanager
+def atomic_temp_path(target_path: Path, *, prefix: Optional[str] = None, mode: int = 0o644):
+    """Creates a sibling temporary file, yields it for writing, and atomically replaces target_path on clean exit."""
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    effective_prefix = prefix or f".{target_path.name}.tmp."
+    fd, tmp_name = tempfile.mkstemp(prefix=effective_prefix, dir=str(target_path.parent))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        yield tmp_path
+        with contextlib.suppress(OSError):
+            os.chmod(tmp_path, mode)
+        atomic_replace_with_retry(tmp_path, target_path)
+    finally:
+        if tmp_path.exists():
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
+
+
+def _populate_sfs_sqlite_file(
+    tmp_path: Path,
+    listed_90: Optional[Path],
+    listed_1: Optional[Path],
+    computed_sig: str,
+) -> int:
+    total_inserted = 0
+    conn = sqlite3.connect(tmp_path)
+    try:
+        conn.execute("PRAGMA journal_mode = OFF")
+        conn.execute("PRAGMA synchronous = OFF")
+        conn.execute("PRAGMA temp_store = MEMORY")
+        conn.execute("PRAGMA cache_size = -32768")
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute(
+            "CREATE TABLE listed_ips ("
+            "ip BLOB PRIMARY KEY, "
+            "frequency INTEGER NOT NULL, "
+            "last_seen TEXT NOT NULL, "
+            "source_mask INTEGER NOT NULL"
+            ") WITHOUT ROWID"
+        )
+        upsert_sql = (
+            "INSERT INTO listed_ips (ip, frequency, last_seen, source_mask) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(ip) DO UPDATE SET "
+            "frequency = MAX(listed_ips.frequency, excluded.frequency), "
+            "last_seen = CASE WHEN excluded.last_seen > listed_ips.last_seen "
+            "THEN excluded.last_seen ELSE listed_ips.last_seen END, "
+            "source_mask = listed_ips.source_mask | excluded.source_mask"
+        )
+
+        batch: List[Tuple[bytes, int, str, int]] = []
+        for path, mask in ((listed_90, _SOURCE_MASK_90), (listed_1, _SOURCE_MASK_1)):
+            if path is None or not path.is_file():
+                continue
+            for entry in _iter_sfs_listed_rows(path, mask):
+                batch.append(entry)
+                total_inserted += 1
+                if len(batch) >= 20000:
+                    conn.executemany(upsert_sql, batch)
+                    batch.clear()
+        if batch:
+            conn.executemany(upsert_sql, batch)
+            batch.clear()
+
+        row_count_row = conn.execute("SELECT COUNT(*) FROM listed_ips").fetchone()
+        unique_count = int(row_count_row[0]) if row_count_row else 0
+        conn.executemany(
+            "INSERT INTO meta (key, value) VALUES (?, ?)",
+            (
+                ("source_signature", computed_sig),
+                ("built_at", datetime.now(timezone.utc).isoformat()),
+                ("unique_ips", str(unique_count)),
+                ("raw_rows", str(total_inserted)),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return total_inserted
 
 
 def build_stopforumspam_sqlite_index(
@@ -565,72 +783,9 @@ def build_stopforumspam_sqlite_index(
     if computed_sig is None:
         raise ValueError("At least one StopForumSpam listed IP file is required to build the SQLite index.")
 
-    target_sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target_sqlite_path.with_name(f".{target_sqlite_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    total_inserted = 0
-
-    try:
-        conn = sqlite3.connect(tmp_path)
-        try:
-            conn.execute("PRAGMA journal_mode = OFF")
-            conn.execute("PRAGMA synchronous = OFF")
-            conn.execute("PRAGMA temp_store = MEMORY")
-            conn.execute("PRAGMA cache_size = -32768")
-            conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            conn.execute(
-                "CREATE TABLE listed_ips ("
-                "ip BLOB PRIMARY KEY, "
-                "frequency INTEGER NOT NULL, "
-                "last_seen TEXT NOT NULL, "
-                "source_mask INTEGER NOT NULL"
-                ") WITHOUT ROWID"
-            )
-            upsert_sql = (
-                "INSERT INTO listed_ips (ip, frequency, last_seen, source_mask) VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(ip) DO UPDATE SET "
-                "frequency = MAX(listed_ips.frequency, excluded.frequency), "
-                "last_seen = CASE WHEN excluded.last_seen > listed_ips.last_seen "
-                "THEN excluded.last_seen ELSE listed_ips.last_seen END, "
-                "source_mask = listed_ips.source_mask | excluded.source_mask"
-            )
-
-            batch: List[Tuple[bytes, int, str, int]] = []
-            for path, mask in ((listed_90, _SOURCE_MASK_90), (listed_1, _SOURCE_MASK_1)):
-                if path is None or not path.is_file():
-                    continue
-                for entry in _iter_sfs_listed_rows(path, mask):
-                    batch.append(entry)
-                    total_inserted += 1
-                    if len(batch) >= 20000:
-                        conn.executemany(upsert_sql, batch)
-                        batch.clear()
-            if batch:
-                conn.executemany(upsert_sql, batch)
-                batch.clear()
-
-            row_count_row = conn.execute("SELECT COUNT(*) FROM listed_ips").fetchone()
-            unique_count = int(row_count_row[0]) if row_count_row else 0
-            conn.executemany(
-                "INSERT INTO meta (key, value) VALUES (?, ?)",
-                (
-                    ("source_signature", computed_sig),
-                    ("built_at", datetime.now(timezone.utc).isoformat()),
-                    ("unique_ips", str(unique_count)),
-                    ("raw_rows", str(total_inserted)),
-                ),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-        with contextlib.suppress(OSError):
-            os.chmod(tmp_path, 0o644)
-        _atomic_replace_with_retry(tmp_path, target_sqlite_path)
-        return total_inserted
-    finally:
-        if tmp_path.exists():
-            with contextlib.suppress(OSError):
-                tmp_path.unlink()
+    prefix = f".{target_sqlite_path.name}.{os.getpid()}.{threading.get_ident()}."
+    with atomic_temp_path(target_sqlite_path, prefix=prefix) as tmp_path:
+        return _populate_sfs_sqlite_file(tmp_path, listed_90, listed_1, computed_sig)
 
 
 def _fallback_temp_sqlite_path(source_signature: str) -> Path:
@@ -638,9 +793,10 @@ def _fallback_temp_sqlite_path(source_signature: str) -> Path:
     return Path(tempfile.gettempdir()) / "proxycheck_sfs_cache" / f"stopforumspam_{digest}.sqlite3"
 
 
-def _ensure_stopforumspam_sqlite_index(paths: Dict[str, Optional[Path]]) -> Optional[Path]:
-    global _sfs_sqlite_validated_state
+_sfs_sqlite_build_lock = threading.Lock()
 
+
+def _ensure_stopforumspam_sqlite_index(paths: Dict[str, Optional[Path]]) -> Optional[Path]:
     listed_90 = paths.get("listed_90")
     listed_1 = paths.get("listed_1")
     sqlite_path = paths.get("sqlite_index")
@@ -649,32 +805,29 @@ def _ensure_stopforumspam_sqlite_index(paths: Dict[str, Optional[Path]]) -> Opti
     if source_sig is None:
         if sqlite_path is not None and sqlite_path.is_file():
             return sqlite_path
-        with _sfs_cache_lock:
-            _sfs_sqlite_validated_state = None
+        _sfs_sqlite_state_cache.clear()
         return None
 
-    candidate_primary = sqlite_path or (_base_dir().parent / "data" / SFS_SQLITE_FILENAME)
-    with _sfs_cache_lock:
-        validated = _sfs_sqlite_validated_state
-    if validated is not None and validated[0] == source_sig:
-        cached_path = Path(validated[1])
-        if _get_file_stat_signature(cached_path) == validated[2]:
+    cached = _sfs_sqlite_state_cache.peek_matching(lambda key, _val: key == source_sig)
+    if cached is not None:
+        cached_path = Path(cached[0])
+        if get_file_stat_signature(cached_path) == cached[1]:
             return cached_path
 
-    with _sfs_cache_lock:
-        validated = _sfs_sqlite_validated_state
-        if validated is not None and validated[0] == source_sig:
-            cached_path = Path(validated[1])
-            if _get_file_stat_signature(cached_path) == validated[2]:
+    candidate_primary = sqlite_path or (_effective_base_dir().parent / "data" / SFS_SQLITE_FILENAME)
+    with _sfs_sqlite_build_lock:
+        cached = _sfs_sqlite_state_cache.peek_matching(lambda key, _val: key == source_sig)
+        if cached is not None:
+            cached_path = Path(cached[0])
+            if get_file_stat_signature(cached_path) == cached[1]:
                 return cached_path
 
         fallback_path = _fallback_temp_sqlite_path(source_sig)
         for existing_candidate in (candidate_primary, fallback_path):
             if _read_sqlite_source_signature(existing_candidate) == source_sig:
-                _sfs_sqlite_validated_state = (
+                _sfs_sqlite_state_cache.store(
                     source_sig,
-                    str(existing_candidate),
-                    _get_file_stat_signature(existing_candidate),
+                    (str(existing_candidate), get_file_stat_signature(existing_candidate)),
                 )
                 return existing_candidate
 
@@ -700,11 +853,7 @@ def _ensure_stopforumspam_sqlite_index(paths: Dict[str, Optional[Path]]) -> Opti
             )
             chosen_path = fallback_path
 
-        _sfs_sqlite_validated_state = (
-            source_sig,
-            str(chosen_path),
-            _get_file_stat_signature(chosen_path),
-        )
+        _sfs_sqlite_state_cache.store(source_sig, (str(chosen_path), get_file_stat_signature(chosen_path)))
         return chosen_path
 
 
@@ -739,11 +888,7 @@ def query_stopforumspam_offline(ip: str) -> Dict[str, Any]:
     sqlite_path = paths.get("sqlite_index")
 
     has_toxic = toxic_path is not None and toxic_path.is_file()
-    has_listed = (
-        (listed_90_path is not None and listed_90_path.is_file())
-        or (listed_1_path is not None and listed_1_path.is_file())
-        or (sqlite_path is not None and sqlite_path.is_file())
-    )
+    has_listed = any(p is not None and p.is_file() for p in (listed_90_path, listed_1_path, sqlite_path))
 
     if not has_toxic and not has_listed:
         return {
@@ -758,9 +903,7 @@ def query_stopforumspam_offline(ip: str) -> Dict[str, Any]:
             "db_version": 0,
         }
 
-    toxic_cidr_hit: Optional[str] = None
-    if has_toxic:
-        toxic_cidr_hit = _get_toxic_cidr_index(toxic_path).match(ip)
+    toxic_cidr_hit = _get_toxic_cidr_index(toxic_path).match(ip) if has_toxic else None
 
     listed_hit: Optional[Tuple[int, str, int]] = None
     active_sqlite: Optional[Path] = None
@@ -769,12 +912,10 @@ def query_stopforumspam_offline(ip: str) -> Dict[str, Any]:
         if active_sqlite is not None and active_sqlite.is_file():
             listed_hit = _lookup_ip_in_sqlite(active_sqlite, ip)
 
-    with _sfs_cache_lock:
+    with _sfs_warm_lock:
         _sfs_cache_warmed = True
 
-    sources: List[str] = []
-    if toxic_cidr_hit is not None:
-        sources.append("toxic_ip_cidr")
+    sources: List[str] = ["toxic_ip_cidr"] if toxic_cidr_hit is not None else []
     frequency = 0
     last_seen: Optional[str] = None
     if listed_hit is not None:
@@ -807,60 +948,135 @@ def warm_stopforumspam_caches() -> None:
     global _sfs_cache_warmed
 
     paths = resolve_stopforumspam_paths()
-    toxic_path = paths.get("toxic_cidr")
-    _get_toxic_cidr_index(toxic_path)
+    _get_toxic_cidr_index(paths.get("toxic_cidr"))
     try:
         _ensure_stopforumspam_sqlite_index(paths)
     except (OSError, sqlite3.Error, ValueError) as exc:
         logger.warning("Failed to warm StopForumSpam SQLite index: %s", exc)
-    with _sfs_cache_lock:
+    with _sfs_warm_lock:
         _sfs_cache_warmed = True
 
 
 def are_stopforumspam_caches_warm() -> bool:
-    with _sfs_cache_lock:
+    with _sfs_warm_lock:
         return _sfs_cache_warmed
 
 
 def clear_stopforumspam_caches() -> None:
-    global _sfs_toxic_cache_key, _sfs_toxic_cache_index, _sfs_sqlite_validated_state, _sfs_cache_warmed
-    with _sfs_cache_lock:
-        _sfs_toxic_cache_key = None
-        _sfs_toxic_cache_index = None
-        _sfs_sqlite_validated_state = None
+    global _sfs_cache_warmed
+    _toxic_cidr_cache.clear()
+    _sfs_sqlite_state_cache.clear()
+    with _sfs_warm_lock:
         _sfs_cache_warmed = False
 
 
-def resolve_maxmind_paths() -> Dict[str, Path]:
-    """Resolves Country, City, and ASN MMDB paths using configured TOOL_DATA_DIR or fallbacks."""
-    from proxycheck.settings import resolve_mmdb_file
+def _resolve_mmdb_path_with_overrides(
+    configured_dir: str,
+    filename: str,
+    standard_dirs: Sequence[Path],
+) -> Optional[Path]:
+    expanded = expand_configured_path(configured_dir)
+    if expanded:
+        configured = Path(expanded)
+        if configured.is_file():
+            return configured
+        if configured.is_dir():
+            return find_mmdb_in_directory(configured, filename)
+        return None
+    for directory in standard_dirs:
+        matched = find_mmdb_in_directory(directory, filename)
+        if matched is not None:
+            return matched
+    return None
 
-    base_dir = _base_dir()
-    configured_dir = resolve_configured_data_dir()
+
+def resolve_maxmind_paths(
+    *,
+    env_overrides: Optional[Mapping[str, str]] = None,
+    base_dir: Optional[Path] = None,
+) -> Dict[str, Optional[Path]]:
+    """Resolves Country, City, and ASN MMDB paths using configured TOOL_DATA_DIR or fallbacks."""
+    resolved_base = _effective_base_dir(base_dir)
+    configured_dir = resolve_configured_data_dir(env_overrides=env_overrides)
+    if env_overrides is not None:
+        standard_dirs = _effective_standard_dirs(env_overrides=env_overrides, base_dir=resolved_base)
+        return {
+            "country": _resolve_mmdb_path_with_overrides(configured_dir, MAXMIND_COUNTRY_DB_FILENAME, standard_dirs),
+            "city": _resolve_mmdb_path_with_overrides(configured_dir, MAXMIND_CITY_DB_FILENAME, standard_dirs),
+            "asn": _resolve_mmdb_path_with_overrides(configured_dir, MAXMIND_ASN_DB_FILENAME, standard_dirs),
+        }
     return {
-        "country": Path(resolve_mmdb_file(configured_dir, MAXMIND_COUNTRY_DB_FILENAME, base_dir)),
-        "city": Path(resolve_mmdb_file(configured_dir, MAXMIND_CITY_DB_FILENAME, base_dir)),
-        "asn": Path(resolve_mmdb_file(configured_dir, MAXMIND_ASN_DB_FILENAME, base_dir)),
+        "country": Path(resolve_mmdb_file(configured_dir, MAXMIND_COUNTRY_DB_FILENAME, resolved_base)),
+        "city": Path(resolve_mmdb_file(configured_dir, MAXMIND_CITY_DB_FILENAME, resolved_base)),
+        "asn": Path(resolve_mmdb_file(configured_dir, MAXMIND_ASN_DB_FILENAME, resolved_base)),
     }
 
 
-def resolve_cloud_cidr_path() -> Tuple[Optional[Path], str]:
+def resolve_cloud_cidr_path(
+    *,
+    env_overrides: Optional[Mapping[str, str]] = None,
+    base_dir: Optional[Path] = None,
+) -> Tuple[Optional[Path], str]:
     """Resolves the local cloud provider CIDR file from TOOL_DATA_DIR or standard data directories."""
-    from proxycheck.settings import resolve_data_file
-
-    filenames = ("cloud_cidrs.json", "computehosts.json")
-    configured_dir = resolve_configured_data_dir()
+    configured_dir = resolve_configured_data_dir(env_overrides=env_overrides)
     if configured_dir:
-        base = Path(configured_dir)
-        for fname in filenames:
+        base = Path(expand_configured_path(configured_dir))
+        for fname in CLOUD_CIDR_FILENAMES:
             candidate = base / fname
             if candidate.is_file():
                 return candidate, candidate.name
+        return None, CLOUD_CIDR_FILENAMES[0]
+
+    resolved_base = _effective_base_dir(base_dir)
+    if env_overrides is not None:
+        for directory in _effective_standard_dirs(env_overrides=env_overrides, base_dir=resolved_base):
+            for fname in CLOUD_CIDR_FILENAMES:
+                candidate = directory / fname
+                if candidate.is_file():
+                    return candidate, candidate.name
+        return None, CLOUD_CIDR_FILENAMES[0]
+
+    for fname in CLOUD_CIDR_FILENAMES:
+        resolved = resolve_data_file("", fname, resolved_base, default_missing="")
+        if resolved:
+            candidate = Path(resolved)
+            if candidate.is_file():
+                return candidate, candidate.name
+    return None, CLOUD_CIDR_FILENAMES[0]
+
+
+def resolve_hosting_rules_path(
+    *,
+    env_overrides: Optional[Mapping[str, str]] = None,
+    base_dir: Optional[Path] = None,
+) -> Tuple[Optional[Path], str]:
+    """Resolves the hosting ASN rules JSON file across explicit overrides and standard data directories."""
+    filenames = (HOSTING_RULES_FILENAME,)
+    raw_configured = _lookup_config_value("HOSTING_ASN_RULES_PATH", env_overrides=env_overrides)
+    resolved_base = _effective_base_dir(base_dir)
+    if raw_configured:
+        expanded = Path(expand_configured_path(raw_configured))
+        if expanded.is_file():
+            return expanded, expanded.name
+        if expanded.is_dir():
+            for fname in filenames:
+                candidate = expanded / fname
+                if candidate.is_file():
+                    return candidate, candidate.name
+            return None, filenames[0]
+        if env_overrides is not None or expanded != resolved_base.parent / "data" / filenames[0]:
+            return None, expanded.name or filenames[0]
+
+    if env_overrides is not None:
+        for directory in _effective_standard_dirs(env_overrides=env_overrides, base_dir=resolved_base):
+            for fname in filenames:
+                candidate = directory / fname
+                if candidate.is_file():
+                    return candidate, candidate.name
         return None, filenames[0]
 
-    base_dir = _base_dir()
     for fname in filenames:
-        resolved = resolve_data_file("", fname, base_dir, default_missing="")
+        resolved = resolve_data_file("", fname, resolved_base, default_missing="")
         if resolved:
             candidate = Path(resolved)
             if candidate.is_file():
@@ -871,35 +1087,7 @@ def resolve_cloud_cidr_path() -> Tuple[Optional[Path], str]:
 def get_maxmind_newest_mtime_iso() -> Optional[str]:
     """Returns the newest UTC ISO-8601 modification timestamp across existing MaxMind MMDB files."""
     paths = resolve_maxmind_paths()
-    return _newest_mtime_iso(path for path in paths.values() if path.is_file())
-
-
-def _resolve_rule_file(setting_name: str, filenames: Tuple[str, ...]) -> Tuple[Optional[Path], str]:
-    from proxycheck.settings import resolve_data_file
-
-    raw_configured = _get_setting_or_env(setting_name)
-    base_dir = _base_dir()
-    if raw_configured:
-        expanded = Path(_expand_path(raw_configured))
-        if expanded.is_file():
-            return expanded, expanded.name
-        if expanded.is_dir():
-            for fname in filenames:
-                candidate = expanded / fname
-                if candidate.is_file():
-                    return candidate, candidate.name
-            return None, filenames[0]
-        default_missing = base_dir.parent / "data" / filenames[0]
-        if expanded != default_missing:
-            return None, expanded.name or filenames[0]
-
-    for fname in filenames:
-        resolved = resolve_data_file("", fname, base_dir, default_missing="")
-        if resolved:
-            candidate = Path(resolved)
-            if candidate.is_file():
-                return candidate, candidate.name
-    return None, filenames[0]
+    return _newest_mtime_iso(path for path in paths.values() if path is not None and path.is_file())
 
 
 def _build_offline_db_entry(
@@ -1026,7 +1214,7 @@ def build_offline_database_entries(
             "StopForumSpam",
             "StopForumSpam Listed IPs (90d)",
             sfs_paths.get("listed_90"),
-            SFS_LISTED_90_FILENAMES[0],
+            SFS_LISTED_90_ZIP_NAME,
             False,
             sfs_90_stale,
             None,
@@ -1036,7 +1224,7 @@ def build_offline_database_entries(
             "StopForumSpam",
             "StopForumSpam Listed IPs (1d)",
             sfs_paths.get("listed_1"),
-            SFS_LISTED_1_FILENAMES[0],
+            SFS_LISTED_1_ZIP_NAME,
             True,
             sfs_1_stale,
             None,
@@ -1087,30 +1275,45 @@ def build_offline_database_entries(
             missing_label=missing_label,
         )
         if include_resolved_path:
-            entry["resolvedPath"] = str(file_path) if file_path is not None else ""
+            entry["resolvedPath"] = str(file_path) if (file_path is not None and entry["exists"]) else ""
         entries.append(entry)
     return entries
 
 
-def collect_offline_databases_status(*, now_dt: Optional[datetime] = None) -> List[Dict[str, Any]]:
+def collect_offline_databases_status(
+    *,
+    now_dt: Optional[datetime] = None,
+    env_overrides: Optional[Mapping[str, str]] = None,
+    base_dir: Optional[Path] = None,
+    include_resolved_path: bool = False,
+) -> List[Dict[str, Any]]:
     """Inventories all local offline databases and rules using file mtime metadata."""
     current_dt = now_dt or datetime.now(timezone.utc)
     now_ts = current_dt.timestamp()
 
-    maxmind_stale = _get_positive_int_setting("OFFLINE_DB_MAXMIND_STALE_SECONDS", _DEFAULT_STALE_MAXMIND_SECONDS)
-    sfs_toxic_stale = _get_positive_int_setting("OFFLINE_DB_SFS_TOXIC_STALE_SECONDS", _DEFAULT_STALE_SFS_TOXIC_SECONDS)
-    sfs_90_stale = _get_positive_int_setting("OFFLINE_DB_SFS_90_STALE_SECONDS", _DEFAULT_STALE_SFS_90_SECONDS)
-    sfs_1_stale = _get_positive_int_setting("OFFLINE_DB_SFS_1_STALE_SECONDS", _DEFAULT_STALE_SFS_1_SECONDS)
-    cloud_cidrs_stale = _get_positive_int_setting(
-        "OFFLINE_DB_CLOUD_CIDRS_STALE_SECONDS",
-        _DEFAULT_STALE_CLOUD_CIDRS_SECONDS,
+    maxmind_stale = get_positive_int_setting(
+        "OFFLINE_DB_MAXMIND_STALE_SECONDS", DEFAULT_STALE_MAXMIND_SECONDS, env_overrides=env_overrides
     )
-    rules_stale = _get_positive_int_setting("OFFLINE_DB_RULES_STALE_SECONDS", _DEFAULT_STALE_RULES_SECONDS)
+    sfs_toxic_stale = get_positive_int_setting(
+        "OFFLINE_DB_SFS_TOXIC_STALE_SECONDS", DEFAULT_STALE_SFS_TOXIC_SECONDS, env_overrides=env_overrides
+    )
+    sfs_90_stale = get_positive_int_setting(
+        "OFFLINE_DB_SFS_90_STALE_SECONDS", DEFAULT_STALE_SFS_90_SECONDS, env_overrides=env_overrides
+    )
+    sfs_1_stale = get_positive_int_setting(
+        "OFFLINE_DB_SFS_1_STALE_SECONDS", DEFAULT_STALE_SFS_1_SECONDS, env_overrides=env_overrides
+    )
+    cloud_cidrs_stale = get_positive_int_setting(
+        "OFFLINE_DB_CLOUD_CIDRS_STALE_SECONDS", DEFAULT_STALE_CLOUD_CIDRS_SECONDS, env_overrides=env_overrides
+    )
+    rules_stale = get_positive_int_setting(
+        "OFFLINE_DB_RULES_STALE_SECONDS", DEFAULT_STALE_RULES_SECONDS, env_overrides=env_overrides
+    )
 
-    maxmind_paths = resolve_maxmind_paths()
-    sfs_paths = resolve_stopforumspam_paths()
-    cloud_cidr_path, cloud_cidr_name = resolve_cloud_cidr_path()
-    hosting_rules_path, hosting_rules_name = _resolve_rule_file("HOSTING_ASN_RULES_PATH", ("hosting_asn_rules.json",))
+    maxmind_paths = resolve_maxmind_paths(env_overrides=env_overrides, base_dir=base_dir)
+    sfs_paths = resolve_stopforumspam_paths(env_overrides=env_overrides, base_dir=base_dir)
+    cloud_cidr_path, cloud_cidr_name = resolve_cloud_cidr_path(env_overrides=env_overrides, base_dir=base_dir)
+    hosting_rules_path, hosting_rules_name = resolve_hosting_rules_path(env_overrides=env_overrides, base_dir=base_dir)
 
     return build_offline_database_entries(
         maxmind_paths=maxmind_paths,
@@ -1126,4 +1329,5 @@ def collect_offline_databases_status(*, now_dt: Optional[datetime] = None) -> Li
         rules_stale=rules_stale,
         cloud_cidrs_stale=cloud_cidrs_stale,
         now_ts=now_ts,
+        include_resolved_path=include_resolved_path,
     )

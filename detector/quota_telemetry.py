@@ -12,30 +12,29 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from django.conf import settings
+from django.core.signals import setting_changed
 
+from .cache_backends import get_redis_client, mark_redis_failure, provider_cooldown_key
 from .oauth import is_allowlisted_wiki_user
 from .offline_dbs import collect_offline_databases_status
-
-try:
-    from redis.exceptions import RedisError as _RedisError
-except ImportError:
-    _RedisError = None
-
-_REDIS_ERRORS: Tuple[type[BaseException], ...] = (
-    (ConnectionError, TimeoutError, OSError, _RedisError)
-    if _RedisError is not None
-    else (ConnectionError, TimeoutError, OSError)
+from .provider_registry import (
+    DEFAULT_QUOTA_LIMITS,
+    PROVIDER_CREDENTIAL_SETTINGS,
+    PROVIDER_REGISTRY,
+    REDIS_KEY_NAMESPACE,
+    REDIS_TRANSPORT_ERRORS,
+    ProviderMetadata,
 )
 
 logger = logging.getLogger(__name__)
+_get_redis_client = get_redis_client
 
 MINUTE_QUOTA_TTL_SECONDS = 120
 DAILY_QUOTA_TTL_SECONDS = 172800
 TELEMETRY_TTL_SECONDS = 7 * 86400
-REDIS_KEY_NAMESPACE = "proxycheck:v1"
 
 VALID_PROVIDER_OUTCOMES = frozenset(
     {
@@ -48,37 +47,7 @@ VALID_PROVIDER_OUTCOMES = frozenset(
     }
 )
 
-_PROVIDER_CREDENTIAL_SETTING: Dict[str, str] = {
-    "cloudflare_radar": "CLOUDFLARE_RADAR_TOKEN",
-    "abuseipdb": "ABUSEIPDB_API_KEY",
-    "ipdata": "IPDATA_API_KEY",
-    "ipregistry": "IPREGISTRY_API_KEY",
-    "ip2location": "IP2LOCATION_API_KEY",
-    "getipintel": "GETIPINTEL_CONTACT_EMAIL",
-    "proxycheck": "PROXYCHECK_API_KEY",
-    "iphub": "IPHUB_API_KEY",
-    "iphunter": "IPHUNTER_API_KEY",
-}
-
-_DEFAULT_QUOTA_LIMITS: Dict[str, Tuple[int, int]] = {
-    "cloudflare_radar": (0, 0),
-    "abuseipdb": (0, 0),
-    "ipdata": (0, 0),
-    "ipregistry": (0, 0),
-    "ip2location": (0, 0),
-    "getipintel": (15, 5000),
-    "proxycheck": (0, 1000),
-    "iphub": (0, 1000),
-    "iphunter": (0, 1000),
-    "maxmind": (0, 0),
-    "spamhaus_zen": (1000, 0),
-    "spamcop": (0, 0),
-    "tor_onionoo": (0, 0),
-    "stopforumspam": (0, 0),
-    "dshield": (1000, 0),
-}
-
-PROVIDER_QUOTA_SPECS = _DEFAULT_QUOTA_LIMITS
+PROVIDER_QUOTA_SPECS: Dict[str, Tuple[int, int]] = DEFAULT_QUOTA_LIMITS
 
 _QUOTA_CONSUME_LUA = """
 local min_key = KEYS[1]
@@ -128,8 +97,19 @@ end
 return {1, "", min_val, day_val}
 """
 
-_INITIAL_SETTING_LIMITS: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
-_INITIAL_DICT_LIMITS: Optional[Dict[str, Dict[str, int]]] = None
+_OVERRIDDEN_SETTING_KEYS: Set[str] = set()
+
+
+def _on_quota_setting_changed(*, setting: str, enter: bool, **kwargs: Any) -> None:
+    """Tracks active Django test setting overrides without mutating import-time baselines."""
+    if setting == "PROVIDER_QUOTA_LIMITS" or setting.endswith(("_RPM_LIMIT", "_DAILY_LIMIT")):
+        if enter:
+            _OVERRIDDEN_SETTING_KEYS.add(setting)
+        else:
+            _OVERRIDDEN_SETTING_KEYS.discard(setting)
+
+
+setting_changed.connect(_on_quota_setting_changed, dispatch_uid="detector.quota_telemetry.setting_changed")
 
 
 def _parse_non_negative_int(value: Any) -> Optional[int]:
@@ -143,35 +123,6 @@ def _parse_non_negative_int(value: Any) -> Optional[int]:
         if re.fullmatch(r"\d+", cleaned):
             return int(cleaned)
     return None
-
-
-def _capture_initial_limits_once() -> None:
-    """Snapshots import-time quota settings so runtime overrides are always detected."""
-    global _INITIAL_DICT_LIMITS
-    if _INITIAL_SETTING_LIMITS:
-        return
-    if not getattr(settings, "configured", False):
-        return
-
-    for provider_key in _DEFAULT_QUOTA_LIMITS:
-        prefix = provider_key.upper()
-        rpm_val = _parse_non_negative_int(getattr(settings, f"{prefix}_RPM_LIMIT", None))
-        daily_val = _parse_non_negative_int(getattr(settings, f"{prefix}_DAILY_LIMIT", None))
-        _INITIAL_SETTING_LIMITS[provider_key] = (rpm_val, daily_val)
-
-    raw_dict = getattr(settings, "PROVIDER_QUOTA_LIMITS", None)
-    if isinstance(raw_dict, dict):
-        copied: Dict[str, Dict[str, int]] = {}
-        for key, entry in raw_dict.items():
-            if isinstance(entry, dict):
-                copied[key] = {
-                    "rpm": _parse_non_negative_int(entry.get("rpm")) or 0,
-                    "daily": _parse_non_negative_int(entry.get("daily")) or 0,
-                }
-        _INITIAL_DICT_LIMITS = copied
-
-
-_capture_initial_limits_once()
 
 
 @dataclass(frozen=True)
@@ -188,23 +139,9 @@ class QuotaCheckResult:
     daily_limit: int = 0
 
 
-def _get_redis_client() -> Optional[Any]:
-    """Delegates to the shared event-loop-scoped Redis client helper."""
-    from detector import views as detector_views
-
-    return detector_views._get_redis_client()
-
-
-def _mark_redis_failure(exc: BaseException) -> None:
-    """Propagates connection or timeout failures to the shared Redis circuit breaker."""
-    from detector import views as detector_views
-
-    detector_views.mark_redis_failure(exc)
-
-
 def is_provider_configured(provider_key: str) -> bool:
     """Returns True when the provider either needs no credentials or has one configured."""
-    setting_name = _PROVIDER_CREDENTIAL_SETTING.get(provider_key)
+    setting_name = PROVIDER_CREDENTIAL_SETTINGS.get(provider_key)
     if not setting_name:
         return True
     raw_value = os.environ.get(setting_name) or getattr(settings, setting_name, "")
@@ -216,45 +153,44 @@ def get_provider_quota_limits(provider_key: str) -> Tuple[int, int]:
     Resolves effective (rpm_limit, daily_limit) for a provider, honouring Django
     override_settings on individual limits or PROVIDER_QUOTA_LIMITS as well as os.environ.
     """
-    _capture_initial_limits_once()
-    default_rpm, default_daily = _DEFAULT_QUOTA_LIMITS.get(provider_key, (0, 0))
+    default_rpm, default_daily = DEFAULT_QUOTA_LIMITS.get(provider_key, (0, 0))
     prefix = provider_key.upper()
     rpm_name = f"{prefix}_RPM_LIMIT"
     daily_name = f"{prefix}_DAILY_LIMIT"
 
-    initial_rpm, initial_daily = _INITIAL_SETTING_LIMITS.get(provider_key, (None, None))
     setting_rpm = _parse_non_negative_int(getattr(settings, rpm_name, None))
     setting_daily = _parse_non_negative_int(getattr(settings, daily_name, None))
 
     current_dict = getattr(settings, "PROVIDER_QUOTA_LIMITS", None)
     dict_entry = current_dict.get(provider_key) if isinstance(current_dict, dict) else None
-    initial_dict_entry = _INITIAL_DICT_LIMITS.get(provider_key) if _INITIAL_DICT_LIMITS else None
+    dict_overridden = "PROVIDER_QUOTA_LIMITS" in _OVERRIDDEN_SETTING_KEYS
 
     def _resolve_window(
+        setting_name: str,
         setting_val: Optional[int],
-        initial_val: Optional[int],
-        env_name: str,
         dict_field: str,
         fallback: int,
     ) -> int:
-        if setting_val is not None and initial_val is not None and setting_val != initial_val:
+        dict_val = _parse_non_negative_int(dict_entry.get(dict_field)) if isinstance(dict_entry, dict) else None
+        if setting_name in _OVERRIDDEN_SETTING_KEYS and setting_val is not None:
             return setting_val
-        if isinstance(dict_entry, dict):
-            dict_val = _parse_non_negative_int(dict_entry.get(dict_field))
-            initial_dict_val = initial_dict_entry.get(dict_field) if isinstance(initial_dict_entry, dict) else None
-            if dict_val is not None and dict_val != initial_dict_val:
-                return dict_val
-        if env_name in os.environ:
-            env_val = _parse_non_negative_int(os.environ.get(env_name))
+        if dict_overridden and dict_val is not None:
+            return dict_val
+        if setting_name in os.environ:
+            env_val = _parse_non_negative_int(os.environ.get(setting_name))
             if env_val is not None:
                 return env_val
+        if setting_val is not None and setting_val != fallback:
+            return setting_val
+        if dict_val is not None and dict_val != fallback:
+            return dict_val
         if setting_val is not None:
             return setting_val
         return fallback
 
     return (
-        _resolve_window(setting_rpm, initial_rpm, rpm_name, "rpm", default_rpm),
-        _resolve_window(setting_daily, initial_daily, daily_name, "daily", default_daily),
+        _resolve_window(rpm_name, setting_rpm, "rpm", default_rpm),
+        _resolve_window(daily_name, setting_daily, "daily", default_daily),
     )
 
 
@@ -365,6 +301,96 @@ async def _run_quota_lua(
     return _build_blocked_result(blocked_window, minute_used, daily_used, rpm_limit, daily_limit)
 
 
+def _needs_window_expiry(counter_val: int, observed_ttl: Any) -> bool:
+    if counter_val <= 1:
+        return True
+    return isinstance(observed_ttl, int) and not isinstance(observed_ttl, bool) and observed_ttl < 0
+
+
+def _is_valid_counter(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+async def _increment_quota_windows_via_pipeline(
+    pipeline_fn: Any,
+    min_key: str,
+    day_key: str,
+) -> Optional[Tuple[int, int, bool, bool]]:
+    pipe = pipeline_fn(transaction=True)
+    ttl_fn = getattr(pipe, "ttl", None)
+    supports_ttl = callable(ttl_fn)
+
+    pipe.incr(min_key)
+    if supports_ttl:
+        ttl_fn(min_key)
+    pipe.incr(day_key)
+    if supports_ttl:
+        ttl_fn(day_key)
+
+    exec_call = pipe.execute()
+    if not inspect.isawaitable(exec_call):
+        return None
+    results = await exec_call
+    min_len = 4 if supports_ttl else 2
+    if not isinstance(results, (list, tuple)) or len(results) < min_len:
+        return None
+
+    min_val = results[0]
+    day_val = results[2] if supports_ttl else results[1]
+    if not _is_valid_counter(min_val) or not _is_valid_counter(day_val):
+        return None
+
+    min_ttl = results[1] if supports_ttl else (-1 if min_val == 1 else MINUTE_QUOTA_TTL_SECONDS)
+    day_ttl = results[3] if supports_ttl else (-1 if day_val == 1 else DAILY_QUOTA_TTL_SECONDS)
+    return (
+        min_val,
+        day_val,
+        _needs_window_expiry(min_val, min_ttl),
+        _needs_window_expiry(day_val, day_ttl),
+    )
+
+
+async def _rollback_quota_pipeline(
+    pipeline_fn: Any,
+    min_key: str,
+    day_key: str,
+    tel_key: str,
+    min_val: int,
+    day_val: int,
+    *,
+    need_min_expire: bool,
+    need_day_expire: bool,
+) -> Tuple[int, int]:
+    rb_pipe = pipeline_fn(transaction=True)
+    rb_pipe.decr(min_key)
+    rb_pipe.decr(day_key)
+    if need_min_expire:
+        rb_pipe.expire(min_key, MINUTE_QUOTA_TTL_SECONDS)
+    if need_day_expire:
+        rb_pipe.expire(day_key, DAILY_QUOTA_TTL_SECONDS)
+    rb_pipe.hincrby(tel_key, "quota_blocked", 1)
+    rb_pipe.expire(tel_key, TELEMETRY_TTL_SECONDS)
+
+    rolled_min = max(0, min_val - 1)
+    rolled_day = max(0, day_val - 1)
+    rb_exec = rb_pipe.execute()
+    if not inspect.isawaitable(rb_exec):
+        return rolled_min, rolled_day
+
+    rb_res = await rb_exec
+    if isinstance(rb_res, (list, tuple)) and len(rb_res) >= 2:
+        if _is_valid_counter(rb_res[0]):
+            rolled_min = max(0, rb_res[0])
+        if _is_valid_counter(rb_res[1]):
+            rolled_day = max(0, rb_res[1])
+        await _clamp_negative_quota_counters(
+            pipeline_fn,
+            [(min_key, MINUTE_QUOTA_TTL_SECONDS), (day_key, DAILY_QUOTA_TTL_SECONDS)],
+            rb_res[:2],
+        )
+    return rolled_min, rolled_day
+
+
 async def _run_quota_pipeline(
     client: Any,
     min_key: str,
@@ -376,25 +402,10 @@ async def _run_quota_pipeline(
     pipeline_fn = getattr(client, "pipeline", None)
     if not callable(pipeline_fn):
         return None
-    pipe = pipeline_fn(transaction=True)
-    pipe.incr(min_key)
-    pipe.expire(min_key, MINUTE_QUOTA_TTL_SECONDS)
-    pipe.incr(day_key)
-    pipe.expire(day_key, DAILY_QUOTA_TTL_SECONDS)
-    exec_call = pipe.execute()
-    if not inspect.isawaitable(exec_call):
+    incremented = await _increment_quota_windows_via_pipeline(pipeline_fn, min_key, day_key)
+    if incremented is None:
         return None
-    results = await exec_call
-    if not isinstance(results, (list, tuple)) or len(results) < 4:
-        return None
-    min_val, _, day_val, _ = results[0], results[1], results[2], results[3]
-    if (
-        isinstance(min_val, bool)
-        or not isinstance(min_val, int)
-        or isinstance(day_val, bool)
-        or not isinstance(day_val, int)
-    ):
-        return None
+    min_val, day_val, need_min_expire, need_day_expire = incremented
 
     blocked_window: Optional[str] = None
     if rpm_limit > 0 and min_val > rpm_limit:
@@ -403,6 +414,15 @@ async def _run_quota_pipeline(
         blocked_window = "rpd"
 
     if blocked_window is None:
+        if need_min_expire or need_day_expire:
+            exp_pipe = pipeline_fn(transaction=False)
+            if need_min_expire:
+                exp_pipe.expire(min_key, MINUTE_QUOTA_TTL_SECONDS)
+            if need_day_expire:
+                exp_pipe.expire(day_key, DAILY_QUOTA_TTL_SECONDS)
+            exp_call = exp_pipe.execute()
+            if inspect.isawaitable(exp_call):
+                await exp_call
         return QuotaCheckResult(
             allowed=True,
             minute_used=min_val,
@@ -411,22 +431,16 @@ async def _run_quota_pipeline(
             daily_limit=daily_limit,
         )
 
-    rb_pipe = pipeline_fn(transaction=True)
-    rb_pipe.decr(min_key)
-    rb_pipe.decr(day_key)
-    rb_pipe.hincrby(tel_key, "quota_blocked", 1)
-    rb_pipe.expire(tel_key, TELEMETRY_TTL_SECONDS)
-    rb_exec = rb_pipe.execute()
-    rolled_min = max(0, min_val - 1)
-    rolled_day = max(0, day_val - 1)
-    if inspect.isawaitable(rb_exec):
-        rb_res = await rb_exec
-        if isinstance(rb_res, (list, tuple)) and len(rb_res) >= 2:
-            if isinstance(rb_res[0], int) and not isinstance(rb_res[0], bool):
-                rolled_min = max(0, rb_res[0])
-            if isinstance(rb_res[1], int) and not isinstance(rb_res[1], bool):
-                rolled_day = max(0, rb_res[1])
-
+    rolled_min, rolled_day = await _rollback_quota_pipeline(
+        pipeline_fn,
+        min_key,
+        day_key,
+        tel_key,
+        min_val,
+        day_val,
+        need_min_expire=need_min_expire,
+        need_day_expire=need_day_expire,
+    )
     return _build_blocked_result(blocked_window, rolled_min, rolled_day, rpm_limit, daily_limit)
 
 
@@ -455,8 +469,8 @@ async def check_and_consume_quota(
             return lua_result
     except NotImplementedError:
         pass
-    except _REDIS_ERRORS as exc:
-        _mark_redis_failure(exc)
+    except REDIS_TRANSPORT_ERRORS as exc:
+        mark_redis_failure(exc)
         logger.warning(f"Quota Lua check bypassed for {provider_key} due to Redis error ({type(exc).__name__})")
         return QuotaCheckResult(allowed=True, minute_limit=rpm_limit, daily_limit=daily_limit)
 
@@ -464,8 +478,8 @@ async def check_and_consume_quota(
         pipe_result = await _run_quota_pipeline(client, min_key, day_key, tel_key, rpm_limit, daily_limit)
         if pipe_result is not None:
             return pipe_result
-    except _REDIS_ERRORS as exc:
-        _mark_redis_failure(exc)
+    except REDIS_TRANSPORT_ERRORS as exc:
+        mark_redis_failure(exc)
         logger.warning(f"Quota pipeline check bypassed for {provider_key} due to Redis error ({type(exc).__name__})")
 
     return QuotaCheckResult(allowed=True, minute_limit=rpm_limit, daily_limit=daily_limit)
@@ -688,8 +702,8 @@ async def record_provider_outcomes_batch(
         exec_call = pipe.execute()
         results = await exec_call if inspect.isawaitable(exec_call) else None
         await _clamp_negative_quota_counters(pipeline_fn, tracked_ops, results)
-    except _REDIS_ERRORS as exc:
-        _mark_redis_failure(exc)
+    except REDIS_TRANSPORT_ERRORS as exc:
+        mark_redis_failure(exc)
         logger.warning(f"Batch telemetry write bypassed due to Redis error ({type(exc).__name__})")
 
 
@@ -731,8 +745,8 @@ async def record_global_request_telemetry(
         exec_call = pipe.execute()
         if inspect.isawaitable(exec_call):
             await exec_call
-    except _REDIS_ERRORS as exc:
-        _mark_redis_failure(exc)
+    except REDIS_TRANSPORT_ERRORS as exc:
+        mark_redis_failure(exc)
         logger.warning(f"Global telemetry write bypassed due to Redis error ({type(exc).__name__})")
 
 
@@ -778,11 +792,10 @@ def _decode_pipeline_provider_row(results: Any, idx: int) -> Tuple[int, int, int
 
 async def _fetch_dashboard_pipeline_data(
     client: Any,
-    specs: Tuple[Any, ...],
+    registry: Tuple[ProviderMetadata, ...],
     current_dt: datetime,
-    cooldown_key_fn: Any,
 ) -> Tuple[bool, Dict[str, str], Dict[str, Tuple[int, int, int, Optional[str], Dict[str, str]]]]:
-    """Fetches global telemetry and per-provider quota/cooldown metrics in a single Redis pipeline."""
+    """Fetches global telemetry and per-provider quota and cooldown metrics in a single Redis pipeline."""
     if client is None:
         return False, {}, {}
     pipeline_fn = getattr(client, "pipeline", None)
@@ -792,29 +805,26 @@ async def _fetch_dashboard_pipeline_data(
     try:
         pipe = pipeline_fn(transaction=False)
         pipe.hgetall(_global_telemetry_key(current_dt))
-        for provider_key, _, _, _, _ in specs:
-            cooldown_key = cooldown_key_fn(provider_key)
-            pipe.get(_quota_minute_key(provider_key, current_dt))
-            pipe.get(_quota_daily_key(provider_key, current_dt))
+        for meta in registry:
+            cooldown_key = provider_cooldown_key(meta.key)
+            pipe.get(_quota_minute_key(meta.key, current_dt))
+            pipe.get(_quota_daily_key(meta.key, current_dt))
             pipe.ttl(cooldown_key)
             pipe.get(cooldown_key)
-            pipe.hgetall(_provider_telemetry_key(provider_key, current_dt))
+            pipe.hgetall(_provider_telemetry_key(meta.key, current_dt))
 
         exec_call = pipe.execute()
         if not inspect.isawaitable(exec_call):
             return False, {}, {}
         results = await exec_call
-        expected_len = 1 + (len(specs) * 5)
+        expected_len = 1 + (len(registry) * 5)
         if not isinstance(results, (list, tuple)) or len(results) != expected_len:
             return False, {}, {}
         global_hash = _decode_hash(results[0])
-        provider_rows = {
-            provider_key: _decode_pipeline_provider_row(results, idx)
-            for idx, (provider_key, _, _, _, _) in enumerate(specs)
-        }
+        provider_rows = {meta.key: _decode_pipeline_provider_row(results, idx) for idx, meta in enumerate(registry)}
         return True, global_hash, provider_rows
-    except _REDIS_ERRORS as exc:
-        _mark_redis_failure(exc)
+    except REDIS_TRANSPORT_ERRORS as exc:
+        mark_redis_failure(exc)
         logger.warning(f"Dashboard snapshot fell back to empty telemetry ({type(exc).__name__})")
         return False, {}, {}
 
@@ -859,19 +869,17 @@ def _resolve_provider_dashboard_status(
 
 
 def _build_provider_dashboard_entry(
-    provider_key: str,
-    provider_name: str,
-    uses_http: bool,
+    meta: ProviderMetadata,
     pipeline_row: Tuple[int, int, int, Optional[str], Dict[str, str]],
     *,
     has_maxmind_db: bool,
     has_sfs_db: bool,
 ) -> Dict[str, Any]:
-    configured = is_provider_configured(provider_key)
-    rpm_limit, daily_limit = get_provider_quota_limits(provider_key)
+    configured = is_provider_configured(meta.key)
+    rpm_limit, daily_limit = get_provider_quota_limits(meta.key)
     minute_used, daily_used, cooldown_ttl, cd_raw, tel_hash = pipeline_row
     status_key, status_label = _resolve_provider_dashboard_status(
-        provider_key,
+        meta.key,
         configured=configured,
         cooldown_ttl=cooldown_ttl,
         minute_used=minute_used,
@@ -882,9 +890,9 @@ def _build_provider_dashboard_entry(
         has_sfs_db=has_sfs_db,
     )
     return {
-        "key": provider_key,
-        "name": provider_name,
-        "usesHttp": uses_http,
+        "key": meta.key,
+        "name": meta.label,
+        "usesHttp": meta.uses_http,
         "configured": configured,
         "status": status_label,
         "statusKey": status_key,
@@ -941,15 +949,11 @@ async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict
     Aggregates global request telemetry and all provider quota, cooldown TTL, and status
     metrics in a single Redis pipeline without exposing IP addresses or user identities.
     """
-    from detector import views as detector_views
-
     current_dt = now_dt or datetime.now(timezone.utc)
-    specs = detector_views._PROVIDER_SPECS
     redis_available, global_hash, provider_pipeline_rows = await _fetch_dashboard_pipeline_data(
         _get_redis_client(),
-        specs,
+        PROVIDER_REGISTRY,
         current_dt,
-        detector_views._provider_cooldown_key,
     )
 
     offline_databases = await asyncio.to_thread(collect_offline_databases_status, now_dt=current_dt)
@@ -962,14 +966,12 @@ async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict
 
     providers_out = [
         _build_provider_dashboard_entry(
-            provider_key,
-            provider_name,
-            uses_http,
-            provider_pipeline_rows.get(provider_key, (0, 0, 0, None, {})),
+            meta,
+            provider_pipeline_rows.get(meta.key, (0, 0, 0, None, {})),
             has_maxmind_db=has_maxmind_db,
             has_sfs_db=has_sfs_db,
         )
-        for provider_key, provider_name, uses_http, _supports_cooldown, _ in specs
+        for meta in PROVIDER_REGISTRY
     ]
 
     return {

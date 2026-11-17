@@ -7,10 +7,12 @@ import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import dns.resolver
 import httpx
 from django.test import SimpleTestCase, TestCase, override_settings
 
-from detector import views
+from detector import providers, views
+from detector.provider_registry import PROVIDER_REGISTRY
 
 from .helpers import (
     EMPTY_UPSTREAM_SECRETS,
@@ -57,10 +59,10 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         fake_resolver.resolve = AsyncMock(side_effect=self._clean_dns_side_effect)
 
         with (
-            patch("detector.views.redis_client", fake_redis),
-            patch("detector.views.httpx.AsyncClient") as mock_client_cls,
-            patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver),
-            patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
+            patch("detector.cache_backends.redis_client", fake_redis),
+            patch("detector.http_client.httpx.AsyncClient") as mock_client_cls,
+            patch("detector.dns_providers.dns.asyncresolver.Resolver", return_value=fake_resolver),
+            patch("detector.dns_providers.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
         ):
             _patch_async_client(mock_client_cls, fake_get)
             first_response = self.client.get("/api/v1/detect?ip=8.8.8.8")
@@ -86,13 +88,13 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         self.assertEqual(guarded_row["rawJson"]["window"], "rpm")
         self.assertEqual(third_rows["Proxycheck"]["status"], "200 OK")
 
-        from_guarded_key = views._build_cooldown_provider_row(
+        from_guarded_key = providers._build_cooldown_provider_row(
             "GetIPIntel",
             {"statusCode": 429, "isQuotaGuarded": True, "reason": "RPM limit"},
         )
         self.assertTrue(from_guarded_key["isQuotaGuarded"])
         self.assertTrue(from_guarded_key["isQuotaGuard"])
-        normal_cooldown = views._build_cooldown_provider_row(
+        normal_cooldown = providers._build_cooldown_provider_row(
             "GetIPIntel",
             {"statusCode": 503, "reason": "Upstream 503"},
         )
@@ -127,10 +129,10 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         fake_resolver.resolve = AsyncMock(side_effect=self._clean_dns_side_effect)
 
         with (
-            patch("detector.views.redis_client", fake_redis),
-            patch("detector.views.httpx.AsyncClient") as mock_client_cls,
-            patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver),
-            patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
+            patch("detector.cache_backends.redis_client", fake_redis),
+            patch("detector.http_client.httpx.AsyncClient") as mock_client_cls,
+            patch("detector.dns_providers.dns.asyncresolver.Resolver", return_value=fake_resolver),
+            patch("detector.dns_providers.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
         ):
             _patch_async_client(mock_client_cls, fake_get)
             self.client.get("/api/v1/detect?ip=8.8.8.8")
@@ -157,7 +159,7 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
 
         lua_client = MagicMock()
         lua_client.eval = AsyncMock(side_effect=[[1, "", 1, 1], [0, "rpm", 15, 42]])
-        with patch("detector.views.redis_client", lua_client):
+        with patch("detector.cache_backends.redis_client", lua_client):
             allowed_res = async_to_sync(quota_telemetry.check_and_consume_quota)("getipintel")
             blocked_res = async_to_sync(quota_telemetry.check_and_consume_quota)("getipintel")
 
@@ -172,7 +174,7 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         failing_client = MagicMock()
         failing_client.eval = AsyncMock(side_effect=ConnectionError("redis offline"))
         failing_client.pipeline = MagicMock(side_effect=ConnectionError("redis offline"))
-        with patch("detector.views.redis_client", failing_client):
+        with patch("detector.cache_backends.redis_client", failing_client):
             fail_open_res = async_to_sync(quota_telemetry.check_and_consume_quota)("getipintel")
             snapshot = async_to_sync(quota_telemetry.build_dashboard_snapshot)()
 
@@ -180,13 +182,13 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         self.assertFalse(snapshot["redisAvailable"])
         self.assertIn("providers", snapshot)
 
-        with patch("detector.views.redis_client", None):
+        with patch("detector.cache_backends.redis_client", None):
             no_redis_res = async_to_sync(quota_telemetry.check_and_consume_quota)("getipintel")
         self.assertTrue(no_redis_res.allowed)
 
         with (
             override_settings(GETIPINTEL_RPM_LIMIT=0, GETIPINTEL_DAILY_LIMIT=0),
-            patch("detector.views.redis_client", FakeAsyncRedis()),
+            patch("detector.cache_backends.redis_client", FakeAsyncRedis()),
         ):
             for _ in range(2):
                 zero_limit_res = async_to_sync(quota_telemetry.check_and_consume_quota)("getipintel")
@@ -198,12 +200,12 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         _login_authorised(self)
 
         fake_resolver = MagicMock()
-        fake_resolver.resolve = AsyncMock(side_effect=views.dns.resolver.NXDOMAIN())
+        fake_resolver.resolve = AsyncMock(side_effect=dns.resolver.NXDOMAIN())
 
         with (
-            patch("detector.views.redis_client", fake_redis),
-            patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver),
-            patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
+            patch("detector.cache_backends.redis_client", fake_redis),
+            patch("detector.dns_providers.dns.asyncresolver.Resolver", return_value=fake_resolver),
+            patch("detector.dns_providers.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
         ):
             response = self.client.get("/api/v1/detect?ip=2001:4860:4860::8888")
 
@@ -239,10 +241,10 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         gadget_token = views.issue_gadget_token("SensitiveGadgetUser")
 
         with (
-            patch("detector.views.redis_client", fake_redis),
-            patch("detector.views.httpx.AsyncClient") as mock_client_cls,
-            patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver),
-            patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
+            patch("detector.cache_backends.redis_client", fake_redis),
+            patch("detector.http_client.httpx.AsyncClient") as mock_client_cls,
+            patch("detector.dns_providers.dns.asyncresolver.Resolver", return_value=fake_resolver),
+            patch("detector.dns_providers.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
         ):
             _patch_async_client(mock_client_cls, fake_get)
             first_session = self.client.get(
@@ -329,10 +331,10 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         fake_resolver.resolve = AsyncMock(side_effect=self._clean_dns_side_effect)
 
         with (
-            patch("detector.views.redis_client", fake_redis),
-            patch("detector.views.httpx.AsyncClient") as mock_client_cls,
-            patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver),
-            patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
+            patch("detector.cache_backends.redis_client", fake_redis),
+            patch("detector.http_client.httpx.AsyncClient") as mock_client_cls,
+            patch("detector.dns_providers.dns.asyncresolver.Resolver", return_value=fake_resolver),
+            patch("detector.dns_providers.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
         ):
             _patch_async_client(mock_client_cls, fake_get)
             first_resp = self.client.get("/api/v1/detect?ip=8.8.8.8")
@@ -364,7 +366,7 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         gadget_client = self.client.__class__()
         gadget_token = views.issue_gadget_token("AllowlistedDashboardAdmin")
 
-        with patch("detector.views.redis_client", fake_redis):
+        with patch("detector.cache_backends.redis_client", fake_redis):
             with (
                 override_settings(ALLOWED_WIKI_USERS="AllowlistedDashboardAdmin, second_admin, ~2026-12345"),
                 patch.dict(
@@ -544,7 +546,10 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         _login_authorised(self)
         fake_dt_cls = MagicMock()
         fake_dt_cls.now.return_value = now_dt
-        with patch("detector.views.redis_client", fake_redis), patch("detector.quota_telemetry.datetime", fake_dt_cls):
+        with (
+            patch("detector.cache_backends.redis_client", fake_redis),
+            patch("detector.quota_telemetry.datetime", fake_dt_cls),
+        ):
             response = self.client.get("/api/v1/admin/provider-dashboard")
 
         self.assertEqual(response.status_code, 200)
@@ -564,29 +569,29 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         self.assertEqual(kpis["activeCooldownCount"], 1)
         self.assertEqual(kpis["activeQuotaGuardCount"], 1)
 
-        providers = {row["key"]: row for row in payload["providers"]}
-        self.assertEqual(set(providers.keys()), {spec[0] for spec in views._PROVIDER_SPECS})
+        providers_map = {row["key"]: row for row in payload["providers"]}
+        self.assertEqual(set(providers_map.keys()), {meta.key for meta in PROVIDER_REGISTRY})
 
-        self.assertEqual(providers["abuseipdb"]["status"], "No API Key")
-        self.assertEqual(providers["abuseipdb"]["statusKey"], "no_api_key")
-        self.assertFalse(providers["abuseipdb"]["configured"])
+        self.assertEqual(providers_map["abuseipdb"]["status"], "No API Key")
+        self.assertEqual(providers_map["abuseipdb"]["statusKey"], "no_api_key")
+        self.assertFalse(providers_map["abuseipdb"]["configured"])
 
-        self.assertEqual(providers["getipintel"]["status"], "Quota Guarded")
-        self.assertEqual(providers["getipintel"]["statusKey"], "quota_guarded")
-        self.assertEqual(providers["getipintel"]["minuteUsed"], 15)
-        self.assertEqual(providers["getipintel"]["minuteLimit"], 15)
-        self.assertEqual(providers["getipintel"]["telemetry"]["quotaBlocked"], 2)
+        self.assertEqual(providers_map["getipintel"]["status"], "Quota Guarded")
+        self.assertEqual(providers_map["getipintel"]["statusKey"], "quota_guarded")
+        self.assertEqual(providers_map["getipintel"]["minuteUsed"], 15)
+        self.assertEqual(providers_map["getipintel"]["minuteLimit"], 15)
+        self.assertEqual(providers_map["getipintel"]["telemetry"]["quotaBlocked"], 2)
 
-        self.assertEqual(providers["ipregistry"]["status"], "Cooldown (95s)")
-        self.assertEqual(providers["ipregistry"]["statusKey"], "cooldown")
-        self.assertEqual(providers["ipregistry"]["cooldownTtlSeconds"], 95)
-        self.assertEqual(providers["ipregistry"]["cooldownReason"], "HTTP 429")
+        self.assertEqual(providers_map["ipregistry"]["status"], "Cooldown (95s)")
+        self.assertEqual(providers_map["ipregistry"]["statusKey"], "cooldown")
+        self.assertEqual(providers_map["ipregistry"]["cooldownTtlSeconds"], 95)
+        self.assertEqual(providers_map["ipregistry"]["cooldownReason"], "HTTP 429")
 
-        self.assertEqual(providers["proxycheck"]["status"], "Healthy")
-        self.assertEqual(providers["proxycheck"]["statusKey"], "healthy")
-        self.assertEqual(providers["proxycheck"]["upstreamRemaining"], 991)
-        self.assertEqual(providers["proxycheck"]["upstreamLimit"], 1000)
-        self.assertEqual(providers["proxycheck"]["telemetry"]["cacheHit"], 6)
+        self.assertEqual(providers_map["proxycheck"]["status"], "Healthy")
+        self.assertEqual(providers_map["proxycheck"]["statusKey"], "healthy")
+        self.assertEqual(providers_map["proxycheck"]["upstreamRemaining"], 991)
+        self.assertEqual(providers_map["proxycheck"]["upstreamLimit"], 1000)
+        self.assertEqual(providers_map["proxycheck"]["telemetry"]["cacheHit"], 6)
 
     @override_settings(
         **TEST_UPSTREAM_SECRETS,
@@ -618,10 +623,10 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         fake_resolver.resolve = AsyncMock(side_effect=self._clean_dns_side_effect)
 
         with (
-            patch("detector.views.redis_client", fake_redis),
-            patch("detector.views.httpx.AsyncClient") as mock_client_cls,
-            patch("detector.views.dns.asyncresolver.Resolver", return_value=fake_resolver),
-            patch("detector.views.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
+            patch("detector.cache_backends.redis_client", fake_redis),
+            patch("detector.http_client.httpx.AsyncClient") as mock_client_cls,
+            patch("detector.dns_providers.dns.asyncresolver.Resolver", return_value=fake_resolver),
+            patch("detector.dns_providers.query_maxmind", new_callable=AsyncMock, return_value=dict(MAXMIND_STUB)),
         ):
             _patch_async_client(mock_client_cls, fake_get)
             response = self.client.get("/api/v1/detect?ip=8.8.8.8")
@@ -846,7 +851,7 @@ class CheckSetupCommandTests(SimpleTestCase):
             # Missing required: DJANGO_SECRET_KEY (gen), WIKIMEDIA_CLIENT_ID, WIKIMEDIA_CLIENT_SECRET
             # Attention recommended: DJANGO_ALLOWED_HOSTS (local only), WIKIMEDIA_REDIRECT_URI (prod URL on dev),
             # REDIS_URL (missing), TOOL_DATA_DIR, MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY, ALLOWED_WIKI_USERS
-            # Provider y/N -> y, then 9 provider prompts (first set, remaining 8 skipped)
+            # Provider prompt answered yes, then 9 provider prompts (first set, remaining 8 skipped)
             getpass_answers = iter(
                 [
                     "gen",

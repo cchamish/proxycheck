@@ -7,23 +7,39 @@ export const REQUIRED_USER_RIGHTS = [
   'checkuser-temporary-account-no-preference',
 ] as const;
 
+export const PROVIDER_NAMES = [
+  'Cloudflare Radar',
+  'AbuseIPDB',
+  'IPData',
+  'IPRegistry',
+  'IP2Location',
+  'GetIPIntel',
+  'Proxycheck',
+  'IPHub',
+  'IPHunter',
+  'MaxMind',
+  'Spamhaus ZEN',
+  'SpamCop',
+  'Tor Onionoo',
+  'StopForumSpam',
+  'DShield',
+] as const;
+
+export type ProviderName = (typeof PROVIDER_NAMES)[number];
+
+export const COMMERCIAL_ARBITRATION_PROVIDERS = [
+  'AbuseIPDB',
+  'IPData',
+  'IPRegistry',
+  'IP2Location',
+  'GetIPIntel',
+  'Proxycheck',
+  'IPHub',
+  'IPHunter',
+] as const;
+
 export interface ProviderRawResult {
-  provider:
-    | 'Cloudflare Radar'
-    | 'AbuseIPDB'
-    | 'IPData'
-    | 'IPRegistry'
-    | 'IP2Location'
-    | 'GetIPIntel'
-    | 'Proxycheck'
-    | 'IPHub'
-    | 'IPHunter'
-    | 'MaxMind'
-    | 'Spamhaus ZEN'
-    | 'SpamCop'
-    | 'Tor Onionoo'
-    | 'StopForumSpam'
-    | 'DShield';
+  provider: ProviderName;
   status: string;
   statusCode: number | null;
   asn: string;
@@ -32,6 +48,7 @@ export interface ProviderRawResult {
   location: string;
   usageType: string;
   securityFlags: { label: string; isHighRisk: boolean }[];
+  riskScore?: number | null;
   chance?: number | null;
   block?: number | null;
   countryCode?: string;
@@ -64,6 +81,15 @@ export interface ProviderRawResult {
   threatfeeds?: string[];
   maxDate?: string | null;
   offlineDbUpdatedAt?: string | null;
+  isCooldown?: boolean;
+  isQuotaGuarded?: boolean;
+  isQuotaGuard?: boolean;
+  isDeferred?: boolean;
+  isSkippedIpv6?: boolean;
+  isListed?: boolean;
+  isPolicyRange?: boolean;
+  isQueryRestricted?: boolean;
+  listedCodes?: string[];
   isCached?: boolean;
   cachedAt?: string | null;
   rawJson: Record<string, unknown>;
@@ -84,17 +110,10 @@ export interface OfflineDatabaseEntry {
   statusLabel: string;
 }
 
-export interface SystemStatusResponse {
-  generatedAt: string;
-  offlineDatabases: OfflineDatabaseEntry[];
-  durationSeconds?: number;
-  memoryMb?: number | null;
-}
-
 export type PtrCategory = 'dynamic_residential' | 'hosting_or_gateway' | 'unclassified' | 'none';
 
 export interface CacheMeta {
-  status: 'hit' | 'partial' | 'miss';
+  status: 'hit' | 'partial' | 'miss' | 'bypassed';
   isPartial: boolean;
   hitCount: number;
   missCount: number;
@@ -105,6 +124,8 @@ export interface CacheMeta {
 
 export interface DetectionResponse {
   ip: string;
+  queryMode?: 'light' | 'full';
+  isPartialMode?: boolean;
   isCached: boolean;
   cacheMeta?: CacheMeta;
   durationSeconds?: number;
@@ -514,6 +535,149 @@ export function simplifySecurityFlags(
   return [{ label: 'No Flags', isHighRisk: false }];
 }
 
+export type ProviderDisplayRow = Omit<Partial<ProviderRawResult>, 'port'> & {
+  port?: number | string | null;
+  last_seen?: string | null;
+};
+
+/**
+ * Builds secondary metadata items for a provider comparison row.
+ */
+export function getProviderMetaItems(
+  row: ProviderDisplayRow | null | undefined,
+  now: Date | number = Date.now(),
+  formatDbTimestamp: (iso?: string | null, currentNow?: Date | number) => string = formatOfflineDbTimestamp
+): string[] {
+  if (!row || typeof row !== 'object') return [];
+  const items: string[] = [];
+  if (row.port !== undefined && row.port !== null && row.port !== '') {
+    items.push(`Port: ${row.port}`);
+  }
+  if (row.provider === 'StopForumSpam' || row.frequency !== undefined || row.confidence !== undefined) {
+    if (row.frequency !== undefined && row.frequency !== null) {
+      items.push(`Frequency: ${row.frequency}`);
+    }
+    if (row.confidence !== undefined && row.confidence !== null) {
+      items.push(`Confidence: ${row.confidence}%`);
+    }
+  }
+  if (row.provider === 'DShield' || row.attacks !== undefined || row.count !== undefined) {
+    if (row.attacks !== undefined && row.attacks !== null) {
+      items.push(`Attacks: ${row.attacks}`);
+    }
+    if (row.count !== undefined && row.count !== null) {
+      items.push(`Targets: ${row.count}`);
+    }
+    if (Array.isArray(row.threatfeeds) && row.threatfeeds.length > 0) {
+      items.push(`Feeds: ${row.threatfeeds.join(', ')}`);
+    }
+  }
+  if (row.carrier) {
+    items.push(`Carrier: ${row.carrier}`);
+  }
+  if (row.mobileBrand) {
+    items.push(`Mobile brand: ${row.mobileBrand}`);
+  }
+  if (row.cloudProvider) {
+    items.push(`Cloud: ${row.cloudProvider}`);
+  }
+  if (row.provider === 'AbuseIPDB' || row.totalReports !== undefined || row.numDistinctUsers !== undefined) {
+    if (row.totalReports !== undefined && row.totalReports !== null) {
+      items.push(`Reports: ${row.totalReports}`);
+    }
+    if (row.numDistinctUsers !== undefined && row.numDistinctUsers !== null) {
+      items.push(`Distinct users: ${row.numDistinctUsers}`);
+    }
+  }
+  const lastSeenValue = row.lastSeen || row.last_seen || row.maxDate;
+  if (lastSeenValue) {
+    items.push(`Last seen: ${lastSeenValue}`);
+  }
+  if (row.offlineDbUpdatedAt) {
+    items.push(`Offline DB: ${formatDbTimestamp(row.offlineDbUpdatedAt, now)}`);
+  }
+  return items;
+}
+
+/**
+ * Maps a provider HTTP or circuit-breaker status string to a Codex badge severity class.
+ */
+export function getStatusBadgeClass(status?: string | null): string {
+  if (!status) return 'badge-neutral';
+  if (status === '200 OK') return 'badge-success';
+  if (
+    status === 'No API Key' ||
+    status === 'Database Missing' ||
+    status === 'Offline DB Missing' ||
+    status === 'Skipped (IPv6)' ||
+    status === 'Deferred (Light Mode)'
+  ) {
+    return 'badge-neutral';
+  }
+  if (status.includes('429') || status.includes('Cooldown') || status.includes('Quota Guard')) {
+    return 'badge-warning';
+  }
+  return 'badge-destructive';
+}
+
+/**
+ * Resolves the executive Prediction gauge ring tier class from backend tier or fallback score.
+ */
+export function getPredictionScoreTierClass(
+  data: Partial<DetectionResponse> | null | undefined
+): string {
+  if (!data) return 'score-tier-low';
+  if (data.predictionTier === 'destructive') return 'score-tier-high';
+  if (data.predictionTier === 'warning') return 'score-tier-moderate';
+  if (data.predictionTier === 'success') return 'score-tier-low';
+  const score = Number(data.prediction_score ?? 0);
+  if (score >= 70) return 'score-tier-high';
+  if (score >= 30) return 'score-tier-moderate';
+  return 'score-tier-low';
+}
+
+/**
+ * Resolves the multi-source arbitration badge class from consensus tier or verdict text.
+ */
+export function getArbitrationBadgeClass(
+  data: Partial<DetectionResponse> | null | undefined
+): string {
+  if (!data) return 'badge-neutral';
+  if (data.arbitrationTier === 'destructive' || data.isMajorityProxyVpn) {
+    return 'badge-destructive';
+  }
+  if (data.arbitrationTier === 'warning' || String(data.arbitrationVerdict || '').startsWith('Disputed')) {
+    return 'badge-warning';
+  }
+  if (data.arbitrationTier === 'neutral') {
+    return 'badge-neutral';
+  }
+  return 'badge-success';
+}
+
+/**
+ * Resolves the reverse DNS classification badge class.
+ */
+export function getPtrBadgeClass(data: Partial<DetectionResponse> | null | undefined): string {
+  if (!data || !data.ptrCategory) return 'badge-neutral';
+  if (data.ptrCategory === 'hosting_or_gateway' || data.ptrIsHighRisk) {
+    return 'badge-destructive';
+  }
+  if (data.ptrCategory === 'dynamic_residential') {
+    return 'badge-success';
+  }
+  return 'badge-neutral';
+}
+
+/**
+ * Formats a numeric probability percentage to at most three decimal places.
+ */
+export function formatChance(score?: number | string | null): number {
+  const num = Number(score ?? 0);
+  if (Number.isNaN(num)) return 0;
+  return Number(num.toFixed(3));
+}
+
 export interface DiagnosticMetrics {
   duration: number;
   memory: number | null;
@@ -628,6 +792,18 @@ export interface UserSessionState {
   isAdmin?: boolean;
   localGroups?: string[];
   globalGroups?: string[];
+}
+
+export function createLoggedOutUserState(): UserSessionState {
+  return {
+    isLoggedIn: false,
+    username: '',
+    role: '',
+    hasAccess: false,
+    isAdmin: false,
+    localGroups: [],
+    globalGroups: [],
+  };
 }
 
 export interface ProviderDashboardTelemetry {
@@ -814,15 +990,7 @@ export function createDetectionCoordinator(
         const expiredMessage = 'Your session has expired. Please log in again with Wikimedia.';
         state.sessionExpiredMessage = expiredMessage;
         state.validationError = expiredMessage;
-        state.user = {
-          isLoggedIn: false,
-          username: '',
-          role: '',
-          hasAccess: false,
-          isAdmin: false,
-          localGroups: [],
-          globalGroups: [],
-        };
+        state.user = createLoggedOutUserState();
         state.detectionData = null;
         state.diagnostic = null;
         return;

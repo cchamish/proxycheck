@@ -55,6 +55,7 @@
 
     var ipPromiseCache = new Map();
     var ipFullPromiseCache = new Map();
+    var inflightFullPromisesByIp = new Map();
     var latestResultByIp = new Map();
     var fullResultMetaByIp = new Map();
     var renderedBadgeEntriesByIp = new Map();
@@ -122,11 +123,22 @@
         }
     }
 
-    function clearRequestQueue() {
+    function clearBatchDebounceTimer() {
         if (batchDebounceTimer !== null) {
             window.clearTimeout(batchDebounceTimer);
             batchDebounceTimer = null;
         }
+    }
+
+    function clearContributionsFallbackTimer() {
+        if (ipContributionsFallbackTimer !== null) {
+            window.clearTimeout(ipContributionsFallbackTimer);
+            ipContributionsFallbackTimer = null;
+        }
+    }
+
+    function clearRequestQueue() {
+        clearBatchDebounceTimer();
         while (pendingBatchQueue.length > 0) {
             var pending = pendingBatchQueue.shift();
             pending.resolve(null);
@@ -161,10 +173,7 @@
             window.clearTimeout(ipContributionsObserverTimer);
             ipContributionsObserverTimer = null;
         }
-        if (ipContributionsFallbackTimer !== null) {
-            window.clearTimeout(ipContributionsFallbackTimer);
-            ipContributionsFallbackTimer = null;
-        }
+        clearContributionsFallbackTimer();
         pendingContributionsPageCheck = false;
         pendingSpurRefresh = false;
         clearRequestQueue();
@@ -262,7 +271,7 @@
         return octets;
     }
 
-    // Normalize IPv4 and IPv6 addresses into a canonical RFC 5952 cache key
+    // Normalise IPv4 and IPv6 addresses into a canonical RFC 5952 cache key
     function canonicalizeIpKey(rawIp) {
         if (rawIp === null || rawIp === undefined) {
             return '';
@@ -754,6 +763,12 @@
         latestResultByIp.set(cacheKey, data);
     }
 
+    function deleteKeyFromPersistedStore(backend, store, cacheKey, now) {
+        var nextEntries = cloneEntriesExcluding(store.entries, cacheKey);
+        pruneExpiredResultEntries(nextEntries, now);
+        writePersistedResultStore(backend, { entries: nextEntries }, null);
+    }
+
     function readPersistedIpResultEntry(cacheKey) {
         if (!cacheKey || typeof cacheKey !== 'string') {
             return null;
@@ -767,9 +782,7 @@
         var now = Date.now();
         var entry = store.entries[cacheKey];
         if (!isResultEntryValid(entry, now)) {
-            var nextEntries = cloneEntriesExcluding(store.entries, cacheKey);
-            pruneExpiredResultEntries(nextEntries, now);
-            writePersistedResultStore(backend, { entries: nextEntries }, null);
+            deleteKeyFromPersistedStore(backend, store, cacheKey, now);
             return null;
         }
 
@@ -790,9 +803,7 @@
         if (!store || !Object.prototype.hasOwnProperty.call(store.entries, cacheKey)) {
             return;
         }
-        var nextEntries = cloneEntriesExcluding(store.entries, cacheKey);
-        pruneExpiredResultEntries(nextEntries, Date.now());
-        writePersistedResultStore(backend, { entries: nextEntries }, null);
+        deleteKeyFromPersistedStore(backend, store, cacheKey, Date.now());
     }
 
     function invalidateIpResultCache(ip) {
@@ -1130,6 +1141,20 @@
         return refreshGadgetToken(null);
     }
 
+    function handleDetectAuthStatus(status, token, hasRetried, retryFn) {
+        if (status === 403 || (status === 401 && hasRetried)) {
+            clearStoredToken();
+            blockAccess();
+            return null;
+        }
+        return refreshGadgetToken(token).then(function (freshToken) {
+            if (!freshToken || accessBlocked) {
+                return null;
+            }
+            return retryFn(freshToken);
+        });
+    }
+
     function fetchDetectWithToken(ip, token, hasRetried, mode) {
         var resolvedMode = normalizeQueryMode(mode);
         return fetch(
@@ -1145,21 +1170,8 @@
                 headers: { 'Authorization': 'Bearer ' + token }
             }
         ).then(function (response) {
-            if (response.status === 403) {
-                clearStoredToken();
-                blockAccess();
-                return null;
-            }
-            if (response.status === 401) {
-                if (hasRetried) {
-                    clearStoredToken();
-                    blockAccess();
-                    return null;
-                }
-                return refreshGadgetToken(token).then(function (freshToken) {
-                    if (!freshToken || accessBlocked) {
-                        return null;
-                    }
+            if (response.status === 401 || response.status === 403) {
+                return handleDetectAuthStatus(response.status, token, hasRetried, function (freshToken) {
                     return fetchDetectWithToken(ip, freshToken, true, resolvedMode);
                 });
             }
@@ -1256,21 +1268,8 @@
                 batchEndpointSupported = false;
                 return { fallbackSingle: true };
             }
-            if (response.status === 403) {
-                clearStoredToken();
-                blockAccess();
-                return null;
-            }
-            if (response.status === 401) {
-                if (hasRetried) {
-                    clearStoredToken();
-                    blockAccess();
-                    return null;
-                }
-                return refreshGadgetToken(token).then(function (freshToken) {
-                    if (!freshToken || accessBlocked) {
-                        return null;
-                    }
+            if (response.status === 401 || response.status === 403) {
+                return handleDetectAuthStatus(response.status, token, hasRetried, function (freshToken) {
                     return fetchBatchDetectWithToken(ips, freshToken, true, resolvedMode);
                 });
             }
@@ -1367,10 +1366,7 @@
             });
         }).then(function (batchPayload) {
             if (batchPayload && batchPayload.fallbackSingle) {
-                if (batchDebounceTimer !== null) {
-                    window.clearTimeout(batchDebounceTimer);
-                    batchDebounceTimer = null;
-                }
+                clearBatchDebounceTimer();
                 var remainingItems = pendingBatchQueue.splice(0, pendingBatchQueue.length);
                 fallbackBatchItemsToSingle(bucketItems.concat(remainingItems));
                 return;
@@ -1416,10 +1412,7 @@
     }
 
     function flushPendingBatch() {
-        if (batchDebounceTimer !== null) {
-            window.clearTimeout(batchDebounceTimer);
-            batchDebounceTimer = null;
-        }
+        clearBatchDebounceTimer();
         if (accessBlocked) {
             clearRequestQueue();
             return;
@@ -1504,7 +1497,7 @@
         return false;
     }
 
-    function fetchIpIntelligence(ip, mode) {
+    function fetchIpIntelligence(ip, mode, options) {
         if (accessBlocked) {
             return Promise.resolve(null);
         }
@@ -1514,55 +1507,71 @@
         }
 
         var resolvedMode = normalizeQueryMode(mode);
+        var forceRefresh = Boolean(options && options.forceRefresh);
         if (resolvedMode === 'full') {
-            pruneExpiredFullMemoryCache(cacheKey);
-            if (ipFullPromiseCache.has(cacheKey)) {
-                return ipFullPromiseCache.get(cacheKey);
+            if (inflightFullPromisesByIp.has(cacheKey)) {
+                return inflightFullPromisesByIp.get(cacheKey);
             }
+            if (forceRefresh) {
+                invalidateIpResultCache(ip);
+            } else {
+                pruneExpiredFullMemoryCache(cacheKey);
+                if (ipFullPromiseCache.has(cacheKey)) {
+                    return ipFullPromiseCache.get(cacheKey);
+                }
 
-            var cachedLatestFull = latestResultByIp.get(cacheKey);
-            if (
-                cachedLatestFull &&
-                !isPartialLightResult(cachedLatestFull) &&
-                isMemoryFullResultFresh(cacheKey, cachedLatestFull)
-            ) {
-                var promotedPromise = Promise.resolve(cachedLatestFull);
-                ipFullPromiseCache.set(cacheKey, promotedPromise);
-                return promotedPromise;
-            }
+                var cachedLatestFull = latestResultByIp.get(cacheKey);
+                if (
+                    cachedLatestFull &&
+                    !isPartialLightResult(cachedLatestFull) &&
+                    isMemoryFullResultFresh(cacheKey, cachedLatestFull)
+                ) {
+                    var promotedPromise = Promise.resolve(cachedLatestFull);
+                    ipFullPromiseCache.set(cacheKey, promotedPromise);
+                    return promotedPromise;
+                }
 
-            var persistedFullEntry = readPersistedIpResultEntry(cacheKey);
-            if (persistedFullEntry && persistedFullEntry.data && !isPartialLightResult(persistedFullEntry.data)) {
-                recordLatestIpResult(cacheKey, persistedFullEntry.data);
-                recordFullResultMeta(cacheKey, persistedFullEntry.data, persistedFullEntry.ts);
-                var cachedFullPromise = Promise.resolve(persistedFullEntry.data);
-                ipFullPromiseCache.set(cacheKey, cachedFullPromise);
-                ipPromiseCache.set(cacheKey, cachedFullPromise);
-                return cachedFullPromise;
+                var persistedFullEntry = readPersistedIpResultEntry(cacheKey);
+                if (persistedFullEntry && persistedFullEntry.data && !isPartialLightResult(persistedFullEntry.data)) {
+                    recordLatestIpResult(cacheKey, persistedFullEntry.data);
+                    recordFullResultMeta(cacheKey, persistedFullEntry.data, persistedFullEntry.ts);
+                    var cachedFullPromise = Promise.resolve(persistedFullEntry.data);
+                    ipFullPromiseCache.set(cacheKey, cachedFullPromise);
+                    ipPromiseCache.set(cacheKey, cachedFullPromise);
+                    return cachedFullPromise;
+                }
             }
 
             var fullPromise = enqueueSingleIpDetection(ip, 'full').then(function (data) {
+                if (inflightFullPromisesByIp.get(cacheKey) === fullPromise) {
+                    inflightFullPromisesByIp.delete(cacheKey);
+                }
                 if (!data || typeof data !== 'object') {
-                    if (ipFullPromiseCache.get(cacheKey) === fullPromise) {
-                        ipFullPromiseCache.delete(cacheKey);
-                    }
                     return null;
                 }
+                var resolvedAliasKey = typeof data.ip === 'string' ? canonicalizeIpKey(data.ip) : '';
+                if (resolvedAliasKey && inflightFullPromisesByIp.get(resolvedAliasKey) === fullPromise) {
+                    inflightFullPromisesByIp.delete(resolvedAliasKey);
+                }
+                ipFullPromiseCache.set(cacheKey, fullPromise);
                 ipPromiseCache.set(cacheKey, fullPromise);
                 syncResolvedIpAliases(cacheKey, data, fullPromise, true, Date.now());
                 return data;
             }).catch(function (err) {
-                console.warn('[proxycheck] Full detection request failed for ' + ip + ':', err);
-                if (ipFullPromiseCache.get(cacheKey) === fullPromise) {
-                    ipFullPromiseCache.delete(cacheKey);
+                if (inflightFullPromisesByIp.get(cacheKey) === fullPromise) {
+                    inflightFullPromisesByIp.delete(cacheKey);
                 }
+                console.warn('[proxycheck] Full detection request failed for ' + ip + ':', err);
                 return null;
             });
 
-            ipFullPromiseCache.set(cacheKey, fullPromise);
+            inflightFullPromisesByIp.set(cacheKey, fullPromise);
             return fullPromise;
         }
 
+        if (inflightFullPromisesByIp.has(cacheKey)) {
+            return inflightFullPromisesByIp.get(cacheKey);
+        }
         pruneExpiredFullMemoryCache(cacheKey);
         if (ipFullPromiseCache.has(cacheKey)) {
             return ipFullPromiseCache.get(cacheKey);
@@ -1991,6 +2000,35 @@
         });
     }
 
+    function upsertProviderEntry(byKey, entries, key, value, provider) {
+        var entry = byKey.get(key);
+        if (!entry) {
+            entry = {
+                value: value,
+                providers: [],
+                showProviders: true,
+                defaultChecked: false
+            };
+            byKey.set(key, entry);
+            entries.push(entry);
+        }
+        if (provider && entry.providers.indexOf(provider) === -1) {
+            entry.providers.push(provider);
+        }
+    }
+
+    function collectGroupedProviderValues(rows, extractItem) {
+        var byKey = new Map();
+        var entries = [];
+        rows.forEach(function (row) {
+            var extracted = row ? extractItem(row) : null;
+            if (extracted && extracted.key && extracted.value) {
+                upsertProviderEntry(byKey, entries, extracted.key, extracted.value, row.provider || 'Provider');
+            }
+        });
+        return entries;
+    }
+
     function normalizeIspKey(value) {
         return value
             .toLowerCase()
@@ -2001,45 +2039,19 @@
     }
 
     function collectIspEntries(rows) {
-        var byKey = new Map();
-        var entries = [];
-
-        rows.forEach(function (row) {
-            var raw = '';
-            if (row && isUsableProviderValue(row.isp)) {
-                raw = row.isp;
-            } else if (row && isUsableProviderValue(row.organisation)) {
-                raw = row.organisation;
-            }
+        return collectGroupedProviderValues(rows, function (row) {
+            var raw = isUsableProviderValue(row.isp)
+                ? row.isp
+                : (isUsableProviderValue(row.organisation) ? row.organisation : '');
             if (!raw) {
-                return;
+                return null;
             }
             var cleaned = stripTrailingMetadataParens(raw, true);
             if (!isUsableProviderValue(cleaned)) {
-                return;
+                return null;
             }
-            var key = normalizeIspKey(cleaned);
-            if (!key) {
-                return;
-            }
-            var provider = (row && row.provider) || 'Provider';
-            var entry = byKey.get(key);
-            if (!entry) {
-                entry = {
-                    value: cleaned,
-                    providers: [],
-                    showProviders: true,
-                    defaultChecked: false
-                };
-                byKey.set(key, entry);
-                entries.push(entry);
-            }
-            if (entry.providers.indexOf(provider) === -1) {
-                entry.providers.push(provider);
-            }
+            return { key: normalizeIspKey(cleaned), value: cleaned };
         });
-
-        return entries;
     }
 
     function collapseLocationDuplicates(value) {
@@ -2062,37 +2074,17 @@
     }
 
     function collectLocationEntries(rows) {
-        var byKey = new Map();
-        var entries = [];
-
-        rows.forEach(function (row) {
-            if (!row || !isUsableProviderValue(row.location)) {
-                return;
+        return collectGroupedProviderValues(rows, function (row) {
+            if (!isUsableProviderValue(row.location)) {
+                return null;
             }
-            var stripped = stripTrailingMetadataParens(row.location, false);
-            var normalized = collapseLocationDuplicates(stripped);
+            var normalized = collapseLocationDuplicates(stripTrailingMetadataParens(row.location, false));
             if (!normalized) {
-                return;
+                return null;
             }
             var key = normalized.toLowerCase().replace(/\s*,\s*/g, ', ').replace(/\s+/g, ' ').trim();
-            var provider = row.provider || 'Provider';
-            var entry = byKey.get(key);
-            if (!entry) {
-                entry = {
-                    value: normalized,
-                    providers: [],
-                    showProviders: true,
-                    defaultChecked: false
-                };
-                byKey.set(key, entry);
-                entries.push(entry);
-            }
-            if (entry.providers.indexOf(provider) === -1) {
-                entry.providers.push(provider);
-            }
+            return { key: key, value: normalized };
         });
-
-        return entries;
     }
 
     function normalizeRiskFlagLabel(label) {
@@ -2130,21 +2122,7 @@
             if (!text) {
                 return;
             }
-            var key = text.toLowerCase();
-            var entry = byKey.get(key);
-            if (!entry) {
-                entry = {
-                    value: text,
-                    providers: [],
-                    showProviders: true,
-                    defaultChecked: false
-                };
-                byKey.set(key, entry);
-                entries.push(entry);
-            }
-            if (provider && entry.providers.indexOf(provider) === -1) {
-                entry.providers.push(provider);
-            }
+            upsertProviderEntry(byKey, entries, text.toLowerCase(), text, provider);
         }
 
         if (risk.isTor) {
@@ -2194,10 +2172,6 @@
         return entries;
     }
 
-    function isSpurIpInfoPage() {
-        return isContributionsSpecialPage();
-    }
-
     function extractDomLines(element) {
         if (!element) {
             return [];
@@ -2241,7 +2215,7 @@
 
     // Read Spur proxy types from MediaWiki IPInfo when rendered on contributions special pages
     function getSpurProxyText() {
-        if (!isSpurIpInfoPage()) {
+        if (!isContributionsSpecialPage()) {
             return '';
         }
         var $panel = $('.ext-ipinfo-panel-layout').first();
@@ -2371,6 +2345,37 @@
     }
 
     function buildUserscriptCss() {
+        var boldTiers = ['high', 'medium', 'nonpublic'];
+        var allTiers = ['high', 'medium', 'nonpublic', 'low'];
+        var ipBadgeTierRules = boldTiers.map(function (tier) {
+            return [
+                'a.proxycheck-ip-badge.proxycheck-tier-' + tier + ', a.proxycheck-ip-badge.proxycheck-tier-' + tier + ':visited {',
+                '  background-color: var(--proxycheck-' + tier + '-bg);',
+                '  color: var(--proxycheck-' + tier + '-color) !important;',
+                '  border: 1px solid var(--proxycheck-' + tier + '-border);',
+                '  font-weight: bold;',
+                '}'
+            ].join('\n');
+        });
+        var bannerTierRules = allTiers.map(function (tier) {
+            return [
+                '#proxycheck-pageinfo.proxycheck-banner-tier-' + tier + ' {',
+                '  border-left-color: var(--proxycheck-banner-' + tier + '-accent);',
+                '  background-color: var(--proxycheck-banner-' + tier + '-bg);',
+                '}'
+            ].join('\n');
+        });
+        var bannerBadgeTierRules = boldTiers.map(function (tier) {
+            return [
+                '.proxycheck-banner-badge.proxycheck-tier-' + tier + ' {',
+                '  background-color: var(--proxycheck-' + tier + '-bg);',
+                '  color: var(--proxycheck-' + tier + '-color);',
+                '  border: 1px solid var(--proxycheck-' + tier + '-border);',
+                '  font-weight: bold;',
+                '}'
+            ].join('\n');
+        });
+
         return [
             ':root {',
             '  --proxycheck-surface-bg: var(--background-color-interactive-subtle, #f8f9fa);',
@@ -2413,24 +2418,7 @@
             '  text-decoration: none;',
             '  white-space: nowrap;',
             '}',
-            'a.proxycheck-ip-badge.proxycheck-tier-high, a.proxycheck-ip-badge.proxycheck-tier-high:visited {',
-            '  background-color: var(--proxycheck-high-bg);',
-            '  color: var(--proxycheck-high-color) !important;',
-            '  border: 1px solid var(--proxycheck-high-border);',
-            '  font-weight: bold;',
-            '}',
-            'a.proxycheck-ip-badge.proxycheck-tier-medium, a.proxycheck-ip-badge.proxycheck-tier-medium:visited {',
-            '  background-color: var(--proxycheck-medium-bg);',
-            '  color: var(--proxycheck-medium-color) !important;',
-            '  border: 1px solid var(--proxycheck-medium-border);',
-            '  font-weight: bold;',
-            '}',
-            'a.proxycheck-ip-badge.proxycheck-tier-nonpublic, a.proxycheck-ip-badge.proxycheck-tier-nonpublic:visited {',
-            '  background-color: var(--proxycheck-nonpublic-bg);',
-            '  color: var(--proxycheck-nonpublic-color) !important;',
-            '  border: 1px solid var(--proxycheck-nonpublic-border);',
-            '  font-weight: bold;',
-            '}',
+            ipBadgeTierRules.join('\n'),
             'a.proxycheck-ip-badge.proxycheck-tier-low, a.proxycheck-ip-badge.proxycheck-tier-low:visited {',
             '  background-color: var(--proxycheck-low-bg);',
             '  color: var(--proxycheck-low-color) !important;',
@@ -2469,22 +2457,7 @@
             '  border-left: 4px solid var(--proxycheck-border-color);',
             '  border-radius: 2px;',
             '}',
-            '#proxycheck-pageinfo.proxycheck-banner-tier-high {',
-            '  border-left-color: var(--proxycheck-banner-high-accent);',
-            '  background-color: var(--proxycheck-banner-high-bg);',
-            '}',
-            '#proxycheck-pageinfo.proxycheck-banner-tier-medium {',
-            '  border-left-color: var(--proxycheck-banner-medium-accent);',
-            '  background-color: var(--proxycheck-banner-medium-bg);',
-            '}',
-            '#proxycheck-pageinfo.proxycheck-banner-tier-nonpublic {',
-            '  border-left-color: var(--proxycheck-banner-nonpublic-accent);',
-            '  background-color: var(--proxycheck-banner-nonpublic-bg);',
-            '}',
-            '#proxycheck-pageinfo.proxycheck-banner-tier-low {',
-            '  border-left-color: var(--proxycheck-banner-low-accent);',
-            '  background-color: var(--proxycheck-banner-low-bg);',
-            '}',
+            bannerTierRules.join('\n'),
             '#proxycheck-pageinfo code {',
             '  background-color: var(--proxycheck-code-bg);',
             '  color: inherit;',
@@ -2495,24 +2468,7 @@
             '  border-radius: 3px;',
             '  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;',
             '}',
-            '.proxycheck-banner-badge.proxycheck-tier-high {',
-            '  background-color: var(--proxycheck-high-bg);',
-            '  color: var(--proxycheck-high-color);',
-            '  border: 1px solid var(--proxycheck-high-border);',
-            '  font-weight: bold;',
-            '}',
-            '.proxycheck-banner-badge.proxycheck-tier-medium {',
-            '  background-color: var(--proxycheck-medium-bg);',
-            '  color: var(--proxycheck-medium-color);',
-            '  border: 1px solid var(--proxycheck-medium-border);',
-            '  font-weight: bold;',
-            '}',
-            '.proxycheck-banner-badge.proxycheck-tier-nonpublic {',
-            '  background-color: var(--proxycheck-nonpublic-bg);',
-            '  color: var(--proxycheck-nonpublic-color);',
-            '  border: 1px solid var(--proxycheck-nonpublic-border);',
-            '  font-weight: bold;',
-            '}',
+            bannerBadgeTierRules.join('\n'),
             '.proxycheck-banner-badge.proxycheck-tier-low {',
             '  background-color: var(--proxycheck-banner-low-badge-bg);',
             '  color: var(--proxycheck-low-color);',
@@ -2607,6 +2563,36 @@
         ].join('\n');
     }
 
+    function createEl(tag, className, text, attrs) {
+        var el = document.createElement(tag);
+        if (className) {
+            el.className = className;
+        }
+        if (text !== undefined && text !== null) {
+            if ('textContent' in el) {
+                el.textContent = String(text);
+            } else if (typeof el.appendChild === 'function') {
+                el.appendChild(document.createTextNode(String(text)));
+            }
+        }
+        if (attrs && typeof attrs === 'object') {
+            var attrKeys = Object.keys(attrs);
+            for (var i = 0; i < attrKeys.length; i++) {
+                var attrName = attrKeys[i];
+                var attrVal = attrs[attrName];
+                if (attrVal === undefined || attrVal === null || /^on/i.test(attrName)) {
+                    continue;
+                }
+                if (attrName === 'href' || attrName === 'title' || attrName === 'target' || attrName === 'rel' || attrName === 'id' || attrName === 'type') {
+                    el[attrName] = String(attrVal);
+                } else if (typeof el.setAttribute === 'function') {
+                    el.setAttribute(attrName, String(attrVal));
+                }
+            }
+        }
+        return el;
+    }
+
     function ensureUserscriptStyles() {
         if (stylesInjected || typeof document === 'undefined') {
             return;
@@ -2622,14 +2608,10 @@
             typeof document.createElement === 'function' &&
             typeof styleParent.appendChild === 'function'
         ) {
-            var styleElement = document.createElement('style');
-            styleElement.id = STYLE_ELEMENT_ID;
-            styleElement.type = 'text/css';
-            if ('textContent' in styleElement) {
-                styleElement.textContent = cssText;
-            } else {
-                styleElement.appendChild(document.createTextNode(cssText));
-            }
+            var styleElement = createEl('style', '', cssText, {
+                id: STYLE_ELEMENT_ID,
+                type: 'text/css'
+            });
             styleParent.appendChild(styleElement);
             stylesInjected = true;
             return;
@@ -2815,20 +2797,34 @@
             text: 'Copy result'
         });
         var resetTimerId = null;
+        var panelDisposed = false;
 
-        function scheduleCopyLabelReset(delayMs) {
+        function clearCopyResetTimer() {
             if (resetTimerId !== null) {
                 window.clearTimeout(resetTimerId);
+                resetTimerId = null;
+            }
+        }
+
+        function scheduleCopyLabelReset(delayMs) {
+            clearCopyResetTimer();
+            if (panelDisposed) {
+                return;
             }
             resetTimerId = window.setTimeout(function () {
                 resetTimerId = null;
-                $copyLink.text('Copy result');
+                if (!panelDisposed) {
+                    $copyLink.text('Copy result');
+                }
             }, delayMs);
         }
 
         $copyLink.on('click', function (event) {
             event.preventDefault();
             event.stopPropagation();
+            if (panelDisposed) {
+                return;
+            }
 
             var selectedValues = [];
             checkboxItems.forEach(function (item) {
@@ -2852,12 +2848,16 @@
             var commentBody = sanitizeHtmlCommentContent(selectedValues.join(', ')) + ' ' + BLOCK_REASON_ATTRIBUTION;
             var formattedResult = '<!-- ' + commentBody.trim() + ' -->';
             copyText(formattedResult).then(function () {
-                $copyLink.text('Copied');
-                scheduleCopyLabelReset(1500);
+                if (!panelDisposed) {
+                    $copyLink.text('Copied');
+                    scheduleCopyLabelReset(1500);
+                }
             }).catch(function (err) {
                 console.warn('[proxycheck] Failed to copy result:', err);
-                $copyLink.text('Copy failed');
-                scheduleCopyLabelReset(2000);
+                if (!panelDisposed) {
+                    $copyLink.text('Copy failed');
+                    scheduleCopyLabelReset(2000);
+                }
             });
         });
 
@@ -2865,8 +2865,19 @@
             style: 'margin-top: 8px; display: flex; align-items: center; gap: 12px;'
         }).append($copyLink);
 
+        $panel._proxycheckDispose = function () {
+            panelDisposed = true;
+            clearCopyResetTimer();
+        };
+
         $panel.append($table, $actions);
         return $panel;
+    }
+
+    function disposeDetailsPanel($panel) {
+        if ($panel && typeof $panel._proxycheckDispose === 'function') {
+            $panel._proxycheckDispose();
+        }
     }
 
     function copyText(text) {
@@ -2875,9 +2886,8 @@
         }
 
         return new Promise(function (resolve, reject) {
-            var textarea = document.createElement('textarea');
+            var textarea = createEl('textarea', '', null, { readonly: '' });
             textarea.value = text;
-            textarea.setAttribute('readonly', '');
             textarea.style.position = 'fixed';
             textarea.style.opacity = '0';
             document.body.appendChild(textarea);
@@ -2994,16 +3004,66 @@
         badge.title = buildBadgeTitleText(data, risk);
     }
 
+    function isBadgeDetached(badge) {
+        if (!badge) {
+            return true;
+        }
+        if (badge.isConnected === false) {
+            return true;
+        }
+        if (
+            typeof document !== 'undefined' &&
+            document.body &&
+            typeof document.body.contains === 'function' &&
+            !document.body.contains(badge)
+        ) {
+            return true;
+        }
+        return false;
+    }
+
+    function filterConnectedBadgeEntries(entries) {
+        var active = [];
+        if (!entries) {
+            return active;
+        }
+        for (var i = 0; i < entries.length; i++) {
+            var entry = entries[i];
+            if (entry && entry.anchor && entry.badge && !isBadgeDetached(entry.badge)) {
+                active.push(entry);
+            }
+        }
+        return active;
+    }
+
     function registerRenderedBadge(cacheKey, anchor, badge, ip) {
         if (!cacheKey || !anchor || !badge) {
             return;
         }
-        var existingEntries = renderedBadgeEntriesByIp.get(cacheKey);
-        if (!existingEntries) {
-            existingEntries = [];
-            renderedBadgeEntriesByIp.set(cacheKey, existingEntries);
+        var activeEntries = filterConnectedBadgeEntries(renderedBadgeEntriesByIp.get(cacheKey));
+        activeEntries.push({ anchor: anchor, badge: badge, ip: ip });
+        renderedBadgeEntriesByIp.set(cacheKey, activeEntries);
+
+        if (renderedBadgeEntriesByIp.size > RESULT_CACHE_MAX_ENTRIES) {
+            renderedBadgeEntriesByIp.forEach(function (group, groupKey) {
+                if (groupKey === cacheKey) {
+                    return;
+                }
+                var retained = filterConnectedBadgeEntries(group);
+                if (retained.length > 0) {
+                    renderedBadgeEntriesByIp.set(groupKey, retained);
+                } else {
+                    renderedBadgeEntriesByIp.delete(groupKey);
+                }
+            });
+            while (renderedBadgeEntriesByIp.size > RESULT_CACHE_MAX_ENTRIES) {
+                var oldestKey = renderedBadgeEntriesByIp.keys().next().value;
+                if (!oldestKey || oldestKey === cacheKey) {
+                    break;
+                }
+                renderedBadgeEntriesByIp.delete(oldestKey);
+            }
         }
-        existingEntries.push({ anchor: anchor, badge: badge, ip: ip });
     }
 
     function refreshRenderedBadgesForIp(ip, fullData) {
@@ -3011,29 +3071,30 @@
         if (!cacheKey || !fullData || typeof fullData !== 'object') {
             return;
         }
-        var entries = renderedBadgeEntriesByIp.get(cacheKey);
-        if (!entries || entries.length === 0) {
+        var activeEntries = filterConnectedBadgeEntries(renderedBadgeEntriesByIp.get(cacheKey));
+        if (activeEntries.length === 0) {
+            renderedBadgeEntriesByIp.delete(cacheKey);
             return;
         }
-        var activeEntries = [];
-        for (var i = 0; i < entries.length; i++) {
-            var entry = entries[i];
-            if (!entry || !entry.anchor || !entry.badge) {
-                continue;
-            }
-            // Drop detached DOM entries when a real browser document has updated the page
-            if (typeof document !== 'undefined' && document.body && typeof document.body.contains === 'function' &&
-                !document.body.contains(entry.badge)) {
-                continue;
-            }
+        for (var i = 0; i < activeEntries.length; i++) {
+            var entry = activeEntries[i];
             applyRiskStylingToAnchorAndBadge(entry.anchor, entry.badge, fullData, fullData.ip || entry.ip, true);
-            activeEntries.push(entry);
         }
-        if (activeEntries.length > 0) {
-            renderedBadgeEntriesByIp.set(cacheKey, activeEntries);
-        } else {
-            renderedBadgeEntriesByIp.delete(cacheKey);
-        }
+        renderedBadgeEntriesByIp.set(cacheKey, activeEntries);
+    }
+
+    function requestFullIpUpgrade(targetIp, forceRefresh) {
+        return fetchIpIntelligence(
+            targetIp,
+            'full',
+            forceRefresh ? { forceRefresh: true } : undefined
+        ).then(function (fullData) {
+            if (!fullData || typeof fullData !== 'object') {
+                return null;
+            }
+            refreshRenderedBadgesForIp(fullData.ip || targetIp, fullData);
+            return fullData;
+        });
     }
 
     function showInfoDialog(data, ip) {
@@ -3050,10 +3111,13 @@
             var $message = $('<div>');
             var $panelContainer = $('<div>', { 'class': 'proxycheck-dialog-content' });
             var $retryContainer = $('<div>');
+            var activeDetailsPanel = null;
             var dialogClosed = false;
             var retryInFlight = false;
 
             function renderDialogBody(dialogData, dialogRisk) {
+                disposeDetailsPanel(activeDetailsPanel);
+                activeDetailsPanel = null;
                 $panelContainer.empty();
                 if (dialogRisk.isNonPublic) {
                     $panelContainer.append(
@@ -3067,7 +3131,8 @@
                         )
                     );
                 } else {
-                    $panelContainer.append(buildResultDetailsPanel(dialogData, dialogRisk));
+                    activeDetailsPanel = buildResultDetailsPanel(dialogData, dialogRisk);
+                    $panelContainer.append(activeDetailsPanel);
                 }
             }
 
@@ -3090,6 +3155,17 @@
                     'class': 'proxycheck-retry-full-btn',
                     text: 'Retry Full Check'
                 });
+                function restoreAfterRetryFailure(previousData) {
+                    retryInFlight = false;
+                    if (cacheKey && previousData) {
+                        recordLatestIpResult(cacheKey, previousData);
+                    }
+                    if (!dialogClosed) {
+                        $statusLabel.text('Full check retry failed. ');
+                        $retryBtn.prop('disabled', false).text('Retry Full Check');
+                    }
+                }
+
                 $retryBtn.on('click', function (event) {
                     event.preventDefault();
                     event.stopPropagation();
@@ -3099,22 +3175,14 @@
                     retryInFlight = true;
                     $retryBtn.prop('disabled', true).text('Retrying full check...');
                     var previousData = activeData;
-                    invalidateIpResultCache(targetIp);
 
-                    fetchIpIntelligence(targetIp, 'full').then(function (retryData) {
-                        retryInFlight = false;
-                        if (!retryData || typeof retryData !== 'object') {
-                            if (cacheKey && previousData) {
-                                recordLatestIpResult(cacheKey, previousData);
-                            }
-                            if (!dialogClosed) {
-                                $statusLabel.text('Full check retry failed. ');
-                                $retryBtn.prop('disabled', false).text('Retry Full Check');
-                            }
+                    requestFullIpUpgrade(targetIp, true).then(function (retryData) {
+                        if (!retryData) {
+                            restoreAfterRetryFailure(previousData);
                             return;
                         }
+                        retryInFlight = false;
                         activeData = retryData;
-                        refreshRenderedBadgesForIp(retryData.ip || targetIp, retryData);
                         if (dialogClosed) {
                             return;
                         }
@@ -3122,14 +3190,7 @@
                         renderDialogBody(retryData, retryRisk);
                         syncDegradedRetrySection(retryData, retryRisk);
                     }).catch(function () {
-                        retryInFlight = false;
-                        if (cacheKey && previousData) {
-                            recordLatestIpResult(cacheKey, previousData);
-                        }
-                        if (!dialogClosed) {
-                            $statusLabel.text('Full check retry failed. ');
-                            $retryBtn.prop('disabled', false).text('Retry Full Check');
-                        }
+                        restoreAfterRetryFailure(previousData);
                     });
                 });
 
@@ -3161,15 +3222,14 @@
                 }).text('Loading full commercial provider intelligence...');
                 $message.append($upgradeNotice);
 
-                fetchIpIntelligence(targetIp, 'full').then(function (fullData) {
-                    if (!fullData || typeof fullData !== 'object') {
+                requestFullIpUpgrade(targetIp, false).then(function (fullData) {
+                    if (!fullData) {
                         if (!dialogClosed && $upgradeNotice) {
                             $upgradeNotice.text('Full commercial intelligence unavailable right now.');
                         }
                         return;
                     }
                     activeData = fullData;
-                    refreshRenderedBadgesForIp(fullData.ip || targetIp, fullData);
                     if (dialogClosed) {
                         return;
                     }
@@ -3194,9 +3254,13 @@
                 })
             ).then(function (dialogResult) {
                 dialogClosed = true;
+                disposeDetailsPanel(activeDetailsPanel);
+                activeDetailsPanel = null;
                 return dialogResult;
             }, function (dialogErr) {
                 dialogClosed = true;
+                disposeDetailsPanel(activeDetailsPanel);
+                activeDetailsPanel = null;
                 throw dialogErr;
             });
         }).catch(function (err) {
@@ -3229,24 +3293,13 @@
         }
 
         ensureUserscriptStyles();
-        var badge = document.createElement('a');
-        badge.className = BADGE_CLASS + (options.extraClass ? ' ' + options.extraClass : '');
-        badge.href = '#';
-        if (typeof badge.setAttribute === 'function') {
-            badge.setAttribute('role', 'button');
-        }
-        badge.textContent = options.text;
-        badge.title = options.title;
+        var badge = createEl(
+            'a',
+            BADGE_CLASS + (options.extraClass ? ' ' + options.extraClass : ''),
+            options.text,
+            { href: '#', role: 'button', title: options.title }
+        );
         applyBaseBadgeStyle(badge);
-        if (options.backgroundColor) {
-            badge.style.backgroundColor = options.backgroundColor;
-        }
-        if (options.color) {
-            badge.style.color = options.color;
-        }
-        if (options.border) {
-            badge.style.border = options.border;
-        }
         badge.style.cursor = 'pointer';
 
         badge.addEventListener('click', function (event) {
@@ -3371,10 +3424,10 @@
             }
 
             var resolvedIp = data.ip || ip;
-            var badge = document.createElement('a');
-            badge.className = BADGE_CLASS;
-            badge.target = '_blank';
-            badge.rel = 'noopener noreferrer';
+            var badge = createEl('a', BADGE_CLASS, null, {
+                target: '_blank',
+                rel: 'noopener noreferrer'
+            });
             badge.addEventListener('click', function (event) {
                 event.preventDefault();
                 event.stopPropagation();
@@ -3688,10 +3741,7 @@
             return;
         }
 
-        if (ipContributionsFallbackTimer !== null) {
-            window.clearTimeout(ipContributionsFallbackTimer);
-            ipContributionsFallbackTimer = null;
-        }
+        clearContributionsFallbackTimer();
 
         ipContributionsPending = true;
         var $box = null;
@@ -3824,8 +3874,11 @@
 
             var isStatsExpanded = false;
             var fullUpgradeRequested = false;
+            var activeBannerDetailsPanel = null;
 
             function renderContributionsBannerData(bannerData) {
+                disposeDetailsPanel(activeBannerDetailsPanel);
+                activeBannerDetailsPanel = null;
                 var risk = evaluateRisk(bannerData);
                 var resolvedIp = bannerData.ip || targetIp;
                 var $activeBox = ($box && $box.length > 0) ? $box : $('#proxycheck-pageinfo');
@@ -3845,10 +3898,12 @@
                             'class': badgeClass,
                             text: 'ProxyCheck [' + risk.nonPublicBadgeCode + ']'
                         }),
-                        $('<span>').html(
-                            ' &middot; <b>Address Type:</b> ' + mw.html.escape(risk.nonPublicReason) +
-                            ' &middot; <b>Status:</b> External threat lookups skipped (non-public or reserved IP)' +
-                            ' &middot; '
+                        $('<span>').append(
+                            document.createTextNode(' \u00b7 '),
+                            $('<b>').text('Address Type:'),
+                            document.createTextNode(' ' + risk.nonPublicReason + ' \u00b7 '),
+                            $('<b>').text('Status:'),
+                            document.createTextNode(' External threat lookups skipped (non-public or reserved IP) \u00b7 ')
                         ),
                         $('<a>', {
                             href: TOOL_BASE_URL + '/?ip=' + encodeURIComponent(resolvedIp),
@@ -3927,10 +3982,11 @@
                 );
 
                 var renderedSpurText = getSpurProxyText();
+                activeBannerDetailsPanel = buildResultDetailsPanel(bannerData, risk);
                 var $detailsWrapper = $('<div>', {
                     'class': 'proxycheck-pageinfo-details',
                     style: isStatsExpanded ? 'display: block;' : 'display: none;'
-                }).append(buildResultDetailsPanel(bannerData, risk));
+                }).append(activeBannerDetailsPanel);
 
                 refreshPageInfoSpur = function () {
                     var latestSpurText = getSpurProxyText();
@@ -3938,7 +3994,9 @@
                         return;
                     }
                     renderedSpurText = latestSpurText;
-                    $detailsWrapper.empty().append(buildResultDetailsPanel(bannerData, risk));
+                    disposeDetailsPanel(activeBannerDetailsPanel);
+                    activeBannerDetailsPanel = buildResultDetailsPanel(bannerData, risk);
+                    $detailsWrapper.empty().append(activeBannerDetailsPanel);
                 };
 
                 var $statsToggle = $('<a>', {
@@ -3966,16 +4024,14 @@
                         }).text('Loading full commercial provider intelligence...');
                         $detailsWrapper.append($bannerUpgradeNotice);
 
-                        fetchIpIntelligence(resolvedIp, 'full').then(function (fullData) {
-                            if (!fullData || typeof fullData !== 'object') {
+                        requestFullIpUpgrade(resolvedIp, false).then(function (fullData) {
+                            if (!fullData) {
                                 $bannerUpgradeNotice.text('Full commercial intelligence unavailable right now.');
                                 return;
                             }
-                            refreshRenderedBadgesForIp(fullData.ip || resolvedIp, fullData);
-                            if (!ensureBannerAttached()) {
-                                return;
+                            if (ensureBannerAttached()) {
+                                renderContributionsBannerData(fullData);
                             }
-                            renderContributionsBannerData(fullData);
                         });
                     }
                 });
@@ -4006,13 +4062,11 @@
                             return;
                         }
                         $bannerRetryFull.text('Retrying...');
-                        invalidateIpResultCache(resolvedIp);
-                        fetchIpIntelligence(resolvedIp, 'full').then(function (retryData) {
-                            if (!retryData || typeof retryData !== 'object') {
+                        requestFullIpUpgrade(resolvedIp, true).then(function (retryData) {
+                            if (!retryData) {
                                 $bannerRetryFull.text('Retry Full Check ↻');
                                 return;
                             }
-                            refreshRenderedBadgesForIp(retryData.ip || resolvedIp, retryData);
                             if (ensureBannerAttached()) {
                                 renderContributionsBannerData(retryData);
                             }
@@ -4043,12 +4097,8 @@
                             return;
                         }
                         fullUpgradeRequested = true;
-                        fetchIpIntelligence(targetIp, 'full').then(function (fullData) {
-                            if (!fullData || typeof fullData !== 'object') {
-                                return;
-                            }
-                            refreshRenderedBadgesForIp(fullData.ip || targetIp, fullData);
-                            if (ensureBannerAttached()) {
+                        requestFullIpUpgrade(targetIp, false).then(function (fullData) {
+                            if (fullData && ensureBannerAttached()) {
                                 renderContributionsBannerData(fullData);
                             }
                         }).catch(function (err) {
@@ -4089,15 +4139,12 @@
                 return null;
             }
 
+            var loadingFrames = ['.\u00a0\u00a0', '\u00a0.\u00a0', '\u00a0\u00a0.'];
+            var loadingFrameIndex = 0;
             clearLoadingInterval();
             activeLoadingInterval = window.setInterval(function () {
-                if ($result.html() === '.&nbsp;&nbsp;') {
-                    $result.html('&nbsp;.&nbsp;');
-                } else if ($result.html() === '&nbsp;.&nbsp;') {
-                    $result.html('&nbsp;&nbsp;.');
-                } else {
-                    $result.html('.&nbsp;&nbsp;');
-                }
+                $result.text(loadingFrames[loadingFrameIndex]);
+                loadingFrameIndex = (loadingFrameIndex + 1) % loadingFrames.length;
             }, 300);
 
             return new Promise(function (resolve) {

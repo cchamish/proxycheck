@@ -5,6 +5,7 @@ import copy
 import json
 import os
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -17,16 +18,24 @@ from django.test import SimpleTestCase, TestCase, override_settings
 
 from detector import cache_backends, dns_providers, providers, sanitization, views
 from detector.adapters import (
+    ADAPTER_DISPATCH_TABLE,
     _safe_int,
     adapt_abuseipdb,
     adapt_cloudflare_radar,
+    adapt_dshield,
     adapt_getipintel,
     adapt_ip2location,
     adapt_ipdata,
     adapt_iphub,
     adapt_iphunter,
     adapt_ipregistry,
+    adapt_ipsum_drop,
     adapt_maxmind,
+    adapt_shodan_internetdb,
+    adapt_spamhaus_zen,
+    adapt_stopforumspam,
+    adapt_tor_onionoo,
+    adapt_x4bnet_vpn,
     classify_rdns_hostname,
     compute_cidr_attribution,
 )
@@ -279,7 +288,7 @@ class UpstreamPayloadDefenceTests(TestCase):
 
                 self.assertEqual(response.status_code, 200)
                 rows = {row["provider"]: row for row in response.json()["results"]}
-                self.assertEqual(len(rows), 14)
+                self.assertEqual(len(rows), 17)
                 self.assertNotIn("Tor Onionoo", rows)
                 for provider in expected_format_errors:
                     self.assertEqual(rows[provider]["status"], "502 Error", provider)
@@ -450,12 +459,13 @@ class AggregationAndCacheIntegrityTests(TestCase):
                     response = self.client.get("/api/v1/detect?ip=8.8.8.8")
 
                 self.assertEqual(response.status_code, 200)
+                ns = cache_backends.get_redis_namespace()
                 written_keys = [c.args[0] for c in mock_redis.set.call_args_list]
-                self.assertFalse(any(k.startswith("proxycheck:v1:prov:") for k in written_keys))
+                self.assertFalse(any(k.startswith((f"{ns}:prov:", f"{ns}:snap:")) for k in written_keys))
                 cooldown_calls = [
-                    c for c in mock_redis.set.call_args_list if c.args[0].startswith("proxycheck:v1:cooldown:")
+                    c for c in mock_redis.set.call_args_list if c.args[0].startswith(f"{ns}:cooldown:")
                 ]
-                self.assertEqual(len(cooldown_calls), 13)
+                self.assertEqual(len(cooldown_calls), 14)
                 for call_obj in cooldown_calls:
                     self.assertEqual(call_obj.kwargs.get("ex"), 120)
 
@@ -606,9 +616,12 @@ class ReverseDnsAndCidrAttributionTests(TestCase):
         async def _fake_get(key):
             return cache_store.get(key)
 
-        async def _fake_set(key, val, ex=None):
+        async def _fake_set(key, val, ex=None, nx=False):
+            if nx and key in cache_store:
+                return False
             cache_store[key] = val
             written_ttls[key] = ex
+            return True
 
         mock_redis = MagicMock()
         mock_redis.get = AsyncMock(side_effect=_fake_get)
@@ -629,9 +642,11 @@ class ReverseDnsAndCidrAttributionTests(TestCase):
         timeout_data = timeout_resp.json()
         self.assertIsNone(timeout_data["ptrHostname"])
         self.assertEqual(timeout_data["recommendedCidr"], "8.8.8.0/24")
-        self.assertNotIn("proxycheck:v1:prov:ptr:8.8.8.8", cache_store)
-        self.assertNotIn("proxycheck:v1:cooldown:ptr", cache_store)
-        self.assertEqual(written_ttls.get("proxycheck:v1:prov:cloudflare_radar:8.8.8.8"), 86400)
+        ptr_key = cache_backends.provider_cache_key("ptr", "8.8.8.8")
+        cf_key = cache_backends.provider_cache_key("cloudflare_radar", "8.8.8.8")
+        self.assertNotIn(ptr_key, cache_store)
+        self.assertNotIn(cache_backends.provider_cooldown_key("ptr"), cache_store)
+        self.assertEqual(written_ttls.get(cf_key), 86400)
         self.assertEqual(mock_cf.call_count, 1)
 
         # Subsequent lookup recovers PTR using cached providers without re-querying HTTP APIs
@@ -652,7 +667,7 @@ class ReverseDnsAndCidrAttributionTests(TestCase):
         self.assertFalse(ok_data["isCached"])
         self.assertTrue(ok_data["cacheMeta"]["isPartial"])
         self.assertEqual(ok_data["cacheMeta"]["status"], "partial")
-        self.assertEqual(written_ttls.get("proxycheck:v1:prov:ptr:8.8.8.8"), 7200)
+        self.assertEqual(written_ttls.get(ptr_key), 7200)
         self.assertEqual(mock_cf.call_count, 1)
 
 
@@ -813,6 +828,239 @@ class FlagBasedArbitrationTests(SimpleTestCase):
         self.assertTrue(confirmed_result["isMajorityProxyVpn"])
         self.assertEqual(confirmed_result["arbitrationTier"], "destructive")
         self.assertIn("Confirmed Proxy", confirmed_result["arbitrationVerdict"])
+
+
+class NewIntelligenceAdapterAndQueryTests(SimpleTestCase):
+    """Tests confidence-tiered GetIPIntel thresholds, new offline and Shodan adapters, and Onionoo mirror lookups."""
+
+    def test_getipintel_confidence_thresholds_and_arbitration_weights(self):
+        cases = (
+            ("zero", "0.0", 0.0, False, 0.0, "No Flags"),
+            ("below_20", "0.199", 19.9, False, 0.0, "No Flags"),
+            ("moderate_low", "0.20", 20.0, False, 0.0, "Moderate Prediction"),
+            ("below_75", "0.749", 74.9, False, 0.0, "Moderate Prediction"),
+            ("partial_lower_bound", "0.75", 75.0, False, 0.5, "Moderate Prediction"),
+            ("partial_upper_bound", "0.899", 89.9, False, 0.5, "Moderate Prediction"),
+            ("high_risk_bound", "0.90", 90.0, True, 1.0, "High-Probability Proxy/VPN"),
+            ("high_risk_peak", "0.985", 98.5, True, 1.0, "High-Probability Proxy/VPN"),
+        )
+        for label, raw_score, expected_chance, expected_high_risk, expected_weight, expected_flag in cases:
+            with self.subTest(case=label):
+                row = adapt_getipintel({"status": "success", "result": raw_score}, True, 200)
+                self.assertEqual(row["status"], "200 OK")
+                self.assertEqual(row["chance"], expected_chance)
+                self.assertEqual(row["arbitrationWeight"], expected_weight)
+                self.assertEqual(row["securityFlags"], [{"label": expected_flag, "isHighRisk": expected_high_risk}])
+
+        unconfigured = adapt_getipintel(None, False)
+        self.assertEqual(unconfigured["status"], "No API Key")
+        self.assertEqual(unconfigured["arbitrationWeight"], 0.0)
+
+    def test_ipsum_drop_x4bnet_and_shodan_adapters_and_dispatch_table(self):
+        self.assertEqual(set(ADAPTER_DISPATCH_TABLE), {meta.key for meta in PROVIDER_REGISTRY})
+
+        self.assertEqual(adapt_ipsum_drop(None, has_db=False)["status"], "Offline DB Missing")
+        ipsum_mod = adapt_ipsum_drop({"ipsumScore": 2, "inSpamhausDrop": False, "isIpsumListed": True})
+        self.assertEqual(ipsum_mod["status"], "200 OK")
+        self.assertFalse(any(f["isHighRisk"] for f in ipsum_mod["securityFlags"]))
+        self.assertIn("Moderate", ipsum_mod["usageType"])
+
+        ipsum_high = adapt_ipsum_drop({"ipsumScore": 4, "inSpamhausDrop": False, "isIpsumListed": True})
+        self.assertTrue(any(f["isHighRisk"] for f in ipsum_high["securityFlags"]))
+
+        drop_hit = adapt_ipsum_drop({"ipsumScore": 0, "inSpamhausDrop": True, "dropSblId": "SBL12345"})
+        self.assertTrue(any(f["isHighRisk"] and "SBL12345" in f["label"] for f in drop_hit["securityFlags"]))
+
+        self.assertEqual(adapt_x4bnet_vpn(None, has_db=False)["status"], "Offline DB Missing")
+        x4b_vpn = adapt_x4bnet_vpn({"isListed": True, "isVpn": True, "isHosting": False, "matchedCidr": "198.51.100.0/24"})
+        self.assertTrue(any(f["isHighRisk"] and "VPN" in f["label"] for f in x4b_vpn["securityFlags"]))
+        x4b_dc = adapt_x4bnet_vpn({"isListed": True, "isVpn": False, "isDatacenter": True, "isHosting": True})
+        self.assertFalse(any(f["isHighRisk"] for f in x4b_dc["securityFlags"]))
+        self.assertTrue(any("Hosting" in f["label"] for f in x4b_dc["securityFlags"]))
+
+        shodan_404 = adapt_shodan_internetdb({"detail": "No information available"}, status_code=404)
+        self.assertEqual(shodan_404["status"], "200 OK")
+        self.assertEqual(shodan_404["statusCode"], 200)
+        self.assertEqual(shodan_404["ports"], [])
+        self.assertEqual(shodan_404["openProxyPorts"], [])
+
+        shodan_hit = adapt_shodan_internetdb(
+            {
+                "ports": [8080, 443, 1080, 22],
+                "tags": ["proxy", "cloud", "cve-2024-9999"],
+                "hostnames": ["exit.example.net."],
+                "vulns": ["CVE-2024-9999"],
+            },
+            status_code=200,
+        )
+        self.assertEqual(shodan_hit["openProxyPorts"], [1080, 8080])
+        self.assertEqual(shodan_hit["tags"], ["proxy", "cloud"])
+        self.assertEqual(shodan_hit["hostnames"], ["exit.example.net"])
+        self.assertTrue(any(f["isHighRisk"] and "1080, 8080" in f["label"] for f in shodan_hit["securityFlags"]))
+
+        shodan_v6 = adapt_shodan_internetdb({"status": "skipped_ipv6"}, status_code=200)
+        self.assertEqual(shodan_v6["status"], "Skipped (IPv6)")
+        self.assertIsNone(shodan_v6["statusCode"])
+
+    async def test_shodan_internetdb_and_tor_onionoo_query_behaviours(self):
+        http_client_mock = AsyncMock()
+        v6_row = await providers.query_shodan_internetdb(http_client_mock, "2001:4860:4860::8888")
+        self.assertEqual(v6_row["status"], "Skipped (IPv6)")
+        http_client_mock.get.assert_not_awaited()
+
+        http_client_mock.get.return_value = _mock_response(
+            status_code=404,
+            json_value={"detail": "No information available"},
+        )
+        events = {}
+        token = dns_providers.provider_upstream_events.set(events)
+        try:
+            shodan_empty = await providers.query_shodan_internetdb(http_client_mock, "198.51.100.10")
+        finally:
+            dns_providers.provider_upstream_events.reset(token)
+        self.assertEqual(shodan_empty["status"], "200 OK")
+        self.assertEqual(shodan_empty["openProxyPorts"], [])
+        self.assertFalse(events["shodan_internetdb"]["trigger"])
+        self.assertEqual(events["shodan_internetdb"]["statusCode"], 200)
+
+        http_client_mock.get.reset_mock()
+        with patch(
+            "detector.offline_dbs.lookup_tor_onionoo_offline",
+            return_value={"relays": [{"a": ["185.220.101.4"], "running": True, "flags": ["Exit", "Running"]}]},
+        ):
+            offline_tor = await providers.query_tor_onionoo(http_client_mock, "185.220.101.4")
+        self.assertTrue(offline_tor["isTor"])
+        self.assertTrue(offline_tor["torIsExit"])
+        http_client_mock.get.assert_not_awaited()
+
+        with patch("detector.offline_dbs.lookup_tor_onionoo_offline", return_value={"relays": []}):
+            offline_clean = await providers.query_tor_onionoo(http_client_mock, "8.8.8.8")
+        self.assertFalse(offline_clean["isTor"])
+        http_client_mock.get.assert_not_awaited()
+
+        http_client_mock.get.return_value = _mock_response(status_code=200, json_value={"relays": []})
+        with patch("detector.offline_dbs.lookup_tor_onionoo_offline", return_value=None):
+            fallback_tor = await providers.query_tor_onionoo(http_client_mock, "8.8.8.8")
+        self.assertEqual(fallback_tor["status"], "200 OK")
+        http_client_mock.get.assert_awaited_once()
+
+
+class ConfidenceWeightedArbitrationAndParadoxTests(SimpleTestCase):
+    """Tests residential proxy signal paradox detection, shared privacy egress, and arbitration weighting."""
+
+    @staticmethod
+    def _res_row(provider: str, usage: str = "isp") -> dict:
+        return {
+            "provider": provider,
+            "status": "200 OK",
+            "statusCode": 200,
+            "asn": "AS7922",
+            "isp": "Comcast Cable",
+            "organisation": "Comcast Cable",
+            "location": "United States",
+            "usageType": usage,
+            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
+            "countryCode": "US",
+            "rawJson": {},
+        }
+
+    def test_residential_proxy_signal_paradox_matrix(self):
+        recent_iso = (datetime.now(timezone.utc) - timedelta(days=4)).isoformat()
+        stale_iso = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
+
+        base_res = [self._res_row("IPHub", "residential"), self._res_row("IPData", "isp")]
+        shodan_ports = adapt_shodan_internetdb({"ports": [1080, 443]}, status_code=200)
+        shodan_tag = adapt_shodan_internetdb({"ports": [443], "tags": ["compromised"]}, status_code=200)
+        ipsum_3 = adapt_ipsum_drop({"ipsumScore": 3, "isIpsumListed": True})
+        ipsum_2 = adapt_ipsum_drop({"ipsumScore": 2, "isIpsumListed": True})
+        sfs_recent = adapt_stopforumspam(
+            {"success": 1, "ip": {"appears": 1, "frequency": 6, "lastseen": recent_iso}},
+            status_code=200,
+        )
+        sfs_stale = adapt_stopforumspam(
+            {"success": 1, "ip": {"appears": 1, "frequency": 6, "lastseen": stale_iso}},
+            status_code=200,
+        )
+        dshield_recent = adapt_dshield({"ip": {"attacks": 15, "count": 5, "maxdate": recent_iso[:10]}}, 200)
+
+        cases = (
+            ("res_sources_plus_shodan_port", [*base_res, shodan_ports], None, None, True),
+            ("ptr_dynamic_plus_shodan_tag", [self._res_row("IPHub", "unknown"), shodan_tag], "p1.dip0.t-ipconnect.de", None, True),
+            ("res_plus_ipsum3_and_recent_sfs", [*base_res, ipsum_3, sfs_recent], None, None, True),
+            ("res_plus_ipsum3_and_recent_dshield", [*base_res, ipsum_3, dshield_recent], None, None, True),
+            ("stale_sfs_over_30d_rejected", [*base_res, ipsum_3, sfs_stale], None, None, False),
+            ("moderate_ipsum2_rejected", [*base_res, ipsum_2, sfs_recent], None, None, False),
+            ("datacentre_not_residential", [self._res_row("IPHub", "hosting"), shodan_ports], None, None, False),
+            ("privacy_egress_excluded", [*base_res, shodan_ports], None, "icloud_private_relay", False),
+            (
+                "tor_excluded",
+                [*base_res, shodan_ports, adapt_tor_onionoo({"relays": [{"a": ["1.2.3.4"], "running": True}]}, 200, "1.2.3.4")],
+                None,
+                None,
+                False,
+            ),
+        )
+        for label, rows, ptr_host, privacy_kind, expected_paradox in cases:
+            with self.subTest(case=label):
+                with patch("detector.cidr_attribution.lookup_privacy_relay_offline", return_value=privacy_kind):
+                    agg = views.aggregate_intelligence_metrics("1.2.3.4", rows, ptr_hostname=ptr_host)
+                self.assertEqual(agg["suspectedResidentialProxy"], expected_paradox)
+                if expected_paradox:
+                    self.assertEqual(agg["arbitrationVerdict"], "Suspected Residential Proxy / Compromised Host")
+                    self.assertIn(agg["arbitrationTier"], ("warning", "destructive"))
+
+    def test_shared_privacy_egress_and_weighted_osint_arbitration(self):
+        relay_rows = [
+            adapt_ipregistry(
+                {"connection": {"type": "hosting", "asn": 13335}, "security": {"is_vpn": True, "is_relay": True}},
+                has_api_key=True,
+            ),
+            adapt_ipdata({"ip": "104.28.1.1", "threat": {"is_icloud_relay": True}}, has_api_key=True),
+        ]
+        with patch("detector.cidr_attribution.lookup_privacy_relay_offline", return_value="cloudflare_warp"):
+            clean_warp = views.aggregate_intelligence_metrics("104.28.1.1", relay_rows)
+        self.assertEqual(
+            clean_warp["arbitrationVerdict"],
+            "Shared Privacy Egress (iCloud Relay / WARP — Soft Block Recommended)",
+        )
+        self.assertEqual(clean_warp["arbitrationTier"], "warning")
+        self.assertFalse(clean_warp["isMajorityProxyVpn"])
+
+        high_abuse = adapt_abuseipdb({"data": {"abuseConfidenceScore": 80}}, has_api_key=True)
+        with patch("detector.cidr_attribution.lookup_privacy_relay_offline", return_value="icloud_private_relay"):
+            abused_relay = views.aggregate_intelligence_metrics("172.224.224.1", [*relay_rows, high_abuse])
+        self.assertEqual(abused_relay["arbitrationTier"], "destructive")
+        self.assertIn("Confirmed Proxy / VPN", abused_relay["arbitrationVerdict"])
+
+        # Spamhaus PBL policy ranges never cast negative votes, while SBL does
+        pbl_row = adapt_spamhaus_zen({"status": "listed", "codes": ["127.0.0.10"]}, 200)
+        sbl_row = adapt_spamhaus_zen({"status": "listed", "codes": ["127.0.0.2"]}, 200)
+        four_clean = [self._res_row(name) for name in ("IPHub", "IPHunter", "IPData", "Proxycheck")]
+        pbl_agg = views.aggregate_intelligence_metrics("1.2.3.4", [*four_clean, pbl_row])
+        self.assertEqual(pbl_agg["arbitrationVerdict"], "Clean Residential / Direct (0/4 Sources)")
+        sbl_agg = views.aggregate_intelligence_metrics("1.2.3.4", [*four_clean, sbl_row])
+        self.assertEqual(sbl_agg["arbitrationVerdict"], "Disputed Proxy / VPN (1/5 Sources)")
+        self.assertEqual(sbl_agg["arbitrationTier"], "warning")
+
+        # GetIPIntel 0.5 partial weight breaks a 2-of-4 tie to 2.5/4 majority, while 0.5 alone stays disputed
+        gii_half = adapt_getipintel({"status": "success", "result": "0.82"}, True, 200)
+        two_proxy = [
+            {**self._res_row("IPData"), "securityFlags": [{"label": "Proxy", "isHighRisk": True}]},
+            {**self._res_row("Proxycheck"), "securityFlags": [{"label": "VPN", "isHighRisk": True}]},
+        ]
+        tie_broken = views.aggregate_intelligence_metrics(
+            "1.2.3.4",
+            [self._res_row("IPHub"), *two_proxy, gii_half],
+        )
+        self.assertTrue(tie_broken["isMajorityProxyVpn"])
+        self.assertEqual(tie_broken["arbitrationVerdict"], "Confirmed Proxy / VPN (2.5/4 Sources)")
+
+        lone_half = views.aggregate_intelligence_metrics(
+            "1.2.3.4",
+            [self._res_row("IPHub"), self._res_row("IPData"), self._res_row("Proxycheck"), gii_half],
+        )
+        self.assertFalse(lone_half["isMajorityProxyVpn"])
+        self.assertEqual(lone_half["arbitrationVerdict"], "Disputed Proxy / VPN (0.5/4 Sources)")
 
 
 class CrossStackProviderContractTests(SimpleTestCase):

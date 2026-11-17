@@ -22,7 +22,7 @@ from django.core.asgi import get_asgi_application
 from django.http import HttpResponse
 from django.test import AsyncRequestFactory, RequestFactory, SimpleTestCase, TestCase, override_settings
 
-from detector import detection_service, providers, quota_telemetry, views
+from detector import cache_backends, detection_service, providers, quota_telemetry, views
 from detector.middleware import AsyncWhiteNoiseMiddleware, ResilientSessionMiddleware
 from detector.provider_registry import PROVIDER_REGISTRY
 
@@ -490,12 +490,12 @@ class BatchDetectionEndpointTests(TestCase):
         public_v4 = payload["results"]["1.1.1.1"]
         self.assertEqual(public_v4["ip"], "1.1.1.1")
         self.assertFalse(public_v4.get("isNonPublic", False))
-        self.assertEqual(len(public_v4["results"]), 14)
+        self.assertEqual(len(public_v4["results"]), 17)
 
         public_v6 = payload["results"]["2001:4860:4860::8888"]
         self.assertEqual(public_v6["ip"], "2001:4860:4860::8888")
         self.assertFalse(public_v6.get("isNonPublic", False))
-        self.assertEqual(len(public_v6["results"]), 14)
+        self.assertEqual(len(public_v6["results"]), 17)
 
         loopback_res = payload["results"]["127.0.0.1"]
         self.assertTrue(loopback_res["isNonPublic"])
@@ -605,8 +605,8 @@ class CompactResponseAndCacheControlTests(TestCase):
         self.assertEqual(provider_calls["count"], 1)
         self.assertEqual(compact_resp.status_code, 200)
         self.assertEqual(full_resp.status_code, 200)
-        self.assertEqual(compact_resp.headers.get("Cache-Control"), "private, max-age=300")
-        self.assertEqual(full_resp.headers.get("Cache-Control"), "private, max-age=300")
+        self.assertEqual(compact_resp.headers.get("Cache-Control"), "private, no-cache")
+        self.assertEqual(full_resp.headers.get("Cache-Control"), "private, no-cache")
 
         compact_payload = json.loads(compact_resp.content)
         full_payload = json.loads(full_resp.content)
@@ -638,12 +638,13 @@ class CompactResponseAndCacheControlTests(TestCase):
             compact_cached_resp = self.client.get("/api/v1/detect?ip=8.8.8.8&compact=true")
 
         self.assertEqual(compact_resp.status_code, 200)
-        self.assertEqual(compact_resp.headers.get("Cache-Control"), "private, max-age=300")
+        self.assertEqual(compact_resp.headers.get("Cache-Control"), "private, no-cache")
         for row in compact_resp.json()["results"]:
             self.assertNotIn("rawJson", row)
 
         # Ensure IPData usage count was still extracted from rawJson before stripping the response
-        ipdata_key = next(key for key in fake_redis.hashes if key.startswith("proxycheck:v1:telemetry:ipdata:day:"))
+        ns = cache_backends.get_redis_namespace()
+        ipdata_key = next(key for key in fake_redis.hashes if key.startswith(f"{ns}:telemetry:ipdata:day:"))
         self.assertEqual(fake_redis.hashes[ipdata_key].get("upstream_used"), "142")
 
         self.assertEqual(full_cached_resp.status_code, 200)
@@ -735,6 +736,7 @@ class TwoTierQueryModeTests(TestCase):
         self.assertTrue(payload["isPartialMode"])
         self.assertIsNone(payload["getipintel_chance"])
 
+        ns = cache_backends.get_redis_namespace()
         for deferred_key in (
             "abuseipdb",
             "ipdata",
@@ -744,9 +746,10 @@ class TwoTierQueryModeTests(TestCase):
             "proxycheck",
             "iphub",
             "iphunter",
+            "shodan_internetdb",
         ):
             mocks[deferred_key].assert_not_awaited()
-            self.assertNotIn(f"proxycheck:v1:prov:{deferred_key}:8.8.8.8", fake_redis.strings)
+            self.assertNotIn(cache_backends.provider_cache_key(deferred_key, "8.8.8.8"), fake_redis.strings)
 
         for active_key in (
             "cloudflare_radar",
@@ -756,14 +759,17 @@ class TwoTierQueryModeTests(TestCase):
             "spamcop",
             "tor_onionoo",
             "dshield",
+            "ipsum_drop",
+            "x4bnet_vpn",
         ):
             mocks[active_key].assert_awaited_once()
-            self.assertIn(f"proxycheck:v1:prov:{active_key}:8.8.8.8", fake_redis.strings)
+            self.assertIn(cache_backends.provider_cache_key(active_key, "8.8.8.8"), fake_redis.strings)
 
         consumed_providers = {call.args[0] for call in quota_spy.await_args_list}
         self.assertNotIn("getipintel", consumed_providers)
         self.assertNotIn("proxycheck", consumed_providers)
-        self.assertFalse(any(key.startswith("proxycheck:v1:quota:getipintel:") for key in fake_redis.strings))
+        self.assertNotIn("shodan_internetdb", consumed_providers)
+        self.assertFalse(any(key.startswith(f"{ns}:quota:getipintel:") for key in fake_redis.strings))
 
         rows = {row["provider"]: row for row in payload["results"]}
         self.assertEqual(rows["GetIPIntel"]["status"], "Deferred (Light Mode)")
@@ -783,7 +789,7 @@ class TwoTierQueryModeTests(TestCase):
                 "sanitized": True,
             }
         )
-        fake_redis.strings["proxycheck:v1:prov:getipintel:8.8.8.8"] = cached_getipintel
+        fake_redis.strings[cache_backends.provider_cache_key("getipintel", "8.8.8.8")] = cached_getipintel
 
         with (
             override_settings(**TEST_UPSTREAM_SECRETS),
@@ -805,7 +811,7 @@ class TwoTierQueryModeTests(TestCase):
 
         # Pre-populate the remaining commercial sources so light mode requires no deferrals
         for provider_key, provider_name, _, _, _ in providers._PROVIDER_SPECS:
-            cache_key = f"proxycheck:v1:prov:{provider_key}:8.8.8.8"
+            cache_key = cache_backends.provider_cache_key(provider_key, "8.8.8.8")
             if cache_key not in fake_redis.strings:
                 chance_val = 0.972 if provider_key == "getipintel" else None
                 fake_redis.strings[cache_key] = json.dumps(
@@ -866,8 +872,9 @@ class TwoTierQueryModeTests(TestCase):
         for active_key in ("cloudflare_radar", "maxmind", "stopforumspam", "tor_onionoo", "dshield"):
             mocks[active_key].assert_not_awaited()
 
-        self.assertIn("proxycheck:v1:prov:getipintel:8.8.8.8", fake_redis.strings)
-        self.assertTrue(any(key.startswith("proxycheck:v1:quota:getipintel:") for key in fake_redis.strings))
+        ns = cache_backends.get_redis_namespace()
+        self.assertIn(cache_backends.provider_cache_key("getipintel", "8.8.8.8"), fake_redis.strings)
+        self.assertTrue(any(key.startswith(f"{ns}:quota:getipintel:") for key in fake_redis.strings))
 
     def test_default_invalid_and_non_public_modes_preserve_backward_compatibility(self):
         fake_redis = _BatchingFakeRedis()

@@ -11,7 +11,7 @@ import dns.resolver
 import httpx
 from django.test import SimpleTestCase, TestCase, override_settings
 
-from detector import providers, views
+from detector import cache_backends, providers, views
 from detector.provider_registry import PROVIDER_REGISTRY
 
 from .helpers import (
@@ -101,11 +101,12 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         self.assertNotIn("isQuotaGuarded", normal_cooldown)
         self.assertNotIn("isQuotaGuard", normal_cooldown)
 
-        min_keys = [key for key in fake_redis.strings if key.startswith("proxycheck:v1:quota:getipintel:min:")]
+        ns = cache_backends.get_redis_namespace()
+        min_keys = [key for key in fake_redis.strings if key.startswith(f"{ns}:quota:getipintel:min:")]
         self.assertEqual(len(min_keys), 1)
         self.assertEqual(fake_redis.strings[min_keys[0]], "2")
 
-        telemetry_keys = [key for key in fake_redis.hashes if key.startswith("proxycheck:v1:telemetry:getipintel:day:")]
+        telemetry_keys = [key for key in fake_redis.hashes if key.startswith(f"{ns}:telemetry:getipintel:day:")]
         self.assertEqual(len(telemetry_keys), 1)
         self.assertEqual(fake_redis.hashes[telemetry_keys[0]].get("ok"), "2")
         self.assertEqual(fake_redis.hashes[telemetry_keys[0]].get("quota_blocked"), "1")
@@ -146,8 +147,9 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         self.assertEqual(rows["Proxycheck"]["status"], "Local Quota Guard (1/1 req/day)")
         self.assertEqual(rows["Proxycheck"]["rawJson"]["window"], "rpd")
 
-        min_keys = [key for key in fake_redis.strings if key.startswith("proxycheck:v1:quota:proxycheck:min:")]
-        day_keys = [key for key in fake_redis.strings if key.startswith("proxycheck:v1:quota:proxycheck:day:")]
+        ns = cache_backends.get_redis_namespace()
+        min_keys = [key for key in fake_redis.strings if key.startswith(f"{ns}:quota:proxycheck:min:")]
+        day_keys = [key for key in fake_redis.strings if key.startswith(f"{ns}:quota:proxycheck:day:")]
         self.assertEqual(fake_redis.strings[min_keys[0]], "1")
         self.assertEqual(fake_redis.strings[day_keys[0]], "1")
 
@@ -213,8 +215,9 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         rows = {row["provider"]: row for row in response.json()["results"]}
         self.assertEqual(rows["GetIPIntel"]["status"], "No API Key")
         self.assertEqual(rows["SpamCop"]["status"], "Skipped (IPv6)")
-        self.assertFalse(any(key.startswith("proxycheck:v1:quota:getipintel:") for key in fake_redis.strings))
-        self.assertFalse(any(key.startswith("proxycheck:v1:quota:spamcop:") for key in fake_redis.strings))
+        ns = cache_backends.get_redis_namespace()
+        self.assertFalse(any(key.startswith(f"{ns}:quota:getipintel:") for key in fake_redis.strings))
+        self.assertFalse(any(key.startswith(f"{ns}:quota:spamcop:") for key in fake_redis.strings))
 
     @override_settings(**TEST_UPSTREAM_SECRETS)
     def test_anonymised_telemetry_records_headers_and_never_stores_ip_or_username(self):
@@ -265,17 +268,18 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         self.assertEqual(cached_session.status_code, 200)
         self.assertEqual(gadget_miss.status_code, 200)
 
+        ns = cache_backends.get_redis_namespace()
         serialised_quota_and_telemetry = json.dumps(
             {
                 "strings": {
                     k: v
                     for k, v in fake_redis.strings.items()
-                    if k.startswith(("proxycheck:v1:quota:", "proxycheck:v1:telemetry:"))
+                    if k.startswith((f"{ns}:quota:", f"{ns}:telemetry:"))
                 },
                 "hashes": {
                     k: v
                     for k, v in fake_redis.hashes.items()
-                    if k.startswith(("proxycheck:v1:quota:", "proxycheck:v1:telemetry:"))
+                    if k.startswith((f"{ns}:quota:", f"{ns}:telemetry:"))
                 },
             }
         )
@@ -290,25 +294,25 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         ):
             self.assertNotIn(sensitive, serialised_quota_and_telemetry)
 
-        global_key = next(key for key in fake_redis.hashes if key.startswith("proxycheck:v1:telemetry:global:day:"))
+        global_key = next(key for key in fake_redis.hashes if key.startswith(f"{ns}:telemetry:global:day:"))
         global_hash = fake_redis.hashes[global_key]
         self.assertEqual(global_hash.get("auth_session"), "2")
         self.assertEqual(global_hash.get("auth_gadget"), "1")
         self.assertEqual(global_hash.get("cache_hit"), "1")
         self.assertEqual(global_hash.get("cache_miss"), "2")
+        self.assertEqual(global_hash.get("l1_hit"), "1")
+        self.assertEqual(global_hash.get("upstream_miss"), "2")
 
-        abuse_key = next(key for key in fake_redis.hashes if key.startswith("proxycheck:v1:telemetry:abuseipdb:day:"))
+        abuse_key = next(key for key in fake_redis.hashes if key.startswith(f"{ns}:telemetry:abuseipdb:day:"))
         self.assertEqual(fake_redis.hashes[abuse_key].get("upstream_remaining"), "982")
         self.assertEqual(fake_redis.hashes[abuse_key].get("upstream_limit"), "1000")
         self.assertEqual(fake_redis.hashes[abuse_key].get("ok"), "2")
         self.assertEqual(fake_redis.hashes[abuse_key].get("cache_hit"), "1")
 
-        ipdata_key = next(key for key in fake_redis.hashes if key.startswith("proxycheck:v1:telemetry:ipdata:day:"))
+        ipdata_key = next(key for key in fake_redis.hashes if key.startswith(f"{ns}:telemetry:ipdata:day:"))
         self.assertEqual(fake_redis.hashes[ipdata_key].get("upstream_used"), "142")
 
-        ipregistry_key = next(
-            key for key in fake_redis.hashes if key.startswith("proxycheck:v1:telemetry:ipregistry:day:")
-        )
+        ipregistry_key = next(key for key in fake_redis.hashes if key.startswith(f"{ns}:telemetry:ipregistry:day:"))
         self.assertEqual(fake_redis.hashes[ipregistry_key].get("upstream_remaining"), "4950")
 
     @override_settings(**TEST_UPSTREAM_SECRETS)
@@ -344,21 +348,18 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         self.assertEqual(second_resp.status_code, 200)
         self.assertEqual(second_resp.json()["cacheMeta"]["status"], "partial")
 
-        global_key = next(key for key in fake_redis.hashes if key.startswith("proxycheck:v1:telemetry:global:day:"))
+        ns = cache_backends.get_redis_namespace()
+        global_key = next(key for key in fake_redis.hashes if key.startswith(f"{ns}:telemetry:global:day:"))
         self.assertEqual(fake_redis.hashes[global_key].get("cache_miss"), "1")
         self.assertEqual(fake_redis.hashes[global_key].get("cache_partial"), "1")
 
-        abuse_key = next(key for key in fake_redis.hashes if key.startswith("proxycheck:v1:telemetry:abuseipdb:day:"))
+        abuse_key = next(key for key in fake_redis.hashes if key.startswith(f"{ns}:telemetry:abuseipdb:day:"))
         self.assertEqual(fake_redis.hashes[abuse_key].get("429"), "1")
 
-        ipregistry_key = next(
-            key for key in fake_redis.hashes if key.startswith("proxycheck:v1:telemetry:ipregistry:day:")
-        )
+        ipregistry_key = next(key for key in fake_redis.hashes if key.startswith(f"{ns}:telemetry:ipregistry:day:"))
         self.assertEqual(fake_redis.hashes[ipregistry_key].get("5xx"), "1")
 
-        proxycheck_key = next(
-            key for key in fake_redis.hashes if key.startswith("proxycheck:v1:telemetry:proxycheck:day:")
-        )
+        proxycheck_key = next(key for key in fake_redis.hashes if key.startswith(f"{ns}:telemetry:proxycheck:day:"))
         self.assertEqual(fake_redis.hashes[proxycheck_key].get("timeout"), "1")
 
     def test_admin_provider_dashboard_only_honours_allowlisted_wiki_users(self):
@@ -515,19 +516,26 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         min_bucket = now_dt.strftime("%Y%m%d%H%M")
         day_bucket = now_dt.strftime("%Y%m%d")
 
-        fake_redis.strings[f"proxycheck:v1:quota:getipintel:min:{min_bucket}"] = "15"
-        fake_redis.strings[f"proxycheck:v1:quota:getipintel:day:{day_bucket}"] = "320"
-        fake_redis.strings["proxycheck:v1:cooldown:ipregistry"] = json.dumps({"reason": "HTTP 429"})
-        fake_redis.ttls["proxycheck:v1:cooldown:ipregistry"] = 95
+        ns = cache_backends.get_redis_namespace()
+        fake_redis.strings[f"{ns}:quota:getipintel:min:{min_bucket}"] = "15"
+        fake_redis.strings[f"{ns}:quota:getipintel:day:{day_bucket}"] = "320"
+        fake_redis.strings[f"{ns}:cooldown:ipregistry"] = json.dumps({"reason": "HTTP 429"})
+        fake_redis.ttls[f"{ns}:cooldown:ipregistry"] = 95
 
-        fake_redis.hashes[f"proxycheck:v1:telemetry:global:day:{day_bucket}"] = {
+        fake_redis.hashes[f"{ns}:telemetry:global:day:{day_bucket}"] = {
             "auth_session": "7",
             "auth_gadget": "3",
             "cache_hit": "4",
             "cache_partial": "2",
             "cache_miss": "4",
+            "l1_hit": "2",
+            "l2_hit_fresh": "1",
+            "l2_hit_stale_swr": "1",
+            "upstream_miss": "4",
+            "refresh_ok": "2",
+            "refresh_rate_limited": "1",
         }
-        fake_redis.hashes[f"proxycheck:v1:telemetry:getipintel:day:{day_bucket}"] = {
+        fake_redis.hashes[f"{ns}:telemetry:getipintel:day:{day_bucket}"] = {
             "ok": "11",
             "cache_hit": "4",
             "quota_blocked": "2",
@@ -535,7 +543,7 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
             "5xx": "0",
             "timeout": "0",
         }
-        fake_redis.hashes[f"proxycheck:v1:telemetry:proxycheck:day:{day_bucket}"] = {
+        fake_redis.hashes[f"{ns}:telemetry:proxycheck:day:{day_bucket}"] = {
             "ok": "9",
             "cache_hit": "6",
             "upstream_remaining": "991",
@@ -556,6 +564,13 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         payload = response.json()
         self.assertTrue(payload["redisAvailable"])
         self.assertEqual(payload["dateBucket"], day_bucket)
+        self.assertEqual(payload["cacheTelemetry"]["l1Hit"], 2)
+        self.assertEqual(payload["cacheTelemetry"]["l2HitFresh"], 1)
+        self.assertEqual(payload["cacheTelemetry"]["l2HitStaleSwr"], 1)
+        self.assertEqual(payload["cacheTelemetry"]["upstreamMiss"], 4)
+        self.assertEqual(payload["cacheTelemetry"]["refreshOk"], 2)
+        self.assertEqual(payload["cacheTelemetry"]["refreshRateLimited"], 1)
+        self.assertEqual(payload["cacheTelemetry"]["dualLayerHitRatePercent"], 50.0)
 
         kpis = payload["global"]
         self.assertEqual(kpis["totalRequestsToday"], 10)
@@ -633,13 +648,14 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
 
+        ns = cache_backends.get_redis_namespace()
         # ConnectError and TimeoutException must roll back both minute and daily quota counters to zero
         for refunded_provider in ("getipintel", "proxycheck"):
             min_key = next(
-                key for key in fake_redis.strings if key.startswith(f"proxycheck:v1:quota:{refunded_provider}:min:")
+                key for key in fake_redis.strings if key.startswith(f"{ns}:quota:{refunded_provider}:min:")
             )
             day_key = next(
-                key for key in fake_redis.strings if key.startswith(f"proxycheck:v1:quota:{refunded_provider}:day:")
+                key for key in fake_redis.strings if key.startswith(f"{ns}:quota:{refunded_provider}:day:")
             )
             self.assertEqual(fake_redis.strings[min_key], "0")
             self.assertEqual(fake_redis.strings[day_key], "0")
@@ -647,10 +663,10 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         # Valid HTTP 200 and HTTP 429 responses must retain their consumed quota count
         for retained_provider in ("abuseipdb", "ipdata"):
             min_key = next(
-                key for key in fake_redis.strings if key.startswith(f"proxycheck:v1:quota:{retained_provider}:min:")
+                key for key in fake_redis.strings if key.startswith(f"{ns}:quota:{retained_provider}:min:")
             )
             day_key = next(
-                key for key in fake_redis.strings if key.startswith(f"proxycheck:v1:quota:{retained_provider}:day:")
+                key for key in fake_redis.strings if key.startswith(f"{ns}:quota:{retained_provider}:day:")
             )
             self.assertEqual(fake_redis.strings[min_key], "1")
             self.assertEqual(fake_redis.strings[day_key], "1")
@@ -731,7 +747,7 @@ class CheckSetupCommandTests(SimpleTestCase):
                 self.assertIn("abus...xyz9", output)
                 self.assertNotIn("abuse-secret-token-xyz9", output)
                 self.assertIn("WIKIMEDIA_CLIENT_ID: MISSING", output)
-                self.assertIn("Tuning & Quota Limits (39 optional vars)", output)
+                self.assertIn("Tuning & Quota Limits (41 optional vars)", output)
 
                 with self.assertRaises(CommandError):
                     call_command(

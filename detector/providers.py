@@ -14,7 +14,7 @@ from typing import Any, Dict, Iterator, Optional, Tuple, Union
 import httpx
 from django.conf import settings
 
-from . import adapters, dns_providers, sanitization
+from . import adapters, dns_providers, offline_dbs, sanitization
 from .adapters import (
     adapt_abuseipdb,
     adapt_cloudflare_radar,
@@ -26,6 +26,7 @@ from .adapters import (
     adapt_iphunter,
     adapt_ipregistry,
     adapt_proxycheck,
+    adapt_shodan_internetdb,
     adapt_tor_onionoo,
 )
 from .cache_backends import get_cooldown_bounds
@@ -134,6 +135,7 @@ async def _fetch_upstream_json(
     headers: Optional[Dict[str, str]] = None,
     timeout: Optional[Union[float, httpx.Timeout]] = None,
     follow_redirects: bool = False,
+    treat_404_as_ok: bool = False,
 ) -> Tuple[Any, int]:
     """
     Executes an upstream GET request, parses JSON safely, redacts leaked secrets on error,
@@ -171,6 +173,15 @@ async def _fetch_upstream_json(
 
     raw_status = getattr(resp, "status_code", 502)
     payload, parsed_status, parse_error = parse_upstream_json_with_error(resp)
+    if treat_404_as_ok and raw_status == 404:
+        clean_404_payload = (
+            payload
+            if parse_error is None and isinstance(payload, dict)
+            else {"detail": "No information available"}
+        )
+        _record_http_status_event(resp, provider_key, 200, 200, clean_404_payload, default_cooldown)
+        return clean_404_payload, 404
+
     if isinstance(raw_status, int) and raw_status != 200:
         content_type, body_preview = extract_response_log_details(resp)
         logger.warning(
@@ -290,9 +301,30 @@ async def query_iphunter(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
 
 
 async def query_tor_onionoo(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
+    offline_payload = offline_dbs.lookup_tor_onionoo_offline(ip)
+    if isinstance(offline_payload, dict):
+        return adapt_tor_onionoo(offline_payload, status_code=200, ip=ip)
+
     url = f"https://onionoo.torproject.org/summary?search={ip}"
     payload, status_code = await _fetch_upstream_json(client, "tor_onionoo", "Tor Onionoo", url, timeout=5.0)
     return adapt_tor_onionoo(payload, status_code=status_code, ip=ip)
+
+
+async def query_shodan_internetdb(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
+    """Queries Shodan InternetDB for IPv4 open ports and tags, treating HTTP 404 as clean."""
+    if dns_providers.reverse_ipv4_octets(ip) is None:
+        return adapt_shodan_internetdb({"status": "skipped_ipv6"}, status_code=200)
+
+    url = f"https://internetdb.shodan.io/{ip}"
+    payload, status_code = await _fetch_upstream_json(
+        client,
+        "shodan_internetdb",
+        "Shodan InternetDB",
+        url,
+        timeout=5.0,
+        treat_404_as_ok=True,
+    )
+    return adapt_shodan_internetdb(payload, status_code=status_code)
 
 
 async def query_dshield(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:

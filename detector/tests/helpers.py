@@ -32,10 +32,13 @@ from detector.adapters import (
     adapt_iphub,
     adapt_iphunter,
     adapt_ipregistry,
+    adapt_ipsum_drop,
     adapt_maxmind,
     adapt_proxycheck,
+    adapt_shodan_internetdb,
     adapt_stopforumspam,
     adapt_tor_onionoo,
+    adapt_x4bnet_vpn,
 )
 from detector.provider_registry import PROVIDER_REGISTRY
 
@@ -80,10 +83,17 @@ ALL_ADAPTERS = (
     ("Tor Onionoo", lambda raw, code: adapt_tor_onionoo(raw, code, "8.8.8.8")),
     ("StopForumSpam", lambda raw, code: adapt_stopforumspam(raw, code)),
     ("DShield", lambda raw, code: adapt_dshield(raw, code)),
+    ("IPsum / DROP", lambda raw, code: adapt_ipsum_drop(raw, code)),
+    ("X4BNet VPN", lambda raw, code: adapt_x4bnet_vpn(raw, code)),
+    ("Shodan InternetDB", lambda raw, code: adapt_shodan_internetdb(raw, code)),
 )
 
 
-HTTP_PROVIDERS = tuple(name for name, _ in ALL_ADAPTERS if name not in ("MaxMind", "Tor Onionoo", "StopForumSpam"))
+HTTP_PROVIDERS = tuple(
+    name
+    for name, _ in ALL_ADAPTERS
+    if name not in ("MaxMind", "Tor Onionoo", "StopForumSpam", "IPsum / DROP", "X4BNet VPN")
+)
 
 
 def _mock_ptr_answer(*hostnames):
@@ -233,11 +243,21 @@ class FakeAsyncRedis:
     async def get(self, key):
         return self.strings.get(key)
 
-    async def set(self, key, value, ex=None):
+    async def set(self, key, value, ex=None, nx=False):
+        if nx and key in self.strings:
+            return False
         self.strings[key] = str(value)
         if ex is not None:
             self.ttls[key] = int(ex)
         return True
+
+    async def delete(self, *keys):
+        removed = 0
+        for key in keys:
+            if self.strings.pop(key, None) is not None or self.hashes.pop(key, None) is not None:
+                removed += 1
+                self.ttls.pop(key, None)
+        return removed
 
     async def ttl(self, key):
         if key not in self.strings and key not in self.hashes:
@@ -388,6 +408,7 @@ def build_provider_http_response(url, ip="8.8.8.8"):
             None,
         ),
         ("dshield", {"ip": {"count": 0, "attacks": 0, "as": "15169", "asname": "Google LLC", "ascountry": "US"}}, None),
+        ("internetdb.shodan.io", {"ip": ip, "ports": [], "tags": [], "hostnames": []}, None),
     )
     for fragment, payload, headers in static_payloads:
         if fragment in url:
@@ -406,7 +427,7 @@ def clean_dns_side_effect(qname, rdtype):
     raise dns.resolver.NXDOMAIN()
 
 
-_DNS_PROVIDER_KEYS = frozenset({"maxmind", "spamhaus_zen", "spamcop", "stopforumspam"})
+_DNS_PROVIDER_KEYS = frozenset({"maxmind", "spamhaus_zen", "spamcop", "stopforumspam", "ipsum_drop", "x4bnet_vpn"})
 
 CANONICAL_PROVIDER_PATCH_TARGETS: Dict[str, str] = {
     meta.key: (

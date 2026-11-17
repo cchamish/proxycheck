@@ -5,6 +5,8 @@ Proactive multi-window API quota guard and strictly anonymised Redis telemetry.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import inspect
 import json
 import logging
@@ -14,17 +16,26 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.core.signals import setting_changed
+from django.db import Error as DjangoDbError
+from django.db import close_old_connections, connections
 
-from .cache_backends import get_redis_client, mark_redis_failure, provider_cooldown_key
+from .cache_backends import (
+    get_redis_client,
+    get_redis_namespace,
+    mark_redis_failure,
+    provider_cooldown_key,
+    safe_redis_mget,
+)
+from .models import IpIntelligenceCache
 from .oauth import is_allowlisted_wiki_user
 from .offline_dbs import collect_offline_databases_status
 from .provider_registry import (
     DEFAULT_QUOTA_LIMITS,
     PROVIDER_CREDENTIAL_SETTINGS,
     PROVIDER_REGISTRY,
-    REDIS_KEY_NAMESPACE,
     REDIS_TRANSPORT_ERRORS,
     ProviderMetadata,
 )
@@ -33,8 +44,26 @@ logger = logging.getLogger(__name__)
 _get_redis_client = get_redis_client
 
 MINUTE_QUOTA_TTL_SECONDS = 120
+HOURLY_QUOTA_TTL_SECONDS = 7200
 DAILY_QUOTA_TTL_SECONDS = 172800
 TELEMETRY_TTL_SECONDS = 7 * 86400
+
+DEFAULT_REFRESH_USER_RPM_LIMIT = 6
+DEFAULT_REFRESH_USER_RPH_LIMIT = 60
+DEFAULT_REFRESH_GLOBAL_RPM_LIMIT = 30
+DEFAULT_COMMERCIAL_SWR_GUARD_RATIO = 0.15
+DEFAULT_COMMERCIAL_SWR_GUARD_MAX_AGE_DAYS = 180
+
+VALID_CACHE_TELEMETRY_EVENTS = frozenset(
+    {
+        "l1_hit",
+        "l2_hit_fresh",
+        "l2_hit_stale_swr",
+        "upstream_miss",
+        "refresh_ok",
+        "refresh_rate_limited",
+    }
+)
 
 VALID_PROVIDER_OUTCOMES = frozenset(
     {
@@ -210,19 +239,49 @@ def is_admin_user(session_user: Any) -> bool:
 
 
 def _quota_minute_key(provider_key: str, now_dt: datetime) -> str:
-    return f"{REDIS_KEY_NAMESPACE}:quota:{provider_key}:min:{now_dt.strftime('%Y%m%d%H%M')}"
+    return f"{get_redis_namespace()}:quota:{provider_key}:min:{now_dt.strftime('%Y%m%d%H%M')}"
 
 
 def _quota_daily_key(provider_key: str, now_dt: datetime) -> str:
-    return f"{REDIS_KEY_NAMESPACE}:quota:{provider_key}:day:{now_dt.strftime('%Y%m%d')}"
+    return f"{get_redis_namespace()}:quota:{provider_key}:day:{now_dt.strftime('%Y%m%d')}"
 
 
 def _provider_telemetry_key(provider_key: str, now_dt: datetime) -> str:
-    return f"{REDIS_KEY_NAMESPACE}:telemetry:{provider_key}:day:{now_dt.strftime('%Y%m%d')}"
+    return f"{get_redis_namespace()}:telemetry:{provider_key}:day:{now_dt.strftime('%Y%m%d')}"
 
 
 def _global_telemetry_key(now_dt: datetime) -> str:
-    return f"{REDIS_KEY_NAMESPACE}:telemetry:global:day:{now_dt.strftime('%Y%m%d')}"
+    return f"{get_redis_namespace()}:telemetry:global:day:{now_dt.strftime('%Y%m%d')}"
+
+
+def hash_username_for_rate_limit(username: str) -> str:
+    """Computes an anonymised HMAC-SHA256 digest for per-user rate-limit keys without storing usernames."""
+    secret = str(getattr(settings, "SECRET_KEY", "") or "proxycheck-default-secret")
+    normalized = " ".join(str(username or "").strip().replace("_", " ").split())
+    return hmac.new(secret.encode("utf-8"), normalized.encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+
+
+def _refresh_user_minute_key(user_digest: str, now_dt: datetime) -> str:
+    return f"{get_redis_namespace()}:refresh_rl:user:{user_digest}:min:{now_dt.strftime('%Y%m%d%H%M')}"
+
+
+def _refresh_user_hour_key(user_digest: str, now_dt: datetime) -> str:
+    return f"{get_redis_namespace()}:refresh_rl:user:{user_digest}:hr:{now_dt.strftime('%Y%m%d%H')}"
+
+
+def _refresh_global_minute_key(now_dt: datetime) -> str:
+    return f"{get_redis_namespace()}:refresh_rl:global:min:{now_dt.strftime('%Y%m%d%H%M')}"
+
+
+@dataclass(frozen=True)
+class RefreshRateLimitResult:
+    """Outcome of per-user and global manual or background refresh rate-limit checks."""
+
+    allowed: bool
+    reason: Optional[str] = None
+    retry_after_seconds: int = 0
+    used: int = 0
+    limit: int = 0
 
 
 def _build_blocked_result(
@@ -711,11 +770,13 @@ async def record_global_request_telemetry(
     cache_status: str,
     auth_mode: str,
     *,
+    cache_layer_event: Optional[str] = None,
     now_dt: Optional[datetime] = None,
 ) -> None:
-    """Records anonymised daily global cache-efficiency and authentication-mode counters."""
+    """Records anonymised daily global cache-efficiency, dual-layer SWR, and authentication-mode counters."""
     cache_field = {
         "hit": "cache_hit",
+        "stale": "cache_hit",
         "partial": "cache_partial",
         "miss": "cache_miss",
     }.get(cache_status)
@@ -723,31 +784,265 @@ async def record_global_request_telemetry(
         "session": "auth_session",
         "gadget": "auth_gadget",
     }.get(auth_mode)
-    if not cache_field and not auth_field:
+    layer_field = cache_layer_event if cache_layer_event in VALID_CACHE_TELEMETRY_EVENTS else None
+    if not cache_field and not auth_field and not layer_field:
         return
 
     client = _get_redis_client()
     if client is None:
         return
-    pipeline_fn = getattr(client, "pipeline", None)
-    if not callable(pipeline_fn):
+
+    current_dt = now_dt or datetime.now(timezone.utc)
+    global_key = _global_telemetry_key(current_dt)
+    try:
+        pipeline_fn = getattr(client, "pipeline", None)
+        if callable(pipeline_fn):
+            pipe = pipeline_fn(transaction=False)
+            if cache_field:
+                pipe.hincrby(global_key, cache_field, 1)
+            if auth_field:
+                pipe.hincrby(global_key, auth_field, 1)
+            if layer_field:
+                pipe.hincrby(global_key, layer_field, 1)
+            pipe.expire(global_key, TELEMETRY_TTL_SECONDS)
+            exec_call = pipe.execute()
+            if inspect.isawaitable(exec_call):
+                await exec_call
+            return
+
+        hincrby_fn = getattr(client, "hincrby", None)
+        if callable(hincrby_fn):
+            for field_name in (cache_field, auth_field, layer_field):
+                if field_name:
+                    pending = hincrby_fn(global_key, field_name, 1)
+                    if inspect.isawaitable(pending):
+                        await pending
+            expire_fn = getattr(client, "expire", None)
+            if callable(expire_fn):
+                exp_pending = expire_fn(global_key, TELEMETRY_TTL_SECONDS)
+                if inspect.isawaitable(exp_pending):
+                    await exp_pending
+    except REDIS_TRANSPORT_ERRORS as exc:
+        mark_redis_failure(exc)
+        logger.warning(f"Global telemetry write bypassed due to Redis error ({type(exc).__name__})")
+
+
+async def record_cache_telemetry_event(
+    event_name: str,
+    *,
+    count: int = 1,
+    now_dt: Optional[datetime] = None,
+) -> None:
+    """Increments a daily dual-layer cache or refresh telemetry counter in Redis."""
+    if event_name not in VALID_CACHE_TELEMETRY_EVENTS or count <= 0:
+        return
+    client = _get_redis_client()
+    if client is None:
         return
 
     current_dt = now_dt or datetime.now(timezone.utc)
     global_key = _global_telemetry_key(current_dt)
     try:
-        pipe = pipeline_fn(transaction=False)
-        if cache_field:
-            pipe.hincrby(global_key, cache_field, 1)
-        if auth_field:
-            pipe.hincrby(global_key, auth_field, 1)
-        pipe.expire(global_key, TELEMETRY_TTL_SECONDS)
-        exec_call = pipe.execute()
-        if inspect.isawaitable(exec_call):
-            await exec_call
+        pipeline_fn = getattr(client, "pipeline", None)
+        if callable(pipeline_fn):
+            pipe = pipeline_fn(transaction=False)
+            pipe.hincrby(global_key, event_name, int(count))
+            pipe.expire(global_key, TELEMETRY_TTL_SECONDS)
+            exec_call = pipe.execute()
+            if inspect.isawaitable(exec_call):
+                await exec_call
+            return
+
+        hincrby_fn = getattr(client, "hincrby", None)
+        if callable(hincrby_fn):
+            pending = hincrby_fn(global_key, event_name, int(count))
+            if inspect.isawaitable(pending):
+                await pending
     except REDIS_TRANSPORT_ERRORS as exc:
         mark_redis_failure(exc)
-        logger.warning(f"Global telemetry write bypassed due to Redis error ({type(exc).__name__})")
+        logger.warning(f"Cache telemetry write bypassed due to Redis error ({type(exc).__name__})")
+
+
+def _resolve_refresh_limits() -> Tuple[int, int, int]:
+    user_rpm = _parse_non_negative_int(getattr(settings, "REFRESH_USER_RPM_LIMIT", None))
+    user_rph = _parse_non_negative_int(getattr(settings, "REFRESH_USER_RPH_LIMIT", None))
+    global_rpm = _parse_non_negative_int(getattr(settings, "REFRESH_GLOBAL_RPM_LIMIT", None))
+    return (
+        DEFAULT_REFRESH_USER_RPM_LIMIT if user_rpm is None else user_rpm,
+        DEFAULT_REFRESH_USER_RPH_LIMIT if user_rph is None else user_rph,
+        DEFAULT_REFRESH_GLOBAL_RPM_LIMIT if global_rpm is None else global_rpm,
+    )
+
+
+async def _atomic_incr_with_ttl(client: Any, key: str, ttl_seconds: int) -> Optional[int]:
+    incr_fn = getattr(client, "incr", None)
+    if callable(incr_fn):
+        pending = incr_fn(key)
+        val = await pending if inspect.isawaitable(pending) else pending
+        if _is_valid_counter(val):
+            if val == 1:
+                expire_fn = getattr(client, "expire", None)
+                if callable(expire_fn):
+                    exp = expire_fn(key, ttl_seconds)
+                    if inspect.isawaitable(exp):
+                        await exp
+            return val
+    get_fn = getattr(client, "get", None)
+    set_fn = getattr(client, "set", None)
+    if callable(get_fn) and callable(set_fn):
+        raw_cur = get_fn(key)
+        cur = await raw_cur if inspect.isawaitable(raw_cur) else raw_cur
+        cur_num = _parse_non_negative_int(_decode_redis_str(cur) if isinstance(cur, bytes) else cur) or 0
+        next_val = cur_num + 1
+        put_call = set_fn(key, str(next_val), ex=ttl_seconds)
+        if inspect.isawaitable(put_call):
+            await put_call
+        return next_val
+    return None
+
+
+async def _atomic_decr_clamped(client: Any, key: str, ttl_seconds: int) -> None:
+    decr_fn = getattr(client, "decr", None)
+    set_fn = getattr(client, "set", None)
+    if callable(decr_fn):
+        pending = decr_fn(key)
+        val = await pending if inspect.isawaitable(pending) else pending
+        if _is_valid_counter(val) and val < 0 and callable(set_fn):
+            put_call = set_fn(key, "0", ex=ttl_seconds)
+            if inspect.isawaitable(put_call):
+                await put_call
+        return
+    get_fn = getattr(client, "get", None)
+    if callable(get_fn) and callable(set_fn):
+        raw_cur = get_fn(key)
+        cur = await raw_cur if inspect.isawaitable(raw_cur) else raw_cur
+        cur_num = _parse_non_negative_int(_decode_redis_str(cur) if isinstance(cur, bytes) else cur) or 0
+        put_call = set_fn(key, str(max(0, cur_num - 1)), ex=ttl_seconds)
+        if inspect.isawaitable(put_call):
+            await put_call
+
+
+async def _consume_single_refresh_window(
+    client: Any,
+    key: str,
+    ttl_seconds: int,
+    limit: int,
+    reason: str,
+    retry_after_seconds: int,
+    incremented_keys: List[Tuple[str, int]],
+    current_dt: datetime,
+) -> Optional[RefreshRateLimitResult]:
+    if limit <= 0:
+        return None
+    val = await _atomic_incr_with_ttl(client, key, ttl_seconds)
+    if val is None:
+        return None
+    incremented_keys.append((key, ttl_seconds))
+    if val <= limit:
+        return None
+    for rk, rttl in incremented_keys:
+        await _atomic_decr_clamped(client, rk, rttl)
+    await record_cache_telemetry_event("refresh_rate_limited", now_dt=current_dt)
+    return RefreshRateLimitResult(
+        allowed=False,
+        reason=reason,
+        retry_after_seconds=retry_after_seconds,
+        used=limit,
+        limit=limit,
+    )
+
+
+async def check_and_consume_refresh_rate_limit(
+    username: Optional[str],
+    *,
+    is_admin: bool = False,
+    now_dt: Optional[datetime] = None,
+) -> RefreshRateLimitResult:
+    """
+    Enforces anonymised per-user (6 per minute, 60 per hour) and global (30 per minute)
+    refresh rate limits, exempting allowlisted administrators from per-user caps.
+    """
+    client = _get_redis_client()
+    if client is None:
+        return RefreshRateLimitResult(allowed=True)
+
+    current_dt = now_dt or datetime.now(timezone.utc)
+    user_rpm_limit, user_rph_limit, global_rpm_limit = _resolve_refresh_limits()
+    cleaned_user = str(username or "").strip()
+    exempt_user = bool(is_admin) or (
+        bool(cleaned_user) and not cleaned_user.startswith("~") and is_allowlisted_wiki_user(cleaned_user)
+    )
+    min_retry = max(1, 60 - current_dt.second)
+    hr_retry = max(60, 3600 - (current_dt.minute * 60 + current_dt.second))
+
+    windows: List[Tuple[str, int, int, str, int]] = []
+    if not exempt_user and cleaned_user:
+        user_digest = hash_username_for_rate_limit(cleaned_user)
+        windows.append((_refresh_user_minute_key(user_digest, current_dt), MINUTE_QUOTA_TTL_SECONDS, user_rpm_limit, "user_rpm", min_retry))
+        windows.append((_refresh_user_hour_key(user_digest, current_dt), HOURLY_QUOTA_TTL_SECONDS, user_rph_limit, "user_rph", hr_retry))
+    windows.append((_refresh_global_minute_key(current_dt), MINUTE_QUOTA_TTL_SECONDS, global_rpm_limit, "global_rpm", min_retry))
+
+    incremented_keys: List[Tuple[str, int]] = []
+    try:
+        for key, ttl_s, limit, reason, retry_s in windows:
+            blocked = await _consume_single_refresh_window(
+                client, key, ttl_s, limit, reason, retry_s, incremented_keys, current_dt
+            )
+            if blocked is not None:
+                return blocked
+    except REDIS_TRANSPORT_ERRORS as exc:
+        mark_redis_failure(exc)
+        logger.warning(f"Refresh rate-limit check bypassed due to Redis error ({type(exc).__name__})")
+        return RefreshRateLimitResult(allowed=True)
+
+    return RefreshRateLimitResult(allowed=True)
+
+
+async def should_suppress_auto_refresh_for_quota(
+    age_seconds: int,
+    *,
+    now_dt: Optional[datetime] = None,
+) -> bool:
+    """
+    Returns True when background stale-while-revalidate should be paused for records younger
+    than 180 days because configured commercial providers have less than 15% daily quota left.
+    """
+    max_age_days = _parse_non_negative_int(getattr(settings, "COMMERCIAL_QUOTA_SWR_MAX_AGE_DAYS", None))
+    effective_max_days = DEFAULT_COMMERCIAL_SWR_GUARD_MAX_AGE_DAYS if max_age_days is None else max_age_days
+    if age_seconds >= effective_max_days * 86400:
+        return False
+
+    raw_ratio = getattr(settings, "COMMERCIAL_QUOTA_SWR_GUARD_RATIO", DEFAULT_COMMERCIAL_SWR_GUARD_RATIO)
+    guard_ratio = (
+        float(raw_ratio)
+        if isinstance(raw_ratio, (int, float)) and not isinstance(raw_ratio, bool) and 0.0 < float(raw_ratio) < 1.0
+        else DEFAULT_COMMERCIAL_SWR_GUARD_RATIO
+    )
+
+    tracked: List[Tuple[str, int]] = []
+    for meta in PROVIDER_REGISTRY:
+        if not meta.is_commercial_arbitration or not is_provider_configured(meta.key):
+            continue
+        _, daily_limit = get_provider_quota_limits(meta.key)
+        if daily_limit > 0:
+            tracked.append((meta.key, daily_limit))
+
+    if not tracked or _get_redis_client() is None:
+        return False
+
+    current_dt = now_dt or datetime.now(timezone.utc)
+    day_keys = [_quota_daily_key(provider_key, current_dt) for provider_key, _ in tracked]
+    raw_values = await safe_redis_mget(day_keys)
+    total_limit = sum(limit for _, limit in tracked)
+    if total_limit <= 0:
+        return False
+
+    total_remaining = 0
+    for (_, limit), raw_val in zip(tracked, raw_values, strict=True):
+        used = _parse_non_negative_int(raw_val) or 0
+        total_remaining += max(0, limit - used)
+
+    return (total_remaining / float(total_limit)) < guard_ratio
 
 
 def _decode_hash(raw_hash: Any) -> Dict[str, str]:
@@ -852,10 +1147,16 @@ def _resolve_provider_dashboard_status(
     daily_limit: int,
     has_maxmind_db: bool,
     has_sfs_db: bool,
+    has_ipsum_db: bool = True,
+    has_x4bnet_db: bool = True,
 ) -> Tuple[str, str]:
     if provider_key == "maxmind" and not has_maxmind_db:
         return "db_missing", "Database Missing"
     if provider_key == "stopforumspam" and not has_sfs_db:
+        return "db_missing", "Offline DB Missing"
+    if provider_key == "ipsum_drop" and not has_ipsum_db:
+        return "db_missing", "Offline DB Missing"
+    if provider_key == "x4bnet_vpn" and not has_x4bnet_db:
         return "db_missing", "Offline DB Missing"
     if not configured:
         return "no_api_key", "No API Key"
@@ -874,6 +1175,8 @@ def _build_provider_dashboard_entry(
     *,
     has_maxmind_db: bool,
     has_sfs_db: bool,
+    has_ipsum_db: bool = True,
+    has_x4bnet_db: bool = True,
 ) -> Dict[str, Any]:
     configured = is_provider_configured(meta.key)
     rpm_limit, daily_limit = get_provider_quota_limits(meta.key)
@@ -888,6 +1191,8 @@ def _build_provider_dashboard_entry(
         daily_limit=daily_limit,
         has_maxmind_db=has_maxmind_db,
         has_sfs_db=has_sfs_db,
+        has_ipsum_db=has_ipsum_db,
+        has_x4bnet_db=has_x4bnet_db,
     )
     return {
         "key": meta.key,
@@ -917,9 +1222,71 @@ def _build_provider_dashboard_entry(
     }
 
 
+def _estimate_l2_table_rows_sync() -> Optional[int]:
+    if not bool(getattr(settings, "ENABLE_L2_TOOLSDB_CACHE", True)):
+        return None
+    try:
+        close_old_connections()
+        conn = connections["default"]
+        if conn.vendor == "mysql":
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT table_rows FROM information_schema.tables "
+                    "WHERE table_schema = DATABASE() AND table_name = %s",
+                    [IpIntelligenceCache._meta.db_table],
+                )
+                row = cursor.fetchone()
+                if row and row[0] is not None:
+                    return max(0, int(row[0]))
+        return max(0, int(IpIntelligenceCache.objects.count()))
+    except (DjangoDbError, ValueError, TypeError, OSError):
+        return None
+    except AssertionError as exc:
+        if type(exc).__name__ == "DatabaseOperationForbidden":
+            return None
+        raise
+    finally:
+        close_old_connections()
+
+
+def _build_cache_telemetry_summary(
+    global_hash: Dict[str, str],
+    *,
+    l2_estimated_rows: Optional[int],
+) -> Dict[str, Any]:
+    l1_hit = _safe_hash_int(global_hash, "l1_hit")
+    l2_hit_fresh = _safe_hash_int(global_hash, "l2_hit_fresh")
+    l2_hit_stale_swr = _safe_hash_int(global_hash, "l2_hit_stale_swr")
+    upstream_miss = _safe_hash_int(global_hash, "upstream_miss")
+    refresh_ok = _safe_hash_int(global_hash, "refresh_ok")
+    refresh_rate_limited = _safe_hash_int(global_hash, "refresh_rate_limited")
+
+    layer_total = l1_hit + l2_hit_fresh + l2_hit_stale_swr + upstream_miss
+    dual_layer_hits = l1_hit + l2_hit_fresh + l2_hit_stale_swr
+    dual_hit_rate = round((dual_layer_hits / layer_total) * 100.0, 1) if layer_total > 0 else 0.0
+
+    return {
+        "l1Hit": l1_hit,
+        "l2HitFresh": l2_hit_fresh,
+        "l2HitStaleSwr": l2_hit_stale_swr,
+        "upstreamMiss": upstream_miss,
+        "refreshOk": refresh_ok,
+        "refreshRateLimited": refresh_rate_limited,
+        "l1_hit": l1_hit,
+        "l2_hit_fresh": l2_hit_fresh,
+        "l2_hit_stale_swr": l2_hit_stale_swr,
+        "upstream_miss": upstream_miss,
+        "refresh_ok": refresh_ok,
+        "refresh_rate_limited": refresh_rate_limited,
+        "dualLayerHitRatePercent": dual_hit_rate,
+        "l2EstimatedRows": l2_estimated_rows,
+    }
+
+
 def _build_global_dashboard_summary(
     global_hash: Dict[str, str],
     providers_out: List[Dict[str, Any]],
+    cache_telemetry: Dict[str, Any],
 ) -> Dict[str, Any]:
     auth_session = _safe_hash_int(global_hash, "auth_session")
     auth_gadget = _safe_hash_int(global_hash, "auth_gadget")
@@ -938,6 +1305,14 @@ def _build_global_dashboard_summary(
         "cachePartial": cache_partial,
         "cacheMiss": cache_miss,
         "fullCacheHitRatePercent": hit_rate_percent,
+        "l1Hit": cache_telemetry["l1Hit"],
+        "l2HitFresh": cache_telemetry["l2HitFresh"],
+        "l2HitStaleSwr": cache_telemetry["l2HitStaleSwr"],
+        "upstreamMiss": cache_telemetry["upstreamMiss"],
+        "refreshOk": cache_telemetry["refreshOk"],
+        "refreshRateLimited": cache_telemetry["refreshRateLimited"],
+        "dualLayerHitRatePercent": cache_telemetry["dualLayerHitRatePercent"],
+        "l2EstimatedRows": cache_telemetry["l2EstimatedRows"],
         "totalQuotaBlocksToday": sum(entry["telemetry"]["quotaBlocked"] for entry in providers_out),
         "activeCooldownCount": sum(1 for entry in providers_out if entry["statusKey"] == "cooldown"),
         "activeQuotaGuardCount": sum(1 for entry in providers_out if entry["statusKey"] == "quota_guarded"),
@@ -957,12 +1332,15 @@ async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict
     )
 
     offline_databases = await asyncio.to_thread(collect_offline_databases_status, now_dt=current_dt)
+    l2_estimated_rows = await sync_to_async(_estimate_l2_table_rows_sync, thread_sensitive=True)()
     has_maxmind_db = any(
         entry.get("key", "").startswith("maxmind_") and entry.get("exists") for entry in offline_databases
     )
     has_sfs_db = any(
         entry.get("key", "").startswith("stopforumspam_") and entry.get("exists") for entry in offline_databases
     )
+    has_ipsum_db = any(entry.get("key") == "ipsum_drop_bin" and entry.get("exists") for entry in offline_databases)
+    has_x4bnet_db = any(entry.get("key") == "x4bnet_vpn_bin" and entry.get("exists") for entry in offline_databases)
 
     providers_out = [
         _build_provider_dashboard_entry(
@@ -970,15 +1348,19 @@ async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict
             provider_pipeline_rows.get(meta.key, (0, 0, 0, None, {})),
             has_maxmind_db=has_maxmind_db,
             has_sfs_db=has_sfs_db,
+            has_ipsum_db=has_ipsum_db,
+            has_x4bnet_db=has_x4bnet_db,
         )
         for meta in PROVIDER_REGISTRY
     ]
+    cache_telemetry = _build_cache_telemetry_summary(global_hash, l2_estimated_rows=l2_estimated_rows)
 
     return {
         "generatedAt": current_dt.isoformat(),
         "dateBucket": current_dt.strftime("%Y%m%d"),
         "redisAvailable": redis_available,
-        "global": _build_global_dashboard_summary(global_hash, providers_out),
+        "cacheTelemetry": cache_telemetry,
+        "global": _build_global_dashboard_summary(global_hash, providers_out, cache_telemetry),
         "providers": providers_out,
         "offlineDatabases": offline_databases,
     }

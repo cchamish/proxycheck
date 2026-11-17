@@ -163,12 +163,17 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
             data_dir.mkdir()
             cidr_file = data_dir / "cloud_cidrs.json"
             cidr_file.write_text(json.dumps({"gcp": ["34.64.0.0/16"]}), encoding="utf-8")
-            with override_settings(TOOL_DATA_DIR=tmpdir):
+            clock = [1000.0]
+            with (
+                override_settings(TOOL_DATA_DIR=tmpdir),
+                patch("detector.offline_dbs.time.monotonic", side_effect=lambda: clock[0]),
+            ):
                 self.assertIsNone(match_cloud_cidr("20.48.1.2"))
 
                 cidr_file.write_text(json.dumps({"azure": ["20.48.0.0/16"]}), encoding="utf-8")
                 stat = cidr_file.stat()
                 os.utime(cidr_file, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+                clock[0] += 31.0
 
                 reloaded = match_cloud_cidr("20.48.1.2")
                 self.assertIsNotNone(reloaded)
@@ -569,18 +574,21 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
             fake_maxmind_module = MagicMock()
             fake_maxmind_module.open_database.side_effect = _open_sequence
 
+            clock = [2000.0]
             with (
                 override_settings(
                     TOOL_DATA_DIR=str(tool_root),
                     HOSTING_ASN_RULES_PATH="",
                 ),
                 patch.dict("sys.modules", {"maxminddb": fake_maxmind_module}),
+                patch("detector.offline_dbs.time.monotonic", side_effect=lambda: clock[0]),
             ):
                 row_before_update = dns_providers._read_maxmind_sync("1.2.3.4")
                 self.assertEqual(row_before_update["location"], "China")
 
                 # Replace the file on disk with a different size so the cached reader reopens cleanly
                 city_file.write_bytes(b"city-v2-updated-bytes")
+                clock[0] += 31.0
                 row_after_update = dns_providers._read_maxmind_sync("1.2.3.4")
                 self.assertEqual(row_after_update["location"], "Beijing, China (39.9075, 116.3971)")
                 self.assertEqual(row_after_update["coordinates"], "39.9075, 116.3971")
@@ -612,10 +620,10 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
                 "countryCode": "CN",
                 "rawJson": {"country": {"iso_code": "CN"}},
             }
-            cache_store[f"proxycheck:v1:prov:{provider_key}:{target_ip}"] = json.dumps(
+            cache_store[cache_backends.provider_cache_key(provider_key, target_ip)] = json.dumps(
                 {"row": row_payload, "cachedAt": "2026-11-14T08:00:00+00:00"}
             )
-        cache_store[f"proxycheck:v1:prov:ptr:{target_ip}"] = json.dumps(
+        cache_store[cache_backends.provider_cache_key("ptr", target_ip)] = json.dumps(
             {"hostname": "example.net", "status": "ok", "cachedAt": "2026-11-14T08:00:00+00:00"}
         )
 
@@ -671,16 +679,16 @@ class OfflineHostingAndCloudIntelligenceTests(SimpleTestCase):
         first_mm = next(r for r in first_payload["results"] if r["provider"] == "MaxMind")
         self.assertEqual(first_mm["location"], "Beijing, China (39.9075, 116.3971)")
         self.assertEqual(first_mm["coordinates"], "39.9075, 116.3971")
-        self.assertEqual(first_payload["cacheMeta"]["hitCount"], 15)
+        self.assertEqual(first_payload["cacheMeta"]["hitCount"], len(providers._PROVIDER_SPECS))
 
-        cached_mm_wrapper = json.loads(cache_store[f"proxycheck:v1:prov:maxmind:{target_ip}"])
+        cached_mm_wrapper = json.loads(cache_store[cache_backends.provider_cache_key("maxmind", target_ip)])
         self.assertTrue(cached_mm_wrapper["cityDbLoaded"])
 
         self.assertEqual(second_resp.status_code, 200)
         second_payload = second_resp.json()
         second_mm = next(r for r in second_payload["results"] if r["provider"] == "MaxMind")
         self.assertEqual(second_mm["location"], "Beijing, China (39.9075, 116.3971)")
-        self.assertEqual(second_payload["cacheMeta"]["hitCount"], 16)
+        self.assertEqual(second_payload["cacheMeta"]["hitCount"], len(providers._PROVIDER_SPECS) + 1)
         self.assertEqual(city_reader.get.call_count, 1)
         mock_async_client_cls.assert_not_called()
         mock_dns_resolve.assert_not_called()
@@ -800,6 +808,10 @@ class OfflineStopForumSpamEngineTests(TestCase):
                 gz_handle.write('"198.51.100.42","18","2026-11-16 05:15:00"\n')
                 gz_handle.write('"2001:0db8:cafe:0000:0000:0000:0000:0001","9","2026-11-16 04:00:00"\n')
 
+            from detector import offline_dbs
+
+            offline_dbs.build_stopforumspam_sqlite_index(root / "stopforumspam.sqlite3", zip_90_path, gz_1_path)
+
             with (
                 override_settings(TOOL_DATA_DIR=tmp_dir),
                 patch("detector.http_client.httpx.AsyncClient") as mock_client,
@@ -843,9 +855,11 @@ class OfflineStopForumSpamEngineTests(TestCase):
             root.mkdir()
             toxic_path = root / "toxic_ip_cidr.txt"
             listed_path = root / "listed_ip_90_ipv46_all.txt"
+            sqlite_path = root / "stopforumspam.sqlite3"
 
             toxic_path.write_text("192.0.2.0/24\n", encoding="utf-8")
             listed_path.write_text('"198.51.100.7","5","2026-11-10 00:00:00"\n', encoding="utf-8")
+            offline_dbs.build_stopforumspam_sqlite_index(sqlite_path, listed_path, None)
 
             cache_store = {}
 
@@ -858,16 +872,18 @@ class OfflineStopForumSpamEngineTests(TestCase):
             mock_redis = MagicMock()
             mock_redis.get = AsyncMock(side_effect=_fake_get)
             mock_redis.set = AsyncMock(side_effect=_fake_set)
+            clock = [3000.0]
 
             with (
                 override_settings(TOOL_DATA_DIR=tmp_dir),
                 patch("detector.cache_backends.redis_client", mock_redis),
+                patch("detector.offline_dbs.time.monotonic", side_effect=lambda: clock[0]),
             ):
                 initial_lookup = offline_dbs.query_stopforumspam_offline("198.51.100.88")
                 self.assertFalse(initial_lookup["appears"])
 
                 first_row = asyncio.run(dns_providers.query_stopforumspam("198.51.100.88"))
-                cache_key = cache_backends._provider_cache_key("stopforumspam", "198.51.100.88")
+                cache_key = cache_backends.provider_cache_key("stopforumspam", "198.51.100.88")
                 cache_store[cache_key] = json.dumps(
                     {
                         "row": first_row,
@@ -885,8 +901,10 @@ class OfflineStopForumSpamEngineTests(TestCase):
                     '"198.51.100.7","5","2026-11-10 00:00:00"\n"198.51.100.88","42","2026-11-16 12:00:00"\n',
                     encoding="utf-8",
                 )
+                offline_dbs.build_stopforumspam_sqlite_index(sqlite_path, listed_path, None)
                 future_ts = time.time() + 10.0
-                os.utime(listed_path, (future_ts, future_ts))
+                os.utime(sqlite_path, (future_ts, future_ts))
+                clock[0] += 31.0
 
                 reloaded_lookup = offline_dbs.query_stopforumspam_offline("198.51.100.88")
                 cached_after_update, _ = asyncio.run(detection_service._read_provider_caches("198.51.100.88"))
@@ -1150,7 +1168,11 @@ class UpdateOfflineDbsCommandTests(TestCase):
             self.assertEqual(written["Oracle Cloud"], ["129.146.0.0/16"])
             self.assertEqual(written["Microsoft Azure"], ["20.48.0.0/12"])
 
-            with override_settings(TOOL_DATA_DIR=str(tmp_dir)):
+            clock = [4000.0]
+            with (
+                override_settings(TOOL_DATA_DIR=str(tmp_dir)),
+                patch("detector.offline_dbs.time.monotonic", side_effect=lambda: clock[0]),
+            ):
                 self.assertEqual(match_cloud_cidr("129.146.10.5")["provider"], "Oracle Cloud")
                 self.assertEqual(match_cloud_cidr("20.48.10.5")["provider"], "Microsoft Azure")
 
@@ -1165,6 +1187,7 @@ class UpdateOfflineDbsCommandTests(TestCase):
                     ),
                     encoding="utf-8",
                 )
+                clock[0] += 31.0
                 # Ensure hot-reload detects both mtime and size changes
                 self.assertEqual(match_cloud_cidr("130.35.1.1")["provider"], "Oracle Cloud")
 

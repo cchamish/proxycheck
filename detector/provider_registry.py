@@ -5,6 +5,8 @@ and shared infrastructure constants with zero Django dependencies.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 from dataclasses import dataclass
 from typing import Dict, FrozenSet, Optional, Tuple
 
@@ -15,6 +17,21 @@ except ImportError:
 
 USER_AGENT_HEADER = "ProxyCheck/1.0 (https://proxycheck.toolforge.org; tools.proxycheck@toolforge.org)"
 REDIS_KEY_NAMESPACE = "proxycheck:v1"
+
+
+def build_redis_namespace(prefix: str, secret: str) -> str:
+    """Builds an isolated Redis key namespace combining environment prefix and a keyed secret digest."""
+    cleaned_prefix = str(prefix or "").strip().strip(":_") or "proxycheck"
+    secret_bytes = str(secret or "").encode("utf-8")
+    digest = hmac.new(secret_bytes, f"ns:{cleaned_prefix}".encode("utf-8"), hashlib.sha256).hexdigest()[:12]
+    return f"{cleaned_prefix}:{digest}:v2"
+
+
+def hash_ip_for_redis(canonical_ip: str, secret: str) -> str:
+    """Computes a truncated HMAC-SHA256 digest so plaintext IP addresses never appear in Redis keys."""
+    secret_bytes = str(secret or "").encode("utf-8")
+    ip_bytes = str(canonical_ip or "").strip().encode("utf-8")
+    return hmac.new(secret_bytes, ip_bytes, hashlib.sha256).hexdigest()[:24]
 
 REDIS_TRANSPORT_ERRORS: Tuple[type[BaseException], ...] = (
     (ConnectionError, TimeoutError, OSError, _RedisError)
@@ -211,9 +228,39 @@ PROVIDER_REGISTRY: Tuple[ProviderMetadata, ...] = (
         default_rpm_limit=1000,
         default_daily_limit=0,
     ),
+    ProviderMetadata(
+        key="ipsum_drop",
+        label="IPsum / DROP",
+        uses_http=False,
+        supports_cooldown=False,
+        active_in_light_mode=True,
+        is_offline=True,
+        has_quota_env_vars=False,
+    ),
+    ProviderMetadata(
+        key="x4bnet_vpn",
+        label="X4BNet VPN",
+        uses_http=False,
+        supports_cooldown=False,
+        active_in_light_mode=True,
+        is_offline=True,
+        has_quota_env_vars=False,
+    ),
+    ProviderMetadata(
+        key="shodan_internetdb",
+        label="Shodan InternetDB",
+        uses_http=True,
+        supports_cooldown=True,
+        active_in_light_mode=False,
+        is_commercial_arbitration=False,
+        default_rpm_limit=120,
+        default_daily_limit=0,
+    ),
 )
 
 PROVIDER_BY_KEY: Dict[str, ProviderMetadata] = {meta.key: meta for meta in PROVIDER_REGISTRY}
+
+PROVIDER_BY_LABEL: Dict[str, ProviderMetadata] = {meta.label: meta for meta in PROVIDER_REGISTRY}
 
 PROVIDER_CREDENTIAL_SETTINGS: Dict[str, str] = {
     meta.key: meta.credential_setting for meta in PROVIDER_REGISTRY if meta.credential_setting is not None
@@ -235,10 +282,19 @@ DNSBL_PROVIDER_KEYS: FrozenSet[str] = frozenset(meta.key for meta in PROVIDER_RE
 
 OFFLINE_PROVIDER_KEYS: FrozenSet[str] = frozenset(meta.key for meta in PROVIDER_REGISTRY if meta.is_offline)
 
+OFFLINE_REHYDRATE_PROVIDERS: FrozenSet[str] = frozenset({"maxmind", "stopforumspam", "ipsum_drop", "x4bnet_vpn"})
+
+L1_ONLY_PROVIDERS: FrozenSet[str] = frozenset({"iphub", "spamhaus_zen", "spamcop"})
+
+DEFAULT_PROVIDER_L2_MAX_RETENTION_DAYS: Dict[str, int] = {"ip2location": 30}
+
 EXTRA_SECRET_SETTING_NAMES: Tuple[str, ...] = (
     "MAXMIND_ACCOUNT_ID",
     "MAXMIND_LICENSE_KEY",
     "WIKIMEDIA_CLIENT_SECRET",
+    "REDIS_KEY_SECRET",
+    "TOOLSDB_PASSWORD",
+    "TOOL_TOOLSDB_PASSWORD",
 )
 
 SECRET_SETTING_NAMES: Tuple[str, ...] = (

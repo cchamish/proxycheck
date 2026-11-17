@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import csv
 import gzip
-import hashlib
 import io
 import ipaddress
 import json
@@ -13,14 +12,20 @@ import logging
 import os
 import socket
 import sqlite3
+import stat
 import tempfile
 import threading
 import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Generic, Iterable, List, Mapping, Optional, Sequence, Tuple, TypeVar
+from typing import Any, Callable, Dict, FrozenSet, Generic, Iterable, List, Mapping, Optional, Sequence, Tuple, TypeVar
 
+from detector.binary_prefix_index import (
+    BinaryPrefixFormatError,
+    BinaryPrefixIndexReader,
+    sync_file_to_ephemeral_cache,
+)
 from proxycheck.settings import (
     MAXMIND_ASN_DB_FILENAME,
     MAXMIND_CITY_DB_FILENAME,
@@ -60,6 +65,23 @@ CLOUD_CIDRS_FILENAME = "cloud_cidrs.json"
 CLOUD_CIDR_FILENAMES = (CLOUD_CIDRS_FILENAME, "computehosts.json")
 HOSTING_RULES_FILENAME = "hosting_asn_rules.json"
 
+PRIVACY_RELAYS_BIN_FILENAME = "privacy_relays.bin"
+IPSUM_DROP_BIN_FILENAME = "ipsum_drop.bin"
+TOR_ONIONOO_SUMMARY_FILENAME = "tor_onionoo_summary.json"
+BGP_TOOLS_BIN_FILENAME = "bgp_tools.bin"
+BGP_TAGS_JSON_FILENAME = "bgp_tags.json"
+X4BNET_VPN_BIN_FILENAME = "x4bnet_vpn.bin"
+MOBILE_ASNS_JSON_FILENAME = "mobile_asns.json"
+HTTP_FEED_METADATA_FILENAME = "http_feed_metadata.json"
+
+X4BNET_MASK_VPN = 1
+X4BNET_MASK_DATACENTER = 2
+X4BNET_MASK_HOSTING = 4
+
+MOBILE_BGP_TAG_TOKENS: FrozenSet[str] = frozenset(
+    {"mobile", "cellular", "cell", "lte", "5g", "wireless_mobile", "cgnat"}
+)
+
 MAXMIND_EDITION_SPECS: Tuple[Tuple[str, str], ...] = (
     ("GeoLite2-Country", MAXMIND_COUNTRY_DB_FILENAME),
     ("GeoLite2-City", MAXMIND_CITY_DB_FILENAME),
@@ -69,11 +91,14 @@ MAXMIND_EDITION_SPECS: Tuple[Tuple[str, str], ...] = (
 _SOURCE_MASK_90 = 1
 _SOURCE_MASK_1 = 2
 
+OFFLINE_STAT_THROTTLE_SECONDS = 30.0
 DEFAULT_STALE_MAXMIND_SECONDS = 14 * 86400
 DEFAULT_STALE_SFS_TOXIC_SECONDS = 7 * 86400
 DEFAULT_STALE_SFS_90_SECONDS = 2 * 86400
 DEFAULT_STALE_SFS_1_SECONDS = 6 * 3600
 DEFAULT_STALE_CLOUD_CIDRS_SECONDS = 7 * 86400
+DEFAULT_STALE_TOR_ONIONOO_SECONDS = 6 * 3600
+DEFAULT_STALE_DAILY_FEED_SECONDS = 7 * 86400
 DEFAULT_STALE_RULES_SECONDS = 90 * 86400
 
 _K = TypeVar("_K")
@@ -158,6 +183,73 @@ class FileStatCache(Generic[_K, _V]):
             self._generation += 1
 
 
+class _BinaryIndexCache:
+    """Thread-safe cache managing memory-mapped binary prefix readers and clean handle disposal."""
+
+    def __init__(self, filename: str, override_setting: str = "") -> None:
+        self._filename = filename
+        self._override_setting = override_setting
+        self._lock = threading.Lock()
+        self._key: Optional[Tuple[str, int, int]] = None
+        self._reader: Optional[BinaryPrefixIndexReader] = None
+        self._retired: List[BinaryPrefixIndexReader] = []
+
+    def get_reader_and_mtime(self) -> Tuple[Optional[BinaryPrefixIndexReader], Optional[str]]:
+        path = resolve_feed_data_path(self._filename, override_setting=self._override_setting)
+        if path is None:
+            return None, None
+        sig = get_file_stat_signature(path)
+        if sig is None:
+            return None, None
+
+        updated_iso = datetime.fromtimestamp(sig[0] / 1_000_000_000.0, tz=timezone.utc).isoformat()
+        target_key = (str(path), sig[0], sig[1])
+
+        with self._lock:
+            if self._key == target_key and self._reader is not None and not self._reader.closed:
+                return self._reader, updated_iso
+
+        ephemeral_dir = resolve_local_ephemeral_cache_dir()
+        try:
+            opened = BinaryPrefixIndexReader.open_from_source(path, ephemeral_dir, stat_sig=sig)
+        except (BinaryPrefixFormatError, OSError, ValueError) as exc:
+            logger.warning("Failed to open binary prefix index %s: %s", path, exc)
+            return None, updated_iso
+
+        stale_to_close: List[BinaryPrefixIndexReader] = []
+        with self._lock:
+            if self._key == target_key and self._reader is not None and not self._reader.closed:
+                stale_to_close.append(opened)
+                active = self._reader
+            else:
+                if self._reader is not None:
+                    self._retired.append(self._reader)
+                    while len(self._retired) > 2:
+                        stale_to_close.append(self._retired.pop(0))
+                self._key = target_key
+                self._reader = opened
+                active = opened
+
+        for old_reader in stale_to_close:
+            old_reader.close()
+        return active, updated_iso
+
+    def clear(self) -> None:
+        with self._lock:
+            to_close: List[BinaryPrefixIndexReader] = list(self._retired)
+            if self._reader is not None:
+                to_close.append(self._reader)
+            self._retired.clear()
+            self._reader = None
+            self._key = None
+        for reader in to_close:
+            reader.close()
+
+
+_stat_throttle_lock = threading.Lock()
+_stat_throttle_cache: Dict[str, Tuple[float, Optional[Tuple[int, int]]]] = {}
+
+
 def get_setting(name: str, default: Any = None) -> Any:
     """Reads a Django setting when configured, returning default otherwise."""
     try:
@@ -180,10 +272,70 @@ def _lookup_config_value(
         raw_override = env_overrides.get(name, "")
         return str(raw_override).strip() if raw_override else default
     setting_val = get_setting(name, None)
-    if isinstance(setting_val, str) and setting_val.strip():
-        return setting_val.strip()
+    if isinstance(setting_val, (str, Path)) and str(setting_val).strip():
+        return str(setting_val).strip()
     env_val = os.environ.get(name, "").strip()
     return env_val if env_val else default
+
+
+def resolve_local_ephemeral_cache_dir(*, env_overrides: Optional[Mapping[str, str]] = None) -> Path:
+    """Resolves the local non-NFS ephemeral cache directory across POSIX containers and Windows hosts."""
+    configured = expand_configured_path(_lookup_config_value("LOCAL_EPHEMERAL_CACHE_DIR", env_overrides=env_overrides))
+    if configured:
+        return Path(configured)
+    if os.name == "posix":
+        return Path("/tmp/proxycheck-local")  # noqa: S108
+    return Path(tempfile.gettempdir()) / "proxycheck-local"
+
+
+def _effective_stat_throttle_seconds() -> float:
+    raw = get_setting("OFFLINE_STAT_THROTTLE_SECONDS", OFFLINE_STAT_THROTTLE_SECONDS)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return OFFLINE_STAT_THROTTLE_SECONDS
+    val = float(raw)
+    return val if val >= 0.0 else OFFLINE_STAT_THROTTLE_SECONDS
+
+
+def clear_stat_throttle_cache() -> None:
+    """Clears the monotonic file metadata stat cache."""
+    with _stat_throttle_lock:
+        _stat_throttle_cache.clear()
+
+
+def get_file_stat_signature(
+    file_path: str | Path,
+    *,
+    bypass_throttle: bool = False,
+) -> Optional[Tuple[int, int]]:
+    """Returns nanosecond modification time and byte size for a regular file with 30-second monotonic caching."""
+    key = os.fspath(file_path)
+    throttle_s = 0.0 if bypass_throttle else _effective_stat_throttle_seconds()
+    now_mono = time.monotonic()
+
+    if throttle_s > 0.0:
+        with _stat_throttle_lock:
+            cached = _stat_throttle_cache.get(key)
+            if cached is not None and 0.0 <= (now_mono - cached[0]) < throttle_s:
+                return cached[1]
+
+    try:
+        stat_res = os.stat(key)
+        sig = (stat_res.st_mtime_ns, stat_res.st_size) if stat.S_ISREG(stat_res.st_mode) else None
+    except OSError:
+        sig = None
+
+    if throttle_s > 0.0:
+        with _stat_throttle_lock:
+            if len(_stat_throttle_cache) >= 4096:
+                _stat_throttle_cache.clear()
+            _stat_throttle_cache[key] = (now_mono, sig)
+    return sig
+
+
+def _is_regular_file(file_path: Optional[Path], *, bypass_throttle: bool = False) -> bool:
+    if file_path is None:
+        return False
+    return get_file_stat_signature(file_path, bypass_throttle=bypass_throttle) is not None
 
 
 def get_positive_int_setting(
@@ -228,27 +380,22 @@ def _effective_standard_dirs(
     return list(standard_data_directories(resolved_base))
 
 
-def get_file_stat_signature(file_path: str | Path) -> Optional[Tuple[int, int]]:
-    """Returns nanosecond modification time and byte size for an existing file, or None."""
-    try:
-        stat_res = os.stat(file_path)
-    except OSError:
-        return None
-    return (stat_res.st_mtime_ns, stat_res.st_size)
-
-
-def find_sfs_in_directory(directory: Path, filenames: Tuple[str, ...]) -> Optional[Path]:
+def find_sfs_in_directory(
+    directory: Path,
+    filenames: Tuple[str, ...],
+    *,
+    bypass_throttle: bool = False,
+) -> Optional[Path]:
     """Locates a StopForumSpam data file in directory or its nested stopforumspam subfolder."""
     for fname in filenames:
         direct = directory / fname
-        if direct.is_file():
+        if _is_regular_file(direct, bypass_throttle=bypass_throttle):
             return direct
     nested_dir = directory / "stopforumspam"
-    if nested_dir.is_dir():
-        for fname in filenames:
-            nested = nested_dir / fname
-            if nested.is_file():
-                return nested
+    for fname in filenames:
+        nested = nested_dir / fname
+        if _is_regular_file(nested, bypass_throttle=bypass_throttle):
+            return nested
     return None
 
 
@@ -267,24 +414,21 @@ def _resolve_sfs_component_path(
     standard_dirs: Sequence[Path],
     *,
     env_overrides: Optional[Mapping[str, str]] = None,
+    bypass_throttle: bool = False,
 ) -> Optional[Path]:
     explicit_raw = expand_configured_path(_lookup_config_value(override_setting, env_overrides=env_overrides))
     if explicit_raw:
         explicit = Path(explicit_raw)
-        if explicit.is_file():
+        if _is_regular_file(explicit, bypass_throttle=bypass_throttle):
             return explicit
-        if explicit.is_dir():
-            return find_sfs_in_directory(explicit, filenames)
-        return None
+        return find_sfs_in_directory(explicit, filenames, bypass_throttle=bypass_throttle)
 
     if configured_dir:
         base = Path(expand_configured_path(configured_dir))
-        if base.is_dir():
-            return find_sfs_in_directory(base, filenames)
-        return None
+        return find_sfs_in_directory(base, filenames, bypass_throttle=bypass_throttle)
 
     for directory in standard_dirs:
-        matched = find_sfs_in_directory(directory, filenames)
+        matched = find_sfs_in_directory(directory, filenames, bypass_throttle=bypass_throttle)
         if matched is not None:
             return matched
     return None
@@ -299,12 +443,17 @@ def _resolve_sfs_sqlite_path(
     resolved_base: Path,
     *,
     env_overrides: Optional[Mapping[str, str]] = None,
+    bypass_throttle: bool = False,
 ) -> Optional[Path]:
     explicit_raw = expand_configured_path(
         _lookup_config_value("STOPFORUMSPAM_SQLITE_PATH", env_overrides=env_overrides)
     )
     if explicit_raw:
         explicit = Path(explicit_raw)
+        if explicit.suffix.lower() in (".sqlite3", ".sqlite", ".db") or _is_regular_file(
+            explicit, bypass_throttle=bypass_throttle
+        ):
+            return explicit
         if explicit.is_dir():
             return explicit / SFS_SQLITE_FILENAME
         return explicit
@@ -317,7 +466,7 @@ def _resolve_sfs_sqlite_path(
             return anchor.parent / SFS_SQLITE_FILENAME
 
     for directory in standard_dirs:
-        existing = find_sfs_in_directory(directory, (SFS_SQLITE_FILENAME,))
+        existing = find_sfs_in_directory(directory, (SFS_SQLITE_FILENAME,), bypass_throttle=bypass_throttle)
         if existing is not None:
             return existing
 
@@ -328,6 +477,7 @@ def resolve_stopforumspam_paths(
     *,
     env_overrides: Optional[Mapping[str, str]] = None,
     base_dir: Optional[Path] = None,
+    bypass_throttle: bool = False,
 ) -> Dict[str, Optional[Path]]:
     """Resolves local StopForumSpam database file paths using TOOL_DATA_DIR, overrides, or fallbacks."""
     resolved_base = _effective_base_dir(base_dir)
@@ -340,6 +490,7 @@ def resolve_stopforumspam_paths(
         (SFS_TOXIC_CIDR_FILENAME,),
         standard_dirs,
         env_overrides=env_overrides,
+        bypass_throttle=bypass_throttle,
     )
     listed_90 = _resolve_sfs_component_path(
         "STOPFORUMSPAM_LISTED_90_PATH",
@@ -347,6 +498,7 @@ def resolve_stopforumspam_paths(
         SFS_LISTED_90_FILENAMES,
         standard_dirs,
         env_overrides=env_overrides,
+        bypass_throttle=bypass_throttle,
     )
     listed_1 = _resolve_sfs_component_path(
         "STOPFORUMSPAM_LISTED_1_PATH",
@@ -354,6 +506,7 @@ def resolve_stopforumspam_paths(
         SFS_LISTED_1_FILENAMES,
         standard_dirs,
         env_overrides=env_overrides,
+        bypass_throttle=bypass_throttle,
     )
     sqlite_index = _resolve_sfs_sqlite_path(
         configured_dir,
@@ -363,6 +516,7 @@ def resolve_stopforumspam_paths(
         standard_dirs,
         resolved_base,
         env_overrides=env_overrides,
+        bypass_throttle=bypass_throttle,
     )
     return {
         "toxic_cidr": toxic_cidr,
@@ -370,6 +524,39 @@ def resolve_stopforumspam_paths(
         "listed_1": listed_1,
         "sqlite_index": sqlite_index,
     }
+
+
+def resolve_feed_data_path(
+    filename: str,
+    *,
+    override_setting: str = "",
+    env_overrides: Optional[Mapping[str, str]] = None,
+    base_dir: Optional[Path] = None,
+    bypass_throttle: bool = False,
+) -> Optional[Path]:
+    """Resolves a single offline feed file across explicit settings, TOOL_DATA_DIR, and standard directories."""
+    if override_setting:
+        raw_override = expand_configured_path(_lookup_config_value(override_setting, env_overrides=env_overrides))
+        if raw_override:
+            explicit = Path(raw_override)
+            if _is_regular_file(explicit, bypass_throttle=bypass_throttle):
+                return explicit
+            nested = explicit / filename
+            if _is_regular_file(nested, bypass_throttle=bypass_throttle):
+                return nested
+            return None
+
+    configured_dir = resolve_configured_data_dir(env_overrides=env_overrides)
+    if configured_dir:
+        candidate = Path(expand_configured_path(configured_dir)) / filename
+        return candidate if _is_regular_file(candidate, bypass_throttle=bypass_throttle) else None
+
+    resolved_base = _effective_base_dir(base_dir)
+    for directory in _effective_standard_dirs(env_overrides=env_overrides, base_dir=resolved_base):
+        candidate = directory / filename
+        if _is_regular_file(candidate, bypass_throttle=bypass_throttle):
+            return candidate
+    return None
 
 
 def resolve_writable_data_dir(
@@ -393,16 +580,17 @@ def resolve_writable_data_dir(
 
 
 def has_any_local_stopforumspam_db() -> bool:
-    """Returns True when at least one StopForumSpam offline dataset or index exists on disk."""
+    """Returns True when a StopForumSpam toxic CIDR list or prebuilt SQLite index exists on disk."""
     paths = resolve_stopforumspam_paths()
-    return any(candidate is not None and candidate.is_file() for candidate in paths.values())
+    return _is_regular_file(paths.get("toxic_cidr")) or _is_regular_file(paths.get("sqlite_index"))
 
 
 def get_stopforumspam_db_version() -> int:
-    """Returns the newest nanosecond mtime across active StopForumSpam files, or zero when absent."""
+    """Returns the newest nanosecond mtime across active StopForumSpam lookup files, or zero when absent."""
     paths = resolve_stopforumspam_paths()
     newest = 0
-    for candidate in paths.values():
+    for key in ("toxic_cidr", "sqlite_index"):
+        candidate = paths.get(key)
         if candidate is None:
             continue
         sig = get_file_stat_signature(candidate)
@@ -412,19 +600,18 @@ def get_stopforumspam_db_version() -> int:
 
 
 def _newest_mtime_iso(paths: Iterable[Optional[Path]]) -> Optional[str]:
-    newest_mtime: Optional[float] = None
+    newest_ns: Optional[int] = None
     for candidate in paths:
         if candidate is None:
             continue
-        try:
-            stat_res = os.stat(candidate)
-        except OSError:
+        sig = get_file_stat_signature(candidate)
+        if sig is None:
             continue
-        if newest_mtime is None or stat_res.st_mtime > newest_mtime:
-            newest_mtime = stat_res.st_mtime
-    if newest_mtime is None:
+        if newest_ns is None or sig[0] > newest_ns:
+            newest_ns = sig[0]
+    if newest_ns is None:
         return None
-    return datetime.fromtimestamp(newest_mtime, tz=timezone.utc).isoformat()
+    return datetime.fromtimestamp(newest_ns / 1_000_000_000.0, tz=timezone.utc).isoformat()
 
 
 def _pack_ip_bytes(raw_ip: str) -> Optional[bytes]:
@@ -554,18 +741,32 @@ class _StopForumSpamCidrIndex(PrefixCidrIndex[None]):
 
 _EMPTY_SFS_CIDR_INDEX = _StopForumSpamCidrIndex(())
 _toxic_cidr_cache: FileStatCache[Tuple[str, int, int], _StopForumSpamCidrIndex] = FileStatCache()
-_sfs_sqlite_state_cache: FileStatCache[str, Tuple[str, Optional[Tuple[int, int]]]] = FileStatCache()
+_sfs_sqlite_sync_lock = threading.Lock()
+_sfs_local_sqlite_cache: Tuple[Optional[Tuple[str, int, int]], Optional[Path]] = (None, None)
+_sfs_conn_lock = threading.Lock()
+_sfs_thread_connections: Dict[Tuple[int, str], sqlite3.Connection] = {}
 _sfs_warm_lock = threading.Lock()
 _sfs_cache_warmed = False
 
+_privacy_relays_index = _BinaryIndexCache(PRIVACY_RELAYS_BIN_FILENAME, "PRIVACY_RELAYS_BIN_PATH")
+_ipsum_drop_index = _BinaryIndexCache(IPSUM_DROP_BIN_FILENAME, "IPSUM_DROP_BIN_PATH")
+_bgp_tools_index = _BinaryIndexCache(BGP_TOOLS_BIN_FILENAME, "BGP_TOOLS_BIN_PATH")
+_x4bnet_vpn_index = _BinaryIndexCache(X4BNET_VPN_BIN_FILENAME, "X4BNET_VPN_BIN_PATH")
+
+_tor_onionoo_cache: FileStatCache[Tuple[str, int, int], Dict[str, List[Dict[str, Any]]]] = FileStatCache()
+_bgp_tags_cache: FileStatCache[Tuple[str, int, int], Tuple[Dict[int, Tuple[str, ...]], FrozenSet[int]]] = (
+    FileStatCache()
+)
+_mobile_asns_cache: FileStatCache[Tuple[str, int, int], FrozenSet[int]] = FileStatCache()
+
 
 def _get_toxic_cidr_index(toxic_path: Optional[Path]) -> _StopForumSpamCidrIndex:
-    if toxic_path is None or not toxic_path.is_file():
+    if toxic_path is None:
         return _toxic_cidr_cache.set_constant(("__missing__", -1, -1), _EMPTY_SFS_CIDR_INDEX)
 
     sig = get_file_stat_signature(toxic_path)
     if sig is None:
-        return _EMPTY_SFS_CIDR_INDEX
+        return _toxic_cidr_cache.set_constant(("__missing__", -1, -1), _EMPTY_SFS_CIDR_INDEX)
 
     def _load() -> _StopForumSpamCidrIndex:
         with toxic_path.open("r", encoding="utf-8", errors="replace") as handle:
@@ -579,7 +780,7 @@ def _compute_listed_source_signature(listed_90: Optional[Path], listed_1: Option
     for role, path in (("90d", listed_90), ("1d", listed_1)):
         if path is None:
             continue
-        sig = get_file_stat_signature(path)
+        sig = get_file_stat_signature(path, bypass_throttle=True)
         if sig is not None:
             entries.append([role, str(path), sig[0], sig[1]])
     if not entries:
@@ -616,7 +817,6 @@ def _parse_sfs_listed_line(raw_line: str) -> Optional[Tuple[bytes, int, str]]:
     if not stripped or stripped.startswith(("#", ";")):
         return None
 
-    # Fast path for standard StopForumSpam Excel CSV lines: "IP","frequency","lastseen"
     if stripped.startswith('"') and stripped.endswith('"') and '","' in stripped:
         parts = stripped[1:-1].split('","')
         if len(parts) >= 3 and '"' not in parts[0] and '"' not in parts[1]:
@@ -651,18 +851,6 @@ def _iter_sfs_listed_rows(file_path: Path, source_mask: int) -> Iterable[Tuple[b
             parsed = _parse_sfs_listed_line(line)
             if parsed is not None:
                 yield parsed[0], parsed[1], parsed[2], source_mask
-
-
-def _read_sqlite_source_signature(sqlite_path: Path) -> Optional[str]:
-    if not sqlite_path.is_file():
-        return None
-    try:
-        uri = f"{sqlite_path.resolve().as_uri()}?mode=ro"
-        with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as conn:
-            row = conn.execute("SELECT value FROM meta WHERE key = ?", ("source_signature",)).fetchone()
-            return str(row[0]) if row and row[0] is not None else None
-    except sqlite3.Error, OSError:
-        return None
 
 
 def atomic_replace_with_retry(src_path: Path, dst_path: Path) -> None:
@@ -788,81 +976,79 @@ def build_stopforumspam_sqlite_index(
         return _populate_sfs_sqlite_file(tmp_path, listed_90, listed_1, computed_sig)
 
 
-def _fallback_temp_sqlite_path(source_signature: str) -> Path:
-    digest = hashlib.sha256(source_signature.encode("utf-8")).hexdigest()[:12]
-    return Path(tempfile.gettempdir()) / "proxycheck_sfs_cache" / f"stopforumspam_{digest}.sqlite3"
+def _close_sfs_connections(*, keep_local_path: Optional[str] = None) -> None:
+    to_close: List[sqlite3.Connection] = []
+    with _sfs_conn_lock:
+        keys = list(_sfs_thread_connections.keys())
+        for key in keys:
+            if keep_local_path is None or key[1] != keep_local_path:
+                conn = _sfs_thread_connections.pop(key, None)
+                if conn is not None:
+                    to_close.append(conn)
+    for conn in to_close:
+        with contextlib.suppress(sqlite3.Error):
+            conn.close()
 
 
-_sfs_sqlite_build_lock = threading.Lock()
+def _resolve_local_sfs_sqlite_copy(sqlite_path: Path, sig: Tuple[int, int]) -> Path:
+    global _sfs_local_sqlite_cache
+
+    target_key = (str(sqlite_path), sig[0], sig[1])
+    cached_key, cached_local = _sfs_local_sqlite_cache
+    if cached_key == target_key and cached_local is not None:
+        return cached_local
+
+    with _sfs_sqlite_sync_lock:
+        cached_key, cached_local = _sfs_local_sqlite_cache
+        if cached_key == target_key and cached_local is not None:
+            return cached_local
+
+        ephemeral_dir = resolve_local_ephemeral_cache_dir()
+        local_copy = sync_file_to_ephemeral_cache(sqlite_path, ephemeral_dir, stat_sig=sig)
+        _sfs_local_sqlite_cache = (target_key, local_copy)
+        _close_sfs_connections(keep_local_path=str(local_copy))
+        return local_copy
 
 
-def _ensure_stopforumspam_sqlite_index(paths: Dict[str, Optional[Path]]) -> Optional[Path]:
-    listed_90 = paths.get("listed_90")
-    listed_1 = paths.get("listed_1")
-    sqlite_path = paths.get("sqlite_index")
-    source_sig = _compute_listed_source_signature(listed_90, listed_1)
+def _get_thread_sfs_connection(local_sqlite_path: Path) -> sqlite3.Connection:
+    path_str = str(local_sqlite_path)
+    conn_key = (threading.get_ident(), path_str)
+    with _sfs_conn_lock:
+        existing = _sfs_thread_connections.get(conn_key)
+        if existing is not None:
+            return existing
 
-    if source_sig is None:
-        if sqlite_path is not None and sqlite_path.is_file():
-            return sqlite_path
-        _sfs_sqlite_state_cache.clear()
-        return None
+    base_uri = local_sqlite_path.resolve().as_uri()
+    try:
+        conn = sqlite3.connect(f"{base_uri}?mode=ro&immutable=1", uri=True, timeout=1.0, check_same_thread=False)
+    except sqlite3.OperationalError:
+        conn = sqlite3.connect(f"{base_uri}?mode=ro", uri=True, timeout=1.0, check_same_thread=False)
 
-    cached = _sfs_sqlite_state_cache.peek_matching(lambda key, _val: key == source_sig)
-    if cached is not None:
-        cached_path = Path(cached[0])
-        if get_file_stat_signature(cached_path) == cached[1]:
-            return cached_path
-
-    candidate_primary = sqlite_path or (_effective_base_dir().parent / "data" / SFS_SQLITE_FILENAME)
-    with _sfs_sqlite_build_lock:
-        cached = _sfs_sqlite_state_cache.peek_matching(lambda key, _val: key == source_sig)
-        if cached is not None:
-            cached_path = Path(cached[0])
-            if get_file_stat_signature(cached_path) == cached[1]:
-                return cached_path
-
-        fallback_path = _fallback_temp_sqlite_path(source_sig)
-        for existing_candidate in (candidate_primary, fallback_path):
-            if _read_sqlite_source_signature(existing_candidate) == source_sig:
-                _sfs_sqlite_state_cache.store(
-                    source_sig,
-                    (str(existing_candidate), get_file_stat_signature(existing_candidate)),
-                )
-                return existing_candidate
-
-        try:
-            build_stopforumspam_sqlite_index(
-                candidate_primary,
-                listed_90,
-                listed_1,
-                source_signature=source_sig,
-            )
-            chosen_path = candidate_primary
-        except (OSError, sqlite3.Error) as primary_err:
-            logger.warning(
-                "Could not write StopForumSpam index to %s (%s); building in temporary cache directory",
-                candidate_primary,
-                primary_err,
-            )
-            build_stopforumspam_sqlite_index(
-                fallback_path,
-                listed_90,
-                listed_1,
-                source_signature=source_sig,
-            )
-            chosen_path = fallback_path
-
-        _sfs_sqlite_state_cache.store(source_sig, (str(chosen_path), get_file_stat_signature(chosen_path)))
-        return chosen_path
+    with _sfs_conn_lock:
+        raced = _sfs_thread_connections.get(conn_key)
+        if raced is not None:
+            with contextlib.suppress(sqlite3.Error):
+                conn.close()
+            return raced
+        _sfs_thread_connections[conn_key] = conn
+        return conn
 
 
-def _lookup_ip_in_sqlite(sqlite_path: Path, ip: str) -> Optional[Tuple[int, str, int]]:
+def _evict_thread_sfs_connection(local_sqlite_path: Path) -> None:
+    conn_key = (threading.get_ident(), str(local_sqlite_path))
+    with _sfs_conn_lock:
+        stale = _sfs_thread_connections.pop(conn_key, None)
+    if stale is not None:
+        with contextlib.suppress(sqlite3.Error):
+            stale.close()
+
+
+def _lookup_ip_in_sqlite(local_sqlite_path: Path, ip: str) -> Optional[Tuple[int, str, int]]:
     primary_key, mapped_key = _resolve_lookup_byte_keys(ip)
     if primary_key is None:
         return None
-    uri = f"{sqlite_path.resolve().as_uri()}?mode=ro"
-    with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as conn:
+    conn = _get_thread_sfs_connection(local_sqlite_path)
+    try:
         row = conn.execute(
             "SELECT frequency, last_seen, source_mask FROM listed_ips WHERE ip = ?",
             (primary_key,),
@@ -872,25 +1058,26 @@ def _lookup_ip_in_sqlite(sqlite_path: Path, ip: str) -> Optional[Tuple[int, str,
                 "SELECT frequency, last_seen, source_mask FROM listed_ips WHERE ip = ?",
                 (mapped_key,),
             ).fetchone()
+    except sqlite3.Error:
+        _evict_thread_sfs_connection(local_sqlite_path)
+        raise
     if row is None:
         return None
     return int(row[0]), str(row[1] or ""), int(row[2])
 
 
 def query_stopforumspam_offline(ip: str) -> Dict[str, Any]:
-    """Queries local StopForumSpam toxic CIDR and listed IP databases with automatic mtime hot-reload."""
+    """Queries local StopForumSpam toxic CIDR and local ephemeral SQLite copy without Web rebuilds."""
     global _sfs_cache_warmed
 
     paths = resolve_stopforumspam_paths()
     toxic_path = paths.get("toxic_cidr")
-    listed_90_path = paths.get("listed_90")
-    listed_1_path = paths.get("listed_1")
     sqlite_path = paths.get("sqlite_index")
 
-    has_toxic = toxic_path is not None and toxic_path.is_file()
-    has_listed = any(p is not None and p.is_file() for p in (listed_90_path, listed_1_path, sqlite_path))
+    toxic_sig = get_file_stat_signature(toxic_path) if toxic_path is not None else None
+    sqlite_sig = get_file_stat_signature(sqlite_path) if sqlite_path is not None else None
 
-    if not has_toxic and not has_listed:
+    if toxic_sig is None and sqlite_sig is None:
         return {
             "has_db": False,
             "appears": False,
@@ -903,14 +1090,12 @@ def query_stopforumspam_offline(ip: str) -> Dict[str, Any]:
             "db_version": 0,
         }
 
-    toxic_cidr_hit = _get_toxic_cidr_index(toxic_path).match(ip) if has_toxic else None
+    toxic_cidr_hit = _get_toxic_cidr_index(toxic_path).match(ip) if toxic_sig is not None else None
 
     listed_hit: Optional[Tuple[int, str, int]] = None
-    active_sqlite: Optional[Path] = None
-    if has_listed:
-        active_sqlite = _ensure_stopforumspam_sqlite_index(paths)
-        if active_sqlite is not None and active_sqlite.is_file():
-            listed_hit = _lookup_ip_in_sqlite(active_sqlite, ip)
+    if sqlite_path is not None and sqlite_sig is not None:
+        local_sqlite = _resolve_local_sfs_sqlite_copy(sqlite_path, sqlite_sig)
+        listed_hit = _lookup_ip_in_sqlite(local_sqlite, ip)
 
     with _sfs_warm_lock:
         _sfs_cache_warmed = True
@@ -929,7 +1114,10 @@ def query_stopforumspam_offline(ip: str) -> Dict[str, Any]:
 
     blacklisted = toxic_cidr_hit is not None
     appears = blacklisted or (listed_hit is not None)
-    active_files = [toxic_path, listed_90_path, listed_1_path, active_sqlite]
+    active_files = [
+        toxic_path if toxic_sig is not None else None,
+        sqlite_path if sqlite_sig is not None else None,
+    ]
     return {
         "has_db": True,
         "appears": appears,
@@ -944,15 +1132,20 @@ def query_stopforumspam_offline(ip: str) -> Dict[str, Any]:
 
 
 def warm_stopforumspam_caches() -> None:
-    """Preloads StopForumSpam toxic CIDRs and builds or validates the SQLite index off the event loop."""
+    """Preloads StopForumSpam toxic CIDRs and syncs any prebuilt SQLite index to local ephemeral storage."""
     global _sfs_cache_warmed
 
     paths = resolve_stopforumspam_paths()
     _get_toxic_cidr_index(paths.get("toxic_cidr"))
-    try:
-        _ensure_stopforumspam_sqlite_index(paths)
-    except (OSError, sqlite3.Error, ValueError) as exc:
-        logger.warning("Failed to warm StopForumSpam SQLite index: %s", exc)
+    sqlite_path = paths.get("sqlite_index")
+    if sqlite_path is not None:
+        sqlite_sig = get_file_stat_signature(sqlite_path)
+        if sqlite_sig is not None:
+            try:
+                local_copy = _resolve_local_sfs_sqlite_copy(sqlite_path, sqlite_sig)
+                _get_thread_sfs_connection(local_copy)
+            except (OSError, sqlite3.Error) as exc:
+                logger.warning("Failed to warm StopForumSpam local SQLite copy: %s", exc)
     with _sfs_warm_lock:
         _sfs_cache_warmed = True
 
@@ -963,11 +1156,400 @@ def are_stopforumspam_caches_warm() -> bool:
 
 
 def clear_stopforumspam_caches() -> None:
-    global _sfs_cache_warmed
+    """Clears StopForumSpam caches, closes all cached SQLite and mmap handles, and resets stat throttling."""
+    global _sfs_cache_warmed, _sfs_local_sqlite_cache
+
     _toxic_cidr_cache.clear()
-    _sfs_sqlite_state_cache.clear()
+    _sfs_local_sqlite_cache = (None, None)
+    _close_sfs_connections()
+    _privacy_relays_index.clear()
+    _ipsum_drop_index.clear()
+    _bgp_tools_index.clear()
+    _x4bnet_vpn_index.clear()
+    _tor_onionoo_cache.clear()
+    _bgp_tags_cache.clear()
+    _mobile_asns_cache.clear()
+    clear_stat_throttle_cache()
     with _sfs_warm_lock:
         _sfs_cache_warmed = False
+
+
+def lookup_privacy_relay_offline(ip: str) -> Optional[str]:
+    """Returns icloud_private_relay or cloudflare_warp when matched, excluding Cloudflare CDN ranges."""
+    reader, _updated = _privacy_relays_index.get_reader_and_mtime()
+    if reader is None:
+        return None
+    hit = reader.lookup(ip)
+    if hit is None:
+        return None
+    category = hit[1]
+    if category in ("icloud_private_relay", "cloudflare_warp"):
+        return str(category)
+    return None
+
+
+def _empty_ipsum_drop_result(*, has_db: bool, updated_at: Optional[str]) -> Dict[str, Any]:
+    return {
+        "hasDb": has_db,
+        "has_db": has_db,
+        "isListed": False,
+        "ipsumScore": 0,
+        "isIpsumListed": False,
+        "isHighRisk": False,
+        "inSpamhausDrop": False,
+        "dropSblId": None,
+        "dropCidr": None,
+        "matchedCidr": None,
+        "offlineDbUpdatedAt": updated_at,
+    }
+
+
+def query_ipsum_drop_offline(ip: str) -> Dict[str, Any]:
+    """Queries the compiled IPsum and Spamhaus DROP binary prefix index for IPv4 and IPv6 targets."""
+    reader, updated_at = _ipsum_drop_index.get_reader_and_mtime()
+    if reader is None:
+        return _empty_ipsum_drop_result(has_db=False, updated_at=None)
+
+    hit = reader.lookup(ip)
+    if hit is None:
+        return _empty_ipsum_drop_result(has_db=True, updated_at=updated_at)
+
+    matched_cidr, payload = hit
+    ipsum_score = 0
+    in_drop = False
+    drop_sbl_id: Optional[str] = None
+    drop_cidr: Optional[str] = None
+
+    if isinstance(payload, int) and not isinstance(payload, bool):
+        ipsum_score = max(0, payload)
+    elif isinstance(payload, dict):
+        raw_score = payload.get("score")
+        if isinstance(raw_score, int) and not isinstance(raw_score, bool):
+            ipsum_score = max(0, raw_score)
+        in_drop = bool(payload.get("drop"))
+        raw_sbl = payload.get("sblid")
+        if isinstance(raw_sbl, str) and raw_sbl.strip():
+            drop_sbl_id = raw_sbl.strip()
+        raw_drop_cidr = payload.get("drop_cidr")
+        drop_cidr = raw_drop_cidr.strip() if isinstance(raw_drop_cidr, str) and raw_drop_cidr.strip() else matched_cidr
+
+    is_ipsum_listed = ipsum_score >= 2
+    is_listed = is_ipsum_listed or in_drop
+    if not is_listed:
+        return _empty_ipsum_drop_result(has_db=True, updated_at=updated_at)
+
+    return {
+        "hasDb": True,
+        "has_db": True,
+        "isListed": True,
+        "ipsumScore": ipsum_score,
+        "isIpsumListed": is_ipsum_listed,
+        "isHighRisk": in_drop or ipsum_score >= 3,
+        "inSpamhausDrop": in_drop,
+        "dropSblId": drop_sbl_id,
+        "dropCidr": drop_cidr if in_drop else None,
+        "matchedCidr": matched_cidr,
+        "offlineDbUpdatedAt": updated_at,
+    }
+
+
+def _extract_onionoo_canonical_ip(raw_entry: Any) -> Optional[str]:
+    if not isinstance(raw_entry, str):
+        return None
+    candidate = raw_entry.strip()
+    if not candidate:
+        return None
+    if candidate.startswith("["):
+        end_idx = candidate.find("]")
+        if end_idx <= 1:
+            return None
+        candidate = candidate[1:end_idx]
+    if "%" in candidate and ":" in candidate:
+        candidate = candidate.split("%", 1)[0]
+    try:
+        return ipaddress.ip_address(candidate).compressed
+    except ValueError:
+        pass
+    if candidate.count(":") == 1 and "." in candidate:
+        host_part = candidate.split(":", 1)[0].strip()
+        try:
+            return ipaddress.ip_address(host_part).compressed
+        except ValueError:
+            return None
+    return None
+
+
+def _index_onionoo_summary_payload(payload: Any) -> Optional[Dict[str, List[Dict[str, Any]]]]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("relays"), list):
+        return None
+    by_ip: Dict[str, List[Dict[str, Any]]] = {}
+    for relay in payload["relays"]:
+        if not isinstance(relay, dict):
+            continue
+        seen_for_relay: set[str] = set()
+        for field_name in ("a", "or_addresses", "exit_addresses"):
+            entries = relay.get(field_name)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                canonical = _extract_onionoo_canonical_ip(entry)
+                if canonical and canonical not in seen_for_relay:
+                    seen_for_relay.add(canonical)
+                    by_ip.setdefault(canonical, []).append(relay)
+    return by_ip
+
+
+def lookup_tor_onionoo_offline(ip: str) -> Optional[Dict[str, Any]]:
+    """
+    Looks up an IP in the local Onionoo summary mirror in sub-millisecond time.
+    Returns None only when the local mirror is absent or unreadable so HTTP fallback can run.
+    """
+    path = resolve_feed_data_path(TOR_ONIONOO_SUMMARY_FILENAME, override_setting="TOR_ONIONOO_SUMMARY_PATH")
+    if path is None:
+        return None
+    sig = get_file_stat_signature(path)
+    if sig is None:
+        return None
+
+    target_key = (str(path), sig[0], sig[1])
+    hit = _tor_onionoo_cache.peek_matching(lambda key, _val: key == target_key)
+    if hit is None:
+        try:
+            raw_json = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.warning("Failed to load local Tor Onionoo summary %s: %s", path, exc)
+            return None
+        indexed = _index_onionoo_summary_payload(raw_json)
+        if indexed is None:
+            return None
+        hit = _tor_onionoo_cache.get_or_load(target_key, lambda: indexed)
+
+    canonical = _extract_onionoo_canonical_ip(ip)
+    matched = hit.get(canonical, ()) if canonical else ()
+    return {
+        "relays": [dict(relay) for relay in matched],
+        "bridges": [],
+    }
+
+
+def _parse_asn_int(raw_asn: Any) -> Optional[int]:
+    if isinstance(raw_asn, bool) or raw_asn is None:
+        return None
+    if isinstance(raw_asn, int):
+        return raw_asn if raw_asn > 0 else None
+    if isinstance(raw_asn, str):
+        cleaned = raw_asn.strip().upper()
+        if cleaned.startswith("AS"):
+            cleaned = cleaned[2:].strip()
+        if cleaned.isdigit():
+            parsed = int(cleaned)
+            return parsed if parsed > 0 else None
+    return None
+
+
+def _parse_bgp_tags_json_data(payload: Any) -> Tuple[Dict[int, Tuple[str, ...]], FrozenSet[int]]:
+    asn_tags: Dict[int, Tuple[str, ...]] = {}
+    mobile_asns: set[int] = set()
+    if not isinstance(payload, dict):
+        return asn_tags, frozenset()
+
+    raw_map = payload.get("asn_tags") if isinstance(payload.get("asn_tags"), dict) else payload
+    for raw_key, raw_tags in raw_map.items():
+        if raw_key in ("mobile_asns", "tag_counts"):
+            continue
+        asn_num = _parse_asn_int(raw_key)
+        if asn_num is None or not isinstance(raw_tags, list):
+            continue
+        cleaned_tags = tuple(str(t).strip().lower() for t in raw_tags if isinstance(t, str) and str(t).strip())
+        if cleaned_tags:
+            asn_tags[asn_num] = cleaned_tags
+            if any(tag in MOBILE_BGP_TAG_TOKENS for tag in cleaned_tags):
+                mobile_asns.add(asn_num)
+
+    explicit_mobile = payload.get("mobile_asns")
+    if isinstance(explicit_mobile, list):
+        for item in explicit_mobile:
+            asn_num = _parse_asn_int(item)
+            if asn_num is not None:
+                mobile_asns.add(asn_num)
+
+    return asn_tags, frozenset(mobile_asns)
+
+
+def _get_bgp_tags_data() -> Tuple[Dict[int, Tuple[str, ...]], FrozenSet[int]]:
+    path = resolve_feed_data_path(BGP_TAGS_JSON_FILENAME, override_setting="BGP_TAGS_JSON_PATH")
+    if path is None:
+        return _bgp_tags_cache.set_constant(("__missing__", -1, -1), ({}, frozenset()))
+    sig = get_file_stat_signature(path)
+    if sig is None:
+        return _bgp_tags_cache.set_constant(("__missing__", -1, -1), ({}, frozenset()))
+
+    target_key = (str(path), sig[0], sig[1])
+    hit = _bgp_tags_cache.peek_matching(lambda key, _val: key == target_key)
+    if hit is not None:
+        return hit
+
+    try:
+        parsed = _parse_bgp_tags_json_data(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError) as exc:
+        logger.warning("Failed to parse BGP tags file %s: %s", path, exc)
+        return {}, frozenset()
+    return _bgp_tags_cache.get_or_load(target_key, lambda: parsed)
+
+
+def lookup_bgp_tools_offline(ip: str) -> Optional[Dict[str, Any]]:
+    """Looks up the longest BGP routing prefix, origin ASN, and network tags from offline bgp.tools data."""
+    reader, _updated = _bgp_tools_index.get_reader_and_mtime()
+    if reader is None:
+        return None
+    hit = reader.lookup(ip)
+    if hit is None:
+        return None
+    matched_cidr, payload = hit
+    asn_num = _parse_asn_int(payload.get("asn") if isinstance(payload, dict) else payload)
+    asn_tags_map, _mobile = _get_bgp_tags_data()
+    tags = list(asn_tags_map.get(asn_num, ())) if asn_num is not None else []
+    if isinstance(payload, dict) and isinstance(payload.get("tags"), list):
+        for extra_tag in payload["tags"]:
+            cleaned_tag = str(extra_tag).strip().lower()
+            if cleaned_tag and cleaned_tag not in tags:
+                tags.append(cleaned_tag)
+    return {
+        "bgpPrefix": matched_cidr,
+        "asn": asn_num,
+        "tags": tags,
+    }
+
+
+def _empty_x4bnet_result(*, has_db: bool, updated_at: Optional[str]) -> Dict[str, Any]:
+    return {
+        "hasDb": has_db,
+        "has_db": has_db,
+        "isListed": False,
+        "isVpn": False,
+        "isDatacenter": False,
+        "isHosting": False,
+        "matchedCidr": None,
+        "category": None,
+        "sources": [],
+        "offlineDbUpdatedAt": updated_at,
+    }
+
+
+def _decode_x4bnet_mask(payload: Any) -> int:
+    if isinstance(payload, int) and not isinstance(payload, bool):
+        return payload
+    if isinstance(payload, str):
+        label_text = payload.strip().lower()
+        if label_text == "vpn":
+            return X4BNET_MASK_VPN
+        if label_text == "datacenter":
+            return X4BNET_MASK_DATACENTER
+        if label_text == "hosting":
+            return X4BNET_MASK_HOSTING
+    if isinstance(payload, dict):
+        mask = 0
+        if payload.get("isVpn") or payload.get("category") == "vpn":
+            mask |= X4BNET_MASK_VPN
+        if payload.get("isDatacenter") or payload.get("category") == "datacenter":
+            mask |= X4BNET_MASK_DATACENTER
+        if payload.get("isHosting") or payload.get("category") == "hosting":
+            mask |= X4BNET_MASK_HOSTING
+        return mask
+    return 0
+
+
+def query_x4bnet_vpn_offline(ip: str) -> Dict[str, Any]:
+    """Queries the compiled X4BNet VPN, datacenter, and hosting binary prefix index."""
+    reader, updated_at = _x4bnet_vpn_index.get_reader_and_mtime()
+    if reader is None:
+        return _empty_x4bnet_result(has_db=False, updated_at=None)
+
+    hit = reader.lookup(ip)
+    if hit is None:
+        return _empty_x4bnet_result(has_db=True, updated_at=updated_at)
+
+    matched_cidr, payload = hit
+    mask = _decode_x4bnet_mask(payload)
+    if mask <= 0:
+        return _empty_x4bnet_result(has_db=True, updated_at=updated_at)
+
+    is_vpn = bool(mask & X4BNET_MASK_VPN)
+    is_datacenter = bool(mask & X4BNET_MASK_DATACENTER)
+    is_hosting = bool(mask & (X4BNET_MASK_DATACENTER | X4BNET_MASK_HOSTING))
+    category = "vpn" if is_vpn else ("datacenter" if is_datacenter else "hosting")
+
+    sources: List[str] = []
+    if is_vpn:
+        sources.append("x4bnet_vpn")
+    if is_datacenter:
+        sources.append("x4bnet_datacenter")
+    if mask & X4BNET_MASK_HOSTING:
+        sources.append("ipapi_hosting")
+
+    return {
+        "hasDb": True,
+        "has_db": True,
+        "isListed": True,
+        "isVpn": is_vpn,
+        "isDatacenter": is_datacenter,
+        "isHosting": is_hosting,
+        "matchedCidr": matched_cidr,
+        "category": category,
+        "sources": sources,
+        "offlineDbUpdatedAt": updated_at,
+    }
+
+
+def _parse_mobile_asns_payload(payload: Any) -> FrozenSet[int]:
+    raw_items: Iterable[Any] = ()
+    if isinstance(payload, list):
+        raw_items = payload
+    elif isinstance(payload, dict):
+        for key in ("mobile_asns", "asns", "data"):
+            candidate = payload.get(key)
+            if isinstance(candidate, list):
+                raw_items = candidate
+                break
+
+    asns: set[int] = set()
+    for item in raw_items:
+        asn_num = _parse_asn_int(item.get("asn")) if isinstance(item, dict) else _parse_asn_int(item)
+        if asn_num is not None:
+            asns.add(asn_num)
+    return frozenset(asns)
+
+
+def _get_peeringdb_mobile_asns() -> FrozenSet[int]:
+    path = resolve_feed_data_path(MOBILE_ASNS_JSON_FILENAME, override_setting="MOBILE_ASNS_JSON_PATH")
+    if path is None:
+        return _mobile_asns_cache.set_constant(("__missing__", -1, -1), frozenset())
+    sig = get_file_stat_signature(path)
+    if sig is None:
+        return _mobile_asns_cache.set_constant(("__missing__", -1, -1), frozenset())
+
+    target_key = (str(path), sig[0], sig[1])
+    hit = _mobile_asns_cache.peek_matching(lambda key, _val: key == target_key)
+    if hit is not None:
+        return hit
+
+    try:
+        parsed = _parse_mobile_asns_payload(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError) as exc:
+        logger.warning("Failed to parse mobile ASNs file %s: %s", path, exc)
+        return frozenset()
+    return _mobile_asns_cache.get_or_load(target_key, lambda: parsed)
+
+
+def is_mobile_asn_offline(asn: Optional[int]) -> bool:
+    """Returns True when an ASN is tagged as mobile in PeeringDB mobile_asns.json or bgp_tags.json."""
+    asn_num = _parse_asn_int(asn)
+    if asn_num is None:
+        return False
+    if asn_num in _get_peeringdb_mobile_asns():
+        return True
+    _tags_map, bgp_mobile_asns = _get_bgp_tags_data()
+    return asn_num in bgp_mobile_asns
 
 
 def _resolve_mmdb_path_with_overrides(
@@ -1016,6 +1598,7 @@ def resolve_cloud_cidr_path(
     *,
     env_overrides: Optional[Mapping[str, str]] = None,
     base_dir: Optional[Path] = None,
+    bypass_throttle: bool = False,
 ) -> Tuple[Optional[Path], str]:
     """Resolves the local cloud provider CIDR file from TOOL_DATA_DIR or standard data directories."""
     configured_dir = resolve_configured_data_dir(env_overrides=env_overrides)
@@ -1023,16 +1606,16 @@ def resolve_cloud_cidr_path(
         base = Path(expand_configured_path(configured_dir))
         for fname in CLOUD_CIDR_FILENAMES:
             candidate = base / fname
-            if candidate.is_file():
+            if _is_regular_file(candidate, bypass_throttle=bypass_throttle):
                 return candidate, candidate.name
         return None, CLOUD_CIDR_FILENAMES[0]
 
     resolved_base = _effective_base_dir(base_dir)
-    if env_overrides is not None:
+    if env_overrides is not None or not bypass_throttle:
         for directory in _effective_standard_dirs(env_overrides=env_overrides, base_dir=resolved_base):
             for fname in CLOUD_CIDR_FILENAMES:
                 candidate = directory / fname
-                if candidate.is_file():
+                if _is_regular_file(candidate, bypass_throttle=bypass_throttle):
                     return candidate, candidate.name
         return None, CLOUD_CIDR_FILENAMES[0]
 
@@ -1040,7 +1623,7 @@ def resolve_cloud_cidr_path(
         resolved = resolve_data_file("", fname, resolved_base, default_missing="")
         if resolved:
             candidate = Path(resolved)
-            if candidate.is_file():
+            if _is_regular_file(candidate, bypass_throttle=True):
                 return candidate, candidate.name
     return None, CLOUD_CIDR_FILENAMES[0]
 
@@ -1049,6 +1632,7 @@ def resolve_hosting_rules_path(
     *,
     env_overrides: Optional[Mapping[str, str]] = None,
     base_dir: Optional[Path] = None,
+    bypass_throttle: bool = False,
 ) -> Tuple[Optional[Path], str]:
     """Resolves the hosting ASN rules JSON file across explicit overrides and standard data directories."""
     filenames = (HOSTING_RULES_FILENAME,)
@@ -1056,30 +1640,21 @@ def resolve_hosting_rules_path(
     resolved_base = _effective_base_dir(base_dir)
     if raw_configured:
         expanded = Path(expand_configured_path(raw_configured))
-        if expanded.is_file():
+        if _is_regular_file(expanded, bypass_throttle=bypass_throttle):
             return expanded, expanded.name
+        for fname in filenames:
+            candidate = expanded / fname
+            if _is_regular_file(candidate, bypass_throttle=bypass_throttle):
+                return candidate, candidate.name
         if expanded.is_dir():
-            for fname in filenames:
-                candidate = expanded / fname
-                if candidate.is_file():
-                    return candidate, candidate.name
             return None, filenames[0]
         if env_overrides is not None or expanded != resolved_base.parent / "data" / filenames[0]:
             return None, expanded.name or filenames[0]
 
-    if env_overrides is not None:
-        for directory in _effective_standard_dirs(env_overrides=env_overrides, base_dir=resolved_base):
-            for fname in filenames:
-                candidate = directory / fname
-                if candidate.is_file():
-                    return candidate, candidate.name
-        return None, filenames[0]
-
-    for fname in filenames:
-        resolved = resolve_data_file("", fname, resolved_base, default_missing="")
-        if resolved:
-            candidate = Path(resolved)
-            if candidate.is_file():
+    for directory in _effective_standard_dirs(env_overrides=env_overrides, base_dir=resolved_base):
+        for fname in filenames:
+            candidate = directory / fname
+            if _is_regular_file(candidate, bypass_throttle=bypass_throttle):
                 return candidate, candidate.name
     return None, filenames[0]
 
@@ -1087,7 +1662,7 @@ def resolve_hosting_rules_path(
 def get_maxmind_newest_mtime_iso() -> Optional[str]:
     """Returns the newest UTC ISO-8601 modification timestamp across existing MaxMind MMDB files."""
     paths = resolve_maxmind_paths()
-    return _newest_mtime_iso(path for path in paths.values() if path is not None and path.is_file())
+    return _newest_mtime_iso(path for path in paths.values() if _is_regular_file(path))
 
 
 def _build_offline_db_entry(
@@ -1103,15 +1678,9 @@ def _build_offline_db_entry(
     missing_label: Optional[str] = None,
 ) -> Dict[str, Any]:
     filename = file_path.name if file_path is not None else fallback_filename
-    stat_res = None
-    if file_path is not None:
-        try:
-            if file_path.is_file():
-                stat_res = os.stat(file_path)
-        except OSError:
-            stat_res = None
+    sig = get_file_stat_signature(file_path, bypass_throttle=True) if file_path is not None else None
 
-    if stat_res is None:
+    if sig is None:
         resolved_missing_label = (
             missing_label if missing_label is not None else ("Optional (Not Configured)" if optional else "Missing")
         )
@@ -1130,7 +1699,7 @@ def _build_offline_db_entry(
             "statusLabel": resolved_missing_label,
         }
 
-    mtime_ts = float(stat_res.st_mtime)
+    mtime_ts = sig[0] / 1_000_000_000.0
     age_seconds = max(0, int(now_ts - mtime_ts))
     is_stale = stale_after_seconds > 0 and age_seconds > stale_after_seconds
     last_modified_iso = datetime.fromtimestamp(mtime_ts, tz=timezone.utc).isoformat()
@@ -1141,7 +1710,7 @@ def _build_offline_db_entry(
         "filename": filename,
         "exists": True,
         "optional": optional,
-        "sizeBytes": int(stat_res.st_size),
+        "sizeBytes": int(sig[1]),
         "lastModifiedIso": last_modified_iso,
         "ageSeconds": age_seconds,
         "staleAfterSeconds": stale_after_seconds,
@@ -1165,10 +1734,11 @@ def build_offline_database_entries(
     rules_stale: int,
     now_ts: float,
     cloud_cidrs_stale: Optional[int] = None,
+    extra_feed_specs: Optional[Sequence[Tuple[str, str, str, Optional[Path], str, bool, int, Optional[str]]]] = None,
     include_resolved_path: bool = False,
 ) -> List[Dict[str, Any]]:
     """Builds standardised status entries for all configured offline databases and rule files."""
-    specs = (
+    specs: List[Tuple[str, str, str, Optional[Path], str, bool, int, Optional[str]]] = [
         (
             "maxmind_country",
             "MaxMind",
@@ -1259,7 +1829,9 @@ def build_offline_database_entries(
             rules_stale,
             "Built-in (Optional)",
         ),
-    )
+    ]
+    if extra_feed_specs:
+        specs.extend(extra_feed_specs)
 
     entries: List[Dict[str, Any]] = []
     for key, source, name, file_path, fallback_filename, optional, stale_after_seconds, missing_label in specs:
@@ -1309,11 +1881,120 @@ def collect_offline_databases_status(
     rules_stale = get_positive_int_setting(
         "OFFLINE_DB_RULES_STALE_SECONDS", DEFAULT_STALE_RULES_SECONDS, env_overrides=env_overrides
     )
+    tor_stale = get_positive_int_setting(
+        "OFFLINE_DB_TOR_ONIONOO_STALE_SECONDS", DEFAULT_STALE_TOR_ONIONOO_SECONDS, env_overrides=env_overrides
+    )
+    daily_feed_stale = get_positive_int_setting(
+        "OFFLINE_DB_DAILY_FEED_STALE_SECONDS", DEFAULT_STALE_DAILY_FEED_SECONDS, env_overrides=env_overrides
+    )
 
     maxmind_paths = resolve_maxmind_paths(env_overrides=env_overrides, base_dir=base_dir)
-    sfs_paths = resolve_stopforumspam_paths(env_overrides=env_overrides, base_dir=base_dir)
-    cloud_cidr_path, cloud_cidr_name = resolve_cloud_cidr_path(env_overrides=env_overrides, base_dir=base_dir)
-    hosting_rules_path, hosting_rules_name = resolve_hosting_rules_path(env_overrides=env_overrides, base_dir=base_dir)
+    sfs_paths = resolve_stopforumspam_paths(env_overrides=env_overrides, base_dir=base_dir, bypass_throttle=True)
+    cloud_cidr_path, cloud_cidr_name = resolve_cloud_cidr_path(
+        env_overrides=env_overrides, base_dir=base_dir, bypass_throttle=True
+    )
+    hosting_rules_path, hosting_rules_name = resolve_hosting_rules_path(
+        env_overrides=env_overrides, base_dir=base_dir, bypass_throttle=True
+    )
+
+    extra_specs = (
+        (
+            "privacy_relays",
+            "Privacy Relays",
+            "Apple Private Relay and Cloudflare WARP",
+            resolve_feed_data_path(
+                PRIVACY_RELAYS_BIN_FILENAME,
+                override_setting="PRIVACY_RELAYS_BIN_PATH",
+                env_overrides=env_overrides,
+                base_dir=base_dir,
+                bypass_throttle=True,
+            ),
+            PRIVACY_RELAYS_BIN_FILENAME,
+            True,
+            daily_feed_stale,
+            None,
+        ),
+        (
+            "ipsum_drop",
+            "IPsum and DROP",
+            "IPsum and Spamhaus DROP Index",
+            resolve_feed_data_path(
+                IPSUM_DROP_BIN_FILENAME,
+                override_setting="IPSUM_DROP_BIN_PATH",
+                env_overrides=env_overrides,
+                base_dir=base_dir,
+                bypass_throttle=True,
+            ),
+            IPSUM_DROP_BIN_FILENAME,
+            True,
+            daily_feed_stale,
+            None,
+        ),
+        (
+            "tor_onionoo",
+            "Tor Onionoo",
+            "Tor Onionoo Summary Mirror",
+            resolve_feed_data_path(
+                TOR_ONIONOO_SUMMARY_FILENAME,
+                override_setting="TOR_ONIONOO_SUMMARY_PATH",
+                env_overrides=env_overrides,
+                base_dir=base_dir,
+                bypass_throttle=True,
+            ),
+            TOR_ONIONOO_SUMMARY_FILENAME,
+            True,
+            tor_stale,
+            None,
+        ),
+        (
+            "bgp_tools",
+            "BGP Tools",
+            "BGP Routing Table Prefix Index",
+            resolve_feed_data_path(
+                BGP_TOOLS_BIN_FILENAME,
+                override_setting="BGP_TOOLS_BIN_PATH",
+                env_overrides=env_overrides,
+                base_dir=base_dir,
+                bypass_throttle=True,
+            ),
+            BGP_TOOLS_BIN_FILENAME,
+            True,
+            daily_feed_stale,
+            None,
+        ),
+        (
+            "x4bnet_vpn",
+            "X4BNet VPN",
+            "X4BNet VPN and Hosting Index",
+            resolve_feed_data_path(
+                X4BNET_VPN_BIN_FILENAME,
+                override_setting="X4BNET_VPN_BIN_PATH",
+                env_overrides=env_overrides,
+                base_dir=base_dir,
+                bypass_throttle=True,
+            ),
+            X4BNET_VPN_BIN_FILENAME,
+            True,
+            daily_feed_stale,
+            None,
+        ),
+        (
+            "peeringdb_mobile",
+            "PeeringDB",
+            "PeeringDB Mobile ASNs",
+            resolve_feed_data_path(
+                MOBILE_ASNS_JSON_FILENAME,
+                override_setting="MOBILE_ASNS_JSON_PATH",
+                env_overrides=env_overrides,
+                base_dir=base_dir,
+                bypass_throttle=True,
+            ),
+            MOBILE_ASNS_JSON_FILENAME,
+            True,
+            daily_feed_stale,
+            None,
+        ),
+    )
 
     return build_offline_database_entries(
         maxmind_paths=maxmind_paths,
@@ -1328,6 +2009,7 @@ def collect_offline_databases_status(
         sfs_1_stale=sfs_1_stale,
         rules_stale=rules_stale,
         cloud_cidrs_stale=cloud_cidrs_stale,
+        extra_feed_specs=extra_specs,
         now_ts=now_ts,
         include_resolved_path=include_resolved_path,
     )

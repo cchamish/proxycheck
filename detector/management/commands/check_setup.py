@@ -19,6 +19,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
+from django.db import Error as DjangoDbError
 from django.utils.crypto import get_random_string
 from dotenv import dotenv_values, set_key
 
@@ -32,7 +33,20 @@ from detector.offline_dbs import (
     collect_offline_databases_status,
 )
 from detector.provider_registry import PROVIDER_REGISTRY
-from proxycheck.settings import expand_configured_path, resolve_dotenv_path, resolve_tool_data_subdir
+from detector.sanitization import sanitize_error_message
+from proxycheck.settings import (
+    build_databases_config,
+    expand_configured_path,
+    resolve_dotenv_path,
+    resolve_tool_data_subdir,
+)
+
+try:
+    import pymysql
+    from pymysql.err import MySQLError as _PyMySqlError
+except ImportError:
+    pymysql = None
+    _PyMySqlError = None
 
 ENV_MODES = ("auto", "bastion", "local")
 DEFAULT_PRODUCTION_REDIRECT_URI = "https://proxycheck.toolforge.org/oauth/callback"
@@ -130,6 +144,20 @@ class BastionJobCheck:
     warnings: Tuple[str, ...]
     adapted_image: str
     covered_by: str = ""
+
+
+@dataclass(frozen=True)
+class ToolsDbCheckResult:
+    """Diagnostic outcome for ToolsDB MariaDB connectivity, schema privacy, and grants."""
+
+    status: str
+    db_name: str = ""
+    host: str = ""
+    port: int = 3306
+    user: str = ""
+    is_public_name_hazard: bool = False
+    unsafe_grants: Tuple[str, ...] = ()
+    message: str = ""
 
 
 def _build_core_and_oauth_env_specs() -> Tuple[EnvVarSpec, ...]:
@@ -245,34 +273,62 @@ def _build_provider_api_env_specs() -> Tuple[EnvVarSpec, ...]:
 
 
 def _build_runtime_and_path_env_specs() -> Tuple[EnvVarSpec, ...]:
-    """Returns optional runtime, offline database path, and frontend build metadata specs."""
-    runtime_defs = (
-        ("DJANGO_DEBUG", "False", "Enable Django debug mode (local development only)"),
-        ("DJANGO_SECURE_HSTS_SECONDS", "31536000", "HSTS max-age in seconds when DJANGO_DEBUG is False"),
-        ("PORT", "8000", "Gunicorn HTTP bind port"),
-        ("WEB_CONCURRENCY", "2", "Gunicorn UvicornWorker worker count"),
-        ("REDIS_KEY_PREFIX", "proxycheck_dev_", "Django cache key prefix in Redis"),
-        ("ENABLE_TEST_AUTH", "(disabled)", "Set to 1 alongside DJANGO_DEBUG=True to enable test role switching"),
-        ("WIKIMEDIA_OAUTH_URL", "https://meta.wikimedia.org/w/rest.php/oauth2", "Wikimedia OAuth 2.0 base endpoint"),
-        ("GADGET_TOKEN_TTL_SECONDS", "3600", "Signed userscript gadget token lifetime in seconds"),
+    """Returns optional runtime, ToolsDB storage, offline database path, and build metadata specs."""
+    runtime_defs: Tuple[Tuple[str, str, str, bool], ...] = (
+        ("DJANGO_DEBUG", "False", "Enable Django debug mode (local development only)", False),
+        ("DJANGO_SECURE_HSTS_SECONDS", "31536000", "HSTS max-age in seconds when DJANGO_DEBUG is False", False),
+        ("PORT", "8000", "Gunicorn HTTP bind port", False),
+        ("WEB_CONCURRENCY", "2", "Gunicorn UvicornWorker worker count", False),
+        ("REDIS_KEY_PREFIX", "proxycheck_dev_", "Django cache key prefix in Redis", False),
+        (
+            "REDIS_KEY_SECRET",
+            "(fallback to DJANGO_SECRET_KEY)",
+            "Secret key isolating Shared Redis namespaces and hashing IP suffixes",
+            True,
+        ),
+        ("ENABLE_L2_TOOLSDB_CACHE", "True", "Enable persistent ToolsDB L2 cache storage", False),
+        ("TOOLSDB_NAME", "(unset; SQLite fallback)", "Private ToolsDB database name without a _p suffix", False),
+        ("TOOL_TOOLSDB_NAME", "(unset)", "Buildpack-injected ToolsDB database name override", False),
+        ("TOOLSDB_HOST", "tools.db.svc.wikimedia.cloud", "ToolsDB MariaDB hostname", False),
+        ("TOOLSDB_PORT", "3306", "ToolsDB MariaDB TCP port", False),
+        ("TOOLSDB_USER", "(auto)", "Explicit ToolsDB MariaDB username override", False),
+        ("TOOLSDB_PASSWORD", "(auto)", "Explicit ToolsDB MariaDB password override", True),
+        ("TOOL_TOOLSDB_USER", "(auto)", "Toolforge-injected ToolsDB username", False),
+        ("TOOL_TOOLSDB_PASSWORD", "(auto)", "Toolforge-injected ToolsDB password", True),
+        ("CACHE_SWR_STALE_DAYS", "90", "Age threshold in days before L2 snapshots trigger background refresh", False),
+        ("ENABLE_TEST_AUTH", "(disabled)", "Set to 1 alongside DJANGO_DEBUG=True to enable test role switching", False),
+        (
+            "WIKIMEDIA_OAUTH_URL",
+            "https://meta.wikimedia.org/w/rest.php/oauth2",
+            "Wikimedia OAuth 2.0 base endpoint",
+            False,
+        ),
+        ("GADGET_TOKEN_TTL_SECONDS", "3600", "Signed userscript gadget token lifetime in seconds", False),
         (
             "RESTRICT_TO_ALLOWED_WIKI_USERS",
             "False",
             "Restrict access exclusively to usernames listed in ALLOWED_WIKI_USERS",
+            False,
         ),
-        ("STOPFORUMSPAM_TOXIC_CIDR_PATH", "(auto)", "Override file or directory path for toxic_ip_cidr.txt"),
-        ("STOPFORUMSPAM_LISTED_90_PATH", "(auto)", "Override path for StopForumSpam 90-day listed IP archive"),
-        ("STOPFORUMSPAM_LISTED_1_PATH", "(auto)", "Override path for StopForumSpam 1-day listed IP archive"),
-        ("STOPFORUMSPAM_SQLITE_PATH", "(auto)", "Override path for stopforumspam.sqlite3 index"),
-        ("HOSTING_ASN_RULES_PATH", "(auto)", "Override path for hosting_asn_rules.json"),
-        ("HOSTING_ASNS", "(built-in)", "Extra comma-separated hosting ASNs"),
-        ("HOSTING_ORG_KEYWORDS", "(built-in)", "Extra comma-separated hosting organisation keywords"),
-        ("VITE_GITHUB_REPO", "(unset)", "Build-time GitHub repository slug shown in the UI footer"),
-        ("VITE_COMMIT_HASH", "(git HEAD)", "Build-time commit hash override for the frontend bundle"),
+        ("STOPFORUMSPAM_TOXIC_CIDR_PATH", "(auto)", "Override file or directory path for toxic_ip_cidr.txt", False),
+        (
+            "STOPFORUMSPAM_LISTED_90_PATH",
+            "(auto)",
+            "Override path for StopForumSpam 90-day listed IP archive",
+            False,
+        ),
+        ("STOPFORUMSPAM_LISTED_1_PATH", "(auto)", "Override path for StopForumSpam 1-day listed IP archive", False),
+        ("STOPFORUMSPAM_SQLITE_PATH", "(auto)", "Override path for stopforumspam.sqlite3 index", False),
+        ("HOSTING_ASN_RULES_PATH", "(auto)", "Override path for hosting_asn_rules.json", False),
+        ("HOSTING_ASNS", "(built-in)", "Extra comma-separated hosting ASNs", False),
+        ("HOSTING_ORG_KEYWORDS", "(built-in)", "Extra comma-separated hosting organisation keywords", False),
+        ("VITE_GITHUB_REPO", "(unset)", "Build-time GitHub repository slug shown in the UI footer", False),
+        ("VITE_COMMIT_HASH", "(git HEAD)", "Build-time commit hash override for the frontend bundle", False),
         (
             "VITE_COMMIT_TIMESTAMP",
             "(git commit time)",
             "Build-time UTC commit timestamp override for the frontend bundle",
+            False,
         ),
     )
     return tuple(
@@ -280,10 +336,11 @@ def _build_runtime_and_path_env_specs() -> Tuple[EnvVarSpec, ...]:
             name=name,
             tier="optional",
             category="Runtime, Paths & Build Metadata",
+            sensitive=sensitive,
             default_display=default_display,
             description=description,
         )
-        for name, default_display, description in runtime_defs
+        for name, default_display, description, sensitive in runtime_defs
     )
 
 
@@ -1176,7 +1233,17 @@ def _extract_update_offline_sources(command: str) -> set[str]:
         idx += 1
 
     if not source_tokens or "all" in source_tokens:
-        return {"stopforumspam", "maxmind", "cloud_cidrs"}
+        return {
+            "stopforumspam",
+            "maxmind",
+            "cloud_cidrs",
+            "privacy_relays",
+            "ipsum_drop",
+            "tor_onionoo",
+            "bgp_tools",
+            "x4bnet_vpn",
+            "peeringdb_mobile",
+        }
 
     alias_map = {
         "stopforumspam": "stopforumspam",
@@ -1185,6 +1252,12 @@ def _extract_update_offline_sources(command: str) -> set[str]:
         "cloud_cidrs": "cloud_cidrs",
         "cloud-cidrs": "cloud_cidrs",
         "cloud": "cloud_cidrs",
+        "privacy_relays": "privacy_relays",
+        "ipsum_drop": "ipsum_drop",
+        "tor_onionoo": "tor_onionoo",
+        "bgp_tools": "bgp_tools",
+        "x4bnet_vpn": "x4bnet_vpn",
+        "peeringdb_mobile": "peeringdb_mobile",
     }
     return {alias_map[tok] for tok in source_tokens if tok in alias_map}
 
@@ -1231,8 +1304,15 @@ def _validate_registered_job(
         job_warnings.append(f"mount is '{reg.mount}' (expected '{spec.mount}')")
     if tool_account and reg.image and reg.image != adapted_image:
         job_warnings.append(f"image is '{reg.image}' (expected '{adapted_image}')")
-    if reg.command and not covered_by and "update_offline_dbs" not in reg.command:
-        job_warnings.append(f"command is '{reg.command}' (expected '{spec.command}')")
+    if reg.command and not covered_by:
+        expects_offline_updater = "update_offline_dbs" in spec.command
+        command_mismatch = (
+            ("update_offline_dbs" not in reg.command)
+            if expects_offline_updater
+            else (spec.command.strip() not in reg.command)
+        )
+        if command_mismatch:
+            job_warnings.append(f"command is '{reg.command}' (expected '{spec.command}')")
     if any(token in reg.status.lower() for token in _FAILED_JOB_STATUS_TOKENS):
         job_warnings.append(f"unhealthy job status '{reg.status}'")
 
@@ -1253,7 +1333,12 @@ def _hydrate_missing_job_details(
     expected_names: set[str],
 ) -> None:
     for job_name, reg in list(active_jobs.items()):
-        if job_name not in expected_names and "update" not in job_name and "db" not in job_name:
+        if (
+            job_name not in expected_names
+            and "update" not in job_name
+            and "db" not in job_name
+            and "purge" not in job_name
+        ):
             continue
         if reg.command and reg.image and reg.mount:
             continue
@@ -1363,6 +1448,241 @@ def _format_bytes(size_bytes: Optional[int]) -> str:
     if size_bytes < 1024 * 1024:
         return f"{size_bytes / 1024:.1f} KiB"
     return f"{size_bytes / (1024 * 1024):.1f} MiB"
+
+
+_GRANT_STMT_RE = re.compile(r"^\s*GRANT\s+(.+?)\s+ON\s+(.+?)\s+TO\s+(.+?)\s*;?\s*$", re.IGNORECASE)
+_MYSQL_PROBE_ERRORS: Tuple[type[BaseException], ...] = (
+    (ImportError, OSError, RuntimeError, ValueError, DjangoDbError, _PyMySqlError)
+    if _PyMySqlError is not None
+    else (ImportError, OSError, RuntimeError, ValueError, DjangoDbError)
+)
+
+
+def is_public_toolsdb_name(db_name: str) -> bool:
+    """Returns True when a ToolsDB schema name ends with the public exposure suffix _p."""
+    cleaned = str(db_name or "").strip().strip("`'\"")
+    return bool(cleaned) and cleaned.lower().endswith("_p")
+
+
+def _extract_grantee_user(grantee_clause: str) -> Tuple[str, bool]:
+    trimmed = re.split(r"\s+(?:IDENTIFIED|WITH|REQUIRE)\b", grantee_clause.strip(), maxsplit=1, flags=re.IGNORECASE)[0]
+    trimmed = trimmed.strip()
+    if trimmed.upper() == "PUBLIC" or trimmed.upper().startswith("PUBLIC "):
+        return "PUBLIC", True
+    if "@" not in trimmed:
+        user_only = trimmed.strip("`'\"")
+        return user_only, user_only.upper() == "PUBLIC"
+    user_part, _ = trimmed.rsplit("@", 1)
+    cleaned_user = user_part.strip().strip("`'\"")
+    is_public_or_wildcard = cleaned_user == "" or "%" in cleaned_user or cleaned_user.lower() == "public"
+    return cleaned_user, is_public_or_wildcard
+
+
+def _is_unsafe_grant_statement(stmt: str, *, expected_user: str) -> bool:
+    match = _GRANT_STMT_RE.match(stmt)
+    if not match:
+        return False
+    privs_raw, target_raw, grantee_raw = match.groups()
+    privs_upper = " ".join(privs_raw.upper().split())
+
+    grantee_user, is_public_grantee = _extract_grantee_user(grantee_raw)
+    if is_public_grantee:
+        return True
+    if expected_user and grantee_user and grantee_user != expected_user.strip():
+        return True
+
+    schema_part = target_raw.strip().split(".", 1)[0].strip().strip("`'\"")
+    normalized_schema = schema_part.replace("\\_", "_")
+    if is_public_toolsdb_name(normalized_schema):
+        return True
+    return normalized_schema in ("*", "%") and privs_upper != "USAGE"
+
+
+def find_unsafe_grant_statements(
+    grant_rows: Sequence[Any],
+    *,
+    expected_user: str = "",
+    db_name: str = "",
+) -> List[str]:
+    """Extracts any SHOW GRANTS statements that expose schemas to public or wildcard users."""
+    unsafe: List[str] = []
+    if db_name and is_public_toolsdb_name(db_name):
+        unsafe.append(f"PUBLIC_SCHEMA_NAME:{db_name}")
+    for row in grant_rows:
+        if isinstance(row, str):
+            stmt = row.strip()
+        elif isinstance(row, Sequence) and row:
+            stmt = str(row[0]).strip()
+        else:
+            continue
+        if stmt and _is_unsafe_grant_statement(stmt, expected_user=expected_user):
+            unsafe.append(stmt)
+    return unsafe
+
+
+def check_redis_key_secret_status(
+    env_values: Mapping[str, str],
+    *,
+    hidden_keys: frozenset[str] = frozenset(),
+) -> Tuple[str, str]:
+    """Validates REDIS_KEY_SECRET presence and entropy for multi-tenant Redis isolation."""
+    if "REDIS_KEY_SECRET" in hidden_keys:
+        return "ok", "configured in Toolforge envvars (hidden by CLI)"
+    raw_secret = str(env_values.get("REDIS_KEY_SECRET") or "").strip()
+    if not raw_secret:
+        return "warning", "unset; falling back to DJANGO_SECRET_KEY for Redis namespace HMAC isolation"
+    is_placeholder, weak_reason = _is_weak_secret_key(raw_secret)
+    if is_placeholder:
+        return "error", f"{mask_secret(raw_secret)} ({weak_reason})"
+    if weak_reason:
+        return "warning", f"{mask_secret(raw_secret)} ({weak_reason})"
+    return "ok", f"configured = {mask_secret(raw_secret)}"
+
+
+def _open_mysql_probe_connection(db_cfg: Mapping[str, Any]) -> Any:
+    if pymysql is None:
+        raise ImportError("PyMySQL is not installed in the active Python environment.")
+    options = db_cfg.get("OPTIONS") if isinstance(db_cfg.get("OPTIONS"), Mapping) else {}
+    return pymysql.connect(
+        host=str(db_cfg.get("HOST") or "tools.db.svc.wikimedia.cloud"),
+        port=int(db_cfg.get("PORT") or 3306),
+        user=str(db_cfg.get("USER") or ""),
+        password=str(db_cfg.get("PASSWORD") or ""),
+        database=str(db_cfg.get("NAME") or ""),
+        connect_timeout=int(options.get("connect_timeout") or 3),
+        read_timeout=int(options.get("read_timeout") or 5),
+        write_timeout=int(options.get("write_timeout") or 5),
+        charset=str(options.get("charset") or "utf8mb4"),
+    )
+
+
+def _probe_mysql_connectivity_and_grants(
+    default_cfg: Mapping[str, Any],
+    *,
+    connection_factory: Optional[Callable[[Mapping[str, Any]], Any]],
+) -> ToolsDbCheckResult:
+    resolved_db_name = str(default_cfg.get("NAME") or "").strip()
+    resolved_host = str(default_cfg.get("HOST") or "")
+    resolved_port = int(default_cfg.get("PORT") or 3306)
+    resolved_user = str(default_cfg.get("USER") or "")
+
+    conn_fn = _open_mysql_probe_connection if connection_factory is None else connection_factory
+    conn = None
+    try:
+        conn = conn_fn(default_cfg)
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+            cursor.execute("SHOW GRANTS")
+            grant_rows = list(cursor.fetchall() or ())
+    except _MYSQL_PROBE_ERRORS as exc:
+        safe_msg = sanitize_error_message(str(exc))
+        return ToolsDbCheckResult(
+            status="error",
+            db_name=resolved_db_name,
+            host=resolved_host,
+            port=resolved_port,
+            user=resolved_user,
+            message=f"ToolsDB connection check failed: {safe_msg}",
+        )
+    finally:
+        close_fn = getattr(conn, "close", None)
+        if callable(close_fn):
+            with contextlib.suppress(*_MYSQL_PROBE_ERRORS):
+                close_fn()
+
+    unsafe = tuple(find_unsafe_grant_statements(grant_rows, expected_user=resolved_user, db_name=resolved_db_name))
+    if unsafe:
+        return ToolsDbCheckResult(
+            status="error",
+            db_name=resolved_db_name,
+            host=resolved_host,
+            port=resolved_port,
+            user=resolved_user,
+            unsafe_grants=unsafe,
+            message=f"Unsafe wildcard or public MariaDB grants detected ({len(unsafe)} statement(s)).",
+        )
+    return ToolsDbCheckResult(
+        status="ok",
+        db_name=resolved_db_name,
+        host=resolved_host,
+        port=resolved_port,
+        user=resolved_user,
+        message=f"Connected to {resolved_host}:{resolved_port} schema '{resolved_db_name}' as '{resolved_user}'.",
+    )
+
+
+def check_toolsdb_status(
+    base_dir: Path,
+    env_values: Mapping[str, str],
+    *,
+    hidden_keys: frozenset[str] = frozenset(),
+    home_dir: Optional[Path] = None,
+    connection_factory: Optional[Callable[[Mapping[str, Any]], Any]] = None,
+) -> ToolsDbCheckResult:
+    """Verifies ToolsDB configuration, rejects _p public schema names, and audits MariaDB grants."""
+    raw_db_name = str(env_values.get("TOOLSDB_NAME") or env_values.get("TOOL_TOOLSDB_NAME") or "").strip()
+    if is_public_toolsdb_name(raw_db_name):
+        return ToolsDbCheckResult(
+            status="error",
+            db_name=raw_db_name,
+            is_public_name_hazard=True,
+            message=(
+                f"Database name '{raw_db_name}' ends with '_p', which exposes tables publicly across "
+                "Toolforge and Quarry."
+            ),
+        )
+
+    enable_raw = str(env_values.get("ENABLE_L2_TOOLSDB_CACHE") or "").strip().lower()
+    if enable_raw in ("0", "false", "no", "off"):
+        return ToolsDbCheckResult(
+            status="disabled",
+            db_name=raw_db_name,
+            message="ToolsDB L2 cache is disabled via ENABLE_L2_TOOLSDB_CACHE.",
+        )
+
+    resolved_home = home_dir if home_dir is not None else Path.home()
+    db_configs = build_databases_config(
+        env=env_values,
+        base_dir=base_dir,
+        is_test_run=False,
+        home_dir=resolved_home,
+    )
+    default_cfg = db_configs["default"]
+    if default_cfg.get("ENGINE") != "django.db.backends.mysql":
+        if raw_db_name:
+            if "TOOLSDB_PASSWORD" in hidden_keys or "TOOL_TOOLSDB_PASSWORD" in hidden_keys:
+                return ToolsDbCheckResult(
+                    status="ok",
+                    db_name=raw_db_name,
+                    message=f"Schema '{raw_db_name}' configured in Toolforge envvars (credentials hidden by CLI).",
+                )
+            return ToolsDbCheckResult(
+                status="warning",
+                db_name=raw_db_name,
+                message=f"Schema '{raw_db_name}' is set without ToolsDB credentials; falling back to local SQLite.",
+            )
+        return ToolsDbCheckResult(
+            status="unconfigured",
+            message="ToolsDB not configured; using local SQLite fallback.",
+        )
+
+    resolved_db_name = str(default_cfg.get("NAME") or "").strip()
+    if is_public_toolsdb_name(resolved_db_name):
+        return ToolsDbCheckResult(
+            status="error",
+            db_name=resolved_db_name,
+            host=str(default_cfg.get("HOST") or ""),
+            port=int(default_cfg.get("PORT") or 3306),
+            user=str(default_cfg.get("USER") or ""),
+            is_public_name_hazard=True,
+            message=(
+                f"Database name '{resolved_db_name}' ends with '_p', which exposes tables publicly across "
+                "Toolforge and Quarry."
+            ),
+        )
+
+    return _probe_mysql_connectivity_and_grants(default_cfg, connection_factory=connection_factory)
 
 
 class Command(BaseCommand):
@@ -1781,6 +2101,42 @@ class Command(BaseCommand):
                 self.stdout.write(self.style.ERROR(f"  - {tag} {name} ({filename}): MISSING"))
         return entries
 
+    def _print_storage_security_section(
+        self,
+        *,
+        base_dir: Path,
+        env_result: EnvLoadResult,
+    ) -> Tuple[Tuple[str, str], ToolsDbCheckResult]:
+        self.stdout.write("\n  Cache Isolation & ToolsDB Storage:")
+        redis_status, redis_note = check_redis_key_secret_status(
+            env_result.values,
+            hidden_keys=env_result.hidden_keys,
+        )
+        if redis_status == "ok":
+            self.stdout.write(self.style.SUCCESS(f"  - REDIS_KEY_SECRET: OK ({redis_note})"))
+        elif redis_status == "warning":
+            self.stdout.write(self.style.WARNING(f"  - REDIS_KEY_SECRET: WARNING ({redis_note})"))
+        else:
+            self.stdout.write(self.style.ERROR(f"  - REDIS_KEY_SECRET: ERROR ({redis_note})"))
+
+        toolsdb_result = check_toolsdb_status(
+            base_dir,
+            env_result.values,
+            hidden_keys=env_result.hidden_keys,
+        )
+        if toolsdb_result.status == "ok":
+            self.stdout.write(self.style.SUCCESS(f"  - ToolsDB L2: OK ({toolsdb_result.message})"))
+        elif toolsdb_result.status == "warning":
+            self.stdout.write(self.style.WARNING(f"  - ToolsDB L2: WARNING ({toolsdb_result.message})"))
+        elif toolsdb_result.status == "error":
+            self.stdout.write(self.style.ERROR(f"  - ToolsDB L2: ERROR ({toolsdb_result.message})"))
+            for bad_grant in toolsdb_result.unsafe_grants:
+                self.stdout.write(self.style.ERROR(f"    Unsafe grant: {bad_grant}"))
+        else:
+            self.stdout.write(f"  - ToolsDB L2: {toolsdb_result.status.upper()} ({toolsdb_result.message})")
+
+        return (redis_status, redis_note), toolsdb_result
+
     def _print_jobs_section(
         self,
         *,
@@ -1903,6 +2259,8 @@ class Command(BaseCommand):
         env_result: EnvLoadResult,
         dir_statuses: Sequence[DirectoryStatus],
         offline_entries: Sequence[Dict[str, Any]],
+        redis_secret_check: Tuple[str, str],
+        toolsdb_check: ToolsDbCheckResult,
         job_checks: Sequence[BastionJobCheck],
         jobs_error: Optional[str],
         updated_env_count: int,
@@ -1989,6 +2347,11 @@ class Command(BaseCommand):
             else:
                 self.stdout.write(self.style.SUCCESS("  - Toolforge scheduled jobs match jobs.yaml."))
 
+        if redis_secret_check[0] == "error":
+            self.stdout.write(self.style.ERROR(f"  - Invalid REDIS_KEY_SECRET: {redis_secret_check[1]}"))
+        if toolsdb_check.status == "error":
+            self.stdout.write(self.style.ERROR(f"  - ToolsDB L2 error: {toolsdb_check.message}"))
+
         if commands_to_run:
             self.stdout.write("\n  Recommended commands:")
             for cmd in commands_to_run:
@@ -1999,6 +2362,8 @@ class Command(BaseCommand):
             or missing_dirs
             or broken_dirs
             or missing_or_stale_core_dbs
+            or redis_secret_check[0] == "error"
+            or toolsdb_check.status == "error"
             or jobs_error
             or (mode == "bastion" and any(not j.registered for j in job_checks))
         )
@@ -2064,6 +2429,10 @@ class Command(BaseCommand):
             no_input=no_input,
         )
         offline_entries = self._print_offline_db_section(base_dir=base_dir, env_values=env_result.values)
+        redis_secret_check, toolsdb_check = self._print_storage_security_section(
+            base_dir=base_dir,
+            env_result=env_result,
+        )
         job_checks, jobs_error = self._print_jobs_section(
             mode=mode,
             toolforge_bin=toolforge_bin,
@@ -2077,6 +2446,8 @@ class Command(BaseCommand):
             env_result=env_result,
             dir_statuses=dir_statuses,
             offline_entries=offline_entries,
+            redis_secret_check=redis_secret_check,
+            toolsdb_check=toolsdb_check,
             job_checks=job_checks,
             jobs_error=jobs_error,
             updated_env_count=updated_env_count,

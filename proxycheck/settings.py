@@ -2,16 +2,17 @@
 Django configuration for Proxy Detector on Wikimedia Toolforge.
 """
 
+import configparser
 import math
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Mapping, Optional, Tuple
 
 from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
-from detector.provider_registry import PROVIDER_REGISTRY
+from detector.provider_registry import DEFAULT_PROVIDER_L2_MAX_RETENTION_DAYS, PROVIDER_REGISTRY
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -60,9 +61,17 @@ RESTRICT_TO_ALLOWED_WIKI_USERS = _parse_bool_env("RESTRICT_TO_ALLOWED_WIKI_USERS
 _IS_TEST_RUN = "test" in sys.argv or "pytest" in sys.modules
 _IS_SETUP_CHECK = "check_setup" in sys.argv[1:]
 
+_IS_MIGRATION_CHECK = "makemigrations" in sys.argv[1:]
+
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY")
 if not SECRET_KEY:
-    if not DEBUG and not _IS_TEST_RUN and not _IS_SETUP_CHECK and "collectstatic" not in sys.argv:
+    if (
+        not DEBUG
+        and not _IS_TEST_RUN
+        and not _IS_SETUP_CHECK
+        and not _IS_MIGRATION_CHECK
+        and "collectstatic" not in sys.argv
+    ):
         raise ImproperlyConfigured("DJANGO_SECRET_KEY must be set in production.")
     SECRET_KEY = "django-insecure-dev-key"  # noqa: S105
 
@@ -149,15 +158,170 @@ TEMPLATES = [
 
 ASGI_APPLICATION = "proxycheck.asgi.application"
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": ":memory:" if _IS_TEST_RUN else BASE_DIR / "db.sqlite3",
+DEFAULT_TOOLSDB_HOST = "tools.db.svc.wikimedia.cloud"
+DEFAULT_TOOLSDB_PORT = 3306
+
+
+def _strip_cnf_quotes(raw_value: str) -> str:
+    cleaned = str(raw_value or "").strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in ("'", '"'):
+        return cleaned[1:-1]
+    return cleaned
+
+
+def _parse_port_value(raw_value: str, default: int = DEFAULT_TOOLSDB_PORT) -> int:
+    cleaned = str(raw_value or "").strip()
+    if not cleaned:
+        return default
+    try:
+        parsed = int(cleaned)
+        return parsed if 0 < parsed <= 65535 else default
+    except ValueError:
+        return default
+
+
+def _read_replica_my_cnf(cnf_path: Path) -> Optional[Tuple[str, str, str, Optional[int], str]]:
+    """Reads client credentials from a MariaDB replica.my.cnf file without value interpolation."""
+    if not cnf_path.is_file():
+        return None
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        with cnf_path.open(encoding="utf-8") as handle:
+            parser.read_file(handle)
+    except OSError, UnicodeDecodeError, configparser.Error:
+        return None
+    if not parser.has_section("client"):
+        return None
+    user = _strip_cnf_quotes(parser.get("client", "user", fallback=""))
+    password = _strip_cnf_quotes(parser.get("client", "password", fallback=""))
+    if not user or not password:
+        return None
+    host = _strip_cnf_quotes(parser.get("client", "host", fallback=""))
+    raw_port = _strip_cnf_quotes(parser.get("client", "port", fallback=""))
+    port = _parse_port_value(raw_port, 0) or None
+    database = _strip_cnf_quotes(parser.get("client", "database", fallback=""))
+    return user, password, host, port, database
+
+
+def _replica_cnf_candidates(active_env: Mapping[str, str], home_dir: Optional[Path | str] = None) -> list[Path]:
+    candidates: list[Path] = []
+    tool_data_raw = str(active_env.get("TOOL_DATA_DIR") or "").strip()
+    if tool_data_raw:
+        candidates.append(Path(os.path.expanduser(os.path.expandvars(tool_data_raw))) / "replica.my.cnf")
+    if home_dir is not None:
+        resolved_home = Path(home_dir)
+    elif str(active_env.get("HOME") or "").strip():
+        resolved_home = Path(str(active_env["HOME"]).strip())
+    else:
+        resolved_home = Path.home()
+    home_cnf = resolved_home / "replica.my.cnf"
+    if home_cnf not in candidates:
+        candidates.append(home_cnf)
+    return candidates
+
+
+def _discover_toolsdb_credentials(
+    active_env: Mapping[str, str],
+    *,
+    home_dir: Optional[Path | str] = None,
+) -> Optional[Tuple[str, str, str, int, str]]:
+    env_host = str(active_env.get("TOOLSDB_HOST") or active_env.get("TOOL_TOOLSDB_HOST") or "").strip()
+    env_port_raw = str(active_env.get("TOOLSDB_PORT") or active_env.get("TOOL_TOOLSDB_PORT") or "").strip()
+    env_db_name = str(active_env.get("TOOLSDB_NAME") or active_env.get("TOOL_TOOLSDB_NAME") or "").strip()
+
+    explicit_user = str(active_env.get("TOOLSDB_USER") or "").strip()
+    explicit_pass = str(active_env.get("TOOLSDB_PASSWORD") or "").strip()
+    if explicit_user and explicit_pass:
+        return (
+            explicit_user,
+            explicit_pass,
+            env_host or DEFAULT_TOOLSDB_HOST,
+            _parse_port_value(env_port_raw, DEFAULT_TOOLSDB_PORT),
+            env_db_name,
+        )
+
+    tool_user = str(active_env.get("TOOL_TOOLSDB_USER") or "").strip()
+    tool_pass = str(active_env.get("TOOL_TOOLSDB_PASSWORD") or "").strip()
+    if tool_user and tool_pass:
+        return (
+            tool_user,
+            tool_pass,
+            env_host or DEFAULT_TOOLSDB_HOST,
+            _parse_port_value(env_port_raw, DEFAULT_TOOLSDB_PORT),
+            env_db_name,
+        )
+
+    for cnf_path in _replica_cnf_candidates(active_env, home_dir=home_dir):
+        parsed_cnf = _read_replica_my_cnf(cnf_path)
+        if parsed_cnf is not None:
+            cnf_user, cnf_pass, cnf_host, cnf_port, cnf_db = parsed_cnf
+            return (
+                cnf_user,
+                cnf_pass,
+                env_host or cnf_host or DEFAULT_TOOLSDB_HOST,
+                _parse_port_value(env_port_raw, cnf_port or DEFAULT_TOOLSDB_PORT),
+                env_db_name or cnf_db,
+            )
+    return None
+
+
+def build_databases_config(
+    env: Optional[Mapping[str, str]] = None,
+    base_dir: Path | str = BASE_DIR,
+    *,
+    is_test_run: bool = False,
+    home_dir: Optional[Path | str] = None,
+) -> dict[str, dict[str, Any]]:
+    """Builds the Django DATABASES dictionary using ToolsDB credential discovery or SQLite fallback."""
+    resolved_base = Path(base_dir)
+    if is_test_run:
+        return {
+            "default": {
+                "ENGINE": "django.db.backends.sqlite3",
+                "NAME": ":memory:",
+                "CONN_MAX_AGE": 0,
+            }
+        }
+
+    active_env = os.environ if env is None else env
+    discovered = _discover_toolsdb_credentials(active_env, home_dir=home_dir)
+    if discovered is not None:
+        db_user, db_password, db_host, db_port, db_name = discovered
+        if db_name:
+            return {
+                "default": {
+                    "ENGINE": "django.db.backends.mysql",
+                    "NAME": db_name,
+                    "USER": db_user,
+                    "PASSWORD": db_password,
+                    "HOST": db_host,
+                    "PORT": db_port,
+                    "CONN_MAX_AGE": 0,
+                    "OPTIONS": {
+                        "connect_timeout": 3,
+                        "read_timeout": 5,
+                        "write_timeout": 5,
+                        "charset": "utf8mb4",
+                    },
+                }
+            }
+
+    return {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": resolved_base / "db.sqlite3",
+            "CONN_MAX_AGE": 0,
+        }
     }
-}
+
+
+DATABASES = build_databases_config(os.environ, BASE_DIR, is_test_run=_IS_TEST_RUN)
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
 REDIS_KEY_PREFIX = os.environ.get("REDIS_KEY_PREFIX", "proxycheck_dev_")
+REDIS_KEY_SECRET = os.environ.get("REDIS_KEY_SECRET", "").strip()
+TOOLSDB_PASSWORD = os.environ.get("TOOLSDB_PASSWORD", "")
+TOOL_TOOLSDB_PASSWORD = os.environ.get("TOOL_TOOLSDB_PASSWORD", "")
 
 
 def _build_default_cache_config(redis_url: str, key_prefix: str, *, is_test_run: bool) -> dict:
@@ -268,6 +432,11 @@ PROVIDER_COOLDOWN_MIN_SECONDS = _parse_positive_int_env("PROVIDER_COOLDOWN_MIN_S
 PROVIDER_COOLDOWN_MAX_SECONDS = _parse_positive_int_env("PROVIDER_COOLDOWN_MAX_SECONDS", 300)
 DNS_QUERY_TIMEOUT_SECONDS = _parse_positive_float_env("DNS_QUERY_TIMEOUT_SECONDS", 2.0)
 DNS_QUERY_LIFETIME_SECONDS = _parse_positive_float_env("DNS_QUERY_LIFETIME_SECONDS", 2.0)
+
+ENABLE_L2_TOOLSDB_CACHE = _parse_bool_env("ENABLE_L2_TOOLSDB_CACHE", default=True)
+CACHE_SWR_STALE_DAYS = _parse_positive_int_env("CACHE_SWR_STALE_DAYS", 90)
+CACHE_SWR_STALE_SECONDS = CACHE_SWR_STALE_DAYS * 86400
+PROVIDER_L2_MAX_RETENTION_DAYS = dict(DEFAULT_PROVIDER_L2_MAX_RETENTION_DAYS)
 
 for _provider_meta in PROVIDER_REGISTRY:
     if _provider_meta.credential_setting is not None:

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+import csv
+import gzip
 import hashlib
+import io
 import ipaddress
 import json
 import os
@@ -14,20 +17,34 @@ import tempfile
 import time
 import zipfile
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 import httpx
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
+from detector.binary_prefix_index import compile_binary_prefix_index, parse_cidr_to_int_prefix
 from detector.cidr_attribution import clear_offline_intelligence_caches, parse_cloud_cidr_payload
 from detector.offline_dbs import (
+    BGP_TAGS_JSON_FILENAME,
+    BGP_TOOLS_BIN_FILENAME,
     CLOUD_CIDRS_FILENAME,
+    HTTP_FEED_METADATA_FILENAME,
+    IPSUM_DROP_BIN_FILENAME,
     MAXMIND_EDITION_SPECS,
+    MOBILE_ASNS_JSON_FILENAME,
+    MOBILE_BGP_TAG_TOKENS,
+    PRIVACY_RELAYS_BIN_FILENAME,
     SFS_LISTED_1_ZIP_NAME,
     SFS_LISTED_90_ZIP_NAME,
     SFS_SQLITE_FILENAME,
     SFS_TOXIC_CIDR_FILENAME,
+    TOR_ONIONOO_SUMMARY_FILENAME,
+    X4BNET_MASK_DATACENTER,
+    X4BNET_MASK_HOSTING,
+    X4BNET_MASK_VPN,
+    X4BNET_VPN_BIN_FILENAME,
+    PrefixCidrIndex,
     atomic_temp_path,
     build_stopforumspam_sqlite_index,
     clear_stopforumspam_caches,
@@ -50,13 +67,15 @@ SFS_LISTED_90_MD5_URL = f"{SFS_LISTED_90_ZIP_URL}.md5"
 SFS_LISTED_1_ZIP_URL = f"{SFS_BASE_URL}/{SFS_LISTED_1_ZIP_NAME}"
 SFS_LISTED_1_MD5_URL = f"{SFS_LISTED_1_ZIP_URL}.md5"
 
-# Guard windows stay comfortably below StopForumSpam daily caps of 2 per day for 90d and 24 per day for 1d
-# whilst accommodating minor cron or systemd timer drift.
+# Guard windows stay comfortably below upstream daily or hourly download limits
+# whilst accommodating minor cron or timer drift.
 SFS_TOXIC_MIN_INTERVAL_SECONDS = 12 * 3600 - 300
 SFS_90_MIN_INTERVAL_SECONDS = 12 * 3600 - 300
 SFS_1_MIN_INTERVAL_SECONDS = 3600 - 120
 MAXMIND_MIN_INTERVAL_SECONDS = 24 * 3600 - 300
 CLOUD_CIDRS_MIN_INTERVAL_SECONDS = 24 * 3600 - 300
+TOR_ONIONOO_MIN_INTERVAL_SECONDS = 3600 - 120
+DAILY_FEED_MIN_INTERVAL_SECONDS = 24 * 3600 - 300
 
 AWS_IP_RANGES_URL = "https://ip-ranges.amazonaws.com/ip-ranges.json"
 GCP_IP_RANGES_URL = "https://www.gstatic.com/ipranges/cloud.json"
@@ -64,6 +83,63 @@ OCI_IP_RANGES_URL = "https://docs.oracle.com/en-us/iaas/tools/public_ip_ranges.j
 AZURE_DOWNLOAD_PAGE_URL = "https://www.microsoft.com/en-us/download/details.aspx?id=56519"
 _AZURE_SERVICETAGS_URL_RE = re.compile(
     r"https://download\.microsoft\.com/download/[^\"'\s<>]+/ServiceTags_Public_\d+\.json"
+)
+
+APPLE_PRIVATE_RELAY_URL = "https://mask-api.icloud.com/egress-ip-ranges.csv"
+CLOUDFLARE_LOCAL_GEOFEED_URL = "https://api.cloudflare.com/local-ip-ranges.csv"
+CLOUDFLARE_IPS_V4_URL = "https://www.cloudflare.com/ips-v4"
+CLOUDFLARE_IPS_V6_URL = "https://www.cloudflare.com/ips-v6"
+
+IPSUM_URL = "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt"
+SPAMHAUS_DROP_V4_URL = "https://www.spamhaus.org/drop/drop_v4.json"
+SPAMHAUS_DROP_V6_URL = "https://www.spamhaus.org/drop/drop_v6.json"
+
+TOR_ONIONOO_SUMMARY_URL = "https://onionoo.torproject.org/summary?type=relay"
+
+BGP_TOOLS_USER_AGENT = "ProxyCheck/1.0 bgp.tools - tools.proxycheck@toolforge.org"
+BGP_TOOLS_TABLE_URL = "https://bgp.tools/table.txt"
+BGP_TOOLS_TAGS_URL = "https://bgp.tools/tags.txt"
+BGP_TOOLS_MOBILE_TAG_CSV_URL = "https://bgp.tools/tags/mobile.csv"
+BGP_TOOLS_VPN_TAG_CSV_URL = "https://bgp.tools/tags/vpn.csv"
+
+X4BNET_VPN_IPV4_URL = "https://raw.githubusercontent.com/X4BNet/lists_vpn/main/output/vpn/ipv4.txt"
+X4BNET_VPN_IPV6_URL = "https://raw.githubusercontent.com/X4BNet/lists_vpn/main/output/vpn/ipv6.txt"
+X4BNET_DATACENTER_IPV4_URL = "https://raw.githubusercontent.com/X4BNet/lists_vpn/main/output/datacenter/ipv4.txt"
+X4BNET_DATACENTER_IPV6_URL = "https://raw.githubusercontent.com/X4BNet/lists_vpn/main/output/datacenter/ipv6.txt"
+IPAPI_IS_HOSTING_URL = "https://raw.githubusercontent.com/ipapi-is/ip_to_hosting/main/data/hosting_ranges.txt"
+
+PEERINGDB_NET_URL = "https://www.peeringdb.com/api/net"
+
+_SOURCE_ALIASES: Dict[str, str] = {
+    "stopforumspam": "stopforumspam",
+    "sfs": "stopforumspam",
+    "maxmind": "maxmind",
+    "cloud_cidrs": "cloud_cidrs",
+    "cloud-cidrs": "cloud_cidrs",
+    "cloud": "cloud_cidrs",
+    "privacy_relays": "privacy_relays",
+    "privacy-relays": "privacy_relays",
+    "ipsum_drop": "ipsum_drop",
+    "ipsum-drop": "ipsum_drop",
+    "tor_onionoo": "tor_onionoo",
+    "tor-onionoo": "tor_onionoo",
+    "bgp_tools": "bgp_tools",
+    "bgp-tools": "bgp_tools",
+    "x4bnet_vpn": "x4bnet_vpn",
+    "x4bnet-vpn": "x4bnet_vpn",
+    "peeringdb_mobile": "peeringdb_mobile",
+    "peeringdb-mobile": "peeringdb_mobile",
+}
+_ALL_CANONICAL_SOURCES: Tuple[str, ...] = (
+    "stopforumspam",
+    "maxmind",
+    "cloud_cidrs",
+    "privacy_relays",
+    "ipsum_drop",
+    "tor_onionoo",
+    "bgp_tools",
+    "x4bnet_vpn",
+    "peeringdb_mobile",
 )
 
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
@@ -113,6 +189,128 @@ def _redact_update_error(message: str, secrets_to_hide: Iterable[str] = ()) -> s
         if secret:
             cleaned = cleaned.replace(secret, "[REDACTED]")
     return cleaned
+
+
+def _load_http_feed_metadata(data_dir: Path) -> Dict[str, Dict[str, str]]:
+    meta_path = data_dir / HTTP_FEED_METADATA_FILENAME
+    if not meta_path.is_file():
+        return {}
+    try:
+        raw = json.loads(meta_path.read_text(encoding="utf-8"))
+    except OSError, ValueError:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: Dict[str, Dict[str, str]] = {}
+    for url, entry in raw.items():
+        if isinstance(url, str) and isinstance(entry, dict):
+            cleaned[url] = {str(k): str(v) for k, v in entry.items() if isinstance(v, str) and v}
+    return cleaned
+
+
+def _save_http_feed_metadata(data_dir: Path, metadata: Mapping[str, Mapping[str, str]]) -> None:
+    meta_path = data_dir / HTTP_FEED_METADATA_FILENAME
+    serialisable = {str(k): dict(v) for k, v in sorted(metadata.items())}
+    with atomic_temp_path(meta_path) as tmp_path:
+        tmp_path.write_text(json.dumps(serialisable, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _get_header_ci(headers: Any, target_name: str) -> str:
+    if headers is None:
+        return ""
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        direct = getter(target_name) or getter(target_name.lower()) or getter(target_name.title())
+        if isinstance(direct, str) and direct.strip():
+            return direct.strip()
+    if isinstance(headers, Mapping):
+        lowered = target_name.lower()
+        for k, v in headers.items():
+            if str(k).lower() == lowered and isinstance(v, str) and v.strip():
+                return v.strip()
+    return ""
+
+
+def _url_cache_path(data_dir: Path, url: str) -> Path:
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:20]
+    return data_dir / ".feed_cache" / f"{digest}.txt"
+
+
+def _extract_response_text(resp: Any, url: str) -> str:
+    raw_content = getattr(resp, "content", None)
+    if isinstance(raw_content, (bytes, bytearray)):
+        raw_bytes = bytes(raw_content)
+        if len(raw_bytes) > MAX_ARCHIVE_BYTES:
+            raise CommandError(f"Download exceeded size limit for {url}")
+        if raw_bytes[:2] == b"\x1f\x8b":
+            raw_bytes = gzip.decompress(raw_bytes)
+        text = raw_bytes.decode("utf-8", errors="replace")
+    else:
+        text = str(getattr(resp, "text", "") or "")
+        if len(text.encode("utf-8", errors="replace")) > MAX_ARCHIVE_BYTES:
+            raise CommandError(f"Download exceeded size limit for {url}")
+    if not text.strip():
+        raise CommandError(f"Downloaded empty response from {url}")
+    return text
+
+
+def _fetch_conditional_text(
+    client: httpx.Client,
+    url: str,
+    *,
+    data_dir: Path,
+    meta_map: Dict[str, Dict[str, str]],
+    target_exists: bool,
+    cache_raw: bool = False,
+    extra_headers: Optional[Mapping[str, str]] = None,
+) -> Tuple[Optional[str], bool]:
+    """
+    Fetches an upstream text or JSON feed using stored ETag and Last-Modified headers.
+    Returns (text_or_none, was_modified) where was_modified is False on HTTP 304 responses.
+    """
+    cache_file = _url_cache_path(data_dir, url)
+    can_send_conditional = target_exists and (not cache_raw or cache_file.is_file())
+    prior_meta = meta_map.get(url) if can_send_conditional else None
+
+    req_headers: Dict[str, str] = dict(extra_headers or {})
+    if isinstance(prior_meta, dict):
+        if prior_meta.get("etag"):
+            req_headers["If-None-Match"] = prior_meta["etag"]
+        if prior_meta.get("last_modified"):
+            req_headers["If-Modified-Since"] = prior_meta["last_modified"]
+
+    resp = client.get(url, headers=req_headers) if req_headers else client.get(url)
+    status_code = getattr(resp, "status_code", 200)
+    if status_code == 304:
+        if cache_raw and cache_file.is_file():
+            return cache_file.read_text(encoding="utf-8"), False
+        return None, False
+
+    resp.raise_for_status()
+    text = _extract_response_text(resp, url)
+
+    resp_headers = getattr(resp, "headers", None)
+    etag = _get_header_ci(resp_headers, "ETag")
+    last_modified = _get_header_ci(resp_headers, "Last-Modified")
+    if etag or last_modified:
+        entry: Dict[str, str] = {}
+        if etag:
+            entry["etag"] = etag
+        if last_modified:
+            entry["last_modified"] = last_modified
+        meta_map[url] = entry
+
+    if cache_raw:
+        with atomic_temp_path(cache_file) as tmp_cache:
+            tmp_cache.write_text(text, encoding="utf-8")
+
+    return text, True
+
+
+def _reject_html_payload(raw_text: str, label: str) -> None:
+    first_non_empty = next((ln.strip() for ln in raw_text.splitlines() if ln.strip()), "")
+    if first_non_empty.lower().startswith(("<!doctype", "<html")):
+        raise CommandError(f"{label} download returned HTML instead of feed data.")
 
 
 def _stream_download_to_temp(
@@ -353,25 +551,370 @@ def _load_existing_cloud_cidrs_by_provider(target_path: Path) -> Dict[str, List[
     return {provider: _normalize_cidr_list(cidrs) for provider, cidrs in grouped.items()}
 
 
-def _write_json_atomically(payload: Dict[str, List[str]], target_path: Path) -> None:
+def _write_json_atomically(payload: Any, target_path: Path) -> None:
     with atomic_temp_path(target_path) as tmp_path:
         tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _parse_geofeed_csv_cidrs(raw_text: str, label: str) -> List[str]:
+    _reject_html_payload(raw_text, label)
+    cidrs: List[str] = []
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", ";")):
+            continue
+        first_col = stripped.split(",", 1)[0].strip().strip('"')
+        if parse_cidr_to_int_prefix(first_col) is not None:
+            cidrs.append(first_col)
+    return cidrs
+
+
+def _parse_plaintext_cidrs(raw_text: str, label: str) -> List[str]:
+    _reject_html_payload(raw_text, label)
+    cidrs: List[str] = []
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", ";")):
+            continue
+        first_col = stripped.split()[0].strip()
+        if parse_cidr_to_int_prefix(first_col) is not None:
+            cidrs.append(first_col)
+    return cidrs
+
+
+def _merge_privacy_relay_tags(existing_tag: Any, new_tag: Any) -> str:
+    tags = {str(existing_tag), str(new_tag)}
+    if "icloud_private_relay" in tags:
+        return "icloud_private_relay"
+    if "cloudflare_cdn" in tags:
+        return "cloudflare_cdn"
+    return str(new_tag)
+
+
+def _parse_ipsum_entries(raw_text: str) -> List[Tuple[str, int]]:
+    _reject_html_payload(raw_text, "IPsum")
+    entries: List[Tuple[str, int]] = []
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", ";")):
+            continue
+        parts = stripped.split()
+        if len(parts) < 2:
+            continue
+        try:
+            score = int(parts[1])
+        except ValueError:
+            continue
+        if score >= 2 and parse_cidr_to_int_prefix(parts[0]) is not None:
+            entries.append((parts[0], score))
+    return entries
+
+
+def _extract_drop_record(obj: Any) -> Optional[Tuple[str, Optional[str]]]:
+    if not isinstance(obj, dict) or obj.get("type") == "metadata":
+        return None
+    raw_cidr = obj.get("cidr")
+    if not isinstance(raw_cidr, str) or not raw_cidr.strip():
+        return None
+    try:
+        net = ipaddress.ip_network(raw_cidr.strip(), strict=False)
+    except ValueError:
+        return None
+    sbl_raw = obj.get("sblid") or obj.get("sblId")
+    sbl_id = str(sbl_raw).strip() if isinstance(sbl_raw, str) and str(sbl_raw).strip() else None
+    return str(net), sbl_id
+
+
+def _parse_spamhaus_drop_entries(raw_text: str, label: str) -> List[Tuple[str, Optional[str]]]:
+    _reject_html_payload(raw_text, label)
+    entries: List[Tuple[str, Optional[str]]] = []
+    stripped_body = raw_text.strip()
+    if not stripped_body:
+        return entries
+
+    try:
+        whole = json.loads(stripped_body)
+    except ValueError:
+        whole = None
+
+    if whole is not None:
+        items: Iterable[Any]
+        if isinstance(whole, list):
+            items = whole
+        elif isinstance(whole, dict):
+            items = [whole] if "cidr" in whole else next((v for v in whole.values() if isinstance(v, list)), ())
+        else:
+            items = ()
+        for item in items:
+            rec = _extract_drop_record(item)
+            if rec is not None:
+                entries.append(rec)
+        return entries
+
+    for line in stripped_body.splitlines():
+        cleaned = line.strip()
+        if not cleaned or cleaned.startswith(("#", ";")):
+            continue
+        try:
+            line_obj = json.loads(cleaned)
+        except ValueError:
+            continue
+        rec = _extract_drop_record(line_obj)
+        if rec is not None:
+            entries.append(rec)
+    return entries
+
+
+def _normalise_ipsum_drop_payload(val: Any) -> Dict[str, Any]:
+    if isinstance(val, int) and not isinstance(val, bool):
+        return {"score": val, "drop": False, "sblid": None, "drop_cidr": None}
+    if isinstance(val, dict):
+        return {
+            "score": int(val.get("score") or 0),
+            "drop": bool(val.get("drop")),
+            "sblid": val.get("sblid"),
+            "drop_cidr": val.get("drop_cidr"),
+        }
+    return {"score": 0, "drop": False, "sblid": None, "drop_cidr": None}
+
+
+def _merge_ipsum_drop_payloads(existing_val: Any, new_val: Any) -> Any:
+    left = _normalise_ipsum_drop_payload(existing_val)
+    right = _normalise_ipsum_drop_payload(new_val)
+    merged_score = max(left["score"], right["score"])
+    merged_drop = left["drop"] or right["drop"]
+    if not merged_drop:
+        return merged_score
+    return {
+        "score": merged_score,
+        "drop": True,
+        "sblid": right["sblid"] or left["sblid"],
+        "drop_cidr": right["drop_cidr"] or left["drop_cidr"],
+    }
+
+
+def _build_ipsum_drop_compile_entries(
+    ipsum_rows: List[Tuple[str, int]],
+    drop_rows: List[Tuple[str, Optional[str]]],
+) -> List[Tuple[str, Any]]:
+    drop_index = PrefixCidrIndex([(cidr, (cidr, sbl_id)) for cidr, sbl_id in drop_rows])
+    compiled: List[Tuple[str, Any]] = [
+        (cidr, {"score": 0, "drop": True, "sblid": sbl_id, "drop_cidr": cidr}) for cidr, sbl_id in drop_rows
+    ]
+    for raw_ip_or_cidr, score in ipsum_rows:
+        lookup_probe = raw_ip_or_cidr.split("/", 1)[0].strip()
+        drop_hit = drop_index.lookup(lookup_probe)
+        if drop_hit is not None:
+            compiled.append(
+                (
+                    raw_ip_or_cidr,
+                    {
+                        "score": score,
+                        "drop": True,
+                        "sblid": drop_hit[2][1],
+                        "drop_cidr": drop_hit[2][0],
+                    },
+                )
+            )
+        else:
+            compiled.append((raw_ip_or_cidr, score))
+    return compiled
+
+
+def _parse_asn_token(raw_val: str) -> Optional[int]:
+    cleaned = raw_val.strip().upper()
+    if cleaned.startswith("AS"):
+        cleaned = cleaned[2:].strip()
+    if cleaned.isdigit():
+        parsed = int(cleaned)
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _parse_bgp_table_entries(raw_text: str) -> List[Tuple[str, int]]:
+    _reject_html_payload(raw_text, "bgp.tools table")
+    entries: List[Tuple[str, int]] = []
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", ";")):
+            continue
+        parts = stripped.split()
+        if len(parts) < 2:
+            continue
+        asn_num = _parse_asn_token(parts[1])
+        if asn_num is not None and parse_cidr_to_int_prefix(parts[0]) is not None:
+            entries.append((parts[0], asn_num))
+    return entries
+
+
+def _ingest_bgp_tag_row(
+    tokens: List[str],
+    asn_tags: Dict[int, List[str]],
+    tag_counts: Dict[str, int],
+) -> None:
+    first = tokens[0].strip()
+    first_asn = _parse_asn_token(first)
+    if first_asn is not None:
+        bucket = asn_tags.setdefault(first_asn, [])
+        for raw_tag in tokens[1:]:
+            cleaned_tag = raw_tag.strip().lower()
+            if cleaned_tag and not cleaned_tag.isdigit() and cleaned_tag not in bucket:
+                bucket.append(cleaned_tag)
+        return
+
+    tag_label = first.lower()
+    if not tag_label:
+        return
+    if len(tokens) == 2 and tokens[1].strip().isdigit() and not tokens[1].strip().upper().startswith("AS"):
+        tag_counts[tag_label] = int(tokens[1].strip())
+        return
+
+    for candidate in tokens[1:]:
+        member_asn = _parse_asn_token(candidate)
+        if member_asn is not None:
+            bucket = asn_tags.setdefault(member_asn, [])
+            if tag_label not in bucket:
+                bucket.append(tag_label)
+
+
+def _parse_bgp_tags_text(raw_text: str) -> Tuple[Dict[int, List[str]], Dict[str, int]]:
+    _reject_html_payload(raw_text, "bgp.tools tags")
+    asn_tags: Dict[int, List[str]] = {}
+    tag_counts: Dict[str, int] = {}
+
+    stripped_all = raw_text.strip()
+    if stripped_all.startswith("{"):
+        try:
+            obj = json.loads(stripped_all)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            source_map = obj.get("asn_tags") if isinstance(obj.get("asn_tags"), dict) else obj
+            for k, vals in source_map.items():
+                asn_num = _parse_asn_token(str(k))
+                if asn_num is not None and isinstance(vals, list):
+                    asn_tags[asn_num] = [str(v).strip().lower() for v in vals if str(v).strip()]
+            return asn_tags, tag_counts
+
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", ";")):
+            continue
+        delimiter_parts = [p.strip() for p in re.split(r"[,\t]+", stripped) if p.strip()]
+        tokens = delimiter_parts if len(delimiter_parts) >= 2 else stripped.split()
+        if len(tokens) >= 2:
+            _ingest_bgp_tag_row(tokens, asn_tags, tag_counts)
+
+    return asn_tags, tag_counts
+
+
+def _ingest_bgp_tag_category_csv(raw_text: str, category_tag: str, asn_tags: Dict[int, List[str]]) -> None:
+    tag_clean = category_tag.strip().lower()
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", ";", "<")):
+            continue
+        first_col = stripped.split(",", 1)[0].strip().strip('"')
+        asn_num = _parse_asn_token(first_col)
+        if asn_num is not None:
+            bucket = asn_tags.setdefault(asn_num, [])
+            if tag_clean not in bucket:
+                bucket.append(tag_clean)
+
+
+def _parse_hosting_feed_cidrs(raw_text: str) -> List[str]:
+    _reject_html_payload(raw_text, "ip_to_hosting")
+    stripped_body = raw_text.strip()
+    if not stripped_body:
+        return []
+
+    if stripped_body.startswith(("{", "[")):
+        try:
+            parsed_json = json.loads(stripped_body)
+            return [cidr for cidr, _prov in parse_cloud_cidr_payload(parsed_json, default_provider="Hosting")]
+        except ValueError:
+            pass
+
+    cidrs: List[str] = []
+    for row in csv.reader(io.StringIO(stripped_body)):
+        if not row:
+            continue
+        first = row[0].strip()
+        if not first or first.startswith(("#", ";")) or first.lower() in ("startip", "start_ip", "cidr", "network"):
+            continue
+        if len(row) >= 2 and "/" not in first:
+            second = row[1].strip()
+            try:
+                start_ip = ipaddress.ip_address(first)
+                end_ip = ipaddress.ip_address(second)
+                if start_ip.version == end_ip.version and int(start_ip) <= int(end_ip):
+                    cidrs.extend(str(net) for net in ipaddress.summarize_address_range(start_ip, end_ip))
+                    continue
+            except ValueError:
+                pass
+        candidate = first.split()[0]
+        if parse_cidr_to_int_prefix(candidate) is not None:
+            cidrs.append(candidate)
+    return cidrs
+
+
+def _is_peeringdb_mobile_entry(entry: Mapping[str, Any]) -> bool:
+    info_types = entry.get("info_types")
+    if isinstance(info_types, list) and any(str(item).strip().lower() == "mobile" for item in info_types):
+        return True
+    info_type = entry.get("info_type")
+    return isinstance(info_type, str) and info_type.strip().lower() == "mobile"
+
+
+def _parse_peeringdb_mobile_payload(raw_text: str) -> Dict[str, Any]:
+    _reject_html_payload(raw_text, "PeeringDB")
+    payload = json.loads(raw_text)
+    rows: Iterable[Any]
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        rows = payload["data"]
+    elif isinstance(payload, list):
+        rows = payload
+    else:
+        raise CommandError("PeeringDB payload did not contain a network data list.")
+
+    mobile_asns: Set[int] = set()
+    networks: Dict[str, str] = {}
+    for entry in rows:
+        if not isinstance(entry, Mapping) or not _is_peeringdb_mobile_entry(entry):
+            continue
+        raw_asn = entry.get("asn")
+        asn_num = raw_asn if isinstance(raw_asn, int) and not isinstance(raw_asn, bool) and raw_asn > 0 else None
+        if asn_num is None and isinstance(raw_asn, str):
+            asn_num = _parse_asn_token(raw_asn)
+        if asn_num is not None:
+            mobile_asns.add(asn_num)
+            name = str(entry.get("name") or "").strip()
+            if name:
+                networks[str(asn_num)] = name
+
+    return {
+        "mobile_asns": sorted(mobile_asns),
+        "networks": networks,
+    }
+
+
 class Command(BaseCommand):
-    help = "Downloads and atomically replaces local StopForumSpam, MaxMind, and cloud CIDR offline databases."
+    help = "Downloads and atomically replaces local offline threat intelligence databases and prefix indexes."
 
     def add_arguments(self, parser) -> None:
         parser.add_argument(
             "--sources",
             nargs="+",
             default=["all"],
-            help="Sources to update: all, stopforumspam, maxmind, cloud_cidrs (space or comma separated).",
+            help=(
+                "Sources to update: all, stopforumspam, maxmind, cloud_cidrs, privacy_relays, "
+                "ipsum_drop, tor_onionoo, bgp_tools, x4bnet_vpn, peeringdb_mobile (space or comma separated)."
+            ),
         )
         parser.add_argument(
             "--force",
             action="store_true",
-            help="Bypass local file modification time cooldown checks (still verifies checksums).",
+            help="Bypass local file modification time cooldown checks (still uses conditional requests).",
         )
         parser.add_argument(
             "--skip-listed-1",
@@ -395,21 +938,16 @@ class Command(BaseCommand):
             help="Override destination directory for offline databases (defaults to TOOL_DATA_DIR/data).",
         )
 
-    def _parse_sources(self, raw_sources: Iterable[str]) -> Tuple[bool, bool, bool]:
+    def _parse_sources(self, raw_sources: Iterable[str]) -> Set[str]:
         tokens: List[str] = []
         for entry in raw_sources:
             tokens.extend(part.strip().lower() for part in str(entry).split(",") if part.strip())
         if not tokens or "all" in tokens:
-            return True, True, True
-        valid_tokens = {"stopforumspam", "sfs", "maxmind", "cloud_cidrs", "cloud-cidrs", "cloud", "all"}
-        unknown = [tok for tok in tokens if tok not in valid_tokens]
+            return set(_ALL_CANONICAL_SOURCES)
+        unknown = [tok for tok in tokens if tok not in _SOURCE_ALIASES]
         if unknown:
             raise CommandError(f"Unknown --sources value: {', '.join(unknown)}")
-        return (
-            "stopforumspam" in tokens or "sfs" in tokens,
-            "maxmind" in tokens,
-            any(tok in tokens for tok in ("cloud_cidrs", "cloud-cidrs", "cloud")),
-        )
+        return {_SOURCE_ALIASES[tok] for tok in tokens}
 
     def _download_sfs_zip(
         self,
@@ -656,7 +1194,7 @@ class Command(BaseCommand):
             )
             return 0
         if dry_run:
-            self.stdout.write(f"[dry-run] Would fetch AWS/GCP/OCI/Azure IP ranges -> {target_path}")
+            self.stdout.write(f"[dry-run] Would fetch AWS, GCP, OCI, and Azure IP ranges into {target_path}")
             return 0
 
         existing_by_provider = _load_existing_cloud_cidrs_by_provider(target_path)
@@ -698,6 +1236,414 @@ class Command(BaseCommand):
         )
         return 0
 
+    def _update_privacy_relays(
+        self,
+        client: httpx.Client,
+        *,
+        data_dir: Path,
+        meta_map: Dict[str, Dict[str, str]],
+        force: bool,
+        dry_run: bool,
+    ) -> int:
+        target_path = data_dir / PRIVACY_RELAYS_BIN_FILENAME
+        wait_seconds = _check_mtime_cooldown(target_path, DAILY_FEED_MIN_INTERVAL_SECONDS, force=force)
+        if wait_seconds is not None:
+            self.stdout.write(f"Skipped Privacy Relays ({target_path.name}): wait {wait_seconds}s.")
+            return 0
+        if dry_run:
+            self.stdout.write(f"[dry-run] Would compile Privacy Relays index into {target_path}")
+            return 0
+
+        target_exists = target_path.is_file()
+        sub_feeds = (
+            ("Apple Private Relay", APPLE_PRIVATE_RELAY_URL, "icloud_private_relay", _parse_geofeed_csv_cidrs),
+            ("Cloudflare Local Geofeed", CLOUDFLARE_LOCAL_GEOFEED_URL, "cloudflare_warp", _parse_geofeed_csv_cidrs),
+            ("Cloudflare CDN IPv4", CLOUDFLARE_IPS_V4_URL, "cloudflare_cdn", _parse_plaintext_cidrs),
+            ("Cloudflare CDN IPv6", CLOUDFLARE_IPS_V6_URL, "cloudflare_cdn", _parse_plaintext_cidrs),
+        )
+        try:
+            any_modified = False
+            entries: List[Tuple[str, str]] = []
+            for label, url, tag, parser_fn in sub_feeds:
+                body, modified = _fetch_conditional_text(
+                    client,
+                    url,
+                    data_dir=data_dir,
+                    meta_map=meta_map,
+                    target_exists=target_exists,
+                    cache_raw=True,
+                )
+                any_modified = any_modified or modified
+                if body is not None:
+                    entries.extend((cidr, tag) for cidr in parser_fn(body, label))
+
+            if not any_modified and target_exists:
+                self.stdout.write(f"Skipped Privacy Relays ({target_path.name}): upstream returned 304 Not Modified.")
+                return 0
+            if not entries:
+                raise CommandError("Privacy Relays feeds contained no valid IP prefixes.")
+
+            rule_count = compile_binary_prefix_index(
+                entries,
+                target_path,
+                merge_payloads=_merge_privacy_relay_tags,
+            )
+            clear_offline_intelligence_caches()
+            self.stdout.write(self.style.SUCCESS(f"Updated Privacy Relays ({target_path.name}, {rule_count} CIDRs)."))
+            return 0
+        except _DOWNLOAD_UPDATE_ERRORS as exc:
+            self.stderr.write(self.style.ERROR(_redact_update_error(f"Failed Privacy Relays update: {exc}")))
+            return 1
+
+    def _update_ipsum_drop(
+        self,
+        client: httpx.Client,
+        *,
+        data_dir: Path,
+        meta_map: Dict[str, Dict[str, str]],
+        force: bool,
+        dry_run: bool,
+    ) -> int:
+        target_path = data_dir / IPSUM_DROP_BIN_FILENAME
+        wait_seconds = _check_mtime_cooldown(target_path, DAILY_FEED_MIN_INTERVAL_SECONDS, force=force)
+        if wait_seconds is not None:
+            self.stdout.write(f"Skipped IPsum and DROP ({target_path.name}): wait {wait_seconds}s.")
+            return 0
+        if dry_run:
+            self.stdout.write(f"[dry-run] Would compile IPsum and Spamhaus DROP index into {target_path}")
+            return 0
+
+        target_exists = target_path.is_file()
+        try:
+            ipsum_body, mod_ipsum = _fetch_conditional_text(
+                client,
+                IPSUM_URL,
+                data_dir=data_dir,
+                meta_map=meta_map,
+                target_exists=target_exists,
+                cache_raw=True,
+            )
+            drop4_body, mod_drop4 = _fetch_conditional_text(
+                client,
+                SPAMHAUS_DROP_V4_URL,
+                data_dir=data_dir,
+                meta_map=meta_map,
+                target_exists=target_exists,
+                cache_raw=True,
+            )
+            drop6_body, mod_drop6 = _fetch_conditional_text(
+                client,
+                SPAMHAUS_DROP_V6_URL,
+                data_dir=data_dir,
+                meta_map=meta_map,
+                target_exists=target_exists,
+                cache_raw=True,
+            )
+            if not (mod_ipsum or mod_drop4 or mod_drop6) and target_exists:
+                self.stdout.write(f"Skipped IPsum and DROP ({target_path.name}): upstream returned 304 Not Modified.")
+                return 0
+
+            ipsum_rows = _parse_ipsum_entries(ipsum_body or "")
+            drop_rows = _parse_spamhaus_drop_entries(drop4_body or "", "Spamhaus DROP v4")
+            drop_rows.extend(_parse_spamhaus_drop_entries(drop6_body or "", "Spamhaus DROP v6"))
+
+            compile_entries = _build_ipsum_drop_compile_entries(ipsum_rows, drop_rows)
+            if not compile_entries:
+                raise CommandError("IPsum and Spamhaus DROP feeds contained no qualifying prefixes.")
+
+            rule_count = compile_binary_prefix_index(
+                compile_entries,
+                target_path,
+                merge_payloads=_merge_ipsum_drop_payloads,
+            )
+            clear_offline_intelligence_caches()
+            self.stdout.write(self.style.SUCCESS(f"Updated IPsum and DROP ({target_path.name}, {rule_count} rules)."))
+            return 0
+        except _DOWNLOAD_UPDATE_ERRORS as exc:
+            self.stderr.write(self.style.ERROR(_redact_update_error(f"Failed IPsum and DROP update: {exc}")))
+            return 1
+
+    def _update_tor_onionoo(
+        self,
+        client: httpx.Client,
+        *,
+        data_dir: Path,
+        meta_map: Dict[str, Dict[str, str]],
+        force: bool,
+        dry_run: bool,
+    ) -> int:
+        target_path = data_dir / TOR_ONIONOO_SUMMARY_FILENAME
+        wait_seconds = _check_mtime_cooldown(target_path, TOR_ONIONOO_MIN_INTERVAL_SECONDS, force=force)
+        if wait_seconds is not None:
+            self.stdout.write(f"Skipped Tor Onionoo ({target_path.name}): wait {wait_seconds}s.")
+            return 0
+        if dry_run:
+            self.stdout.write(f"[dry-run] Would sync Tor Onionoo summary mirror into {target_path}")
+            return 0
+
+        try:
+            body, modified = _fetch_conditional_text(
+                client,
+                TOR_ONIONOO_SUMMARY_URL,
+                data_dir=data_dir,
+                meta_map=meta_map,
+                target_exists=target_path.is_file(),
+                cache_raw=False,
+                extra_headers={"Accept-Encoding": "gzip"},
+            )
+            if not modified or body is None:
+                self.stdout.write(f"Skipped Tor Onionoo ({target_path.name}): upstream returned 304 Not Modified.")
+                return 0
+
+            _reject_html_payload(body, "Tor Onionoo")
+            parsed = json.loads(body)
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("relays"), list):
+                raise CommandError("Tor Onionoo summary payload missing relays array.")
+
+            _write_json_atomically(parsed, target_path)
+            clear_offline_intelligence_caches()
+            self.stdout.write(
+                self.style.SUCCESS(f"Updated Tor Onionoo ({target_path.name}, {len(parsed['relays'])} relays).")
+            )
+            return 0
+        except _DOWNLOAD_UPDATE_ERRORS as exc:
+            self.stderr.write(self.style.ERROR(_redact_update_error(f"Failed Tor Onionoo update: {exc}")))
+            return 1
+
+    def _enrich_bgp_category_tags(
+        self,
+        client: httpx.Client,
+        *,
+        data_dir: Path,
+        meta_map: Dict[str, Dict[str, str]],
+        target_exists: bool,
+        bgp_headers: Mapping[str, str],
+        tag_counts: Mapping[str, int],
+        asn_tags: Dict[int, List[str]],
+    ) -> bool:
+        modified_any = False
+        category_urls = (
+            ("mobile", BGP_TOOLS_MOBILE_TAG_CSV_URL),
+            ("vpn", BGP_TOOLS_VPN_TAG_CSV_URL),
+        )
+        for category_name, csv_url in category_urls:
+            if tag_counts and category_name not in tag_counts:
+                continue
+            with contextlib.suppress(*_DOWNLOAD_UPDATE_ERRORS):
+                csv_body, csv_mod = _fetch_conditional_text(
+                    client,
+                    csv_url,
+                    data_dir=data_dir,
+                    meta_map=meta_map,
+                    target_exists=target_exists,
+                    cache_raw=True,
+                    extra_headers=bgp_headers,
+                )
+                modified_any = modified_any or csv_mod
+                if csv_body:
+                    _ingest_bgp_tag_category_csv(csv_body, category_name, asn_tags)
+        return modified_any
+
+    def _update_bgp_tools(
+        self,
+        client: httpx.Client,
+        *,
+        data_dir: Path,
+        meta_map: Dict[str, Dict[str, str]],
+        force: bool,
+        dry_run: bool,
+    ) -> int:
+        bin_target = data_dir / BGP_TOOLS_BIN_FILENAME
+        tags_target = data_dir / BGP_TAGS_JSON_FILENAME
+        wait_seconds = _check_mtime_cooldown(bin_target, DAILY_FEED_MIN_INTERVAL_SECONDS, force=force)
+        if wait_seconds is not None and tags_target.is_file():
+            self.stdout.write(f"Skipped BGP Tools ({bin_target.name}): wait {wait_seconds}s.")
+            return 0
+        if dry_run:
+            self.stdout.write(f"[dry-run] Would compile bgp.tools routing table into {bin_target}")
+            return 0
+
+        both_exist = bin_target.is_file() and tags_target.is_file()
+        bgp_headers = {"User-Agent": BGP_TOOLS_USER_AGENT}
+        try:
+            table_body, mod_table = _fetch_conditional_text(
+                client,
+                BGP_TOOLS_TABLE_URL,
+                data_dir=data_dir,
+                meta_map=meta_map,
+                target_exists=both_exist,
+                cache_raw=True,
+                extra_headers=bgp_headers,
+            )
+            tags_body, mod_tags = _fetch_conditional_text(
+                client,
+                BGP_TOOLS_TAGS_URL,
+                data_dir=data_dir,
+                meta_map=meta_map,
+                target_exists=both_exist,
+                cache_raw=True,
+                extra_headers=bgp_headers,
+            )
+            asn_tags, tag_counts = _parse_bgp_tags_text(tags_body or "")
+            mod_extra = False
+            if tag_counts and not asn_tags:
+                mod_extra = self._enrich_bgp_category_tags(
+                    client,
+                    data_dir=data_dir,
+                    meta_map=meta_map,
+                    target_exists=both_exist,
+                    bgp_headers=bgp_headers,
+                    tag_counts=tag_counts,
+                    asn_tags=asn_tags,
+                )
+
+            if not (mod_table or mod_tags or mod_extra) and both_exist:
+                self.stdout.write(f"Skipped BGP Tools ({bin_target.name}): upstream returned 304 Not Modified.")
+                return 0
+
+            table_entries = _parse_bgp_table_entries(table_body or "")
+            if not table_entries:
+                raise CommandError("bgp.tools table feed contained no valid prefix announcements.")
+
+            rule_count = compile_binary_prefix_index(table_entries, bin_target)
+            mobile_asns = sorted(
+                asn_num
+                for asn_num, tags in asn_tags.items()
+                if any(tag in MOBILE_BGP_TAG_TOKENS for tag in tags)
+            )
+            tags_payload = {
+                "asn_tags": {str(k): v for k, v in sorted(asn_tags.items())},
+                "mobile_asns": mobile_asns,
+                "tag_counts": tag_counts,
+            }
+            _write_json_atomically(tags_payload, tags_target)
+            clear_offline_intelligence_caches()
+            self.stdout.write(
+                self.style.SUCCESS(f"Updated BGP Tools ({bin_target.name}, {rule_count} prefixes).")
+            )
+            return 0
+        except _DOWNLOAD_UPDATE_ERRORS as exc:
+            self.stderr.write(self.style.ERROR(_redact_update_error(f"Failed BGP Tools update: {exc}")))
+            return 1
+
+    def _update_x4bnet_vpn(
+        self,
+        client: httpx.Client,
+        *,
+        data_dir: Path,
+        meta_map: Dict[str, Dict[str, str]],
+        force: bool,
+        dry_run: bool,
+    ) -> int:
+        target_path = data_dir / X4BNET_VPN_BIN_FILENAME
+        wait_seconds = _check_mtime_cooldown(target_path, DAILY_FEED_MIN_INTERVAL_SECONDS, force=force)
+        if wait_seconds is not None:
+            self.stdout.write(f"Skipped X4BNet VPN ({target_path.name}): wait {wait_seconds}s.")
+            return 0
+        if dry_run:
+            self.stdout.write(f"[dry-run] Would compile X4BNet VPN and hosting index into {target_path}")
+            return 0
+
+        target_exists = target_path.is_file()
+        hosting_url = str(getattr(settings, "IPAPI_IS_HOSTING_URL", IPAPI_IS_HOSTING_URL) or IPAPI_IS_HOSTING_URL)
+        sources = (
+            ("X4BNet VPN IPv4", X4BNET_VPN_IPV4_URL, X4BNET_MASK_VPN, _parse_plaintext_cidrs, False),
+            ("X4BNet VPN IPv6", X4BNET_VPN_IPV6_URL, X4BNET_MASK_VPN, _parse_plaintext_cidrs, True),
+            ("X4BNet Datacenter IPv4", X4BNET_DATACENTER_IPV4_URL, X4BNET_MASK_DATACENTER, _parse_plaintext_cidrs, False),
+            ("X4BNet Datacenter IPv6", X4BNET_DATACENTER_IPV6_URL, X4BNET_MASK_DATACENTER, _parse_plaintext_cidrs, True),
+            ("ipapi-is Hosting", hosting_url, X4BNET_MASK_HOSTING, lambda txt, _lbl: _parse_hosting_feed_cidrs(txt), True),
+        )
+
+        any_modified = False
+        any_304 = False
+        entries: List[Tuple[str, int]] = []
+        last_error: Optional[Exception] = None
+
+        for label, url, bit_mask, parser_fn, optional_feed in sources:
+            try:
+                body, modified = _fetch_conditional_text(
+                    client,
+                    url,
+                    data_dir=data_dir,
+                    meta_map=meta_map,
+                    target_exists=target_exists,
+                    cache_raw=True,
+                )
+                any_modified = any_modified or modified
+                any_304 = any_304 or (not modified)
+                if body is not None:
+                    entries.extend((cidr, bit_mask) for cidr in parser_fn(body, label))
+            except _DOWNLOAD_UPDATE_ERRORS as exc:
+                last_error = exc
+                if not optional_feed:
+                    self.stderr.write(self.style.WARNING(_redact_update_error(f"Failed {label} fetch: {exc}")))
+
+        if not any_modified and any_304 and target_exists:
+            self.stdout.write(f"Skipped X4BNet VPN ({target_path.name}): upstream returned 304 Not Modified.")
+            return 0
+
+        if not entries:
+            detail = f": {last_error}" if last_error is not None else ""
+            self.stderr.write(self.style.ERROR(_redact_update_error(f"Failed X4BNet VPN update{detail}")))
+            return 1
+
+        try:
+            rule_count = compile_binary_prefix_index(
+                entries,
+                target_path,
+                merge_payloads=lambda a, b: int(a) | int(b),
+            )
+            clear_offline_intelligence_caches()
+            self.stdout.write(self.style.SUCCESS(f"Updated X4BNet VPN ({target_path.name}, {rule_count} CIDRs)."))
+            return 0
+        except _DOWNLOAD_UPDATE_ERRORS as exc:
+            self.stderr.write(self.style.ERROR(_redact_update_error(f"Failed X4BNet VPN compilation: {exc}")))
+            return 1
+
+    def _update_peeringdb_mobile(
+        self,
+        client: httpx.Client,
+        *,
+        data_dir: Path,
+        meta_map: Dict[str, Dict[str, str]],
+        force: bool,
+        dry_run: bool,
+    ) -> int:
+        target_path = data_dir / MOBILE_ASNS_JSON_FILENAME
+        wait_seconds = _check_mtime_cooldown(target_path, DAILY_FEED_MIN_INTERVAL_SECONDS, force=force)
+        if wait_seconds is not None:
+            self.stdout.write(f"Skipped PeeringDB Mobile ({target_path.name}): wait {wait_seconds}s.")
+            return 0
+        if dry_run:
+            self.stdout.write(f"[dry-run] Would fetch PeeringDB mobile ASNs into {target_path}")
+            return 0
+
+        try:
+            body, modified = _fetch_conditional_text(
+                client,
+                PEERINGDB_NET_URL,
+                data_dir=data_dir,
+                meta_map=meta_map,
+                target_exists=target_path.is_file(),
+                cache_raw=False,
+            )
+            if not modified or body is None:
+                self.stdout.write(f"Skipped PeeringDB Mobile ({target_path.name}): upstream returned 304 Not Modified.")
+                return 0
+
+            parsed = _parse_peeringdb_mobile_payload(body)
+            _write_json_atomically(parsed, target_path)
+            clear_offline_intelligence_caches()
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f"Updated PeeringDB Mobile ({target_path.name}, {len(parsed['mobile_asns'])} mobile ASNs)."
+                )
+            )
+            return 0
+        except _DOWNLOAD_UPDATE_ERRORS as exc:
+            self.stderr.write(self.style.ERROR(_redact_update_error(f"Failed PeeringDB Mobile update: {exc}")))
+            return 1
+
     def _resolve_and_validate_data_dir(self, explicit_data_dir: str, *, dry_run: bool) -> Path:
         cleaned_explicit = explicit_data_dir.strip()
         configured_data_dir = resolve_configured_data_dir()
@@ -719,8 +1665,46 @@ class Command(BaseCommand):
 
         return data_dir
 
+    def _dispatch_selected_sources(
+        self,
+        client: httpx.Client,
+        selected: Set[str],
+        *,
+        data_dir: Path,
+        meta_map: Dict[str, Dict[str, str]],
+        force: bool,
+        dry_run: bool,
+        skip_listed_1: bool,
+    ) -> int:
+        total_errors = 0
+        if "stopforumspam" in selected:
+            total_errors += self._update_stopforumspam(
+                client,
+                sfs_dir=data_dir,
+                force=force,
+                dry_run=dry_run,
+                skip_listed_1=skip_listed_1,
+            )
+        if "maxmind" in selected:
+            total_errors += self._update_maxmind(client, maxmind_dir=data_dir, force=force, dry_run=dry_run)
+        if "cloud_cidrs" in selected:
+            total_errors += self._update_cloud_cidrs(client, data_dir=data_dir, force=force, dry_run=dry_run)
+
+        conditional_handlers = (
+            ("privacy_relays", self._update_privacy_relays),
+            ("ipsum_drop", self._update_ipsum_drop),
+            ("tor_onionoo", self._update_tor_onionoo),
+            ("bgp_tools", self._update_bgp_tools),
+            ("x4bnet_vpn", self._update_x4bnet_vpn),
+            ("peeringdb_mobile", self._update_peeringdb_mobile),
+        )
+        for key, handler in conditional_handlers:
+            if key in selected:
+                total_errors += handler(client, data_dir=data_dir, meta_map=meta_map, force=force, dry_run=dry_run)
+        return total_errors
+
     def handle(self, *args, **options) -> None:
-        update_sfs, update_maxmind, update_cloud_cidrs = self._parse_sources(options.get("sources") or ["all"])
+        selected = self._parse_sources(options.get("sources") or ["all"])
         force = bool(options.get("force"))
         dry_run = bool(options.get("dry_run"))
         skip_listed_1 = bool(options.get("skip_listed_1"))
@@ -729,35 +1713,26 @@ class Command(BaseCommand):
             raise CommandError("--timeout must be greater than zero.")
 
         data_dir = self._resolve_and_validate_data_dir(str(options.get("data_dir") or ""), dry_run=dry_run)
+        meta_map = _load_http_feed_metadata(data_dir)
+        initial_meta = json.dumps(meta_map, sort_keys=True)
 
-        total_errors = 0
         with httpx.Client(
             timeout=httpx.Timeout(timeout, connect=10.0),
             follow_redirects=True,
             headers={"User-Agent": USER_AGENT_HEADER},
         ) as client:
-            if update_sfs:
-                total_errors += self._update_stopforumspam(
-                    client,
-                    sfs_dir=data_dir,
-                    force=force,
-                    dry_run=dry_run,
-                    skip_listed_1=skip_listed_1,
-                )
-            if update_maxmind:
-                total_errors += self._update_maxmind(
-                    client,
-                    maxmind_dir=data_dir,
-                    force=force,
-                    dry_run=dry_run,
-                )
-            if update_cloud_cidrs:
-                total_errors += self._update_cloud_cidrs(
-                    client,
-                    data_dir=data_dir,
-                    force=force,
-                    dry_run=dry_run,
-                )
+            total_errors = self._dispatch_selected_sources(
+                client,
+                selected,
+                data_dir=data_dir,
+                meta_map=meta_map,
+                force=force,
+                dry_run=dry_run,
+                skip_listed_1=skip_listed_1,
+            )
+
+        if not dry_run and json.dumps(meta_map, sort_keys=True) != initial_meta:
+            _save_http_feed_metadata(data_dir, meta_map)
 
         if total_errors > 0:
             raise CommandError(f"Offline database update finished with {total_errors} error(s).")

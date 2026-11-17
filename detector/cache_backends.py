@@ -10,10 +10,13 @@ import math
 import os
 import threading
 import time
+import uuid
 import weakref
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, TypeVar
+from datetime import datetime, timezone
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 from django.conf import settings
+from django.core.signals import setting_changed
 
 from proxycheck.settings import (
     MAXMIND_ASN_DB_FILENAME,
@@ -30,7 +33,11 @@ from .offline_dbs import (
     get_stopforumspam_db_version,
     resolve_configured_data_dir,
 )
-from .provider_registry import REDIS_KEY_NAMESPACE, REDIS_TRANSPORT_ERRORS
+from .provider_registry import (
+    REDIS_TRANSPORT_ERRORS,
+    build_redis_namespace,
+    hash_ip_for_redis,
+)
 
 logger = logging.getLogger("detector.views")
 
@@ -485,15 +492,85 @@ def get_cooldown_bounds() -> Tuple[int, int, int]:
     return max(low, min(high, default_s)), low, high
 
 
+_OVERRIDDEN_REDIS_SETTINGS: set[str] = set()
+
+_RELEASE_UPDATING_LOCK_LUA = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+else
+    return 0
+end
+"""
+
+
+def _on_redis_setting_changed(*, setting: str, enter: bool, **kwargs: Any) -> None:
+    if setting in ("REDIS_KEY_PREFIX", "REDIS_KEY_SECRET", "SECRET_KEY"):
+        if enter:
+            _OVERRIDDEN_REDIS_SETTINGS.add(setting)
+        else:
+            _OVERRIDDEN_REDIS_SETTINGS.discard(setting)
+
+
+setting_changed.connect(_on_redis_setting_changed, dispatch_uid="detector.cache_backends.setting_changed")
+
+
+def _resolve_effective_redis_prefix() -> str:
+    if "REDIS_KEY_PREFIX" in _OVERRIDDEN_REDIS_SETTINGS:
+        raw_prefix = getattr(settings, "REDIS_KEY_PREFIX", "")
+    else:
+        raw_prefix = os.environ.get("REDIS_KEY_PREFIX") or getattr(settings, "REDIS_KEY_PREFIX", "proxycheck_dev_")
+    return str(raw_prefix or "proxycheck_dev_")
+
+
+def _resolve_effective_redis_secret() -> str:
+    if "REDIS_KEY_SECRET" in _OVERRIDDEN_REDIS_SETTINGS:
+        raw_secret = str(getattr(settings, "REDIS_KEY_SECRET", "") or "").strip()
+    else:
+        raw_secret = str(getattr(settings, "REDIS_KEY_SECRET", "") or os.environ.get("REDIS_KEY_SECRET", "")).strip()
+    if raw_secret:
+        return raw_secret
+    return str(getattr(settings, "SECRET_KEY", "") or "").strip()
+
+
+def get_redis_namespace() -> str:
+    """Returns the environment-isolated and secret-keyed Redis namespace."""
+    return build_redis_namespace(_resolve_effective_redis_prefix(), _resolve_effective_redis_secret())
+
+
+def get_redis_ip_digest(canonical_ip: str) -> str:
+    """Returns a 24-character HMAC-SHA256 digest for a canonical IP address."""
+    return hash_ip_for_redis(canonical_ip, _resolve_effective_redis_secret())
+
+
+def _normalize_snapshot_mode(mode: str = "full") -> str:
+    return "light" if str(mode or "").strip().lower() == "light" else "full"
+
+
 def provider_cache_key(provider_key: str, canonical_ip: str) -> str:
-    return f"{REDIS_KEY_NAMESPACE}:prov:{provider_key}:{canonical_ip}"
+    return f"{get_redis_namespace()}:prov:{provider_key}:{get_redis_ip_digest(canonical_ip)}"
 
 
 _provider_cache_key = provider_cache_key
 
 
 def provider_cooldown_key(provider_key: str) -> str:
-    return f"{REDIS_KEY_NAMESPACE}:cooldown:{provider_key}"
+    return f"{get_redis_namespace()}:cooldown:{provider_key}"
+
+
+def snapshot_cache_key(canonical_ip: str, mode: str = "full") -> str:
+    return f"{get_redis_namespace()}:snap:{_normalize_snapshot_mode(mode)}:{get_redis_ip_digest(canonical_ip)}"
+
+
+def updating_lock_key(canonical_ip: str) -> str:
+    return f"{get_redis_namespace()}:updating:{get_redis_ip_digest(canonical_ip)}"
+
+
+def refresh_cooldown_key(canonical_ip: str) -> str:
+    return f"{get_redis_namespace()}:refresh_cd:{get_redis_ip_digest(canonical_ip)}"
+
+
+def swr_backoff_key(canonical_ip: str) -> str:
+    return f"{get_redis_namespace()}:swr_backoff:{get_redis_ip_digest(canonical_ip)}"
 
 
 _T = TypeVar("_T")
@@ -752,3 +829,238 @@ def should_refresh_cached_stopforumspam_entry(row: Dict[str, Any]) -> bool:
     if cached_db_version is None:
         return False
     return cached_db_version != get_stopforumspam_db_version()
+
+
+def _sanitize_snapshot_rows(results: Any) -> Any:
+    if not isinstance(results, list):
+        return results
+    sanitize_fn = sanitization.sanitize_payload
+    sanitized_rows: List[Any] = []
+    for item in results:
+        if isinstance(item, dict) and isinstance(item.get("rawJson"), (dict, list)):
+            sanitized_rows.append({**item, "rawJson": sanitize_fn(item["rawJson"])})
+        elif isinstance(item, dict):
+            sanitized_rows.append(dict(item))
+        else:
+            sanitized_rows.append(item)
+    return sanitized_rows
+
+
+def _decode_cached_snapshot_entry(raw_value: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not raw_value:
+        return None
+    try:
+        parsed = json.loads(raw_value)
+    except ValueError, TypeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+
+    is_sanitized = parsed.get("sanitized") is True
+    envelope_fetched_at = parsed.get("fetchedAt")
+    if isinstance(parsed.get("snapshot"), dict):
+        snapshot = dict(parsed["snapshot"])
+        existing_fetched = snapshot.get("fetchedAt")
+        if not (isinstance(existing_fetched, str) and existing_fetched.strip()) and isinstance(
+            envelope_fetched_at, str
+        ) and envelope_fetched_at.strip():
+            snapshot["fetchedAt"] = envelope_fetched_at
+        if not is_sanitized and "results" in snapshot:
+            snapshot["results"] = _sanitize_snapshot_rows(snapshot["results"])
+        return snapshot
+
+    if "ip" in parsed or "results" in parsed:
+        snapshot = dict(parsed)
+        if not is_sanitized and "results" in snapshot:
+            snapshot["results"] = _sanitize_snapshot_rows(snapshot["results"])
+        return snapshot
+    return None
+
+
+async def get_cached_ip_snapshot(canonical_ip: str, mode: str = "full") -> Optional[Dict[str, Any]]:
+    """Reads a full or light IP intelligence snapshot from Redis L1 cache."""
+    if not isinstance(canonical_ip, str) or not canonical_ip.strip():
+        return None
+    raw_value = await safe_redis_get(snapshot_cache_key(canonical_ip, mode=mode))
+    return _decode_cached_snapshot_entry(raw_value)
+
+
+async def get_cached_ip_snapshots_bulk(
+    canonical_ips: Sequence[str],
+    mode: str = "full",
+) -> Dict[str, Dict[str, Any]]:
+    """Reads multiple IP intelligence snapshots from Redis L1 in a single MGET round trip."""
+    unique_ips = list(dict.fromkeys(ip.strip() for ip in canonical_ips if isinstance(ip, str) and ip.strip()))
+    if not unique_ips or _get_redis_client() is None:
+        return {}
+    keys = [snapshot_cache_key(ip, mode=mode) for ip in unique_ips]
+    raw_values = await safe_redis_mget(keys)
+    hits: Dict[str, Dict[str, Any]] = {}
+    for ip, raw_val in zip(unique_ips, raw_values, strict=True):
+        decoded = _decode_cached_snapshot_entry(raw_val)
+        if decoded is not None:
+            hits[ip] = decoded
+    return hits
+
+
+async def set_cached_ip_snapshot(
+    canonical_ip: str,
+    snapshot: Dict[str, Any],
+    *,
+    mode: str = "full",
+    ttl_seconds: int = DEFAULT_STATIC_CACHE_TTL_SECONDS,
+) -> None:
+    """Writes an IP snapshot to Redis L1 while preserving existing fetchedAt timestamps verbatim."""
+    if not isinstance(canonical_ip, str) or not canonical_ip.strip() or not isinstance(snapshot, dict):
+        return
+    if ttl_seconds <= 0:
+        return
+
+    payload = dict(snapshot)
+    existing_fetched = payload.get("fetchedAt")
+    if isinstance(existing_fetched, str) and existing_fetched.strip():
+        preserved_fetched_at = existing_fetched
+    else:
+        cache_meta = payload.get("cacheMeta")
+        meta_fetched = cache_meta.get("fetchedAt") if isinstance(cache_meta, dict) else None
+        if isinstance(meta_fetched, str) and meta_fetched.strip():
+            preserved_fetched_at = meta_fetched
+        else:
+            preserved_fetched_at = datetime.now(timezone.utc).isoformat()
+        payload["fetchedAt"] = preserved_fetched_at
+
+    if "results" in payload:
+        payload["results"] = _sanitize_snapshot_rows(payload["results"])
+
+    envelope = {
+        "snapshot": payload,
+        "fetchedAt": preserved_fetched_at,
+        "sanitized": True,
+    }
+    await safe_redis_set(
+        snapshot_cache_key(canonical_ip, mode=mode),
+        json.dumps(envelope),
+        ex=int(ttl_seconds),
+    )
+
+
+async def is_ip_updating_locked(canonical_ip: str) -> bool:
+    """Returns True when another worker currently holds the singleflight refresh lock for this IP."""
+    if not isinstance(canonical_ip, str) or not canonical_ip.strip():
+        return False
+    return (await safe_redis_get(updating_lock_key(canonical_ip))) is not None
+
+
+async def acquire_ip_updating_lock(canonical_ip: str, ttl_seconds: int = 25) -> Optional[str]:
+    """Atomically acquires a distributed singleflight lock for an IP and returns its release token."""
+    if not isinstance(canonical_ip, str) or not canonical_ip.strip() or ttl_seconds <= 0:
+        return None
+    client = _get_redis_client()
+    if client is None:
+        return None
+
+    token = uuid.uuid4().hex
+    lock_key = updating_lock_key(canonical_ip)
+    ttl = int(ttl_seconds)
+    try:
+        pending = client.set(lock_key, token, nx=True, ex=ttl)
+        acquired = await pending if inspect.isawaitable(pending) else pending
+    except TypeError:
+        existing = await safe_redis_get(lock_key)
+        if existing is not None:
+            return None
+        await safe_redis_set(lock_key, token, ex=ttl)
+        return token
+    except _REDIS_CIRCUIT_FAILURE_ERRORS as redis_err:
+        mark_redis_failure(redis_err)
+        logger.warning(f"Redis lock acquire bypassed for {lock_key} due to error: {redis_err}")
+        return None
+    return token if acquired else None
+
+
+async def _try_lua_lock_release(client: Any, lock_key: str, token: str) -> Optional[bool]:
+    eval_fn = getattr(client, "eval", None)
+    if not callable(eval_fn):
+        return None
+    try:
+        pending = eval_fn(_RELEASE_UPDATING_LOCK_LUA, 1, lock_key, token)
+        raw_res = await pending if inspect.isawaitable(pending) else pending
+    except AttributeError, TypeError, NotImplementedError:
+        return None
+    if isinstance(raw_res, bool):
+        return raw_res
+    if isinstance(raw_res, int):
+        return raw_res > 0
+    return None
+
+
+async def _fallback_lock_release(client: Any, lock_key: str, token: str) -> bool:
+    pending_get = client.get(lock_key)
+    raw_current = await pending_get if inspect.isawaitable(pending_get) else pending_get
+    if _decode_redis_text_value(raw_current) != token:
+        return False
+    delete_fn = getattr(client, "delete", None)
+    if callable(delete_fn):
+        pending_del = delete_fn(lock_key)
+        raw_del = await pending_del if inspect.isawaitable(pending_del) else pending_del
+        if isinstance(raw_del, bool):
+            return raw_del
+        if isinstance(raw_del, int):
+            return raw_del > 0
+        return True
+    strings_map = getattr(client, "strings", None)
+    if isinstance(strings_map, dict):
+        removed = strings_map.pop(lock_key, None) is not None
+        ttls_map = getattr(client, "ttls", None)
+        if isinstance(ttls_map, dict):
+            ttls_map.pop(lock_key, None)
+        return removed
+    return False
+
+
+async def release_ip_updating_lock(canonical_ip: str, token: str) -> bool:
+    """Releases the distributed singleflight lock only when the caller owns the matching token."""
+    if not isinstance(canonical_ip, str) or not canonical_ip.strip() or not isinstance(token, str) or not token:
+        return False
+    client = _get_redis_client()
+    if client is None:
+        return False
+
+    lock_key = updating_lock_key(canonical_ip)
+    try:
+        lua_outcome = await _try_lua_lock_release(client, lock_key, token)
+        if lua_outcome is not None:
+            return lua_outcome
+        return await _fallback_lock_release(client, lock_key, token)
+    except _REDIS_CIRCUIT_FAILURE_ERRORS as redis_err:
+        mark_redis_failure(redis_err)
+        logger.warning(f"Redis lock release bypassed for {lock_key} due to error: {redis_err}")
+        return False
+
+
+async def is_refresh_on_cooldown(canonical_ip: str) -> bool:
+    """Returns True while an IP is within its minimum manual refresh cooldown window."""
+    if not isinstance(canonical_ip, str) or not canonical_ip.strip():
+        return False
+    return (await safe_redis_get(refresh_cooldown_key(canonical_ip))) is not None
+
+
+async def set_refresh_cooldown(canonical_ip: str, ttl_seconds: int = 60) -> None:
+    """Sets the per-IP manual refresh cooldown key in Redis."""
+    if not isinstance(canonical_ip, str) or not canonical_ip.strip() or ttl_seconds <= 0:
+        return
+    await safe_redis_set(refresh_cooldown_key(canonical_ip), "1", ex=int(ttl_seconds))
+
+
+async def is_swr_backed_off(canonical_ip: str) -> bool:
+    """Returns True while background stale-while-revalidate refreshes are backed off for an IP."""
+    if not isinstance(canonical_ip, str) or not canonical_ip.strip():
+        return False
+    return (await safe_redis_get(swr_backoff_key(canonical_ip))) is not None
+
+
+async def set_swr_backoff(canonical_ip: str, ttl_seconds: int = 1800) -> None:
+    """Sets the background stale-while-revalidate backoff marker after a degraded refresh."""
+    if not isinstance(canonical_ip, str) or not canonical_ip.strip() or ttl_seconds <= 0:
+        return
+    await safe_redis_set(swr_backoff_key(canonical_ip), "1", ex=int(ttl_seconds))

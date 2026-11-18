@@ -186,7 +186,7 @@ def evaluate_wikimedia_rights(user_info: Dict[str, Any]) -> Tuple[bool, str, Lis
         return False, "Standard User (Unauthorised)", local_groups, global_groups
 
     if getattr(settings, "RESTRICT_TO_ALLOWED_WIKI_USERS", False):
-        if is_allowlisted_wiki_user(username):
+        if username and is_allowlisted_wiki_user(username):
             return True, "Allowlisted Wikimedia User", local_groups, global_groups
         return False, "Access Denied (restricted user allowlist)", local_groups, global_groups
 

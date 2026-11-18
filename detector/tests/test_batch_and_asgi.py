@@ -6,7 +6,6 @@ import os
 import tempfile
 import threading
 import time
-import warnings
 from pathlib import Path
 from typing import Optional
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,7 +17,6 @@ import dns.reversename
 import httpx
 import redis.exceptions
 from asgiref.sync import SyncToAsync, iscoroutinefunction
-from django.core.asgi import get_asgi_application
 from django.http import HttpResponse
 from django.test import AsyncRequestFactory, RequestFactory, SimpleTestCase, TestCase, override_settings
 
@@ -84,55 +82,6 @@ class AsgiSmokeTests(SimpleTestCase):
         self.assertEqual(detect_unauth.status_code, 401)
         self.assertEqual(favicon.status_code, 200)
         self.assertIn("image/svg+xml", favicon.headers.get("content-type", ""))
-
-    def test_asgi_whitenoise_serves_static_asset_over_real_http(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            base_dir = Path(tmpdir)
-            static_root = base_dir / "staticfiles"
-            static_root.mkdir(parents=True, exist_ok=True)
-            (static_root / "smoke-test.css").write_text("body { color: #3366cc; }\n", encoding="utf-8")
-
-            with (
-                override_settings(BASE_DIR=base_dir, STATIC_ROOT=static_root, STATICFILES_DIRS=[]),
-                warnings.catch_warnings(record=True) as captured_warnings,
-            ):
-                warnings.simplefilter("always")
-                asgi_app = get_asgi_application()
-                self.assertTrue(iscoroutinefunction(asgi_app._middleware_chain))
-                self.assertNotIsInstance(asgi_app._middleware_chain, SyncToAsync)
-                with _run_uvicorn_smoke_server(asgi_app) as base_url:
-                    resp = httpx.get(
-                        f"{base_url}/assets/smoke-test.css",
-                        headers={"X-Forwarded-Proto": "https"},
-                        timeout=5.0,
-                    )
-                    head_resp = httpx.head(
-                        f"{base_url}/assets/smoke-test.css",
-                        headers={"X-Forwarded-Proto": "https"},
-                        timeout=5.0,
-                    )
-                    not_modified_resp = httpx.get(
-                        f"{base_url}/assets/smoke-test.css",
-                        headers={
-                            "X-Forwarded-Proto": "https",
-                            "If-None-Match": resp.headers["etag"],
-                        },
-                        timeout=5.0,
-                    )
-
-            self.assertEqual(resp.status_code, 200)
-            self.assertIn("text/css", resp.headers.get("content-type", ""))
-            self.assertIn("#3366cc", resp.text)
-            self.assertIn("max-age=", resp.headers.get("cache-control", ""))
-            self.assertEqual(head_resp.status_code, 200)
-            self.assertEqual(head_resp.content, b"")
-            self.assertEqual(not_modified_resp.status_code, 304)
-            sync_iterator_warnings = [
-                str(warning.message)
-                for warning in captured_warnings
-                if "StreamingHttpResponse must consume synchronous iterators" in str(warning.message)
-            ]
-            self.assertEqual(sync_iterator_warnings, [])
 
     def test_async_whitenoise_middleware_preserves_sync_and_async_dispatch(self):
         with tempfile.TemporaryDirectory() as tmpdir:

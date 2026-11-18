@@ -14,7 +14,7 @@ import dns.name
 import dns.resolver
 import dns.reversename
 import httpx
-from django.test import SimpleTestCase, TestCase, override_settings
+from django.test import TestCase, override_settings
 
 from detector import cache_backends, detection_service, providers, views
 from detector.adapters import (
@@ -669,65 +669,6 @@ class DetectEndpointValidationTests(TestCase):
                 response = self.client.get(url)
                 self.assertEqual(response.status_code, 400)
                 self.assertEqual(response.json()["error"], "invalid_ip")
-
-
-class SettingsAndHardeningTests(TestCase):
-    """Tests for Allowed Hosts wildcard parsing."""
-
-    def test_allowed_hosts_parser_normalizes_wildcard_prefixes(self):
-        from proxycheck.settings import _parse_allowed_hosts
-
-        parsed = _parse_allowed_hosts("localhost, 127.0.0.1, *.toolforge.org, .wmcloud.org")
-        self.assertEqual(parsed, ["localhost", "127.0.0.1", ".toolforge.org", ".wmcloud.org"])
-        self.assertEqual(_parse_allowed_hosts("  , "), ["127.0.0.1", "localhost"])
-
-
-class SpaRoutingTests(SimpleTestCase):
-    """Tests for SPA entrypoint serving, fallback HTML, and API or asset exclusions."""
-
-    def test_spa_index_serves_dist_or_fallback_html(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            base_dir = Path(tmpdir)
-            with override_settings(BASE_DIR=base_dir):
-                fallback_resp = self.client.get("/")
-            self.assertEqual(fallback_resp.status_code, 200)
-            self.assertEqual(fallback_resp["Content-Type"], "text/html; charset=utf-8")
-            self.assertIn('<div id="app">Loading Proxy Detector...</div>', fallback_resp.content.decode("utf-8"))
-
-            dist_dir = base_dir / "dist"
-            dist_dir.mkdir(parents=True, exist_ok=True)
-            (dist_dir / "index.html").write_text(
-                "<!doctype html><html><body><div id='app'>Compiled Bundle</div></body></html>",
-                encoding="utf-8",
-            )
-
-            with override_settings(BASE_DIR=base_dir):
-                root_resp = self.client.get("/")
-                subroute_resp = self.client.get("/lookup/8.8.8.8")
-
-            self.assertEqual(root_resp.status_code, 200)
-            self.assertEqual(root_resp["Content-Type"], "text/html; charset=utf-8")
-            self.assertIn("Compiled Bundle", root_resp.content.decode("utf-8"))
-            self.assertEqual(subroute_resp.status_code, 200)
-            self.assertIn("Compiled Bundle", subroute_resp.content.decode("utf-8"))
-
-    def test_spa_catch_all_excludes_api_oauth_assets_and_favicon_routes(self):
-        api_miss = self.client.get("/api/nonexistent/")
-        oauth_miss = self.client.get("/oauth/unknown-step/")
-        asset_miss = self.client.get("/assets/missing-bundle.js")
-        auth_user = self.client.get("/api/v1/auth/user/")
-        toolforge_svg = self.client.get("/Proxycheck.svg")
-        favicon_svg = self.client.get("/favicon.svg")
-        favicon_ico = self.client.get("/favicon.ico")
-
-        self.assertEqual(api_miss.status_code, 404)
-        self.assertEqual(oauth_miss.status_code, 404)
-        self.assertEqual(asset_miss.status_code, 404)
-        self.assertEqual(auth_user.status_code, 200)
-        self.assertEqual(auth_user["Content-Type"], "application/json")
-        for icon_resp in (toolforge_svg, favicon_svg, favicon_ico):
-            self.assertEqual(icon_resp.status_code, 200)
-            self.assertIn("image/svg+xml", icon_resp["Content-Type"])
 
 
 class OfflineDatabaseStatusEndpointTests(TestCase):

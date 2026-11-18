@@ -801,8 +801,7 @@ def _select_cidr_recommendation(
     if narrow_mmdb and (not narrow_cloud or (valid_mmdb_prefix or 0) >= (valid_cloud_prefix or 0)):
         clamped_mmdb = _clamp_mediawiki_prefix_len(addr.version, valid_mmdb_prefix or default_prefix)
         return _format_clamped_cidr(addr, clamped_mmdb), (
-            f"Narrower MMDB prefix /{clamped_mmdb} selected over default "
-            f"/{default_prefix} to avoid collateral blocking"
+            f"Narrower MMDB prefix /{clamped_mmdb} selected over default /{default_prefix} to avoid collateral blocking"
         )
     if narrow_cloud:
         clamped_cloud = _clamp_mediawiki_prefix_len(addr.version, valid_cloud_prefix or default_prefix)

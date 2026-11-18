@@ -5168,13 +5168,17 @@
                     if (isAutoSwr && !tryConsumeAutoSwrBudget()) {
                         return;
                     }
+                    var refreshSeq = bannerLoadSeq;
                     bannerRefreshInFlight = true;
                     $bannerWarning.css('display', 'none').text('');
                     $bannerRefetchBtn.prop('disabled', true).text('Updating...');
 
                     executeIpRefresh(resolvedIp).then(function (outcome) {
+                        if (refreshSeq !== bannerLoadSeq || currentCanonicalKey !== resolvedKey) {
+                            return;
+                        }
                         bannerRefreshInFlight = false;
-                        if (!ensureBannerAttached() || currentCanonicalKey !== resolvedKey) {
+                        if (!ensureBannerAttached()) {
                             return;
                         }
                         if (!outcome || !outcome.ok || !outcome.data) {

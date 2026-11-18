@@ -861,9 +861,11 @@ def _decode_cached_snapshot_entry(raw_value: Optional[str]) -> Optional[Dict[str
     if isinstance(parsed.get("snapshot"), dict):
         snapshot = dict(parsed["snapshot"])
         existing_fetched = snapshot.get("fetchedAt")
-        if not (isinstance(existing_fetched, str) and existing_fetched.strip()) and isinstance(
-            envelope_fetched_at, str
-        ) and envelope_fetched_at.strip():
+        if (
+            not (isinstance(existing_fetched, str) and existing_fetched.strip())
+            and isinstance(envelope_fetched_at, str)
+            and envelope_fetched_at.strip()
+        ):
             snapshot["fetchedAt"] = envelope_fetched_at
         if not is_sanitized and "results" in snapshot:
             snapshot["results"] = _sanitize_snapshot_rows(snapshot["results"])

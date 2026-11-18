@@ -978,9 +978,27 @@ async def check_and_consume_refresh_rate_limit(
     windows: List[Tuple[str, int, int, str, int]] = []
     if not exempt_user and cleaned_user:
         user_digest = hash_username_for_rate_limit(cleaned_user)
-        windows.append((_refresh_user_minute_key(user_digest, current_dt), MINUTE_QUOTA_TTL_SECONDS, user_rpm_limit, "user_rpm", min_retry))
-        windows.append((_refresh_user_hour_key(user_digest, current_dt), HOURLY_QUOTA_TTL_SECONDS, user_rph_limit, "user_rph", hr_retry))
-    windows.append((_refresh_global_minute_key(current_dt), MINUTE_QUOTA_TTL_SECONDS, global_rpm_limit, "global_rpm", min_retry))
+        windows.append(
+            (
+                _refresh_user_minute_key(user_digest, current_dt),
+                MINUTE_QUOTA_TTL_SECONDS,
+                user_rpm_limit,
+                "user_rpm",
+                min_retry,
+            )
+        )
+        windows.append(
+            (
+                _refresh_user_hour_key(user_digest, current_dt),
+                HOURLY_QUOTA_TTL_SECONDS,
+                user_rph_limit,
+                "user_rph",
+                hr_retry,
+            )
+        )
+    windows.append(
+        (_refresh_global_minute_key(current_dt), MINUTE_QUOTA_TTL_SECONDS, global_rpm_limit, "global_rpm", min_retry)
+    )
 
     incremented_keys: List[Tuple[str, int]] = []
     try:
@@ -1239,7 +1257,7 @@ def _estimate_l2_table_rows_sync() -> Optional[int]:
                 if row and row[0] is not None:
                     return max(0, int(row[0]))
         return max(0, int(IpIntelligenceCache.objects.count()))
-    except (DjangoDbError, ValueError, TypeError, OSError):
+    except DjangoDbError, ValueError, TypeError, OSError:
         return None
     except AssertionError as exc:
         if type(exc).__name__ == "DatabaseOperationForbidden":
@@ -1339,8 +1357,8 @@ async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict
     has_sfs_db = any(
         entry.get("key", "").startswith("stopforumspam_") and entry.get("exists") for entry in offline_databases
     )
-    has_ipsum_db = any(entry.get("key") == "ipsum_drop_bin" and entry.get("exists") for entry in offline_databases)
-    has_x4bnet_db = any(entry.get("key") == "x4bnet_vpn_bin" and entry.get("exists") for entry in offline_databases)
+    has_ipsum_db = any(entry.get("key") == "ipsum_drop" and entry.get("exists") for entry in offline_databases)
+    has_x4bnet_db = any(entry.get("key") == "x4bnet_vpn" and entry.get("exists") for entry in offline_databases)
 
     providers_out = [
         _build_provider_dashboard_entry(

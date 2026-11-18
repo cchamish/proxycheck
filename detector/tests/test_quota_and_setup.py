@@ -272,14 +272,10 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         serialised_quota_and_telemetry = json.dumps(
             {
                 "strings": {
-                    k: v
-                    for k, v in fake_redis.strings.items()
-                    if k.startswith((f"{ns}:quota:", f"{ns}:telemetry:"))
+                    k: v for k, v in fake_redis.strings.items() if k.startswith((f"{ns}:quota:", f"{ns}:telemetry:"))
                 },
                 "hashes": {
-                    k: v
-                    for k, v in fake_redis.hashes.items()
-                    if k.startswith((f"{ns}:quota:", f"{ns}:telemetry:"))
+                    k: v for k, v in fake_redis.hashes.items() if k.startswith((f"{ns}:quota:", f"{ns}:telemetry:"))
                 },
             }
         )
@@ -651,23 +647,15 @@ class ProactiveQuotaAndTelemetryTests(TestCase):
         ns = cache_backends.get_redis_namespace()
         # ConnectError and TimeoutException must roll back both minute and daily quota counters to zero
         for refunded_provider in ("getipintel", "proxycheck"):
-            min_key = next(
-                key for key in fake_redis.strings if key.startswith(f"{ns}:quota:{refunded_provider}:min:")
-            )
-            day_key = next(
-                key for key in fake_redis.strings if key.startswith(f"{ns}:quota:{refunded_provider}:day:")
-            )
+            min_key = next(key for key in fake_redis.strings if key.startswith(f"{ns}:quota:{refunded_provider}:min:"))
+            day_key = next(key for key in fake_redis.strings if key.startswith(f"{ns}:quota:{refunded_provider}:day:"))
             self.assertEqual(fake_redis.strings[min_key], "0")
             self.assertEqual(fake_redis.strings[day_key], "0")
 
         # Valid HTTP 200 and HTTP 429 responses must retain their consumed quota count
         for retained_provider in ("abuseipdb", "ipdata"):
-            min_key = next(
-                key for key in fake_redis.strings if key.startswith(f"{ns}:quota:{retained_provider}:min:")
-            )
-            day_key = next(
-                key for key in fake_redis.strings if key.startswith(f"{ns}:quota:{retained_provider}:day:")
-            )
+            min_key = next(key for key in fake_redis.strings if key.startswith(f"{ns}:quota:{retained_provider}:min:"))
+            day_key = next(key for key in fake_redis.strings if key.startswith(f"{ns}:quota:{retained_provider}:day:"))
             self.assertEqual(fake_redis.strings[min_key], "1")
             self.assertEqual(fake_redis.strings[day_key], "1")
 

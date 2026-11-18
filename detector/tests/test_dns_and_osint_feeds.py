@@ -961,9 +961,7 @@ class OsintFeedsAndProxycheckExtensionsTests(TestCase):
             self.assertEqual(rows["StopForumSpam"]["lastSeen"], "2026-11-12 09:00:00")
             self.assertEqual(rows["DShield"]["attacks"], 80)
             self.assertEqual(rows["DShield"]["threatfeeds"], ["scanner"])
-            self.assertEqual(
-                written_ttls.get(cache_backends.provider_cache_key("tor_onionoo", "185.220.101.4")), 7200
-            )
+            self.assertEqual(written_ttls.get(cache_backends.provider_cache_key("tor_onionoo", "185.220.101.4")), 7200)
             self.assertEqual(
                 written_ttls.get(cache_backends.provider_cache_key("stopforumspam", "185.220.101.4")), 7200
             )

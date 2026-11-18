@@ -607,7 +607,9 @@ class IpCanonicalizationAndSecurityBaselineTests(TestCase):
         mock_redis = MagicMock()
         mock_redis.get = AsyncMock(side_effect=_fake_get)
         mock_redis.set = AsyncMock(side_effect=_fake_set)
-        mock_redis.delete = AsyncMock(side_effect=lambda *keys: sum(1 for k in keys if cache_store.pop(k, None) is not None))
+        mock_redis.delete = AsyncMock(
+            side_effect=lambda *keys: sum(1 for k in keys if cache_store.pop(k, None) is not None)
+        )
 
         with patch("detector.cache_backends.redis_client", mock_redis):
             first_resp = self.client.get("/api/v1/detect?ip=2001:0486:4860:0:0::8888")

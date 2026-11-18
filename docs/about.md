@@ -15,21 +15,3 @@ Most of the APIs currently used are also on their free tiers, so please be gentl
 And finally, here's to a Wikimedia universe with no vandals whatsoever.
 
 *Yes, I know. One can dream. And one great show can change the world.*
-
-## Data sources and attribution
-
-This product includes GeoLite2 data created by MaxMind, available from [https://www.maxmind.com](https://www.maxmind.com).
-
-ProxyCheck uses [IP2Location.io](https://www.ip2location.io) IP geolocation web service.
-
-Autonomous system and network intelligence includes data from [Cloudflare Radar](https://radar.cloudflare.com/), licensed under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) for non-commercial use, alongside open routing and mobile carrier records from [PeeringDB](https://www.peeringdb.com/) and [bgp.tools](https://bgp.tools/).
-
-Proxy and threat scoring incorporates intelligence from [GetIPIntel.net](https://getipintel.net/) and [ipdata.co](https://ipdata.co/), together with on-demand open proxy port enrichment from [Shodan InternetDB](https://internetdb.shodan.io/) used strictly for non-commercial anti-abuse investigations.
-
-Tor relay and exit node metadata is sourced from [Tor Project Onionoo](https://metrics.torproject.org/onionoo.html) under [CC0-1.0](https://creativecommons.org/publicdomain/zero/1.0/). Offline blocklist and hijacked prefix checks incorporate [Spamhaus DROP](https://www.spamhaus.org/blocklists/do-not-route-or-peer/) for non-commercial use and [stamparm/ipsum](https://github.com/stamparm/ipsum) under [The Unlicense](https://unlicense.org/).
-
-Offline VPN and hosting range classification includes datasets from [X4BNet lists_vpn](https://github.com/X4BNet/lists_vpn), [IPLocate](https://www.iplocate.io/), and [ipapi-is ip_to_hosting](https://github.com/ipapi-is/ip_to_hosting), licensed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
-
-## Privacy and data minimisation
-
-In accordance with the [Wikimedia Cloud Services Terms of Use](https://wikitech.wikimedia.org/wiki/Wikitech:Cloud_Services_Terms_of_use), access is restricted to authorised Wikimedia functionaries and anti-vandalism patrollers via Wikimedia OAuth. No temporary account names, revision identifiers, or requester query histories are stored in the database, and query strings containing inspected IP addresses are omitted from container access logs. Raw upstream provider payloads are retained only transiently in the short-lived L1 Redis cache, whilst persistent L2 cache entries store only sanitised, normalised summary indicators subject to upstream retention limits.

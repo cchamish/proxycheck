@@ -359,7 +359,11 @@ class RedisIsolationAndSingleflightLockTests(TestCase):
             fallback_digest = cache_backends.get_redis_ip_digest("198.51.100.9")
             self.assertEqual(fallback_digest, hash_ip_for_redis("198.51.100.9", "fallback-django-secret-key"))
 
-    @override_settings(REDIS_KEY_PREFIX="proxycheck_test_", REDIS_KEY_SECRET="snapshot-hmac-secret", ABUSEIPDB_API_KEY="leak-secret-val")
+    @override_settings(
+        REDIS_KEY_PREFIX="proxycheck_test_",
+        REDIS_KEY_SECRET="snapshot-hmac-secret",
+        ABUSEIPDB_API_KEY="leak-secret-val",
+    )
     async def test_l1_snapshot_preserves_historical_fetched_at_and_batches_mget(self) -> None:
         fake_redis = _BatchingFakeRedis()
         historical_iso = "2026-07-15T09:12:30.104500+00:00"
@@ -577,7 +581,9 @@ class ToolsDbL2CacheRepositoryTests(TestCase):
         l2_cache.merge_and_upsert_l2_snapshot("203.0.113.50", _make_snapshot("203.0.113.50", rows=rows), now_dt=base_dt)
         l2_cache.merge_and_upsert_l2_snapshot("203.0.113.51", _make_snapshot("203.0.113.51", rows=rows), now_dt=base_dt)
         fresh_dt = base_dt + timedelta(days=20)
-        l2_cache.merge_and_upsert_l2_snapshot("203.0.113.52", _make_snapshot("203.0.113.52", rows=rows), now_dt=fresh_dt)
+        l2_cache.merge_and_upsert_l2_snapshot(
+            "203.0.113.52", _make_snapshot("203.0.113.52", rows=rows), now_dt=fresh_dt
+        )
 
         within_30d = l2_cache.get_ip_snapshot("203.0.113.50", now_dt=base_dt + timedelta(days=29))
         assert within_30d is not None
@@ -596,13 +602,19 @@ class ToolsDbL2CacheRepositoryTests(TestCase):
         self.assertIn("IP2Location", {r["provider"] for r in bulk_after_30d["203.0.113.52"]["results"]})
 
         dry_out = io.StringIO()
-        with patch("detector.l2_cache._ensure_utc", side_effect=lambda dt=None: past_30d_now if dt is None else dt.astimezone(timezone.utc)):
+        with patch(
+            "detector.l2_cache._ensure_utc",
+            side_effect=lambda dt=None: past_30d_now if dt is None else dt.astimezone(timezone.utc),
+        ):
             call_command("purge_l2_cache", batch_size=1, dry_run=True, stdout=dry_out)
         self.assertIn("2 rows require cleanup", dry_out.getvalue())
         self.assertIn("ip2location", IpIntelligenceCache.objects.get(canonical_ip="203.0.113.50").provider_fetched_map)
 
         live_out = io.StringIO()
-        with patch("detector.l2_cache._ensure_utc", side_effect=lambda dt=None: past_30d_now if dt is None else dt.astimezone(timezone.utc)):
+        with patch(
+            "detector.l2_cache._ensure_utc",
+            side_effect=lambda dt=None: past_30d_now if dt is None else dt.astimezone(timezone.utc),
+        ):
             call_command("purge_l2_cache", batch_size=1, stdout=live_out)
         self.assertIn("Purged 2 expired provider entries across 2 rows", live_out.getvalue())
 
@@ -627,9 +639,14 @@ class ToolsDbL2CacheRepositoryTests(TestCase):
             ),
             now_dt=recent_refresh_dt,
         )
-        with patch("detector.l2_cache._ensure_utc", side_effect=lambda dt=None: past_30d_now if dt is None else dt.astimezone(timezone.utc)):
+        with patch(
+            "detector.l2_cache._ensure_utc",
+            side_effect=lambda dt=None: past_30d_now if dt is None else dt.astimezone(timezone.utc),
+        ):
             call_command("purge_l2_cache", batch_size=2, stdout=io.StringIO())
-        self.assertNotIn("ip2location", IpIntelligenceCache.objects.get(canonical_ip="203.0.113.53").provider_fetched_map)
+        self.assertNotIn(
+            "ip2location", IpIntelligenceCache.objects.get(canonical_ip="203.0.113.53").provider_fetched_map
+        )
 
         with self.assertRaises(CommandError):
             call_command("purge_l2_cache", batch_size=0, stdout=io.StringIO())
@@ -643,7 +660,9 @@ class ToolsDbL2CacheRepositoryTests(TestCase):
             _make_provider_row("IPRegistry"),
         ]
         target_ip = "203.0.113.88"
-        first = l2_cache.merge_and_upsert_l2_snapshot(target_ip, _make_snapshot(target_ip, rows=initial_rows), now_dt=t_initial)
+        first = l2_cache.merge_and_upsert_l2_snapshot(
+            target_ip, _make_snapshot(target_ip, rows=initial_rows), now_dt=t_initial
+        )
         self.assertTrue(first.saved)
         self.assertEqual(first.valid_commercial_count, 4)
 
@@ -651,10 +670,17 @@ class ToolsDbL2CacheRepositoryTests(TestCase):
         partial_rows = [
             _make_provider_row("AbuseIPDB", extra={"abuseScore": 85}),
             _make_provider_row("IPData"),
-            _make_provider_row("Proxycheck", status="Local Quota Guard (1000/1000 req/day)", status_code=429, extra={"isQuotaGuard": True}),
+            _make_provider_row(
+                "Proxycheck",
+                status="Local Quota Guard (1000/1000 req/day)",
+                status_code=429,
+                extra={"isQuotaGuard": True},
+            ),
             _make_provider_row("IPRegistry", status="504 Gateway Timeout", status_code=504),
         ]
-        merged = l2_cache.merge_and_upsert_l2_snapshot(target_ip, _make_snapshot(target_ip, rows=partial_rows), now_dt=t_partial)
+        merged = l2_cache.merge_and_upsert_l2_snapshot(
+            target_ip, _make_snapshot(target_ip, rows=partial_rows), now_dt=t_partial
+        )
         self.assertTrue(merged.saved)
         self.assertFalse(merged.degraded_fallback)
         self.assertTrue(merged.has_degraded_sources)

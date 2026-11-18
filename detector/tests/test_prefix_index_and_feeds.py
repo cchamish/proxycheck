@@ -119,9 +119,7 @@ def _build_all_feeds_payloads() -> Dict[str, Tuple[str | bytes, Dict[str, str]]]
 
     return {
         "mask-api.icloud.com/egress-ip-ranges.csv": (
-            "# Apple Private Relay\n"
-            "172.224.226.0/27,US,US-CA,San Francisco,\n"
-            "2a02:26f7:b400::/48,GB,GB-LND,London,\n",
+            "# Apple Private Relay\n172.224.226.0/27,US,US-CA,San Francisco,\n2a02:26f7:b400::/48,GB,GB-LND,London,\n",
             {"ETag": '"apple-v1"', "Last-Modified": "Wed, 18 Nov 2026 01:00:00 GMT"},
         ),
         "api.cloudflare.com/local-ip-ranges.csv": (
@@ -132,9 +130,7 @@ def _build_all_feeds_payloads() -> Dict[str, Tuple[str | bytes, Dict[str, str]]]
             {"ETag": '"cf-local-v1"', "Last-Modified": "Wed, 18 Nov 2026 01:00:00 GMT"},
         ),
         "cloudflare.com/ips-v4": (
-            "173.245.48.0/20\n"
-            "172.64.0.0/16\n"
-            "104.28.20.0/24\n",
+            "173.245.48.0/20\n172.64.0.0/16\n104.28.20.0/24\n",
             {"ETag": '"cf-v4-v1"', "Last-Modified": "Wed, 18 Nov 2026 01:00:00 GMT"},
         ),
         "cloudflare.com/ips-v6": (
@@ -142,11 +138,7 @@ def _build_all_feeds_payloads() -> Dict[str, Tuple[str | bytes, Dict[str, str]]]
             {"ETag": '"cf-v6-v1"', "Last-Modified": "Wed, 18 Nov 2026 01:00:00 GMT"},
         ),
         "stamparm/ipsum": (
-            "# ipsum feed\n"
-            "198.51.100.10\t1\n"
-            "198.51.100.11\t2\n"
-            "198.51.100.12\t5\n"
-            "192.0.2.55\t4\n",
+            "# ipsum feed\n198.51.100.10\t1\n198.51.100.11\t2\n198.51.100.12\t5\n192.0.2.55\t4\n",
             {"ETag": '"ipsum-v1"', "Last-Modified": "Wed, 18 Nov 2026 02:00:00 GMT"},
         ),
         "spamhaus.org/drop/drop_v4.json": (
@@ -306,13 +298,11 @@ class BinaryPrefixIndexTests(SimpleTestCase):
                 self.assertEqual(second_json_hit[1], {"asn": 64501, "tags": ["vpn"]})
 
     def test_large_table_lookup_latency_and_ephemeral_platform_defaults(self) -> None:
-        with patch.object(offline_dbs.os, "name", "posix"):
-            posix_dir = resolve_local_ephemeral_cache_dir(env_overrides={"LOCAL_EPHEMERAL_CACHE_DIR": ""})
-            self.assertEqual(posix_dir.as_posix(), "/tmp/proxycheck-local")  # noqa: S108
-
-        with patch.object(offline_dbs.os, "name", "nt"):
-            win_dir = resolve_local_ephemeral_cache_dir(env_overrides={"LOCAL_EPHEMERAL_CACHE_DIR": ""})
-            self.assertEqual(win_dir, Path(tempfile.gettempdir()) / "proxycheck-local")
+        cache_dir = resolve_local_ephemeral_cache_dir(env_overrides={"LOCAL_EPHEMERAL_CACHE_DIR": ""})
+        if offline_dbs.sys.platform == "win32":
+            self.assertEqual(cache_dir, Path(tempfile.gettempdir()) / "proxycheck-local")
+        else:
+            self.assertEqual(cache_dir.as_posix(), "/tmp/proxycheck-local")  # noqa: S108
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             bin_path = Path(tmp_dir) / "large.bin"

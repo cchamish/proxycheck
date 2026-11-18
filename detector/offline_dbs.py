@@ -13,6 +13,7 @@ import os
 import socket
 import sqlite3
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -283,7 +284,7 @@ def resolve_local_ephemeral_cache_dir(*, env_overrides: Optional[Mapping[str, st
     configured = expand_configured_path(_lookup_config_value("LOCAL_EPHEMERAL_CACHE_DIR", env_overrides=env_overrides))
     if configured:
         return Path(configured)
-    if os.name == "posix":
+    if sys.platform != "win32":
         return Path("/tmp/proxycheck-local")  # noqa: S108
     return Path(tempfile.gettempdir()) / "proxycheck-local"
 

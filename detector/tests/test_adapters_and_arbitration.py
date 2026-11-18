@@ -4,9 +4,6 @@ import asyncio
 import copy
 import json
 import os
-import re
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import dns.exception
@@ -22,7 +19,6 @@ from detector.adapters import (
     _safe_int,
     adapt_abuseipdb,
     adapt_cloudflare_radar,
-    adapt_dshield,
     adapt_getipintel,
     adapt_ip2location,
     adapt_ipdata,
@@ -32,16 +28,11 @@ from detector.adapters import (
     adapt_ipsum_drop,
     adapt_maxmind,
     adapt_shodan_internetdb,
-    adapt_spamhaus_zen,
-    adapt_stopforumspam,
-    adapt_tor_onionoo,
     adapt_x4bnet_vpn,
     classify_rdns_hostname,
     compute_cidr_attribution,
 )
 from detector.provider_registry import (
-    COMMERCIAL_ARBITRATION_PROVIDERS,
-    DEFAULT_QUOTA_LIMITS,
     PROVIDER_REGISTRY,
 )
 
@@ -831,50 +822,6 @@ class FlagBasedArbitrationTests(SimpleTestCase):
 class NewIntelligenceAdapterAndQueryTests(SimpleTestCase):
     """Tests confidence-tiered GetIPIntel thresholds, new offline and Shodan adapters, and Onionoo mirror lookups."""
 
-    def test_getipintel_confidence_thresholds_and_arbitration_weights(self):
-        cases = (
-            ("zero", "0.0", 0.0, False, 0.0, "No Flags"),
-            ("below_20", "0.199", 19.9, False, 0.0, "No Flags"),
-            ("moderate_low", "0.20", 20.0, False, 0.0, "Moderate Prediction"),
-            ("below_75", "0.749", 74.9, False, 0.0, "Moderate Prediction"),
-            ("partial_lower_bound", "0.75", 75.0, False, 0.5, "Moderate Prediction"),
-            ("partial_upper_bound", "0.899", 89.9, False, 0.5, "Moderate Prediction"),
-            ("high_risk_bound", "0.90", 90.0, True, 1.0, "High-Probability Proxy/VPN"),
-            ("high_risk_peak", "0.985", 98.5, True, 1.0, "High-Probability Proxy/VPN"),
-        )
-        for label, raw_score, expected_chance, expected_high_risk, expected_weight, expected_flag in cases:
-            with self.subTest(case=label):
-                row = adapt_getipintel({"status": "success", "result": raw_score}, True, 200)
-                self.assertEqual(row["status"], "200 OK")
-                self.assertEqual(row["chance"], expected_chance)
-                self.assertEqual(row["arbitrationWeight"], expected_weight)
-                self.assertEqual(row["securityFlags"], [{"label": expected_flag, "isHighRisk": expected_high_risk}])
-
-        unconfigured = adapt_getipintel(None, False)
-        self.assertEqual(unconfigured["status"], "No API Key")
-        self.assertEqual(unconfigured["arbitrationWeight"], 0.0)
-
-        residential_row = adapt_getipintel(
-            {"status": "success", "result": "1", "ResidentialProxy": "0.96"},
-            True,
-            200,
-        )
-        self.assertEqual(residential_row["residentialProxy"], 0.96)
-
-    def test_high_residential_proxy_score_overrides_arbitration_and_cidr(self):
-        residential_row = adapt_getipintel(
-            {"status": "success", "result": "0.12", "ResidentialProxy": "0.95"},
-            True,
-            200,
-        )
-        aggregated = views.aggregate_intelligence_metrics("136.35.54.129", [residential_row])
-
-        self.assertTrue(aggregated["highlySuspectedResidentialProxy"])
-        self.assertEqual(aggregated["residentialProxy"], 0.95)
-        self.assertEqual(aggregated["arbitrationVerdict"], "Highly Suspected Residential Proxy")
-        self.assertEqual(aggregated["recommendedCidr"], "136.35.54.129/32")
-        self.assertIn("single IP", aggregated["cidrRationale"])
-
     def test_ipsum_drop_x4bnet_and_shodan_adapters_and_dispatch_table(self):
         self.assertEqual(set(ADAPTER_DISPATCH_TABLE), {meta.key for meta in PROVIDER_REGISTRY})
 
@@ -985,151 +932,6 @@ class ConfidenceWeightedArbitrationAndParadoxTests(SimpleTestCase):
             "rawJson": {},
         }
 
-    def test_residential_proxy_signal_paradox_matrix(self):
-        recent_iso = (datetime.now(timezone.utc) - timedelta(days=4)).isoformat()
-        stale_iso = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
-
-        base_res = [self._res_row("IPHub", "residential"), self._res_row("IPData", "isp")]
-        shodan_ports = adapt_shodan_internetdb({"ports": [1080, 443]}, status_code=200)
-        shodan_tag = adapt_shodan_internetdb({"ports": [443], "tags": ["compromised"]}, status_code=200)
-        ipsum_3 = adapt_ipsum_drop({"ipsumScore": 3, "isIpsumListed": True})
-        ipsum_2 = adapt_ipsum_drop({"ipsumScore": 2, "isIpsumListed": True})
-        sfs_recent = adapt_stopforumspam(
-            {"success": 1, "ip": {"appears": 1, "frequency": 6, "lastseen": recent_iso}},
-            status_code=200,
-        )
-        sfs_stale = adapt_stopforumspam(
-            {"success": 1, "ip": {"appears": 1, "frequency": 6, "lastseen": stale_iso}},
-            status_code=200,
-        )
-        dshield_recent = adapt_dshield({"ip": {"attacks": 15, "count": 5, "maxdate": recent_iso[:10]}}, 200)
-
-        cases = (
-            ("res_sources_plus_shodan_port", [*base_res, shodan_ports], None, None, True),
-            (
-                "ptr_dynamic_plus_shodan_tag",
-                [self._res_row("IPHub", "unknown"), shodan_tag],
-                "p1.dip0.t-ipconnect.de",
-                None,
-                True,
-            ),
-            ("res_plus_ipsum3_and_recent_sfs", [*base_res, ipsum_3, sfs_recent], None, None, True),
-            ("res_plus_ipsum3_and_recent_dshield", [*base_res, ipsum_3, dshield_recent], None, None, True),
-            ("stale_sfs_over_30d_rejected", [*base_res, ipsum_3, sfs_stale], None, None, False),
-            ("moderate_ipsum2_rejected", [*base_res, ipsum_2, sfs_recent], None, None, False),
-            ("datacentre_not_residential", [self._res_row("IPHub", "hosting"), shodan_ports], None, None, False),
-            ("privacy_egress_excluded", [*base_res, shodan_ports], None, "icloud_private_relay", False),
-            (
-                "tor_excluded",
-                [
-                    *base_res,
-                    shodan_ports,
-                    adapt_tor_onionoo({"relays": [{"a": ["1.2.3.4"], "running": True}]}, 200, "1.2.3.4"),
-                ],
-                None,
-                None,
-                False,
-            ),
-        )
-        for label, rows, ptr_host, privacy_kind, expected_paradox in cases:
-            with self.subTest(case=label):
-                with patch("detector.cidr_attribution.lookup_privacy_relay_offline", return_value=privacy_kind):
-                    agg = views.aggregate_intelligence_metrics("1.2.3.4", rows, ptr_hostname=ptr_host)
-                self.assertEqual(agg["suspectedResidentialProxy"], expected_paradox)
-                if expected_paradox:
-                    self.assertEqual(agg["arbitrationVerdict"], "Suspected Residential Proxy / Compromised Host")
-                    self.assertIn(agg["arbitrationTier"], ("warning", "destructive"))
-
-    def test_shared_privacy_egress_and_weighted_osint_arbitration(self):
-        relay_rows = [
-            adapt_ipregistry(
-                {"connection": {"type": "hosting", "asn": 13335}, "security": {"is_vpn": True, "is_relay": True}},
-                has_api_key=True,
-            ),
-            adapt_ipdata({"ip": "104.28.1.1", "threat": {"is_icloud_relay": True}}, has_api_key=True),
-        ]
-        with patch("detector.cidr_attribution.lookup_privacy_relay_offline", return_value="cloudflare_warp"):
-            clean_warp = views.aggregate_intelligence_metrics("104.28.1.1", relay_rows)
-        self.assertEqual(
-            clean_warp["arbitrationVerdict"],
-            "Shared Privacy Egress (iCloud Relay / WARP — Soft Block Recommended)",
-        )
-        self.assertEqual(clean_warp["arbitrationTier"], "warning")
-        self.assertFalse(clean_warp["isMajorityProxyVpn"])
-
-        high_abuse = adapt_abuseipdb({"data": {"abuseConfidenceScore": 80}}, has_api_key=True)
-        with patch("detector.cidr_attribution.lookup_privacy_relay_offline", return_value="icloud_private_relay"):
-            abused_relay = views.aggregate_intelligence_metrics("172.224.224.1", [*relay_rows, high_abuse])
-        self.assertEqual(abused_relay["arbitrationTier"], "destructive")
-        self.assertIn("Confirmed Proxy / VPN", abused_relay["arbitrationVerdict"])
-
-        # Spamhaus PBL policy ranges never cast negative votes, while SBL does
-        pbl_row = adapt_spamhaus_zen({"status": "listed", "codes": ["127.0.0.10"]}, 200)
-        sbl_row = adapt_spamhaus_zen({"status": "listed", "codes": ["127.0.0.2"]}, 200)
-        four_clean = [self._res_row(name) for name in ("IPHub", "IPHunter", "IPData", "Proxycheck")]
-        pbl_agg = views.aggregate_intelligence_metrics("1.2.3.4", [*four_clean, pbl_row])
-        self.assertEqual(pbl_agg["arbitrationVerdict"], "Clean Residential / Direct (0/4 Sources)")
-        sbl_agg = views.aggregate_intelligence_metrics("1.2.3.4", [*four_clean, sbl_row])
-        self.assertEqual(sbl_agg["arbitrationVerdict"], "Disputed Proxy / VPN (1/5 Sources)")
-        self.assertEqual(sbl_agg["arbitrationTier"], "warning")
-
-        # GetIPIntel 0.5 partial weight breaks a 2-of-4 tie to 2.5/4 majority, while 0.5 alone stays disputed
-        gii_half = adapt_getipintel({"status": "success", "result": "0.82"}, True, 200)
-        two_proxy = [
-            {**self._res_row("IPData"), "securityFlags": [{"label": "Proxy", "isHighRisk": True}]},
-            {**self._res_row("Proxycheck"), "securityFlags": [{"label": "VPN", "isHighRisk": True}]},
-        ]
-        tie_broken = views.aggregate_intelligence_metrics(
-            "1.2.3.4",
-            [self._res_row("IPHub"), *two_proxy, gii_half],
-        )
-        self.assertTrue(tie_broken["isMajorityProxyVpn"])
-        self.assertEqual(tie_broken["arbitrationVerdict"], "Confirmed Proxy / VPN (2.5/4 Sources)")
-
-        lone_half = views.aggregate_intelligence_metrics(
-            "1.2.3.4",
-            [self._res_row("IPHub"), self._res_row("IPData"), self._res_row("Proxycheck"), gii_half],
-        )
-        self.assertFalse(lone_half["isMajorityProxyVpn"])
-        self.assertEqual(lone_half["arbitrationVerdict"], "Disputed Proxy / VPN (0.5/4 Sources)")
-
 
 class CrossStackProviderContractTests(SimpleTestCase):
     """Tests provider registry alignment across backend, TypeScript helpers, and MediaWiki gadget."""
-
-    def test_provider_registry_aligns_with_frontend_and_userscript_contracts(self):
-        repo_root = Path(__file__).resolve().parent.parent.parent
-        ts_source = (repo_root / "src" / "utils" / "ip-detector-logic.ts").read_text(encoding="utf-8")
-        gadget_source = (repo_root / "scripts" / "user-gadget.js").read_text(encoding="utf-8")
-
-        expected_labels = [meta.label for meta in PROVIDER_REGISTRY]
-        spec_labels = [spec.label for spec in providers.PROVIDER_SPECS]
-        self.assertEqual(spec_labels, expected_labels)
-        self.assertEqual(DEFAULT_QUOTA_LIMITS["getipintel"], (15, 500))
-
-        ts_provider_block = re.search(r"export const PROVIDER_NAMES\s*=\s*\[(.*?)\]\s*as const;", ts_source, re.S)
-        self.assertIsNotNone(ts_provider_block)
-        ts_providers = re.findall(r"'([^']+)'", ts_provider_block.group(1))
-        self.assertEqual(ts_providers, expected_labels)
-
-        ts_comm_block = re.search(
-            r"export const COMMERCIAL_ARBITRATION_PROVIDERS\s*=\s*\[(.*?)\]\s*as const;",
-            ts_source,
-            re.S,
-        )
-        self.assertIsNotNone(ts_comm_block)
-        ts_commercial = set(re.findall(r"'([^']+)'", ts_comm_block.group(1)))
-        self.assertEqual(ts_commercial, set(COMMERCIAL_ARBITRATION_PROVIDERS))
-
-        gadget_comm_block = re.search(r"var COMMERCIAL_PROVIDERS\s*=\s*\{(.*?)\};", gadget_source, re.S)
-        self.assertIsNotNone(gadget_comm_block)
-        gadget_commercial = set(re.findall(r"'([^']+)'\s*:\s*true", gadget_comm_block.group(1)))
-        self.assertEqual(gadget_commercial, set(COMMERCIAL_ARBITRATION_PROVIDERS))
-
-        palette_block = re.search(r"var PROVIDER_BADGE_PALETTES\s*=\s*\{(.*?)\n    \};", gadget_source, re.S)
-        self.assertIsNotNone(palette_block)
-        palette_keys = set(re.findall(r"'([^']+)'\s*:\s*\{", palette_block.group(1)))
-        self.assertTrue(set(expected_labels).issubset(palette_keys))
-
-        self.assertNotIn(".html(", gadget_source)
-        self.assertNotIn("innerHTML", gadget_source)

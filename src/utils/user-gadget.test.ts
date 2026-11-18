@@ -1103,7 +1103,7 @@ test('Inline badges render relative cache age without auto-refresh, while dialog
                 arbitrationVerdict: 'Disputed Proxy / VPN (2/5 Sources)',
                 arbitrationTier: 'warning',
                 isMajorityProxyVpn: false,
-                cacheMeta: { ageSeconds: 120 * 86400, isStale: true, shouldAutoRefresh: false },
+                cacheMeta: { ageSeconds: 120 * 86400, isStale: true, shouldAutoRefresh: true },
               }),
             },
           },

@@ -1040,3 +1040,4 @@ class CheckSetupCommandTests(SimpleTestCase):
         )
         self.assertEqual(completed.returncode, 0, msg=completed.stderr)
         self.assertIn("Proxy Detector Environment Check", completed.stdout)
+

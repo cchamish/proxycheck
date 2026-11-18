@@ -1478,6 +1478,18 @@ def _extract_grantee_user(grantee_clause: str) -> Tuple[str, bool]:
     return cleaned_user, is_public_or_wildcard
 
 
+_WIKI_REPLICA_SCHEMA_PATTERN = "%_p"
+_WIKI_REPLICA_READONLY_PRIVS = frozenset({"SELECT", "SHOW VIEW"})
+
+
+def _is_wiki_replica_readonly_grant(normalized_schema: str, privs_upper: str) -> bool:
+    """Toolforge grants every tool read-only access to Wiki Replicas (`%\\_p`); this is expected."""
+    if normalized_schema != _WIKI_REPLICA_SCHEMA_PATTERN:
+        return False
+    privs = {part.strip() for part in privs_upper.split(",") if part.strip()}
+    return bool(privs) and privs <= _WIKI_REPLICA_READONLY_PRIVS
+
+
 def _is_unsafe_grant_statement(stmt: str, *, expected_user: str) -> bool:
     match = _GRANT_STMT_RE.match(stmt)
     if not match:
@@ -1493,6 +1505,8 @@ def _is_unsafe_grant_statement(stmt: str, *, expected_user: str) -> bool:
 
     schema_part = target_raw.strip().split(".", 1)[0].strip().strip("`'\"")
     normalized_schema = schema_part.replace("\\_", "_")
+    if _is_wiki_replica_readonly_grant(normalized_schema, privs_upper):
+        return False
     if is_public_toolsdb_name(normalized_schema):
         return True
     return normalized_schema in ("*", "%") and privs_upper != "USAGE"

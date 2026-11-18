@@ -1040,3 +1040,31 @@ class CheckSetupCommandTests(SimpleTestCase):
         )
         self.assertEqual(completed.returncode, 0, msg=completed.stderr)
         self.assertIn("Proxy Detector Environment Check", completed.stdout)
+
+    def test_find_unsafe_grants_allows_wiki_replica_readonly_and_flags_real_hazards(self):
+        from detector.management.commands.check_setup import find_unsafe_grant_statements
+
+        expected_user = "s58357"
+        cache_db = "s58357__proxycheck_cache"
+        cases = [
+            ("GRANT USAGE ON *.* TO `s58357`@`%` IDENTIFIED BY PASSWORD '*abc'", False),
+            ("GRANT ALL PRIVILEGES ON `s58357\\_\\_%`.* TO `s58357`@`%`", False),
+            ("GRANT SELECT, SHOW VIEW ON `%\\_p`.* TO `s58357`@`%`", False),
+            ("GRANT ALL PRIVILEGES ON `%\\_p`.* TO `s58357`@`%`", True),
+            ("GRANT SELECT ON `s58357__cache_p`.* TO `s58357`@`%`", True),
+            ("GRANT ALL PRIVILEGES ON *.* TO `s58357`@`%`", True),
+            ("GRANT SELECT ON `s58357__x`.* TO `other`@`%`", True),
+        ]
+        for stmt, expect_unsafe in cases:
+            with self.subTest(stmt=stmt):
+                result = find_unsafe_grant_statements([stmt], expected_user=expected_user, db_name=cache_db)
+                self.assertEqual(bool(result), expect_unsafe, msg=result)
+
+        real_rows = [(c,) for c, _ in cases[:3]]
+        self.assertEqual(
+            find_unsafe_grant_statements(real_rows, expected_user=expected_user, db_name=cache_db),
+            [],
+        )
+
+        flagged = find_unsafe_grant_statements([], expected_user=expected_user, db_name="s58357__cache_p")
+        self.assertEqual(flagged, ["PUBLIC_SCHEMA_NAME:s58357__cache_p"])

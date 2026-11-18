@@ -592,7 +592,7 @@ def adapt_getipintel(
     raw_data: Optional[Dict[str, Any]], has_contact_email: bool, status_code: int = 200
 ) -> Dict[str, Any]:
     """Normalises GetIPIntel probability scores and assigns confidence-tiered arbitration weights."""
-    error_extra = {"chance": None, "arbitrationWeight": 0.0}
+    error_extra = {"chance": None, "residentialProxy": None, "arbitrationWeight": 0.0}
     if not has_contact_email:
         return _build_error_row(
             "GetIPIntel",
@@ -629,6 +629,14 @@ def adapt_getipintel(
         )
 
     chance = round(raw_result * 100.0, 3)
+    residential_proxy: Optional[float] = None
+    try:
+        raw_residential_proxy = float(raw_data.get("ResidentialProxy", -1))
+    except ValueError, TypeError:
+        raw_residential_proxy = -1.0
+    if math.isfinite(raw_residential_proxy) and 0.0 <= raw_residential_proxy <= 1.0:
+        residential_proxy = round(raw_residential_proxy, 4)
+
     if raw_result >= 0.90:
         arbitration_weight = 1.0
         flags: List[Dict[str, Any]] = [{"label": "High-Probability Proxy/VPN", "isHighRisk": True}]
@@ -647,7 +655,11 @@ def adapt_getipintel(
         raw_data,
         usage_type="ML Prediction",
         security_flags=flags,
-        extra={"chance": chance, "arbitrationWeight": arbitration_weight},
+        extra={
+            "chance": chance,
+            "residentialProxy": residential_proxy,
+            "arbitrationWeight": arbitration_weight,
+        },
     )
 
 

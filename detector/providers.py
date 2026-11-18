@@ -261,7 +261,7 @@ async def query_getipintel(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]
     if not contact_email:
         return adapt_getipintel(None, False)
 
-    url = f"https://check.getipintel.net/check.php?ip={ip}&contact={contact_email}&flags=f&format=json"
+    url = f"https://check.getipintel.net/check.php?ip={ip}&contact={contact_email}&flags=f&oflags=r&format=json"
     payload, status_code = await _fetch_upstream_json(client, "getipintel", "GetIPIntel", url, timeout=5.0)
     return adapters.adapt_getipintel(payload, True, status_code)
 

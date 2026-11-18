@@ -1986,6 +1986,7 @@
             (stopforumspamRow.appears || (stopforumspamRow.frequency && Number(stopforumspamRow.frequency) > 0))
         );
         var suspectedResidentialProxy = Boolean(data.suspectedResidentialProxy);
+        var highlySuspectedResidentialProxy = Boolean(data.highlySuspectedResidentialProxy);
         var sharedPrivacyEgress = typeof data.sharedPrivacyEgress === 'string' && data.sharedPrivacyEgress.trim()
             ? data.sharedPrivacyEgress.trim().toLowerCase()
             : '';
@@ -2000,6 +2001,7 @@
         var hasHighOrMediumSignals = Boolean(
             isTor ||
             isMajorityProxyVpn ||
+            highlySuspectedResidentialProxy ||
             suspectedResidentialProxy ||
             openProxyPorts.length > 0 ||
             Boolean(sharedPrivacyEgress) ||
@@ -2036,6 +2038,7 @@
         if (isNonPublic) {
             riskTier = 'nonpublic';
         } else if ((hasPrediction && prediction > 80) || isTor || isMajorityProxyVpn ||
+            highlySuspectedResidentialProxy ||
             arbitrationTier === 'destructive' || isSfsBlacklisted) {
             riskTier = 'high';
         } else if ((hasPrediction && prediction >= 30) || broadcastIp || suspectedResidentialProxy ||
@@ -2069,7 +2072,9 @@
         }
 
         var badgePrimaryLabel = 'N/A';
-        if (isMajorityProxyVpn || arbitrationTier === 'destructive') {
+        if (highlySuspectedResidentialProxy) {
+            badgePrimaryLabel = 'RES-PROXY';
+        } else if (isMajorityProxyVpn || arbitrationTier === 'destructive') {
             badgePrimaryLabel = /datacenter|hosting/i.test(arbitrationVerdict)
                 ? 'HOSTING'
                 : 'PROXY';
@@ -2112,6 +2117,7 @@
             isTor: isTor,
             isMajorityProxyVpn: isMajorityProxyVpn,
             suspectedResidentialProxy: suspectedResidentialProxy,
+            highlySuspectedResidentialProxy: highlySuspectedResidentialProxy,
             sharedPrivacyEgress: sharedPrivacyEgress,
             isMobileOrCgnat: isMobileOrCgnat,
             openProxyPorts: openProxyPorts,
@@ -2689,6 +2695,9 @@
         if (data.suspectedResidentialProxy) {
             addEntry('Suspected Residential Proxy / Compromised Host', 'Multi-Source');
         }
+        if (data.highlySuspectedResidentialProxy) {
+            addEntry('Highly Suspected Residential Proxy', 'GetIPIntel ResidentialProxy');
+        }
 
         var openPorts = extractShodanOpenProxyPorts(data);
         if (openPorts.length > 0) {
@@ -3158,6 +3167,10 @@
             '  color: var(--proxycheck-subtle-color);',
             '  margin-top: 2px;',
             '}',
+            '.proxycheck-residential-proxy-warning {',
+            '  color: var(--proxycheck-high-color);',
+            '  font-weight: 600;',
+            '}',
             '.proxycheck-quick-links {',
             '  margin-top: 8px;',
             '  padding-top: 6px;',
@@ -3372,10 +3385,11 @@
         var sharedEgressLabel = getSharedPrivacyEgressLabel(data);
         var mobileOrCgnat = isMobileOrCgnatPayload(data);
         var residentialParadox = Boolean(data && data.suspectedResidentialProxy);
+        var highlySuspectedResidentialProxy = Boolean(data && data.highlySuspectedResidentialProxy);
         var freshRecheckNeeded = shouldRecommendFreshResidentialRecheck(data);
         var shodanPorts = extractShodanOpenProxyPorts(data);
 
-        if (sharedEgressLabel || mobileOrCgnat || residentialParadox || shodanPorts.length > 0) {
+        if (sharedEgressLabel || mobileOrCgnat || residentialParadox || highlySuspectedResidentialProxy || shodanPorts.length > 0) {
             var $banners = $('<div>', { 'class': 'proxycheck-signal-banners' });
             if (sharedEgressLabel) {
                 $banners.append(
@@ -3403,6 +3417,14 @@
                     $('<div>', {
                         'class': 'proxycheck-signal-pill proxycheck-signal-danger',
                         text: paradoxText
+                    })
+                );
+            }
+            if (highlySuspectedResidentialProxy) {
+                $banners.append(
+                    $('<div>', {
+                        'class': 'proxycheck-signal-pill proxycheck-signal-danger',
+                        text: 'Highly Suspected Residential Proxy'
                     })
                 );
             }
@@ -3519,7 +3541,7 @@
         var $cidrCellContent = $('<div>');
         var $cidrPrimaryLine = $('<div>');
         $cidrPrimaryLine.append($('<code>').text(recommendedCidrText));
-        if (escalationCidrText) {
+        if (escalationCidrText && !data.highlySuspectedResidentialProxy) {
             $cidrPrimaryLine.append(
                 $('<span>', {
                     'class': 'proxycheck-inline-pill',
@@ -3527,7 +3549,7 @@
                 })
             );
         }
-        if (bgpPrefixText) {
+        if (bgpPrefixText && !data.highlySuspectedResidentialProxy) {
             $cidrPrimaryLine.append(
                 $('<span>', {
                     'class': 'proxycheck-inline-pill',
@@ -3536,7 +3558,15 @@
             );
         }
         $cidrCellContent.append($cidrPrimaryLine);
-        if (cidrRationaleText) {
+        if (data && data.highlySuspectedResidentialProxy) {
+            $cidrCellContent.append(
+                $('<div>', {
+                    'class': 'proxycheck-cidr-rationale proxycheck-residential-proxy-warning',
+                    text: 'Highly Suspected Residential Proxy: this IP is highly likely to use residential proxy infrastructure. Restrict CIDR blocking to this single IP and proceed with discretion on CIDR.'
+                })
+            );
+        }
+        if (cidrRationaleText && !data.highlySuspectedResidentialProxy) {
             $cidrCellContent.append(
                 $('<div>', {
                     'class': 'proxycheck-cidr-rationale',

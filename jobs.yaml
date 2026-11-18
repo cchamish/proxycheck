@@ -17,20 +17,20 @@
 - name: update-cloud-cidrs-db
   command: python manage.py update_offline_dbs --sources cloud_cidrs privacy_relays
   image: tool-proxycheck/tool-proxycheck:latest
-  schedule: "0 3 * * *"
+  schedule: "@daily"
   mount: all
 - name: update-threat-feeds-db
   command: python manage.py update_offline_dbs --sources ipsum_drop x4bnet_vpn
   image: tool-proxycheck/tool-proxycheck:latest
-  schedule: "20 3 * * *"
+  schedule: "@daily"
   mount: all
 - name: update-routing-intel-db
   command: python manage.py update_offline_dbs --sources bgp_tools peeringdb_mobile
   image: tool-proxycheck/tool-proxycheck:latest
-  schedule: "40 3 * * *"
+  schedule: "@daily"
   mount: all
 - name: purge-l2-restricted-cache
   command: python manage.py purge_l2_cache
   image: tool-proxycheck/tool-proxycheck:latest
-  schedule: "15 4 * * *"
+  schedule: "@daily"
   mount: all

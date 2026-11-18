@@ -141,9 +141,57 @@
 
         <cdx-card v-if="detectionData" class="executive-overview-card">
           <template #title>
-            <h2 class="overview-card-title">Executive Overview</h2>
+            <div class="overview-header-bar">
+              <h2 class="overview-card-title">Executive Overview</h2>
+              <div v-if="refetchButtonState.visible" class="overview-cache-controls">
+                <span
+                  v-if="cacheAgeBadgeLabel"
+                  class="cdx-badge cache-age-badge"
+                  :class="isCurrentCacheStale ? 'badge-warning cache-age-badge--stale' : 'badge-neutral'"
+                  :title="cacheExactUtcTooltip || undefined"
+                >
+                  {{ cacheAgeBadgeLabel }}
+                </span>
+                <cdx-button
+                  type="button"
+                  action="progressive"
+                  weight="normal"
+                  size="small"
+                  class="overview-refetch-btn"
+                  :disabled="refetchButtonState.disabled"
+                  @click="handleRefetch"
+                >
+                  {{ refetchButtonState.label }}
+                </cdx-button>
+              </div>
+            </div>
           </template>
           <template #description>
+            <cdx-message
+              v-if="refreshWarningMessage"
+              type="warning"
+              :inline="false"
+              class="overview-warning-banner"
+            >
+              {{ refreshWarningMessage }}
+            </cdx-message>
+            <cdx-message
+              v-if="showFreshRecheckPrompt"
+              type="warning"
+              :inline="false"
+              class="overview-recheck-banner"
+            >
+              Cached residential proxy evidence is older than 7 days. Click
+              <button
+                type="button"
+                class="inline-refetch-trigger"
+                :disabled="refetchButtonState.disabled"
+                @click="handleRefetch"
+              >
+                Refetch
+              </button>
+              to verify the current dynamic DHCP assignment before applying a long-term block.
+            </cdx-message>
             <div class="overview-body">
               <div class="score-gauge-container prediction-gauge-container">
                 <span class="gauge-title">Prediction</span>
@@ -210,18 +258,51 @@
                           >
                             {{ detectionData.torSummary }}
                           </span>
+                          <span
+                            v-if="sharedPrivacyInfo"
+                            class="privacy-egress-badge"
+                            :title="sharedPrivacyInfo.guidance"
+                          >
+                            {{ sharedPrivacyInfo.pillText }}
+                          </span>
+                          <span
+                            v-if="detectionData.suspectedResidentialProxy"
+                            class="cdx-badge badge-warning residential-paradox-badge"
+                          >
+                            Suspected Residential Proxy / Compromised Host
+                          </span>
+                          <span
+                            v-for="proxyPort in openProxyPorts"
+                            :key="`proxy-port-${proxyPort}`"
+                            class="cdx-badge badge-destructive shodan-port-badge"
+                            title="Open proxy port detected via Shodan InternetDB"
+                          >
+                            Open Proxy Port: {{ proxyPort }}
+                          </span>
+                          <span
+                            v-for="shodanTag in shodanTags"
+                            :key="`shodan-tag-${shodanTag}`"
+                            class="cdx-badge badge-warning"
+                          >
+                            Shodan: {{ shodanTag }}
+                          </span>
                         </div>
                       </td>
                     </tr>
                     <tr>
                       <th scope="row">ARBITRATION</th>
                       <td>
-                        <span
-                          class="arbitration-pill"
-                          :class="getArbitrationBadgeClass(detectionData)"
-                        >
-                          {{ detectionData.arbitrationVerdict || 'Direct Connection (No Commercial Threats)' }}
-                        </span>
+                        <div class="arbitration-cell-content">
+                          <span
+                            class="arbitration-pill"
+                            :class="getArbitrationBadgeClass(detectionData)"
+                          >
+                            {{ detectionData.arbitrationVerdict || 'Direct Connection (No Commercial Threats)' }}
+                          </span>
+                          <span v-if="sharedPrivacyInfo" class="privacy-egress-guidance">
+                            {{ sharedPrivacyInfo.guidance }}
+                          </span>
+                        </div>
                       </td>
                     </tr>
                     <tr>
@@ -256,14 +337,71 @@
                     <tr>
                       <th scope="row">RECOMMENDED CIDR</th>
                       <td>
-                        <div class="ip-value-wrapper">
-                          <code class="asn-tag">{{ detectionData.recommendedCidr || '-' }}</code>
-                          <span
-                            v-if="detectionData.mmdbCidr && detectionData.mmdbCidr !== detectionData.recommendedCidr"
-                            class="text-muted"
-                          >
-                            (BGP: {{ detectionData.mmdbCidr }})
-                          </span>
+                        <div class="cidr-cell-stack">
+                          <div class="ip-value-wrapper">
+                            <code class="asn-tag">{{ detectionData.recommendedCidr || '-' }}</code>
+                            <span
+                              v-if="detectionData.bgpPrefix || (detectionData.mmdbCidr && detectionData.mmdbCidr !== detectionData.recommendedCidr)"
+                              class="text-muted"
+                            >
+                              (BGP: {{ detectionData.bgpPrefix || detectionData.mmdbCidr }})
+                            </span>
+                            <span v-if="detectionData.escalationCidr" class="escalation-cidr-pill">
+                              Escalation CIDR: <code class="asn-tag">{{ detectionData.escalationCidr }}</code>
+                            </span>
+                          </div>
+                          <div v-if="isMobileOrCgnat" class="cgnat-collateral-warning" role="status">
+                            <strong>Mobile Cellular / CGNAT Shared Gateway:</strong>
+                            Locked to single-host <code>/32</code> IPv4 or <code>/64</code> IPv6 — avoid broad <code>/24</code> or <code>/48</code> range blocks and prefer anon-only soft blocks (<code>anononly</code>) to prevent collateral damage.
+                          </div>
+                          <div v-if="detectionData.cidrRationale" class="cidr-rationale-note">
+                            {{ detectionData.cidrRationale }}
+                          </div>
+                          <div v-if="verificationLinks" class="cidr-quick-actions">
+                            <a
+                              :href="verificationLinks.globalContributionsUrl"
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              class="quick-verify-link"
+                            >
+                              Special:GlobalContributions
+                            </a>
+                            <a
+                              :href="verificationLinks.rangeblockFinderUrl"
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              class="quick-verify-link"
+                            >
+                              Rangeblock Finder
+                            </a>
+                            <a
+                              :href="verificationLinks.whoisGatewayUrl"
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              class="quick-verify-link"
+                            >
+                              WHOIS Gateway
+                            </a>
+                            <a
+                              :href="verificationLinks.specialBlockUrl"
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              class="quick-verify-link quick-verify-link--block"
+                              :title="verificationLinks.isSoftBlockRecommended ? 'Pre-filled with anon-only soft-block parameters (wpHardBlock=0, wpDisableUTEdit=0)' : 'Open Special:Block for the recommended CIDR'"
+                            >
+                              {{ verificationLinks.isSoftBlockRecommended ? 'Special:Block (Soft / Anon-only)' : 'Special:Block' }}
+                            </a>
+                            <cdx-button
+                              type="button"
+                              action="default"
+                              weight="normal"
+                              size="small"
+                              class="copy-wikitext-btn"
+                              @click="handleCopyWikitext"
+                            >
+                              {{ wikitextCopied ? 'Copied Wikitext!' : 'Copy Wikitext Summary' }}
+                            </cdx-button>
+                          </div>
                         </div>
                       </td>
                     </tr>
@@ -376,6 +514,58 @@
           &middot; {{ formatDiagnosticSummary(footerDiagnostic) }}
           <span v-if="footerDiagnostic.isCached" class="cached-pill">Cached</span>
         </span>
+        <span class="footer-attribution-text">
+          Data sources:
+          GeoLite2 by
+          <a
+            href="https://www.maxmind.com"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="commit-link"
+          >MaxMind</a>
+          &middot;
+          <a
+            href="https://radar.cloudflare.com/"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="commit-link"
+          >Cloudflare Radar</a>
+          (<a
+            href="https://creativecommons.org/licenses/by-nc/4.0/"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="commit-link"
+          >CC BY-NC 4.0</a>)
+          &middot;
+          <a
+            href="https://www.ip2location.io"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="commit-link"
+          >IP2Location.io</a>
+          &middot;
+          <a
+            href="https://getipintel.net/"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="commit-link"
+          >GetIPIntel</a>
+          &middot;
+          <a
+            href="https://ipdata.co/"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="commit-link"
+          >ipdata.co</a>
+          &middot;
+          <button
+            type="button"
+            class="footer-about-link"
+            @click="isAboutOpen = true"
+          >
+            Attribution &amp; About
+          </button>
+        </span>
       </div>
       <div class="footer-right">
         <div class="footer-banner">
@@ -431,10 +621,21 @@ import {
   REQUIRED_USER_RIGHTS,
   buildOAuthLoginUrl,
   buildPageUrlWithIp,
+  buildVerificationLinks,
+  buildWikitextSummary,
   createLoggedOutUserState,
+  extractOpenProxyPorts,
+  extractShodanTags,
+  formatCacheAgeBadgeLabel,
+  formatExactUtcTimestamp,
+  getSharedPrivacyEgressInfo,
   isAuthorisedAdminUser,
+  isCacheStale,
+  isMobileOrCgnatDetection,
   isValidIpAddress,
   filterComparisonResults,
+  resolveRefetchButtonState,
+  shouldRecommendFreshRecheck,
   simplifySecurityFlags,
   createDetectionCoordinator,
   resolveRepoBaseUrl,
@@ -520,8 +721,11 @@ function saveStoredHistory(history: string[]): void {
 
 const uiState = reactive<DetectionCoordinatorState>({
   isLoading: false,
+  isRefreshing: false,
   validationError: '',
   sessionExpiredMessage: '',
+  refreshWarningMessage: '',
+  lastRefreshedAt: null,
   detectionData: null,
   diagnostic: null,
   user: createLoggedOutUserState(),
@@ -535,14 +739,20 @@ const isAdminUser = computed(() => isAuthorisedAdminUser(user.value));
 const {
   user,
   isLoading,
+  isRefreshing,
   validationError,
   sessionExpiredMessage,
+  refreshWarningMessage,
+  lastRefreshedAt,
   ipHistory,
   detectionData,
   diagnostic,
 } = toRefs(uiState);
 
 const inputIp = ref('');
+const wikitextCopied = ref(false);
+let wikitextCopyResetTimer: ReturnType<typeof setTimeout> | null = null;
+
 const commitHash = typeof __COMMIT_HASH__ !== 'undefined' ? __COMMIT_HASH__ : 'dev';
 const commitTimestamp = typeof __COMMIT_TIMESTAMP__ !== 'undefined' ? __COMMIT_TIMESTAMP__ : '';
 const commitVersionLabel = formatCommitVersionLabel(commitHash, commitTimestamp);
@@ -577,6 +787,50 @@ const coordinator = createDetectionCoordinator(
   }
 );
 
+const nowTimestampMs = ref(Date.now());
+
+const refetchButtonState = computed(() =>
+  resolveRefetchButtonState({
+    data: detectionData.value,
+    isRefreshing: Boolean(isRefreshing?.value),
+    isLoading: isLoading.value,
+  })
+);
+
+const isCurrentCacheStale = computed(() => isCacheStale(detectionData.value));
+
+const cacheAgeBadgeLabel = computed(() =>
+  formatCacheAgeBadgeLabel(
+    detectionData.value,
+    nowTimestampMs.value,
+    lastRefreshedAt?.value ?? null
+  )
+);
+
+const cacheExactUtcTooltip = computed(() => {
+  const data = detectionData.value;
+  const rawStamp =
+    data?.cacheMeta?.fetchedAt || data?.fetchedAt || data?.cacheMeta?.cachedAt || null;
+  const formatted = formatExactUtcTimestamp(rawStamp);
+  return formatted ? `Fetched ${formatted}` : null;
+});
+
+const sharedPrivacyInfo = computed(() =>
+  getSharedPrivacyEgressInfo(detectionData.value?.sharedPrivacyEgress)
+);
+
+const isMobileOrCgnat = computed(() => isMobileOrCgnatDetection(detectionData.value));
+
+const openProxyPorts = computed(() => extractOpenProxyPorts(detectionData.value));
+
+const shodanTags = computed(() => extractShodanTags(detectionData.value));
+
+const showFreshRecheckPrompt = computed(
+  () => shouldRecommendFreshRecheck(detectionData.value) && !refetchButtonState.value.isBusy
+);
+
+const verificationLinks = computed(() => buildVerificationLinks(detectionData.value));
+
 const filteredResults = computed(() => {
   if (!detectionData.value || !Array.isArray(detectionData.value.results)) {
     return [];
@@ -586,6 +840,58 @@ const filteredResults = computed(() => {
 
 async function executeDetection(ipToQuery: string): Promise<void> {
   await coordinator.executeDetection(ipToQuery);
+}
+
+async function handleRefetch(): Promise<void> {
+  await coordinator.refreshDetection();
+  nowTimestampMs.value = Date.now();
+}
+
+function clearWikitextCopyTimer(): void {
+  if (wikitextCopyResetTimer !== null) {
+    clearTimeout(wikitextCopyResetTimer);
+    wikitextCopyResetTimer = null;
+  }
+}
+
+async function handleCopyWikitext(): Promise<void> {
+  const snippet = buildWikitextSummary(detectionData.value, nowTimestampMs.value);
+  if (!snippet) {
+    return;
+  }
+  let copied = false;
+  if (typeof navigator !== 'undefined' && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    try {
+      await navigator.clipboard.writeText(snippet);
+      copied = true;
+    } catch {
+      copied = false;
+    }
+  }
+  if (!copied && typeof document !== 'undefined') {
+    const textarea = document.createElement('textarea');
+    textarea.value = snippet;
+    textarea.setAttribute('readonly', 'true');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+      copied = document.execCommand('copy');
+    } catch {
+      copied = false;
+    } finally {
+      document.body.removeChild(textarea);
+    }
+  }
+  if (copied) {
+    wikitextCopied.value = true;
+    clearWikitextCopyTimer();
+    wikitextCopyResetTimer = setTimeout(() => {
+      wikitextCopied.value = false;
+      wikitextCopyResetTimer = null;
+    }, 2000);
+  }
 }
 
 function handleSearch(): void {
@@ -599,10 +905,10 @@ function queryFromHistory(ip: string): void {
   executeDetection(ip);
 }
 
-const nowTimestampMs = ref(Date.now());
-
 watch(detectionData, () => {
   nowTimestampMs.value = Date.now();
+  wikitextCopied.value = false;
+  clearWikitextCopyTimer();
 });
 
 function getProviderUpdatedLabel(row: ProviderDisplayRow | null | undefined): string | null {
@@ -668,6 +974,9 @@ async function handleLogout() {
       return;
     }
     const data = await res.json().catch(() => null);
+    coordinator.cancelPending();
+    clearWikitextCopyTimer();
+    wikitextCopied.value = false;
     user.value = createLoggedOutUserState();
     isDashboardOpen.value = false;
     inputIp.value = '';
@@ -722,6 +1031,8 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.removeEventListener('storage', handleThemeStorageSync);
+  coordinator.cancelPending();
+  clearWikitextCopyTimer();
   if (relativeTimeTimer !== null) {
     clearInterval(relativeTimeTimer);
     relativeTimeTimer = null;

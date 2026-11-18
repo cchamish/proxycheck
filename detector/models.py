@@ -8,7 +8,7 @@ from django.db import models
 class IpIntelligenceCache(models.Model):
     """Stores compressed and compliance-sanitised online IP intelligence snapshots."""
 
-    ip_bin = models.BinaryField(max_length=16, primary_key=True)
+    ip_bin = models.BinaryField(max_length=16, unique=True)
     ip_version = models.PositiveSmallIntegerField()
     canonical_ip = models.CharField(max_length=45, unique=True)
     schema_version = models.PositiveSmallIntegerField(default=1)

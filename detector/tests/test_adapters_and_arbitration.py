@@ -854,6 +854,27 @@ class NewIntelligenceAdapterAndQueryTests(SimpleTestCase):
         self.assertEqual(unconfigured["status"], "No API Key")
         self.assertEqual(unconfigured["arbitrationWeight"], 0.0)
 
+        residential_row = adapt_getipintel(
+            {"status": "success", "result": "1", "ResidentialProxy": "0.96"},
+            True,
+            200,
+        )
+        self.assertEqual(residential_row["residentialProxy"], 0.96)
+
+    def test_high_residential_proxy_score_overrides_arbitration_and_cidr(self):
+        residential_row = adapt_getipintel(
+            {"status": "success", "result": "0.12", "ResidentialProxy": "0.95"},
+            True,
+            200,
+        )
+        aggregated = views.aggregate_intelligence_metrics("136.35.54.129", [residential_row])
+
+        self.assertTrue(aggregated["highlySuspectedResidentialProxy"])
+        self.assertEqual(aggregated["residentialProxy"], 0.95)
+        self.assertEqual(aggregated["arbitrationVerdict"], "Highly Suspected Residential Proxy")
+        self.assertEqual(aggregated["recommendedCidr"], "136.35.54.129/32")
+        self.assertIn("single IP", aggregated["cidrRationale"])
+
     def test_ipsum_drop_x4bnet_and_shodan_adapters_and_dispatch_table(self):
         self.assertEqual(set(ADAPTER_DISPATCH_TABLE), {meta.key for meta in PROVIDER_REGISTRY})
 

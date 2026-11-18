@@ -272,6 +272,13 @@
                             Suspected Residential Proxy / Compromised Host
                           </span>
                           <span
+                            v-if="detectionData.highlySuspectedResidentialProxy"
+                            class="cdx-badge badge-destructive residential-proxy-high-risk-badge"
+                            :title="detectionData.residentialProxy != null ? `GetIPIntel ResidentialProxy: ${formatChance(detectionData.residentialProxy * 100)}%` : 'GetIPIntel ResidentialProxy'"
+                          >
+                            Highly Suspected Residential Proxy
+                          </span>
+                          <span
                             v-for="proxyPort in openProxyPorts"
                             :key="`proxy-port-${proxyPort}`"
                             class="cdx-badge badge-destructive shodan-port-badge"
@@ -341,12 +348,12 @@
                           <div class="ip-value-wrapper">
                             <code class="asn-tag">{{ detectionData.recommendedCidr || '-' }}</code>
                             <span
-                              v-if="detectionData.bgpPrefix || (detectionData.mmdbCidr && detectionData.mmdbCidr !== detectionData.recommendedCidr)"
+                              v-if="!detectionData.highlySuspectedResidentialProxy && (detectionData.bgpPrefix || (detectionData.mmdbCidr && detectionData.mmdbCidr !== detectionData.recommendedCidr))"
                               class="text-muted"
                             >
                               (BGP: {{ detectionData.bgpPrefix || detectionData.mmdbCidr }})
                             </span>
-                            <span v-if="detectionData.escalationCidr" class="escalation-cidr-pill">
+                            <span v-if="!detectionData.highlySuspectedResidentialProxy && detectionData.escalationCidr" class="escalation-cidr-pill">
                               Escalation CIDR: <code class="asn-tag">{{ detectionData.escalationCidr }}</code>
                             </span>
                           </div>
@@ -354,7 +361,15 @@
                             <strong>Mobile Cellular / CGNAT Shared Gateway:</strong>
                             Locked to single-host <code>/32</code> IPv4 or <code>/64</code> IPv6 — avoid broad <code>/24</code> or <code>/48</code> range blocks and prefer anon-only soft blocks (<code>anononly</code>) to prevent collateral damage.
                           </div>
-                          <div v-if="detectionData.cidrRationale" class="cidr-rationale-note">
+                          <div
+                            v-if="detectionData.highlySuspectedResidentialProxy"
+                            class="residential-proxy-cidr-warning"
+                            role="status"
+                          >
+                            <strong>Highly Suspected Residential Proxy:</strong>
+                            This IP is highly likely to use residential proxy infrastructure. CIDR blocking should be restricted to this single IP; proceed with discretion on CIDR.
+                          </div>
+                          <div v-if="!detectionData.highlySuspectedResidentialProxy && detectionData.cidrRationale" class="cidr-rationale-note">
                             {{ detectionData.cidrRationale }}
                           </div>
                           <div v-if="verificationLinks" class="cidr-quick-actions">

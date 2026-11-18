@@ -53,6 +53,7 @@ export interface ProviderRawResult {
   securityFlags: { label: string; isHighRisk: boolean }[];
   riskScore?: number | null;
   chance?: number | null;
+  residentialProxy?: number | null;
   block?: number | null;
   countryCode?: string;
   coordinates?: string;
@@ -186,6 +187,8 @@ export interface DetectionResponse {
   predictionLabel?: string;
   predictionTier?: string;
   getipintel_chance: number | null;
+  residentialProxy?: number | null;
+  highlySuspectedResidentialProxy?: boolean;
   arbitrationVerdict: string;
   arbitrationTier?: string;
   isMajorityProxyVpn: boolean;

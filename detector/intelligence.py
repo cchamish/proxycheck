@@ -310,6 +310,7 @@ class _ArbitrationAccumulator:
     valid_locations: List[str] = field(default_factory=list)
     valid_coords: List[str] = field(default_factory=list)
     getipintel_chance: Optional[float] = None
+    residential_proxy: Optional[float] = None
     positive_proxy_vpn_votes: float = 0.0
     total_commercial_responses: int = 0
     hosting_source_count: int = 0
@@ -403,6 +404,9 @@ def _record_row_network_metadata(row: Dict[str, Any], acc: _ArbitrationAccumulat
         chance_val = row.get("chance")
         if isinstance(chance_val, (int, float)):
             acc.getipintel_chance = round(float(chance_val), 3)
+        residential_proxy = row.get("residentialProxy")
+        if isinstance(residential_proxy, (int, float)) and not isinstance(residential_proxy, bool):
+            acc.residential_proxy = round(float(residential_proxy), 4)
 
 
 def _resolve_getipintel_vote_weight(row: Dict[str, Any], flags: List[Dict[str, Any]]) -> float:
@@ -725,6 +729,7 @@ def aggregate_intelligence_metrics(
             _classify_row_arbitration_signals(row, acc)
 
     prediction_score, prediction_label, prediction_tier = _compute_getipintel_prediction(acc.getipintel_chance)
+    highly_suspected_residential_proxy = acc.residential_proxy is not None and acc.residential_proxy >= 0.95
     mmdb_prefix_len, cloud_cidr, cloud_provider = _extract_maxmind_cidr_hints(comparison_results)
     rdns_info = classify_rdns_hostname(ptr_hostname)
     primary_asn = acc.valid_asns[0] if acc.valid_asns else "-"
@@ -740,6 +745,7 @@ def aggregate_intelligence_metrics(
         ptr_hostname=rdns_info["ptrHostname"],
         ptr_category=rdns_info["ptrCategory"],
         provider_rows=comparison_results,
+        highly_suspected_residential_proxy=highly_suspected_residential_proxy,
     )
     shared_privacy_egress = cidr_info["sharedPrivacyEgress"]
     suspected_residential_proxy = _detect_residential_signal_paradox(
@@ -748,12 +754,17 @@ def aggregate_intelligence_metrics(
         shared_privacy_egress=shared_privacy_egress,
         is_tor=tor.is_tor,
     )
-    arbitration_verdict, arbitration_tier, is_majority_proxy_vpn = _resolve_arbitration_verdict(
-        acc,
-        tor,
-        shared_privacy_egress=shared_privacy_egress,
-        suspected_residential_proxy=suspected_residential_proxy,
-    )
+    if highly_suspected_residential_proxy:
+        arbitration_verdict = "Highly Suspected Residential Proxy"
+        arbitration_tier = "destructive"
+        is_majority_proxy_vpn = True
+    else:
+        arbitration_verdict, arbitration_tier, is_majority_proxy_vpn = _resolve_arbitration_verdict(
+            acc,
+            tor,
+            shared_privacy_egress=shared_privacy_egress,
+            suspected_residential_proxy=suspected_residential_proxy,
+        )
 
     return {
         "ip": ip,
@@ -768,6 +779,8 @@ def aggregate_intelligence_metrics(
         "predictionLabel": prediction_label,
         "predictionTier": prediction_tier,
         "getipintel_chance": acc.getipintel_chance,
+        "residentialProxy": acc.residential_proxy,
+        "highlySuspectedResidentialProxy": highly_suspected_residential_proxy,
         "arbitrationVerdict": arbitration_verdict,
         "arbitrationTier": arbitration_tier,
         "isMajorityProxyVpn": is_majority_proxy_vpn,

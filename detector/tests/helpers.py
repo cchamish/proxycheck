@@ -14,14 +14,6 @@ import dns.resolver
 import dns.reversename
 import uvicorn
 
-from detector import (
-    cache_backends,
-    cidr_attribution,
-    detection_service,
-    dns_providers,
-    http_client,
-    intelligence,
-)
 from detector.adapters import (
     adapt_abuseipdb,
     adapt_cloudflare_radar,
@@ -494,16 +486,3 @@ def patch_non_dnsbl_providers(
             else:
                 mocks[key] = stack.enter_context(patch(target_path, side_effect=side_effect_builder(label)))
         yield mocks
-
-
-def reset_detector_caches() -> None:
-    """Resets shared HTTP, Redis, MaxMind, DNS, offline, and singleflight caches between tests."""
-    with http_client.http_client_lock:
-        http_client.http_clients_by_loop.clear()
-    cache_backends.clear_redis_clients()
-    cache_backends.clear_maxmind_readers()
-    cache_backends.clear_maxmind_probe_cache()
-    dns_providers.clear_dns_resolver_cache()
-    intelligence.clear_proc_rss_cache()
-    detection_service._ip_detect_inflight.clear()
-    cidr_attribution.clear_offline_intelligence_caches()

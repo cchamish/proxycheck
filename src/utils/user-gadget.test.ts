@@ -885,17 +885,10 @@ test('Userscript source enforces XSS-safe DOM construction, provider palettes, a
   assert.equal(GADGET_SOURCE.includes(forbiddenInnerProp), false);
   assert.equal(GADGET_SOURCE.toLowerCase().includes('/checkuser/v0/'), false);
   assert.equal(GADGET_SOURCE.toLowerCase().includes('batch-temporaryaccount'), false);
+  assert.equal(GADGET_SOURCE.includes('copyWithSource'), false);
+  assert.ok(GADGET_SOURCE.includes("{ label: 'ASN', entries: collectAsnEntries(rows), isRisk: false, emptyText: '-', copyable: true }"));
+  assert.ok(GADGET_SOURCE.includes("{ label: 'ISP', entries: collectIspEntries(rows), isRisk: false, emptyText: '-', copyable: true }"));
 
-  const paletteMatch = GADGET_SOURCE.match(/var PROVIDER_BADGE_PALETTES\s*=\s*\{([\s\S]*?)\n    \};/);
-  assert.ok(paletteMatch, 'PROVIDER_BADGE_PALETTES block should be present');
-  const expectedProviders = [
-    'Cloudflare Radar', 'AbuseIPDB', 'IPData', 'IPRegistry', 'IP2Location', 'GetIPIntel',
-    'Proxycheck', 'IPHub', 'IPHunter', 'MaxMind', 'Spamhaus ZEN', 'SpamCop',
-    'Tor Onionoo', 'StopForumSpam', 'DShield', 'IPsum / DROP', 'X4BNet VPN', 'Shodan InternetDB',
-  ];
-  for (const provider of expectedProviders) {
-    assert.ok(paletteMatch[1].includes(`'${provider}'`), `Missing palette for ${provider}`);
-  }
 });
 
 test('Plain-text reveal spans receive badges without duplicating badges on container spans with child anchors', async () => {

@@ -911,27 +911,3 @@ class NewIntelligenceAdapterAndQueryTests(SimpleTestCase):
             fallback_tor = await providers.query_tor_onionoo(http_client_mock, "8.8.8.8")
         self.assertEqual(fallback_tor["status"], "200 OK")
         http_client_mock.get.assert_awaited_once()
-
-
-class ConfidenceWeightedArbitrationAndParadoxTests(SimpleTestCase):
-    """Tests residential proxy signal paradox detection, shared privacy egress, and arbitration weighting."""
-
-    @staticmethod
-    def _res_row(provider: str, usage: str = "isp") -> dict:
-        return {
-            "provider": provider,
-            "status": "200 OK",
-            "statusCode": 200,
-            "asn": "AS7922",
-            "isp": "Comcast Cable",
-            "organisation": "Comcast Cable",
-            "location": "United States",
-            "usageType": usage,
-            "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-            "countryCode": "US",
-            "rawJson": {},
-        }
-
-
-class CrossStackProviderContractTests(SimpleTestCase):
-    """Tests provider registry alignment across backend, TypeScript helpers, and MediaWiki gadget."""

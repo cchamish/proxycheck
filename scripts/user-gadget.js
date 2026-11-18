@@ -16,10 +16,12 @@
     }
 
     var TOOL_BASE_URL = 'https://proxycheck.toolforge.org';
-    var TARGET_SELECTOR = 'a.ext-checkuser-tempaccount-reveal-ip-anchor';
+    var REVEAL_ANCHOR_SELECTOR = 'a.ext-checkuser-tempaccount-reveal-ip-anchor';
+    var REVEAL_CONTAINER_SELECTOR = '.ext-checkuser-tempaccount-reveal-ip';
+    var TARGET_SELECTOR = REVEAL_ANCHOR_SELECTOR + ', ' + REVEAL_CONTAINER_SELECTOR;
     var BADGE_CLASS = 'proxycheck-ip-badge';
     var STYLE_ELEMENT_ID = 'proxycheck-userscript-styles';
-    var INTERNAL_NODE_SELECTOR = '#proxycheck-pageinfo, #proxycheck_result, #proxycheck-userscript-styles, .proxycheck-ip-badge, .proxycheck-details-panel, .proxycheck-light-upgrade-notice, .proxycheck-degraded-retry-notice, .proxycheck-retry-full-btn';
+    var INTERNAL_NODE_SELECTOR = '#proxycheck-pageinfo, #proxycheck_result, #proxycheck-userscript-styles, .proxycheck-ip-badge, .proxycheck-details-panel, .proxycheck-light-upgrade-notice, .proxycheck-dialog-cache-bar, .proxycheck-cache-controls, .proxycheck-refetch-btn, .proxycheck-refresh-warning, .proxycheck-temp-ip-switcher, .proxycheck-quick-links';
     var IPINFO_PANEL_SELECTOR = '.ext-ipinfo-panel-layout';
     var OBSERVER_THROTTLE_MS = 100;
     var IPINFO_FALLBACK_DELAY_MS = 400;
@@ -39,6 +41,10 @@
     var DEGRADED_CACHE_TTL_MS = 60 * 1000;
     var CONTRIB_FULL_TRIGGER_DELAY_MS = 500;
     var RESULT_CACHE_MAX_ENTRIES = 200;
+    var AUTO_SWR_STORAGE_KEY = 'proxycheck-auto-swr-timestamps-v1';
+    var AUTO_SWR_WINDOW_MS = 60 * 1000;
+    var AUTO_SWR_MAX_REQUESTS = 3;
+    var RESIDENTIAL_RECHECK_THRESHOLD_SECONDS = 7 * 86400;
 
     var IPV4_PATTERN = /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
     var IPV6_PATTERN = /^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))$/;
@@ -56,9 +62,13 @@
     var ipPromiseCache = new Map();
     var ipFullPromiseCache = new Map();
     var inflightFullPromisesByIp = new Map();
+    var inflightRefreshByIp = new Map();
     var latestResultByIp = new Map();
     var fullResultMetaByIp = new Map();
     var renderedBadgeEntriesByIp = new Map();
+    var batchOriginatedPayloads = typeof WeakSet === 'function' ? new WeakSet() : null;
+    var autoSwrAttemptedKeys = new Set();
+    var activeContributionsController = null;
     var persistedCacheRaw = null;
     var persistedCacheStore = null;
     var storageFailureWarned = false;
@@ -475,6 +485,99 @@
             warnPersistedCacheOnce('storage access failed for mw.storage', err);
         }
         return wrapWebStorage('sessionStorage');
+    }
+
+    var memoryAutoSwrTimestamps = [];
+
+    function getAutoSwrStorageBackend() {
+        try {
+            if (
+                mw &&
+                mw.storage &&
+                typeof mw.storage.get === 'function' &&
+                typeof mw.storage.set === 'function'
+            ) {
+                return {
+                    get: function (key) {
+                        return mw.storage.get(key);
+                    },
+                    set: function (key, value) {
+                        return mw.storage.set(key, value) !== false;
+                    }
+                };
+            }
+        } catch (err) {
+            warnPersistedCacheOnce('auto-refresh limiter access failed for mw.storage', err);
+        }
+        return wrapWebStorage('localStorage');
+    }
+
+    // Cap background stale revalidations across tabs using an anonymous timestamp window
+    function tryConsumeAutoSwrBudget() {
+        var now = Date.now();
+        var backend = getAutoSwrStorageBackend();
+        var recent = [];
+        var raw = null;
+
+        if (backend) {
+            try {
+                raw = backend.get(AUTO_SWR_STORAGE_KEY);
+            } catch (err) {
+                warnPersistedCacheOnce('auto-refresh limiter read failed', err);
+            }
+        }
+
+        if (typeof raw === 'string' && raw) {
+            try {
+                var parsed = JSON.parse(raw);
+                if (Array.isArray(parsed)) {
+                    for (var i = 0; i < parsed.length; i++) {
+                        var ts = parsed[i];
+                        if (
+                            typeof ts === 'number' &&
+                            isFinite(ts) &&
+                            (now - ts) > -5000 &&
+                            (now - ts) < AUTO_SWR_WINDOW_MS
+                        ) {
+                            recent.push(ts);
+                        }
+                    }
+                }
+            } catch (parseErr) {
+                warnPersistedCacheOnce('auto-refresh limiter parse failed', parseErr);
+                recent = [];
+            }
+        } else if (!backend) {
+            for (var m = 0; m < memoryAutoSwrTimestamps.length; m++) {
+                var memTs = memoryAutoSwrTimestamps[m];
+                if ((now - memTs) > -5000 && (now - memTs) < AUTO_SWR_WINDOW_MS) {
+                    recent.push(memTs);
+                }
+            }
+        }
+
+        if (recent.length >= AUTO_SWR_MAX_REQUESTS) {
+            memoryAutoSwrTimestamps = recent.slice();
+            if (backend) {
+                try {
+                    backend.set(AUTO_SWR_STORAGE_KEY, JSON.stringify(recent));
+                } catch (writeTrimErr) {
+                    warnPersistedCacheOnce('auto-refresh limiter trim failed', writeTrimErr);
+                }
+            }
+            return false;
+        }
+
+        recent.push(now);
+        memoryAutoSwrTimestamps = recent.slice();
+        if (backend) {
+            try {
+                backend.set(AUTO_SWR_STORAGE_KEY, JSON.stringify(recent));
+            } catch (err) {
+                warnPersistedCacheOnce('auto-refresh limiter write failed', err);
+            }
+        }
+        return true;
     }
 
     // Clone payload without provider rawJson fields to keep persisted storage compact
@@ -1156,6 +1259,9 @@
     }
 
     function fetchDetectWithToken(ip, token, hasRetried, mode) {
+        if (!isValidIp(ip)) {
+            return Promise.resolve(null);
+        }
         var resolvedMode = normalizeQueryMode(mode);
         return fetch(
             TOOL_BASE_URL +
@@ -1180,6 +1286,61 @@
                 return null;
             }
             return response.json();
+        });
+    }
+
+    function fetchRefreshDetectWithToken(ip, token, hasRetried, mode) {
+        if (!isValidIp(ip)) {
+            return Promise.resolve({ ok: false, status: 0, rateLimited: false, data: null });
+        }
+        var resolvedMode = normalizeQueryMode(mode || 'full');
+        return fetch(TOOL_BASE_URL + '/api/v1/detect/refresh', {
+            method: 'POST',
+            mode: 'cors',
+            credentials: 'omit',
+            headers: {
+                'Authorization': 'Bearer ' + token,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                ip: ip,
+                mode: resolvedMode,
+                compact: false
+            })
+        }).then(function (response) {
+            if (response.status === 401 || response.status === 403) {
+                return Promise.resolve(
+                    handleDetectAuthStatus(response.status, token, hasRetried, function (freshToken) {
+                        return fetchRefreshDetectWithToken(ip, freshToken, true, resolvedMode);
+                    })
+                ).then(function (retryOutcome) {
+                    return retryOutcome || { ok: false, status: response.status, rateLimited: false, data: null };
+                });
+            }
+            if (response.status === 429) {
+                return response.json().catch(function () {
+                    return {};
+                }).then(function (errBody) {
+                    var retrySeconds = errBody && typeof errBody.retryAfterSeconds === 'number'
+                        ? errBody.retryAfterSeconds
+                        : null;
+                    return {
+                        ok: false,
+                        status: 429,
+                        rateLimited: true,
+                        retryAfterSeconds: retrySeconds,
+                        message: errBody && typeof errBody.message === 'string' ? errBody.message : '',
+                        data: null
+                    };
+                });
+            }
+            if (!response.ok) {
+                console.warn('[proxycheck] Refresh API returned HTTP ' + response.status + ' for ' + ip);
+                return { ok: false, status: response.status, rateLimited: false, data: null };
+            }
+            return response.json().then(function (payload) {
+                return { ok: true, status: 200, rateLimited: false, data: payload };
+            });
         });
     }
 
@@ -1253,6 +1414,10 @@
     }
 
     function fetchBatchDetectWithToken(ips, token, hasRetried, mode) {
+        var validIps = Array.isArray(ips) ? ips.filter(isValidIp) : [];
+        if (validIps.length === 0) {
+            return Promise.resolve(null);
+        }
         var resolvedMode = normalizeQueryMode(mode);
         return fetch(TOOL_BASE_URL + '/api/v1/detect/batch?compact=1', {
             method: 'POST',
@@ -1262,7 +1427,7 @@
                 'Authorization': 'Bearer ' + token,
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({ ips: ips, mode: resolvedMode })
+            body: JSON.stringify({ ips: validIps, mode: resolvedMode })
         }).then(function (response) {
             if (response.status === 404 || response.status === 405) {
                 batchEndpointSupported = false;
@@ -1270,7 +1435,7 @@
             }
             if (response.status === 401 || response.status === 403) {
                 return handleDetectAuthStatus(response.status, token, hasRetried, function (freshToken) {
-                    return fetchBatchDetectWithToken(ips, freshToken, true, resolvedMode);
+                    return fetchBatchDetectWithToken(validIps, freshToken, true, resolvedMode);
                 });
             }
             if (!response.ok) {
@@ -1279,6 +1444,13 @@
             }
             return response.json();
         });
+    }
+
+    function markBatchOriginatedPayload(entry) {
+        if (batchOriginatedPayloads && entry && typeof entry === 'object') {
+            batchOriginatedPayloads.add(entry);
+        }
+        return entry;
     }
 
     function extractIpResultFromBatch(batchPayload, rawIp) {
@@ -1293,20 +1465,20 @@
         var lowerIp = trimmedIp.toLowerCase();
         var canonicalKey = canonicalizeIpKey(trimmedIp);
         if (Object.prototype.hasOwnProperty.call(results, trimmedIp) && results[trimmedIp]) {
-            return results[trimmedIp];
+            return markBatchOriginatedPayload(results[trimmedIp]);
         }
         if (Object.prototype.hasOwnProperty.call(results, lowerIp) && results[lowerIp]) {
-            return results[lowerIp];
+            return markBatchOriginatedPayload(results[lowerIp]);
         }
         if (canonicalKey && Object.prototype.hasOwnProperty.call(results, canonicalKey) && results[canonicalKey]) {
-            return results[canonicalKey];
+            return markBatchOriginatedPayload(results[canonicalKey]);
         }
         var inputMap = batchPayload.inputMap;
         if (inputMap && typeof inputMap === 'object') {
             var mappedKey = inputMap[rawIp] || inputMap[trimmedIp] || inputMap[lowerIp] ||
                 (canonicalKey ? inputMap[canonicalKey] : '');
             if (mappedKey && Object.prototype.hasOwnProperty.call(results, mappedKey) && results[mappedKey]) {
-                return results[mappedKey];
+                return markBatchOriginatedPayload(results[mappedKey]);
             }
         }
         var keys = Object.keys(results);
@@ -1314,12 +1486,12 @@
             var entry = results[keys[i]];
             if (keys[i].toLowerCase() === lowerIp ||
                 (canonicalKey && canonicalizeIpKey(keys[i]) === canonicalKey)) {
-                return entry;
+                return markBatchOriginatedPayload(entry);
             }
             if (entry && typeof entry.ip === 'string' &&
                 (entry.ip.toLowerCase() === lowerIp ||
                  (canonicalKey && canonicalizeIpKey(entry.ip) === canonicalKey))) {
-                return entry;
+                return markBatchOriginatedPayload(entry);
             }
         }
         return null;
@@ -1497,8 +1669,103 @@
         return false;
     }
 
+    function executeIpRefresh(ip) {
+        if (accessBlocked || !isValidIp(ip)) {
+            return Promise.resolve({ ok: false, rateLimited: false, degradedFallback: false, data: null });
+        }
+        var cacheKey = canonicalizeIpKey(ip);
+        if (!cacheKey) {
+            return Promise.resolve({ ok: false, rateLimited: false, degradedFallback: false, data: null });
+        }
+        if (inflightRefreshByIp.has(cacheKey)) {
+            return inflightRefreshByIp.get(cacheKey);
+        }
+
+        var refreshPromise = enqueueNetworkTask(function () {
+            if (accessBlocked) {
+                return null;
+            }
+            return ensureGadgetToken().then(function (token) {
+                if (!token || accessBlocked) {
+                    return null;
+                }
+                return fetchRefreshDetectWithToken(ip, token, false, 'full');
+            });
+        }).then(function (res) {
+            if (inflightRefreshByIp.get(cacheKey) === refreshPromise) {
+                inflightRefreshByIp.delete(cacheKey);
+            }
+            autoSwrAttemptedKeys.add(cacheKey);
+
+            if (!res || !res.ok || !res.data || typeof res.data !== 'object') {
+                return {
+                    ok: false,
+                    rateLimited: Boolean(res && res.rateLimited),
+                    retryAfterSeconds: res && typeof res.retryAfterSeconds === 'number' ? res.retryAfterSeconds : null,
+                    degradedFallback: false,
+                    data: null
+                };
+            }
+
+            var resolvedAliasKey = typeof res.data.ip === 'string' ? canonicalizeIpKey(res.data.ip) : '';
+            if (resolvedAliasKey) {
+                autoSwrAttemptedKeys.add(resolvedAliasKey);
+                if (inflightRefreshByIp.get(resolvedAliasKey) === refreshPromise) {
+                    inflightRefreshByIp.delete(resolvedAliasKey);
+                }
+            }
+
+            var meta = res.data.cacheMeta && typeof res.data.cacheMeta === 'object' ? res.data.cacheMeta : null;
+            if (meta && meta.degradedRefreshFallback === true) {
+                var existingCached = latestResultByIp.get(cacheKey) || readPersistedIpResult(cacheKey);
+                if (!existingCached) {
+                    var fallbackPromise = Promise.resolve(res.data);
+                    ipFullPromiseCache.set(cacheKey, fallbackPromise);
+                    ipPromiseCache.set(cacheKey, fallbackPromise);
+                    syncResolvedIpAliases(cacheKey, res.data, fallbackPromise, true, Date.now());
+                }
+                return {
+                    ok: false,
+                    rateLimited: false,
+                    retryAfterSeconds: null,
+                    degradedFallback: true,
+                    data: existingCached || res.data
+                };
+            }
+
+            var freshPromise = Promise.resolve(res.data);
+            ipFullPromiseCache.set(cacheKey, freshPromise);
+            ipPromiseCache.set(cacheKey, freshPromise);
+            syncResolvedIpAliases(cacheKey, res.data, freshPromise, true, Date.now());
+            refreshRenderedBadgesForIp(res.data.ip || ip, res.data);
+            return {
+                ok: true,
+                rateLimited: false,
+                retryAfterSeconds: null,
+                degradedFallback: false,
+                data: res.data
+            };
+        }).catch(function (err) {
+            if (inflightRefreshByIp.get(cacheKey) === refreshPromise) {
+                inflightRefreshByIp.delete(cacheKey);
+            }
+            autoSwrAttemptedKeys.add(cacheKey);
+            console.warn('[proxycheck] Refresh request failed for ' + ip + ':', err);
+            return {
+                ok: false,
+                rateLimited: false,
+                retryAfterSeconds: null,
+                degradedFallback: false,
+                data: null
+            };
+        });
+
+        inflightRefreshByIp.set(cacheKey, refreshPromise);
+        return refreshPromise;
+    }
+
     function fetchIpIntelligence(ip, mode, options) {
-        if (accessBlocked) {
+        if (accessBlocked || !isValidIp(ip)) {
             return Promise.resolve(null);
         }
         var cacheKey = canonicalizeIpKey(ip);
@@ -1509,37 +1776,38 @@
         var resolvedMode = normalizeQueryMode(mode);
         var forceRefresh = Boolean(options && options.forceRefresh);
         if (resolvedMode === 'full') {
+            if (forceRefresh) {
+                return executeIpRefresh(ip).then(function (outcome) {
+                    return outcome && outcome.ok ? outcome.data : null;
+                });
+            }
             if (inflightFullPromisesByIp.has(cacheKey)) {
                 return inflightFullPromisesByIp.get(cacheKey);
             }
-            if (forceRefresh) {
-                invalidateIpResultCache(ip);
-            } else {
-                pruneExpiredFullMemoryCache(cacheKey);
-                if (ipFullPromiseCache.has(cacheKey)) {
-                    return ipFullPromiseCache.get(cacheKey);
-                }
+            pruneExpiredFullMemoryCache(cacheKey);
+            if (ipFullPromiseCache.has(cacheKey)) {
+                return ipFullPromiseCache.get(cacheKey);
+            }
 
-                var cachedLatestFull = latestResultByIp.get(cacheKey);
-                if (
-                    cachedLatestFull &&
-                    !isPartialLightResult(cachedLatestFull) &&
-                    isMemoryFullResultFresh(cacheKey, cachedLatestFull)
-                ) {
-                    var promotedPromise = Promise.resolve(cachedLatestFull);
-                    ipFullPromiseCache.set(cacheKey, promotedPromise);
-                    return promotedPromise;
-                }
+            var cachedLatestFull = latestResultByIp.get(cacheKey);
+            if (
+                cachedLatestFull &&
+                !isPartialLightResult(cachedLatestFull) &&
+                isMemoryFullResultFresh(cacheKey, cachedLatestFull)
+            ) {
+                var promotedPromise = Promise.resolve(cachedLatestFull);
+                ipFullPromiseCache.set(cacheKey, promotedPromise);
+                return promotedPromise;
+            }
 
-                var persistedFullEntry = readPersistedIpResultEntry(cacheKey);
-                if (persistedFullEntry && persistedFullEntry.data && !isPartialLightResult(persistedFullEntry.data)) {
-                    recordLatestIpResult(cacheKey, persistedFullEntry.data);
-                    recordFullResultMeta(cacheKey, persistedFullEntry.data, persistedFullEntry.ts);
-                    var cachedFullPromise = Promise.resolve(persistedFullEntry.data);
-                    ipFullPromiseCache.set(cacheKey, cachedFullPromise);
-                    ipPromiseCache.set(cacheKey, cachedFullPromise);
-                    return cachedFullPromise;
-                }
+            var persistedFullEntry = readPersistedIpResultEntry(cacheKey);
+            if (persistedFullEntry && persistedFullEntry.data && !isPartialLightResult(persistedFullEntry.data)) {
+                recordLatestIpResult(cacheKey, persistedFullEntry.data);
+                recordFullResultMeta(cacheKey, persistedFullEntry.data, persistedFullEntry.ts);
+                var cachedFullPromise = Promise.resolve(persistedFullEntry.data);
+                ipFullPromiseCache.set(cacheKey, cachedFullPromise);
+                ipPromiseCache.set(cacheKey, cachedFullPromise);
+                return cachedFullPromise;
             }
 
             var fullPromise = enqueueSingleIpDetection(ip, 'full').then(function (data) {
@@ -1717,6 +1985,12 @@
             stopforumspamRow &&
             (stopforumspamRow.appears || (stopforumspamRow.frequency && Number(stopforumspamRow.frequency) > 0))
         );
+        var suspectedResidentialProxy = Boolean(data.suspectedResidentialProxy);
+        var sharedPrivacyEgress = typeof data.sharedPrivacyEgress === 'string' && data.sharedPrivacyEgress.trim()
+            ? data.sharedPrivacyEgress.trim().toLowerCase()
+            : '';
+        var isMobileOrCgnat = isMobileOrCgnatPayload(data);
+        var openProxyPorts = extractShodanOpenProxyPorts(data);
         var isPartialLight = Boolean(
             data.isPartialMode || String(data.queryMode || '').trim().toLowerCase() === 'light'
         );
@@ -1726,6 +2000,9 @@
         var hasHighOrMediumSignals = Boolean(
             isTor ||
             isMajorityProxyVpn ||
+            suspectedResidentialProxy ||
+            openProxyPorts.length > 0 ||
+            Boolean(sharedPrivacyEgress) ||
             arbitrationTier === 'destructive' ||
             hasCloudProvider ||
             ptrIsHighRisk ||
@@ -1761,7 +2038,8 @@
         } else if ((hasPrediction && prediction > 80) || isTor || isMajorityProxyVpn ||
             arbitrationTier === 'destructive' || isSfsBlacklisted) {
             riskTier = 'high';
-        } else if ((hasPrediction && prediction >= 30) || broadcastIp ||
+        } else if ((hasPrediction && prediction >= 30) || broadcastIp || suspectedResidentialProxy ||
+            openProxyPorts.length > 0 || Boolean(sharedPrivacyEgress) ||
             arbitrationTier === 'warning' || ptrIsHighRisk || hasCloudProvider || isSfsListed) {
             riskTier = 'medium';
         }
@@ -1795,8 +2073,14 @@
             badgePrimaryLabel = /datacenter|hosting/i.test(arbitrationVerdict)
                 ? 'HOSTING'
                 : 'PROXY';
+        } else if (suspectedResidentialProxy) {
+            badgePrimaryLabel = 'RES-PROXY';
         } else if (isSfsBlacklisted) {
             badgePrimaryLabel = 'BLACKLIST';
+        } else if (openProxyPorts.length > 0) {
+            badgePrimaryLabel = 'PROXY-PORT';
+        } else if (sharedPrivacyEgress) {
+            badgePrimaryLabel = 'RELAY';
         } else if (hasCloudProvider) {
             badgePrimaryLabel = 'CLOUD';
         } else if (ptrIsHighRisk) {
@@ -1827,6 +2111,10 @@
             broadcastIp: broadcastIp,
             isTor: isTor,
             isMajorityProxyVpn: isMajorityProxyVpn,
+            suspectedResidentialProxy: suspectedResidentialProxy,
+            sharedPrivacyEgress: sharedPrivacyEgress,
+            isMobileOrCgnat: isMobileOrCgnat,
+            openProxyPorts: openProxyPorts,
             arbitrationTier: arbitrationTier,
             ptrIsHighRisk: ptrIsHighRisk,
             hasCloudProvider: hasCloudProvider,
@@ -1869,6 +2157,235 @@
             return provider + ' (' + cidr + ')';
         }
         return provider || cidr;
+    }
+
+    function getCacheMeta(data) {
+        return data && data.cacheMeta && typeof data.cacheMeta === 'object' ? data.cacheMeta : null;
+    }
+
+    function getCacheAgeSeconds(data) {
+        var meta = getCacheMeta(data);
+        if (meta && typeof meta.ageSeconds === 'number' && isFinite(meta.ageSeconds) && meta.ageSeconds >= 0) {
+            return Math.floor(meta.ageSeconds);
+        }
+        return null;
+    }
+
+    function formatRelativeCacheAge(ageSeconds) {
+        if (typeof ageSeconds !== 'number' || !isFinite(ageSeconds) || ageSeconds < 0) {
+            return '';
+        }
+        if (ageSeconds >= 86400) {
+            return 'Cached ' + Math.floor(ageSeconds / 86400) + 'd ago';
+        }
+        if (ageSeconds >= 3600) {
+            return 'Cached ' + Math.floor(ageSeconds / 3600) + 'h ago';
+        }
+        if (ageSeconds >= 60) {
+            return 'Cached ' + Math.floor(ageSeconds / 60) + 'm ago';
+        }
+        return 'Cached ' + Math.floor(ageSeconds) + 's ago';
+    }
+
+    function formatCacheStatusLabel(data, isJustUpdated) {
+        if (isJustUpdated) {
+            return 'Just updated';
+        }
+        var meta = getCacheMeta(data);
+        var ageSeconds = getCacheAgeSeconds(data);
+        if (ageSeconds === null) {
+            return data && data.isCached ? 'Cached' : 'Just updated';
+        }
+        if (ageSeconds === 0) {
+            var isCachedLayer = Boolean(
+                (data && data.isCached) ||
+                (meta && meta.layer && meta.layer !== 'upstream')
+            );
+            return isCachedLayer ? 'Cached 0m ago' : 'Just updated';
+        }
+        return formatRelativeCacheAge(ageSeconds);
+    }
+
+    function shouldAutoRefreshPayload(data, cacheKey) {
+        if (!data || typeof data !== 'object' || isPartialLightResult(data)) {
+            return false;
+        }
+        if (cacheKey && autoSwrAttemptedKeys.has(cacheKey)) {
+            return false;
+        }
+        var meta = getCacheMeta(data);
+        if (!meta || meta.refreshInProgress === true || meta.degradedRefreshFallback === true) {
+            return false;
+        }
+        if (meta.shouldAutoRefresh === true) {
+            return true;
+        }
+        if (batchOriginatedPayloads && batchOriginatedPayloads.has(data) && meta.isStale === true) {
+            return true;
+        }
+        return false;
+    }
+
+    function isMobileOrCgnatPayload(data) {
+        if (!data || typeof data !== 'object') {
+            return false;
+        }
+        if (data.isMobileOrCgnat === true) {
+            return true;
+        }
+        var ptrCat = typeof data.ptrCategory === 'string' ? data.ptrCategory.trim().toLowerCase() : '';
+        return ptrCat === 'mobile_or_cgnat';
+    }
+
+    function getSharedPrivacyEgressLabel(data) {
+        if (!data || typeof data !== 'object' || typeof data.sharedPrivacyEgress !== 'string') {
+            return '';
+        }
+        var raw = data.sharedPrivacyEgress.trim().toLowerCase();
+        if (!raw) {
+            return '';
+        }
+        if (raw === 'icloud_private_relay') {
+            return 'Apple iCloud Private Relay';
+        }
+        if (raw === 'cloudflare_warp') {
+            return 'Cloudflare WARP';
+        }
+        return data.sharedPrivacyEgress.trim();
+    }
+
+    function extractShodanOpenProxyPorts(data) {
+        if (!data || typeof data !== 'object') {
+            return [];
+        }
+        var seen = Object.create(null);
+        var ports = [];
+        function collectPortList(list) {
+            if (!Array.isArray(list)) {
+                return;
+            }
+            for (var i = 0; i < list.length; i++) {
+                var parsed = Number(list[i]);
+                if (isFinite(parsed) && Math.floor(parsed) === parsed && parsed >= 1 && parsed <= 65535) {
+                    if (!seen[parsed]) {
+                        seen[parsed] = true;
+                        ports.push(parsed);
+                    }
+                }
+            }
+        }
+        collectPortList(data.openProxyPorts);
+        var rows = Array.isArray(data.results) ? data.results : [];
+        for (var r = 0; r < rows.length; r++) {
+            var row = rows[r];
+            if (row && typeof row === 'object' && isValidProviderRow(row)) {
+                collectPortList(row.openProxyPorts);
+            }
+        }
+        ports.sort(function (a, b) {
+            return a - b;
+        });
+        return ports;
+    }
+
+    function shouldRecommendFreshResidentialRecheck(data) {
+        if (!data || typeof data !== 'object' || !data.suspectedResidentialProxy) {
+            return false;
+        }
+        var meta = getCacheMeta(data);
+        if (meta && meta.recommendFreshRecheck === true) {
+            return true;
+        }
+        var ageSeconds = getCacheAgeSeconds(data);
+        return ageSeconds !== null && ageSeconds > RESIDENTIAL_RECHECK_THRESHOLD_SECONDS;
+    }
+
+    function isSoftBlockAdvised(data) {
+        return Boolean(getSharedPrivacyEgressLabel(data) || isMobileOrCgnatPayload(data));
+    }
+
+    function buildWikiPageUrl(pageTitle, queryParams) {
+        var queryPairs = [];
+        if (queryParams && typeof queryParams === 'object') {
+            var paramKeys = Object.keys(queryParams);
+            for (var i = 0; i < paramKeys.length; i++) {
+                var paramName = paramKeys[i];
+                var paramValue = queryParams[paramName];
+                if (paramValue !== undefined && paramValue !== null && paramValue !== '') {
+                    queryPairs.push(encodeURIComponent(paramName) + '=' + encodeURIComponent(String(paramValue)));
+                }
+            }
+        }
+        var baseUrl = '';
+        if (mw && mw.util && typeof mw.util.getUrl === 'function') {
+            baseUrl = mw.util.getUrl(pageTitle);
+        }
+        if (!baseUrl) {
+            var articlePath = (mw && mw.config && typeof mw.config.get === 'function' && mw.config.get('wgArticlePath')) || '/wiki/$1';
+            var encodedTitle = String(pageTitle).split('/').map(function (segment) {
+                return encodeURIComponent(segment).replace(/%3A/gi, ':');
+            }).join('/');
+            baseUrl = articlePath.replace('$1', encodedTitle);
+        }
+        if (queryPairs.length === 0) {
+            return baseUrl;
+        }
+        return baseUrl + (baseUrl.indexOf('?') === -1 ? '?' : '&') + queryPairs.join('&');
+    }
+
+    function formatUtcFetchDate(data) {
+        var meta = getCacheMeta(data);
+        var rawIso = (data && typeof data.fetchedAt === 'string' && data.fetchedAt.trim())
+            ? data.fetchedAt.trim()
+            : (meta && typeof meta.fetchedAt === 'string' && meta.fetchedAt.trim()
+                ? meta.fetchedAt.trim()
+                : (meta && typeof meta.cachedAt === 'string' && meta.cachedAt.trim() ? meta.cachedAt.trim() : ''));
+        if (rawIso) {
+            var parsedMs = Date.parse(rawIso);
+            if (!isNaN(parsedMs)) {
+                return new Date(parsedMs).toISOString().slice(0, 10) + ' UTC';
+            }
+        }
+        return new Date(Date.now()).toISOString().slice(0, 10) + ' UTC';
+    }
+
+    function sanitizeWikitextFragment(value) {
+        if (value === null || value === undefined) {
+            return '';
+        }
+        return String(value)
+            .replace(/[\r\n\t]+/g, ' ')
+            .replace(/[[\]{}|<>]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function buildDesensitisedWikitextSummary(data, rows, fallbackIp) {
+        var resolvedIp = sanitizeWikitextFragment((data && data.ip) || fallbackIp || 'Unknown IP');
+        var asnValue = normalizeAsnValue(data && data.primaryAsn);
+        if (!asnValue) {
+            var asnEntries = collectAsnEntries(rows);
+            asnValue = asnEntries.length > 0 ? asnEntries[0].value : 'N/A';
+        }
+        var ispEntries = collectIspEntries(rows);
+        var ispValue = ispEntries.length > 0 ? sanitizeWikitextFragment(ispEntries[0].value) : 'N/A';
+        var rawVerdict = data && typeof data.arbitrationVerdict === 'string' && data.arbitrationVerdict.trim()
+            ? sanitizeWikitextFragment(data.arbitrationVerdict)
+            : 'Assessment available';
+        var recommendedCidr = data && typeof data.recommendedCidr === 'string' && data.recommendedCidr.trim()
+            ? sanitizeWikitextFragment(data.recommendedCidr)
+            : 'N/A';
+        var escalationSuffix = data && typeof data.escalationCidr === 'string' && data.escalationCidr.trim()
+            ? ' (escalation: <code>' + sanitizeWikitextFragment(data.escalationCidr) + '</code>)'
+            : '';
+        var fetchedDateUtc = formatUtcFetchDate(data);
+
+        return '* \'\'\'IP\'\'\': <code>' + resolvedIp + '</code>' +
+            ' \u2014 \'\'\'ASN\'\'\': ' + sanitizeWikitextFragment(asnValue) +
+            '; \'\'\'ISP\'\'\': ' + ispValue +
+            '; \'\'\'Verdict\'\'\': ' + rawVerdict +
+            '; \'\'\'Recommended CIDR\'\'\': <code>' + recommendedCidr + '</code>' + escalationSuffix +
+            ' \u2014 fetched ' + fetchedDateUtc + ' ' + BLOCK_REASON_ATTRIBUTION;
     }
 
     var BLOCK_REASON_ATTRIBUTION = '([[:m:User:Hamish/proxycheck.js|proxycheck]])';
@@ -2169,6 +2686,20 @@
             addEntry('PTR (' + data.ptrLabel.trim() + ')', 'Reverse DNS');
         }
 
+        if (data.suspectedResidentialProxy) {
+            addEntry('Suspected Residential Proxy / Compromised Host', 'Multi-Source');
+        }
+
+        var openPorts = extractShodanOpenProxyPorts(data);
+        if (openPorts.length > 0) {
+            addEntry('Open Proxy Ports (' + openPorts.join(', ') + ')', 'Shodan InternetDB');
+        }
+
+        var sharedEgress = getSharedPrivacyEgressLabel(data);
+        if (sharedEgress) {
+            addEntry('Shared Privacy Egress (' + sharedEgress + ')', 'Privacy Relay');
+        }
+
         return entries;
     }
 
@@ -2275,6 +2806,10 @@
         'StopForumSpam': { bg: '#e6f8f5', border: '#9fdcd2', color: '#125c51', darkBg: '#13332e', darkBorder: '#286b60', darkColor: '#7ee0d1' },
         'Spamhaus ZEN': { bg: '#eaedf7', border: '#b5c0de', color: '#2e3f6e', darkBg: '#1e243b', darkBorder: '#404d7d', darkColor: '#a8b8eb' },
         'SpamCop': { bg: '#eaf4fb', border: '#add2ec', color: '#1c537d', darkBg: '#172c3d', darkBorder: '#315c80', darkColor: '#91c6f2' },
+        'IPsum / DROP': { bg: '#f4ecfb', border: '#ceb3ea', color: '#512b78', darkBg: '#2a1d3b', darkBorder: '#5d4180', darkColor: '#d4b8f8' },
+        'X4BNet VPN': { bg: '#e6f4f8', border: '#9fd0df', color: '#0e5266', darkBg: '#132d36', darkBorder: '#285f70', darkColor: '#82d2e8' },
+        'Shodan InternetDB': { bg: '#fbeee8', border: '#e8bca8', color: '#783416', darkBg: '#361f16', darkBorder: '#734330', darkColor: '#f5bba3' },
+        'Privacy Relay': { bg: '#eef0ff', border: '#b5bff7', color: '#2b3a94', darkBg: '#1c2247', darkBorder: '#3f4d96', darkColor: '#a8b5ff' },
         'Cloud CIDR': { bg: '#e8f6ff', border: '#a8d8f8', color: '#0e527d', darkBg: '#152c3d', darkBorder: '#2c5c80', darkColor: '#8ac7f5' },
         'Multi-Source': { bg: '#eef2f6', border: '#b9c6d4', color: '#3b4f66', darkBg: '#222830', darkBorder: '#475466', darkColor: '#b3c2d4' },
         'Reverse DNS': { bg: '#e8f7f7', border: '#a6dada', color: '#185b5e', darkBg: '#153030', darkBorder: '#2c6666', darkColor: '#87dbdb' },
@@ -2340,6 +2875,11 @@
             '  background-color: var(--proxycheck-tag-dark-bg, #1c2a3a);',
             '  border-color: var(--proxycheck-tag-dark-border, #3a5778);',
             '  color: var(--proxycheck-tag-dark-color, #9cc9ff);',
+            '}',
+            scopeSelector + ' .proxycheck-signal-privacy {',
+            '  background-color: #1c2345;',
+            '  color: #b0bfff;',
+            '  border-color: #3d4b8f;',
             '}'
         ].join('\n');
     }
@@ -2446,6 +2986,9 @@
             '  color: var(--proxycheck-low-color) !important;',
             '  border: 1px solid var(--proxycheck-low-border);',
             '}',
+            'a.proxycheck-ip-badge.proxycheck-badge-stale, a.proxycheck-ip-badge.proxycheck-badge-stale:visited {',
+            '  border-style: dashed;',
+            '}',
             '#proxycheck-pageinfo {',
             '  font-size: 92%;',
             '  line-height: 1.5em;',
@@ -2525,33 +3068,131 @@
             '.proxycheck-light-upgrade-notice {',
             '  color: var(--proxycheck-subtle-color);',
             '}',
-            '.proxycheck-degraded-retry-notice {',
-            '  margin-top: 8px;',
-            '  margin-bottom: 0;',
-            '  padding: 6px 8px;',
-            '  border-radius: 3px;',
-            '  font-size: 12px;',
+            '.proxycheck-dialog-cache-bar {',
             '  display: flex;',
             '  align-items: center;',
+            '  justify-content: space-between;',
             '  flex-wrap: wrap;',
             '  gap: 8px;',
+            '  margin-bottom: 8px;',
+            '  padding-bottom: 6px;',
+            '  border-bottom: 1px solid var(--proxycheck-divider-color);',
+            '  font-size: 12px;',
+            '}',
+            '.proxycheck-cache-controls {',
+            '  display: inline-flex;',
+            '  align-items: center;',
+            '  flex-wrap: wrap;',
+            '  gap: 6px;',
+            '}',
+            '.proxycheck-cache-age {',
+            '  color: var(--proxycheck-subtle-color);',
+            '  font-size: 12px;',
+            '}',
+            '.proxycheck-cache-age-stale {',
+            '  color: var(--proxycheck-medium-color);',
+            '  font-weight: 600;',
+            '}',
+            '.proxycheck-refetch-btn {',
+            '  cursor: pointer;',
+            '  font-size: 11.5px;',
+            '  font-weight: 600;',
+            '  padding: 1px 8px;',
+            '  border-radius: 3px;',
+            '  background-color: var(--proxycheck-surface-bg);',
+            '  color: var(--proxycheck-link-color);',
+            '  border: 1px solid var(--proxycheck-border-color);',
+            '}',
+            '.proxycheck-refetch-btn:disabled {',
+            '  opacity: 0.65;',
+            '  cursor: wait;',
+            '}',
+            '.proxycheck-refresh-warning {',
+            '  margin-top: 6px;',
+            '  padding: 5px 8px;',
+            '  border-radius: 3px;',
+            '  font-size: 12px;',
             '  background-color: var(--proxycheck-medium-bg);',
             '  color: var(--proxycheck-medium-color);',
             '  border: 1px solid var(--proxycheck-medium-border);',
             '}',
-            '.proxycheck-retry-full-btn {',
-            '  cursor: pointer;',
-            '  font-size: 12px;',
-            '  font-weight: 600;',
-            '  padding: 2px 8px;',
-            '  border-radius: 3px;',
-            '  background-color: transparent;',
-            '  color: inherit;',
-            '  border: 1px solid currentColor;',
+            '.proxycheck-signal-banners {',
+            '  display: flex;',
+            '  flex-direction: column;',
+            '  gap: 5px;',
+            '  margin-bottom: 8px;',
             '}',
-            '.proxycheck-retry-full-btn:disabled {',
-            '  opacity: 0.6;',
-            '  cursor: wait;',
+            '.proxycheck-signal-pill {',
+            '  padding: 5px 8px;',
+            '  border-radius: 3px;',
+            '  font-size: 12px;',
+            '  line-height: 1.45;',
+            '  border: 1px solid var(--proxycheck-border-color);',
+            '}',
+            '.proxycheck-signal-privacy {',
+            '  background-color: #eef2ff;',
+            '  color: #2c3e99;',
+            '  border-color: #b3bdf5;',
+            '}',
+            '.proxycheck-signal-cgnat {',
+            '  background-color: var(--proxycheck-medium-bg);',
+            '  color: var(--proxycheck-medium-color);',
+            '  border-color: var(--proxycheck-medium-border);',
+            '}',
+            '.proxycheck-signal-danger {',
+            '  background-color: var(--proxycheck-high-bg);',
+            '  color: var(--proxycheck-high-color);',
+            '  border-color: var(--proxycheck-high-border);',
+            '}',
+            '.proxycheck-inline-pill {',
+            '  display: inline-block;',
+            '  font-size: 0.85em;',
+            '  padding: 0 5px;',
+            '  margin-left: 6px;',
+            '  border-radius: 3px;',
+            '  background-color: var(--proxycheck-code-bg);',
+            '  border: 1px solid var(--proxycheck-border-color);',
+            '}',
+            '.proxycheck-cidr-rationale {',
+            '  font-size: 0.9em;',
+            '  color: var(--proxycheck-subtle-color);',
+            '  margin-top: 2px;',
+            '}',
+            '.proxycheck-quick-links {',
+            '  margin-top: 8px;',
+            '  padding-top: 6px;',
+            '  border-top: 1px solid var(--proxycheck-divider-color);',
+            '  display: flex;',
+            '  align-items: center;',
+            '  flex-wrap: wrap;',
+            '  gap: 10px;',
+            '  font-size: 12px;',
+            '}',
+            '.proxycheck-temp-ip-switcher {',
+            '  margin-bottom: 6px;',
+            '  padding-bottom: 6px;',
+            '  border-bottom: 1px solid var(--proxycheck-divider-color);',
+            '  display: flex;',
+            '  align-items: center;',
+            '  flex-wrap: wrap;',
+            '  gap: 6px;',
+            '  font-size: 12px;',
+            '}',
+            '.proxycheck-ip-pill {',
+            '  cursor: pointer;',
+            '  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;',
+            '  font-size: 11.5px;',
+            '  padding: 1px 8px;',
+            '  border-radius: 10px;',
+            '  background-color: var(--proxycheck-surface-bg);',
+            '  color: var(--proxycheck-surface-color);',
+            '  border: 1px solid var(--proxycheck-border-color);',
+            '}',
+            '.proxycheck-ip-pill-active {',
+            '  background-color: var(--proxycheck-link-color);',
+            '  color: #ffffff;',
+            '  border-color: var(--proxycheck-link-color);',
+            '  font-weight: 600;',
             '}',
             '#proxycheck-pageinfo a, .proxycheck-details-panel a, .proxycheck-dialog-link {',
             '  color: var(--proxycheck-link-color);',
@@ -2703,9 +3344,12 @@
         return $('<span>', attrs);
     }
 
-    function buildResultDetailsPanel(data, risk) {
+    function buildResultDetailsPanel(data, risk, fallbackIp) {
         ensureUserscriptStyles();
         var rows = getProviderRows(data);
+        var resolvedIp = isValidIp(data && data.ip)
+            ? String(data.ip).trim()
+            : (isValidIp(fallbackIp) ? String(fallbackIp).trim() : '');
         var providerUpdatedAtMap = {};
         rows.forEach(function (row) {
             if (row && row.provider && typeof row.offlineDbUpdatedAt === 'string' && row.offlineDbUpdatedAt.trim()) {
@@ -2724,6 +3368,55 @@
         var $panel = $('<div>', {
             'class': 'proxycheck-details-panel'
         });
+
+        var sharedEgressLabel = getSharedPrivacyEgressLabel(data);
+        var mobileOrCgnat = isMobileOrCgnatPayload(data);
+        var residentialParadox = Boolean(data && data.suspectedResidentialProxy);
+        var freshRecheckNeeded = shouldRecommendFreshResidentialRecheck(data);
+        var shodanPorts = extractShodanOpenProxyPorts(data);
+
+        if (sharedEgressLabel || mobileOrCgnat || residentialParadox || shodanPorts.length > 0) {
+            var $banners = $('<div>', { 'class': 'proxycheck-signal-banners' });
+            if (sharedEgressLabel) {
+                $banners.append(
+                    $('<div>', {
+                        'class': 'proxycheck-signal-pill proxycheck-signal-privacy',
+                        text: 'Shared Privacy Egress: ' + sharedEgressLabel +
+                            ' \u2014 Soft / anon-only block recommended to avoid collateral impact on logged-in editors.'
+                    })
+                );
+            }
+            if (mobileOrCgnat) {
+                $banners.append(
+                    $('<div>', {
+                        'class': 'proxycheck-signal-pill proxycheck-signal-cgnat',
+                        text: 'Mobile / CGNAT Network: Collateral-damage warning \u2014 recommended block locked to /32 (IPv4) or /64 (IPv6); prefer soft / anon-only block.'
+                    })
+                );
+            }
+            if (residentialParadox) {
+                var paradoxText = 'Suspected Residential Proxy / Compromised Host';
+                if (freshRecheckNeeded) {
+                    paradoxText += ' \u2014 Cached signal is older than 7 days; click Refetch to verify current DHCP assignment before issuing a long-term block.';
+                }
+                $banners.append(
+                    $('<div>', {
+                        'class': 'proxycheck-signal-pill proxycheck-signal-danger',
+                        text: paradoxText
+                    })
+                );
+            }
+            if (shodanPorts.length > 0) {
+                $banners.append(
+                    $('<div>', {
+                        'class': 'proxycheck-signal-pill proxycheck-signal-danger',
+                        text: 'Shodan Open Proxy Ports: ' + shodanPorts.join(', ')
+                    })
+                );
+            }
+            $panel.append($banners);
+        }
+
         var $table = $('<table>', {
             style: 'width: 100%; border-collapse: collapse;'
         });
@@ -2790,19 +3483,104 @@
             ).appendTo($table);
         });
 
+        var verdictPanelText = data && typeof data.arbitrationVerdict === 'string' && data.arbitrationVerdict.trim()
+            ? data.arbitrationVerdict.trim()
+            : '';
+        if (verdictPanelText) {
+            $('<tr>').append(
+                $('<th>', {
+                    'class': 'proxycheck-details-label',
+                    style: 'text-align: left; vertical-align: top; padding: 4px 12px 4px 0; width: 78px; font-weight: 600; white-space: nowrap;'
+                }).text('Verdict'),
+                $('<td>', {
+                    style: 'padding: 4px 0; vertical-align: top;'
+                }).append(
+                    $('<span>', {
+                        'class': 'proxycheck-result-value',
+                        text: verdictPanelText
+                    })
+                )
+            ).appendTo($table);
+        }
+
+        var recommendedCidrText = data && typeof data.recommendedCidr === 'string' && data.recommendedCidr.trim()
+            ? data.recommendedCidr.trim()
+            : 'N/A';
+        var escalationCidrText = data && typeof data.escalationCidr === 'string' && data.escalationCidr.trim()
+            ? data.escalationCidr.trim()
+            : '';
+        var bgpPrefixText = data && typeof data.bgpPrefix === 'string' && data.bgpPrefix.trim()
+            ? data.bgpPrefix.trim()
+            : (data && typeof data.mmdbCidr === 'string' && data.mmdbCidr.trim() ? data.mmdbCidr.trim() : '');
+        var cidrRationaleText = data && typeof data.cidrRationale === 'string' && data.cidrRationale.trim()
+            ? data.cidrRationale.trim()
+            : (data && typeof data.cidrNote === 'string' && data.cidrNote.trim() ? data.cidrNote.trim() : '');
+
+        var $cidrCellContent = $('<div>');
+        var $cidrPrimaryLine = $('<div>');
+        $cidrPrimaryLine.append($('<code>').text(recommendedCidrText));
+        if (escalationCidrText) {
+            $cidrPrimaryLine.append(
+                $('<span>', {
+                    'class': 'proxycheck-inline-pill',
+                    text: 'Escalation: ' + escalationCidrText
+                })
+            );
+        }
+        if (bgpPrefixText) {
+            $cidrPrimaryLine.append(
+                $('<span>', {
+                    'class': 'proxycheck-inline-pill',
+                    text: 'BGP: ' + bgpPrefixText
+                })
+            );
+        }
+        $cidrCellContent.append($cidrPrimaryLine);
+        if (cidrRationaleText) {
+            $cidrCellContent.append(
+                $('<div>', {
+                    'class': 'proxycheck-cidr-rationale',
+                    text: cidrRationaleText
+                })
+            );
+        }
+        $('<tr>').append(
+            $('<th>', {
+                'class': 'proxycheck-details-label',
+                style: 'text-align: left; vertical-align: top; padding: 4px 12px 4px 0; width: 78px; font-weight: 600; white-space: nowrap;'
+            }).text('CIDR'),
+            $('<td>', {
+                style: 'padding: 4px 0; vertical-align: top;'
+            }).append($cidrCellContent)
+        ).appendTo($table);
+
         var $copyLink = $('<a>', {
             href: '#',
             role: 'button',
             'class': 'proxycheck-copy-result',
             text: 'Copy result'
         });
+        var $copyWikitextBtn = $('<a>', {
+            href: '#',
+            role: 'button',
+            'class': 'proxycheck-copy-wikitext',
+            text: 'Copy Wikitext'
+        });
         var resetTimerId = null;
+        var wikitextResetTimerId = null;
         var panelDisposed = false;
 
         function clearCopyResetTimer() {
             if (resetTimerId !== null) {
                 window.clearTimeout(resetTimerId);
                 resetTimerId = null;
+            }
+        }
+
+        function clearWikitextResetTimer() {
+            if (wikitextResetTimerId !== null) {
+                window.clearTimeout(wikitextResetTimerId);
+                wikitextResetTimerId = null;
             }
         }
 
@@ -2815,6 +3593,19 @@
                 resetTimerId = null;
                 if (!panelDisposed) {
                     $copyLink.text('Copy result');
+                }
+            }, delayMs);
+        }
+
+        function scheduleWikitextLabelReset(delayMs) {
+            clearWikitextResetTimer();
+            if (panelDisposed) {
+                return;
+            }
+            wikitextResetTimerId = window.setTimeout(function () {
+                wikitextResetTimerId = null;
+                if (!panelDisposed) {
+                    $copyWikitextBtn.text('Copy Wikitext');
                 }
             }, delayMs);
         }
@@ -2861,16 +3652,78 @@
             });
         });
 
+        $copyWikitextBtn.on('click', function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            if (panelDisposed) {
+                return;
+            }
+            var wikitextSummary = buildDesensitisedWikitextSummary(data, rows, resolvedIp);
+            copyText(wikitextSummary).then(function () {
+                if (!panelDisposed) {
+                    $copyWikitextBtn.text('Copied Wikitext');
+                    scheduleWikitextLabelReset(1500);
+                }
+            }).catch(function (err) {
+                console.warn('[proxycheck] Failed to copy Wikitext summary:', err);
+                if (!panelDisposed) {
+                    $copyWikitextBtn.text('Copy failed');
+                    scheduleWikitextLabelReset(2000);
+                }
+            });
+        });
+
         var $actions = $('<div>', {
-            style: 'margin-top: 8px; display: flex; align-items: center; gap: 12px;'
-        }).append($copyLink);
+            style: 'margin-top: 8px; display: flex; align-items: center; flex-wrap: wrap; gap: 12px;'
+        }).append($copyLink, $copyWikitextBtn);
+
+        $panel.append($table, $actions);
+
+        if (resolvedIp) {
+            var blockTarget = recommendedCidrText !== 'N/A' ? recommendedCidrText : resolvedIp;
+            var softBlock = isSoftBlockAdvised(data);
+            var blockParams = softBlock
+                ? { wpAnonOnly: '1', wpHardBlock: '0', wpDisableUTEdit: '0' }
+                : null;
+            var $quickLinks = $('<div>', { 'class': 'proxycheck-quick-links' }).append(
+                $('<a>', {
+                    'class': 'proxycheck-link-globalcontribs',
+                    href: buildWikiPageUrl('Special:GlobalContributions/' + resolvedIp, null),
+                    target: '_blank',
+                    rel: 'noopener noreferrer',
+                    text: 'GlobalContributions ↗'
+                }),
+                $('<a>', {
+                    'class': 'proxycheck-link-rangeblock',
+                    href: 'https://rangeblockfinder.toolforge.org/?ip=' + encodeURIComponent(resolvedIp),
+                    target: '_blank',
+                    rel: 'noopener noreferrer',
+                    text: 'Rangeblock Finder ↗'
+                }),
+                $('<a>', {
+                    'class': 'proxycheck-link-whois',
+                    href: 'https://whois.toolforge.org/gateway.py?lookup=true&ip=' + encodeURIComponent(resolvedIp),
+                    target: '_blank',
+                    rel: 'noopener noreferrer',
+                    text: 'WHOIS ↗'
+                }),
+                $('<a>', {
+                    'class': 'proxycheck-link-block',
+                    href: buildWikiPageUrl('Special:Block/' + blockTarget, blockParams),
+                    target: '_blank',
+                    rel: 'noopener noreferrer',
+                    text: softBlock ? 'Special:Block (soft) ↗' : 'Special:Block ↗'
+                })
+            );
+            $panel.append($quickLinks);
+        }
 
         $panel._proxycheckDispose = function () {
             panelDisposed = true;
             clearCopyResetTimer();
+            clearWikitextResetTimer();
         };
 
-        $panel.append($table, $actions);
         return $panel;
     }
 
@@ -2921,7 +3774,7 @@
             titleLines.push('Verdict: ' + data.arbitrationVerdict.trim());
         }
         titleLines.push('Recommended CIDR: ' + (data.recommendedCidr || 'N/A'));
-        titleLines.push('BGP CIDR: ' + (data.mmdbCidr || 'N/A'));
+        titleLines.push('BGP CIDR: ' + (data.bgpPrefix || data.mmdbCidr || 'N/A'));
         if (cloudDesc) {
             titleLines.push('Cloud: ' + cloudDesc);
         }
@@ -2951,6 +3804,14 @@
         if (dbBaselines.length > 0) {
             titleLines.push('Offline DB Baseline: ' + dbBaselines.join(', '));
         }
+        var cacheMeta = getCacheMeta(data);
+        var cacheAgeSeconds = getCacheAgeSeconds(data);
+        if (cacheAgeSeconds !== null) {
+            var ageText = formatRelativeCacheAge(cacheAgeSeconds);
+            if (ageText) {
+                titleLines.push(cacheMeta && cacheMeta.isStale ? ageText + ' (stale >90d)' : ageText);
+            }
+        }
         return titleLines.join('\n');
     }
 
@@ -2958,6 +3819,8 @@
         ensureUserscriptStyles();
         var risk = evaluateRisk(data);
         var resolvedIp = (data && data.ip) || fallbackIp;
+        var cacheMeta = getCacheMeta(data);
+        var isStaleCache = Boolean(!risk.isNonPublic && cacheMeta && cacheMeta.isStale === true);
 
         removeElementClass(anchor, 'proxycheck-anchor-risk-high');
         removeElementClass(anchor, 'proxycheck-anchor-risk-medium');
@@ -2997,10 +3860,14 @@
                 stateClass = ' proxycheck-badge-lite';
             }
         }
+        if (isStaleCache) {
+            stateClass += ' proxycheck-badge-stale';
+        }
         badge.className = BADGE_CLASS + ' proxycheck-tier-' + risk.riskTier + stateClass;
 
         applyBaseBadgeStyle(badge);
         badge.style.fontWeight = risk.riskTier === 'low' ? '' : 'bold';
+        badge.style.borderStyle = isStaleCache ? 'dashed' : '';
         badge.title = buildBadgeTitleText(data, risk);
     }
 
@@ -3084,17 +3951,31 @@
     }
 
     function requestFullIpUpgrade(targetIp, forceRefresh) {
-        return fetchIpIntelligence(
-            targetIp,
-            'full',
-            forceRefresh ? { forceRefresh: true } : undefined
-        ).then(function (fullData) {
+        if (forceRefresh) {
+            return executeIpRefresh(targetIp).then(function (outcome) {
+                return outcome && outcome.ok ? outcome.data : null;
+            });
+        }
+        return fetchIpIntelligence(targetIp, 'full').then(function (fullData) {
             if (!fullData || typeof fullData !== 'object') {
                 return null;
             }
             refreshRenderedBadgesForIp(fullData.ip || targetIp, fullData);
             return fullData;
         });
+    }
+
+    function formatRefreshWarningText(outcome) {
+        if (outcome && outcome.rateLimited) {
+            var waitHint = typeof outcome.retryAfterSeconds === 'number' && outcome.retryAfterSeconds > 0
+                ? ' (retry in ' + outcome.retryAfterSeconds + 's)'
+                : '';
+            return 'Refresh rate limit reached' + waitHint + '. Preserving cached intelligence.';
+        }
+        if (outcome && outcome.degradedFallback) {
+            return 'Upstream providers are temporarily degraded or quota-limited. Preserving cached intelligence.';
+        }
+        return 'Refresh temporarily unavailable. Preserving cached intelligence.';
     }
 
     function showInfoDialog(data, ip) {
@@ -3109,11 +3990,43 @@
             var activeData = (cacheKey && latestResultByIp.get(cacheKey)) || data;
             var initialRisk = evaluateRisk(activeData);
             var $message = $('<div>');
+            var $cacheBar = $('<div>', { 'class': 'proxycheck-dialog-cache-bar' });
+            var $cacheAgeSpan = $('<span>', { 'class': 'proxycheck-cache-age' });
+            var $refetchBtn = $('<button>', {
+                type: 'button',
+                'class': 'proxycheck-refetch-btn',
+                text: 'Refetch'
+            });
+            var $warningNotice = $('<div>', {
+                'class': 'proxycheck-refresh-warning',
+                style: 'display: none;'
+            });
             var $panelContainer = $('<div>', { 'class': 'proxycheck-dialog-content' });
-            var $retryContainer = $('<div>');
             var activeDetailsPanel = null;
             var dialogClosed = false;
-            var retryInFlight = false;
+            var refreshInFlight = false;
+
+            $cacheBar.append($cacheAgeSpan, $refetchBtn);
+
+            function syncDialogCacheControls(dialogData, dialogRisk, isJustUpdated) {
+                if (dialogRisk.isNonPublic) {
+                    $cacheBar.css('display', 'none');
+                    $warningNotice.css('display', 'none');
+                    return;
+                }
+                $cacheBar.css('display', 'flex');
+                var meta = getCacheMeta(dialogData);
+                var isStale = Boolean(!isJustUpdated && meta && meta.isStale === true);
+                $cacheAgeSpan.text(formatCacheStatusLabel(dialogData, Boolean(isJustUpdated)));
+                if (isStale) {
+                    $cacheAgeSpan.addClass('proxycheck-cache-age-stale');
+                } else {
+                    $cacheAgeSpan.removeClass('proxycheck-cache-age-stale');
+                }
+                if (!refreshInFlight) {
+                    $refetchBtn.prop('disabled', false).text('Refetch');
+                }
+            }
 
             function renderDialogBody(dialogData, dialogRisk) {
                 disposeDetailsPanel(activeDetailsPanel);
@@ -3131,77 +4044,49 @@
                         )
                     );
                 } else {
-                    activeDetailsPanel = buildResultDetailsPanel(dialogData, dialogRisk);
+                    activeDetailsPanel = buildResultDetailsPanel(dialogData, dialogRisk, targetIp);
                     $panelContainer.append(activeDetailsPanel);
                 }
             }
 
-            function syncDegradedRetrySection(currentData, currentRisk) {
-                $retryContainer.empty();
-                if (
-                    dialogClosed ||
-                    currentRisk.isNonPublic ||
-                    isPartialLightResult(currentData) ||
-                    !hasDegradedQuotaOrCooldown(currentData)
-                ) {
+            function runDialogRefresh(isAutoSwr) {
+                if (refreshInFlight || dialogClosed || accessBlocked || !isValidIp(targetIp)) {
                     return;
                 }
-
-                var $statusLabel = $('<span>').text(
-                    'Some key providers were quota-guarded or in cooldown (cached briefly for 60s). '
-                );
-                var $retryBtn = $('<button>', {
-                    type: 'button',
-                    'class': 'proxycheck-retry-full-btn',
-                    text: 'Retry Full Check'
-                });
-                function restoreAfterRetryFailure(previousData) {
-                    retryInFlight = false;
-                    if (cacheKey && previousData) {
-                        recordLatestIpResult(cacheKey, previousData);
-                    }
-                    if (!dialogClosed) {
-                        $statusLabel.text('Full check retry failed. ');
-                        $retryBtn.prop('disabled', false).text('Retry Full Check');
-                    }
+                if (isAutoSwr && !tryConsumeAutoSwrBudget()) {
+                    return;
                 }
+                refreshInFlight = true;
+                $warningNotice.css('display', 'none').text('');
+                $refetchBtn.prop('disabled', true).text('Updating...');
 
-                $retryBtn.on('click', function (event) {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    if (retryInFlight || dialogClosed || accessBlocked) {
+                executeIpRefresh(targetIp).then(function (outcome) {
+                    refreshInFlight = false;
+                    if (dialogClosed) {
                         return;
                     }
-                    retryInFlight = true;
-                    $retryBtn.prop('disabled', true).text('Retrying full check...');
-                    var previousData = activeData;
-
-                    requestFullIpUpgrade(targetIp, true).then(function (retryData) {
-                        if (!retryData) {
-                            restoreAfterRetryFailure(previousData);
-                            return;
-                        }
-                        retryInFlight = false;
-                        activeData = retryData;
-                        if (dialogClosed) {
-                            return;
-                        }
-                        var retryRisk = evaluateRisk(retryData);
-                        renderDialogBody(retryData, retryRisk);
-                        syncDegradedRetrySection(retryData, retryRisk);
-                    }).catch(function () {
-                        restoreAfterRetryFailure(previousData);
-                    });
+                    if (!outcome || !outcome.ok || !outcome.data) {
+                        $refetchBtn.prop('disabled', false).text('Refetch');
+                        $warningNotice.text(formatRefreshWarningText(outcome)).css('display', 'block');
+                        return;
+                    }
+                    activeData = outcome.data;
+                    var freshRisk = evaluateRisk(activeData);
+                    renderDialogBody(activeData, freshRisk);
+                    syncDialogCacheControls(activeData, freshRisk, true);
+                    $warningNotice.css('display', 'none').text('');
                 });
-
-                $retryContainer.append(
-                    $('<div>', { 'class': 'proxycheck-degraded-retry-notice' }).append($statusLabel, $retryBtn)
-                );
             }
 
+            $refetchBtn.on('click', function (event) {
+                event.preventDefault();
+                event.stopPropagation();
+                runDialogRefresh(false);
+            });
+
             renderDialogBody(activeData, initialRisk);
-            syncDegradedRetrySection(activeData, initialRisk);
-            $message.append($panelContainer, $retryContainer);
+            syncDialogCacheControls(activeData, initialRisk, false);
+            $message.append($cacheBar, $warningNotice, $panelContainer);
             $message.append(
                 $('<p>', { style: 'margin-top: 8px; margin-bottom: 0;' }).append(
                     $('<a>', {
@@ -3235,16 +4120,21 @@
                     }
                     var updatedRisk = evaluateRisk(fullData);
                     renderDialogBody(fullData, updatedRisk);
-                    syncDegradedRetrySection(fullData, updatedRisk);
+                    syncDialogCacheControls(fullData, updatedRisk, false);
                     if ($upgradeNotice) {
                         $upgradeNotice.remove();
                         $upgradeNotice = null;
+                    }
+                    if (shouldAutoRefreshPayload(fullData, cacheKey)) {
+                        runDialogRefresh(true);
                     }
                 }).catch(function () {
                     if (!dialogClosed && $upgradeNotice) {
                         $upgradeNotice.text('Full commercial intelligence unavailable right now.');
                     }
                 });
+            } else if (!initialRisk.isNonPublic && shouldAutoRefreshPayload(activeData, cacheKey)) {
+                runDialogRefresh(true);
             }
 
             return Promise.resolve(
@@ -3333,6 +4223,98 @@
         });
     }
 
+    function matchesSelector(element, selector) {
+        if (!element || element.nodeType !== 1) {
+            return false;
+        }
+        var matcher = element.matches || element.webkitMatchesSelector || element.msMatchesSelector;
+        if (!matcher) {
+            return false;
+        }
+        return matcher.call(element, selector);
+    }
+
+    function closestElement(element, selector) {
+        if (!element || element.nodeType !== 1) {
+            return null;
+        }
+        if (typeof element.closest === 'function') {
+            return element.closest(selector);
+        }
+        var current = element;
+        while (current && current.nodeType === 1) {
+            if (matchesSelector(current, selector)) {
+                return current;
+            }
+            current = current.parentNode;
+        }
+        return null;
+    }
+
+    // Ignore text, comment, and script-owned nodes to prevent self-triggered observer loops
+    function isProxycheckInternalNode(node) {
+        if (!node) {
+            return false;
+        }
+        if (node.nodeType === 8) {
+            return true;
+        }
+        if (node.nodeType === 3) {
+            return !node.parentNode || Boolean(closestElement(node.parentNode, INTERNAL_NODE_SELECTOR));
+        }
+        if (node.nodeType !== 1) {
+            return false;
+        }
+        return Boolean(closestElement(node, INTERNAL_NODE_SELECTOR));
+    }
+
+    // Skip container reveal spans when an inner anchor already carries the IP badge
+    function shouldSkipRevealTarget(element) {
+        if (!element || element.nodeType !== 1) {
+            return true;
+        }
+        if (
+            matchesSelector(element, REVEAL_CONTAINER_SELECTOR) &&
+            !matchesSelector(element, REVEAL_ANCHOR_SELECTOR) &&
+            element.querySelector &&
+            element.querySelector(REVEAL_ANCHOR_SELECTOR)
+        ) {
+            return true;
+        }
+        return false;
+    }
+
+    function extractIpFromRevealElement(element) {
+        if (!element || element.nodeType !== 1 || shouldSkipRevealTarget(element)) {
+            return '';
+        }
+        var rawText = '';
+        if (element.childNodes && element.childNodes.length > 0) {
+            var chunks = [];
+            for (var i = 0; i < element.childNodes.length; i++) {
+                var child = element.childNodes[i];
+                if (child && child.nodeType === 1 && matchesSelector(child, '.' + BADGE_CLASS)) {
+                    continue;
+                }
+                chunks.push(child.textContent || child.nodeValue || '');
+            }
+            rawText = chunks.join('');
+        } else {
+            rawText = element.textContent || '';
+        }
+        var trimmed = rawText.trim();
+        if (isValidIp(trimmed)) {
+            return trimmed;
+        }
+        if (/^\([^()]+\)$/.test(trimmed)) {
+            var unwrapped = trimmed.slice(1, -1).trim();
+            if (isValidIp(unwrapped)) {
+                return unwrapped;
+            }
+        }
+        return '';
+    }
+
     function resumeAfterConsent() {
         if (accessBlocked || consentDeclined || !document.body) {
             return;
@@ -3379,13 +4361,14 @@
             accessBlocked ||
             !anchor ||
             !anchor.dataset ||
+            shouldSkipRevealTarget(anchor) ||
             (anchor.dataset.proxycheckProcessed && anchor.dataset.proxycheckProcessed !== 'observed')
         ) {
             return;
         }
 
-        var ip = (anchor.textContent || '').trim();
-        if (!isValidIp(ip)) {
+        var ip = extractIpFromRevealElement(anchor);
+        if (!ip) {
             return;
         }
 
@@ -3410,15 +4393,15 @@
                 }
                 return;
             }
-            if (!anchor.parentNode) {
-                anchor.dataset.proxycheckProcessed = 'error';
+            if (!anchor.parentNode || shouldSkipRevealTarget(anchor)) {
+                delete anchor.dataset.proxycheckProcessed;
                 return;
             }
             if (anchor.dataset.proxycheckProcessed === 'true') {
                 return;
             }
             var nextEl = anchor.nextElementSibling;
-            if (nextEl && nextEl.classList.contains(BADGE_CLASS)) {
+            if (nextEl && nextEl.classList && nextEl.classList.contains(BADGE_CLASS)) {
                 anchor.dataset.proxycheckProcessed = 'true';
                 return;
             }
@@ -3442,48 +4425,6 @@
             anchor.parentNode.insertBefore(badge, anchor.nextSibling);
             anchor.dataset.proxycheckProcessed = 'true';
         });
-    }
-
-    function matchesSelector(element, selector) {
-        if (!element || element.nodeType !== 1) {
-            return false;
-        }
-        var matcher = element.matches || element.webkitMatchesSelector || element.msMatchesSelector;
-        if (!matcher) {
-            return false;
-        }
-        return matcher.call(element, selector);
-    }
-
-    function closestElement(element, selector) {
-        if (!element || element.nodeType !== 1) {
-            return null;
-        }
-        if (typeof element.closest === 'function') {
-            return element.closest(selector);
-        }
-        var current = element;
-        while (current && current.nodeType === 1) {
-            if (matchesSelector(current, selector)) {
-                return current;
-            }
-            current = current.parentNode;
-        }
-        return null;
-    }
-
-    // Ignore text, comment, and script-owned nodes to prevent self-triggered observer loops
-    function isProxycheckInternalNode(node) {
-        if (!node) {
-            return false;
-        }
-        if (node.nodeType === 3 || node.nodeType === 8) {
-            return true;
-        }
-        if (node.nodeType !== 1) {
-            return false;
-        }
-        return Boolean(closestElement(node, INTERNAL_NODE_SELECTOR));
     }
 
     function isIpInfoPanelMutation(target, addedNode) {
@@ -3527,13 +4468,23 @@
     }
 
     function scheduleAnchor(anchor) {
-        if (accessBlocked || !anchor || !anchor.dataset || anchor.dataset.proxycheckProcessed) {
+        if (
+            accessBlocked ||
+            !anchor ||
+            !anchor.dataset ||
+            anchor.dataset.proxycheckProcessed ||
+            shouldSkipRevealTarget(anchor)
+        ) {
             return;
         }
 
-        var ip = (anchor.textContent || '').trim();
-        if (!isValidIp(ip)) {
+        var ip = extractIpFromRevealElement(anchor);
+        if (!ip) {
             return;
+        }
+
+        if (isIpContributionsPage && !ipContributionsInvalidTarget) {
+            handleIPContributionsPage(true);
         }
 
         var cacheKey = canonicalizeIpKey(ip);
@@ -3604,6 +4555,46 @@
         return typeof targetIp === 'string' ? targetIp.trim() : '';
     }
 
+    function isTemporaryAccountIdentifier(userText) {
+        if (typeof userText !== 'string' || !userText.trim()) {
+            return false;
+        }
+        var trimmed = userText.trim();
+        if (mw && mw.util && typeof mw.util.isTemporaryUser === 'function') {
+            return Boolean(mw.util.isTemporaryUser(trimmed));
+        }
+        return /^~\d{4}-/.test(trimmed);
+    }
+
+    function collectRevealedIpsInDom() {
+        if (typeof document === 'undefined' || !document.body || typeof document.body.querySelectorAll !== 'function') {
+            return [];
+        }
+        var elements = document.body.querySelectorAll(TARGET_SELECTOR);
+        var discovered = [];
+        var seenCanonical = Object.create(null);
+        for (var i = 0; i < elements.length; i++) {
+            var el = elements[i];
+            if (!el || isProxycheckInternalNode(el) || shouldSkipRevealTarget(el)) {
+                continue;
+            }
+            var plainIp = extractIpFromRevealElement(el);
+            if (!plainIp) {
+                continue;
+            }
+            var canonical = canonicalizeIpKey(plainIp);
+            if (!canonical || seenCanonical[canonical]) {
+                continue;
+            }
+            seenCanonical[canonical] = true;
+            discovered.push({
+                canonicalKey: canonical,
+                displayIp: plainIp
+            });
+        }
+        return discovered;
+    }
+
     // Prefer IPInfo panel layout when ready, falling back to standard contributions headers
     function resolveContributionsMountTarget(allowFallback) {
         var $panel = $('.ext-ipinfo-panel-layout');
@@ -3654,6 +4645,9 @@
             return { $element: $node, method: candidate.method };
         }
 
+        if (typeof document !== 'undefined' && document.body) {
+            return { $element: $(document.body), method: 'prepend' };
+        }
         return null;
     }
 
@@ -3709,30 +4703,50 @@
             accessBlocked ||
             consentDeclined ||
             !isIpContributionsPage ||
-            ipContributionsPending ||
-            ipContributionsInvalidTarget ||
-            document.getElementById('proxycheck-pageinfo')
+            ipContributionsInvalidTarget
         ) {
             return;
         }
 
-        var targetIp = extractContributionsTargetIp();
-        if (!isValidIp(targetIp)) {
+        var rawTarget = extractContributionsTargetIp();
+        var isDirectIpTarget = isValidIp(rawTarget);
+        var isTempAccountTarget = !isDirectIpTarget && isTemporaryAccountIdentifier(rawTarget);
+
+        if (!isDirectIpTarget && !isTempAccountTarget) {
             ipContributionsInvalidTarget = true;
             return;
         }
 
-        var initialCachedState = peekCachedIpState(targetIp);
+        var discoveredTempIps = isTempAccountTarget ? collectRevealedIpsInDom() : [];
+        if (isTempAccountTarget && discoveredTempIps.length === 0) {
+            return;
+        }
+
+        var existingBannerEl = document.getElementById('proxycheck-pageinfo');
+        if (existingBannerEl) {
+            if (isTempAccountTarget && activeContributionsController) {
+                activeContributionsController.syncDiscoveredIps(discoveredTempIps);
+            }
+            return;
+        }
+
+        if (ipContributionsPending) {
+            return;
+        }
+
+        var initialTargetIp = isDirectIpTarget ? rawTarget : discoveredTempIps[0].displayIp;
+        var effectiveAllowFallback = Boolean(allowFallback || isTempAccountTarget);
+        var initialCachedState = peekCachedIpState(initialTargetIp);
         if (!initialCachedState && !isDocumentVisible()) {
             scheduleContributionsOnVisible(function () {
-                handleIPContributionsPage(Boolean(allowFallback));
+                handleIPContributionsPage(effectiveAllowFallback);
             });
             return;
         }
 
-        var mountTarget = resolveContributionsMountTarget(Boolean(allowFallback));
+        var mountTarget = resolveContributionsMountTarget(effectiveAllowFallback);
         if (!mountTarget) {
-            if (!allowFallback && ipContributionsFallbackTimer === null) {
+            if (!effectiveAllowFallback && ipContributionsFallbackTimer === null) {
                 ipContributionsFallbackTimer = window.setTimeout(function () {
                     ipContributionsFallbackTimer = null;
                     handleIPContributionsPage(true);
@@ -3742,9 +4756,10 @@
         }
 
         clearContributionsFallbackTimer();
-
         ipContributionsPending = true;
+
         var $box = null;
+        var $switcher = null;
         var $result = null;
 
         function isNodeInDocument(node) {
@@ -3774,7 +4789,7 @@
                 return false;
             }
             if (!isNodeInDocument($box[0])) {
-                var freshTarget = resolveContributionsMountTarget(Boolean(allowFallback)) ||
+                var freshTarget = resolveContributionsMountTarget(effectiveAllowFallback) ||
                     resolveContributionsMountTarget(true);
                 if (!mountBannerElement(freshTarget)) {
                     return false;
@@ -3789,49 +4804,15 @@
                 $box[0].parentNode.removeChild($box[0]);
             }
             $box = null;
+            $switcher = null;
             $result = null;
+            activeContributionsController = null;
         }
 
         function registerResumeWhenVisible() {
             scheduleContributionsOnVisible(function () {
-                handleIPContributionsPage(Boolean(allowFallback));
+                handleIPContributionsPage(effectiveAllowFallback);
             });
-        }
-
-        function renderBannerFailure() {
-            if (!$result || $result.length === 0) {
-                return;
-            }
-            if (accessBlocked) {
-                $result.text('[ProxyCheck] Access denied or disabled');
-                return;
-            }
-            var $retryLink = $('<a>', {
-                href: '#',
-                role: 'button',
-                'class': 'proxycheck-banner-retry',
-                text: 'Retry ↻'
-            });
-            $retryLink.on('click', function (event) {
-                event.preventDefault();
-                event.stopPropagation();
-                if (accessBlocked) {
-                    return;
-                }
-                clearLoadingInterval();
-                clearContributionsSchedule();
-                invalidateIpResultCache(targetIp);
-                var existingBanner = document.getElementById('proxycheck-pageinfo');
-                if (existingBanner && existingBanner.parentNode) {
-                    existingBanner.parentNode.removeChild(existingBanner);
-                }
-                ipContributionsPending = false;
-                handleIPContributionsPage(Boolean(allowFallback));
-            });
-            $result.empty().append(
-                document.createTextNode('[ProxyCheck] Failed to acquire data '),
-                $retryLink
-            );
         }
 
         ensureConsent().then(function (agreed) {
@@ -3840,14 +4821,23 @@
                 return null;
             }
 
-            var cachedState = peekCachedIpState(targetIp);
+            if (isTempAccountTarget) {
+                discoveredTempIps = collectRevealedIpsInDom();
+                if (discoveredTempIps.length === 0) {
+                    ipContributionsPending = false;
+                    return null;
+                }
+                initialTargetIp = discoveredTempIps[0].displayIp;
+            }
+
+            var cachedState = peekCachedIpState(initialTargetIp);
             if (!cachedState && !isDocumentVisible()) {
                 ipContributionsPending = false;
                 registerResumeWhenVisible();
                 return null;
             }
 
-            var activeTarget = resolveContributionsMountTarget(Boolean(allowFallback)) || mountTarget;
+            var activeTarget = resolveContributionsMountTarget(effectiveAllowFallback) || mountTarget;
             if (
                 !activeTarget ||
                 !activeTarget.$element ||
@@ -3865,22 +4855,112 @@
                 id: 'proxycheck-pageinfo',
                 'class': 'proxycheck-pageinfo-banner'
             });
+            $switcher = $('<div>', {
+                'class': 'proxycheck-temp-ip-switcher',
+                style: 'display: none;'
+            });
             $result = $('<span>', {
                 id: 'proxycheck_result',
                 text: '.'
             });
-            $box.append($result);
+            $box.append($switcher, $result);
             mountBannerElement(activeTarget);
 
+            var currentTargetIp = initialTargetIp;
+            var currentCanonicalKey = canonicalizeIpKey(currentTargetIp);
+            var userPinnedKey = null;
+            var currentDiscoveredList = discoveredTempIps.slice();
+            var currentDiscoveredSignature = '';
             var isStatsExpanded = false;
-            var fullUpgradeRequested = false;
+            var fullUpgradeRequestedForKey = Object.create(null);
             var activeBannerDetailsPanel = null;
+            var bannerLoadSeq = 0;
+            var bannerRefreshInFlight = false;
 
-            function renderContributionsBannerData(bannerData) {
+            function computeDiscoveredSignature(list) {
+                var keys = [];
+                for (var i = 0; i < list.length; i++) {
+                    keys.push(list[i].canonicalKey);
+                }
+                return keys.join('|');
+            }
+
+            function renderMultiIpSwitcher() {
+                if (!$switcher) {
+                    return;
+                }
+                $switcher.empty();
+                if (!isTempAccountTarget || currentDiscoveredList.length <= 1) {
+                    $switcher.css('display', 'none');
+                    return;
+                }
+                $switcher.css('display', 'flex');
+                $switcher.append(
+                    $('<span>', {
+                        'class': 'proxycheck-temp-ip-subtitle',
+                        text: currentDiscoveredList.length + ' distinct revealed IPs on this page:'
+                    })
+                );
+                for (var i = 0; i < currentDiscoveredList.length; i++) {
+                    (function (entry) {
+                        var isSelected = entry.canonicalKey === currentCanonicalKey;
+                        var $pill = $('<button>', {
+                            type: 'button',
+                            'class': 'proxycheck-ip-pill' + (isSelected ? ' proxycheck-ip-pill-active' : ''),
+                            'aria-pressed': isSelected ? 'true' : 'false',
+                            text: entry.displayIp
+                        });
+                        $pill.on('click', function (event) {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            if (accessBlocked || entry.canonicalKey === currentCanonicalKey) {
+                                return;
+                            }
+                            userPinnedKey = entry.canonicalKey;
+                            switchInspectedBannerIp(entry.displayIp, true);
+                        });
+                        $switcher.append($pill);
+                    })(currentDiscoveredList[i]);
+                }
+            }
+
+            function renderBannerFailure(failedIp) {
+                if (!$result || $result.length === 0) {
+                    return;
+                }
+                if (accessBlocked) {
+                    $result.text('[ProxyCheck] Access denied or disabled');
+                    return;
+                }
+                var $retryLink = $('<a>', {
+                    href: '#',
+                    role: 'button',
+                    'class': 'proxycheck-banner-retry',
+                    text: 'Retry ↻'
+                });
+                $retryLink.on('click', function (event) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (accessBlocked) {
+                        return;
+                    }
+                    clearLoadingInterval();
+                    clearContributionsSchedule();
+                    invalidateIpResultCache(failedIp);
+                    switchInspectedBannerIp(failedIp, true);
+                });
+                $result.empty().append(
+                    document.createTextNode('[ProxyCheck] Failed to acquire data '),
+                    $retryLink
+                );
+            }
+
+            function renderContributionsBannerData(bannerData, isJustUpdated) {
                 disposeDetailsPanel(activeBannerDetailsPanel);
                 activeBannerDetailsPanel = null;
                 var risk = evaluateRisk(bannerData);
-                var resolvedIp = bannerData.ip || targetIp;
+                var resolvedIp = bannerData.ip || currentTargetIp;
+                var resolvedKey = canonicalizeIpKey(resolvedIp) || currentCanonicalKey;
                 var $activeBox = ($box && $box.length > 0) ? $box : $('#proxycheck-pageinfo');
                 if ($activeBox && $activeBox.length > 0 && $activeBox[0]) {
                     var bannerTiers = ['high', 'medium', 'nonpublic', 'low'];
@@ -3890,6 +4970,7 @@
                     addElementClass($activeBox[0], 'proxycheck-banner-tier-' + risk.riskTier);
                 }
 
+                renderMultiIpSwitcher();
                 var badgeClass = 'proxycheck-banner-badge proxycheck-tier-' + risk.riskTier;
 
                 if (risk.isNonPublic) {
@@ -3917,6 +4998,8 @@
 
                 var torBannerDesc = formatTorDescription(risk);
                 var cloudBannerDesc = formatCloudDescription(bannerData);
+                var sharedEgressBanner = getSharedPrivacyEgressLabel(bannerData);
+                var mobileBannerFlag = isMobileOrCgnatPayload(bannerData);
                 var verdictBannerText = typeof bannerData.arbitrationVerdict === 'string' && bannerData.arbitrationVerdict.trim()
                     ? bannerData.arbitrationVerdict.trim()
                     : '';
@@ -3938,12 +5021,15 @@
                     );
                 }
 
+                if (isTempAccountTarget) {
+                    appendSummaryItem('IP', $('<code>').text(resolvedIp));
+                }
                 appendSummaryItem('Prediction', document.createTextNode(risk.predictionTooltip));
                 if (verdictBannerText) {
                     appendSummaryItem('Verdict', document.createTextNode(verdictBannerText));
                 }
                 appendSummaryItem('Recommended CIDR', document.createTextNode(bannerData.recommendedCidr || 'N/A'));
-                appendSummaryItem('BGP CIDR', document.createTextNode(bannerData.mmdbCidr || 'N/A'));
+                appendSummaryItem('BGP CIDR', document.createTextNode(bannerData.bgpPrefix || bannerData.mmdbCidr || 'N/A'));
 
                 if (ptrHostname || ptrLabel) {
                     var $ptrValue = $('<span>');
@@ -3967,6 +5053,24 @@
                 if (cloudBannerDesc) {
                     appendSummaryItem('Cloud', document.createTextNode(cloudBannerDesc));
                 }
+                if (sharedEgressBanner) {
+                    appendSummaryItem(
+                        'Shared Egress',
+                        $('<strong>', {
+                            'class': 'proxycheck-banner-warning-text',
+                            text: sharedEgressBanner + ' (soft block recommended)'
+                        })
+                    );
+                }
+                if (mobileBannerFlag) {
+                    appendSummaryItem(
+                        'Network',
+                        $('<strong>', {
+                            'class': 'proxycheck-banner-warning-text',
+                            text: 'Mobile / CGNAT (/32 IPv4, /64 IPv6 lock)'
+                        })
+                    );
+                }
 
                 appendSummaryItem(
                     'Broadcast IP',
@@ -3982,7 +5086,7 @@
                 );
 
                 var renderedSpurText = getSpurProxyText();
-                activeBannerDetailsPanel = buildResultDetailsPanel(bannerData, risk);
+                activeBannerDetailsPanel = buildResultDetailsPanel(bannerData, risk, resolvedIp);
                 var $detailsWrapper = $('<div>', {
                     'class': 'proxycheck-pageinfo-details',
                     style: isStatsExpanded ? 'display: block;' : 'display: none;'
@@ -3995,7 +5099,7 @@
                     }
                     renderedSpurText = latestSpurText;
                     disposeDetailsPanel(activeBannerDetailsPanel);
-                    activeBannerDetailsPanel = buildResultDetailsPanel(bannerData, risk);
+                    activeBannerDetailsPanel = buildResultDetailsPanel(bannerData, risk, resolvedIp);
                     $detailsWrapper.empty().append(activeBannerDetailsPanel);
                 };
 
@@ -4015,8 +5119,8 @@
                     $statsToggle.attr('aria-expanded', isStatsExpanded ? 'true' : 'false');
                     $statsToggle.text(isStatsExpanded ? 'Statistic ▾' : 'Statistic ▸');
 
-                    if (isStatsExpanded && isPartialLightResult(bannerData) && !fullUpgradeRequested) {
-                        fullUpgradeRequested = true;
+                    if (isStatsExpanded && isPartialLightResult(bannerData) && !fullUpgradeRequestedForKey[resolvedKey]) {
+                        fullUpgradeRequestedForKey[resolvedKey] = true;
                         clearContributionsSchedule();
                         var $bannerUpgradeNotice = $('<p>', {
                             'class': 'proxycheck-light-upgrade-notice',
@@ -4029,11 +5133,63 @@
                                 $bannerUpgradeNotice.text('Full commercial intelligence unavailable right now.');
                                 return;
                             }
-                            if (ensureBannerAttached()) {
-                                renderContributionsBannerData(fullData);
+                            if (ensureBannerAttached() && currentCanonicalKey === resolvedKey) {
+                                renderContributionsBannerData(fullData, false);
                             }
                         });
                     }
+                });
+
+                var $bannerWarning = $('<div>', {
+                    'class': 'proxycheck-refresh-warning',
+                    style: 'display: none;'
+                });
+
+                var bannerMeta = getCacheMeta(bannerData);
+                var bannerIsStale = Boolean(!isJustUpdated && bannerMeta && bannerMeta.isStale === true);
+                var $bannerAgeSpan = $('<span>', {
+                    'class': 'proxycheck-cache-age' + (bannerIsStale ? ' proxycheck-cache-age-stale' : ''),
+                    text: formatCacheStatusLabel(bannerData, Boolean(isJustUpdated))
+                });
+                var $bannerRefetchBtn = $('<button>', {
+                    type: 'button',
+                    'class': 'proxycheck-refetch-btn',
+                    text: 'Refetch'
+                });
+                var $bannerCacheControls = $('<span>', { 'class': 'proxycheck-cache-controls' }).append(
+                    $bannerAgeSpan,
+                    $bannerRefetchBtn
+                );
+
+                function runBannerRefresh(isAutoSwr) {
+                    if (bannerRefreshInFlight || accessBlocked || !isValidIp(resolvedIp)) {
+                        return;
+                    }
+                    if (isAutoSwr && !tryConsumeAutoSwrBudget()) {
+                        return;
+                    }
+                    bannerRefreshInFlight = true;
+                    $bannerWarning.css('display', 'none').text('');
+                    $bannerRefetchBtn.prop('disabled', true).text('Updating...');
+
+                    executeIpRefresh(resolvedIp).then(function (outcome) {
+                        bannerRefreshInFlight = false;
+                        if (!ensureBannerAttached() || currentCanonicalKey !== resolvedKey) {
+                            return;
+                        }
+                        if (!outcome || !outcome.ok || !outcome.data) {
+                            $bannerRefetchBtn.prop('disabled', false).text('Refetch');
+                            $bannerWarning.text(formatRefreshWarningText(outcome)).css('display', 'block');
+                            return;
+                        }
+                        renderContributionsBannerData(outcome.data, true);
+                    });
+                }
+
+                $bannerRefetchBtn.on('click', function (event) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    runBannerRefresh(false);
                 });
 
                 $summary.append(
@@ -4045,61 +5201,40 @@
                         text: 'Full Report ↗'
                     }),
                     document.createTextNode(' \u00b7 '),
-                    $statsToggle
+                    $statsToggle,
+                    document.createTextNode(' \u00b7 '),
+                    $bannerCacheControls
                 );
 
-                if (!isPartialLightResult(bannerData) && hasDegradedQuotaOrCooldown(bannerData)) {
-                    var $bannerRetryFull = $('<a>', {
-                        href: '#',
-                        role: 'button',
-                        'class': 'proxycheck-banner-retry-full',
-                        text: 'Retry Full Check ↻'
-                    });
-                    $bannerRetryFull.on('click', function (event) {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        if (accessBlocked) {
-                            return;
-                        }
-                        $bannerRetryFull.text('Retrying...');
-                        requestFullIpUpgrade(resolvedIp, true).then(function (retryData) {
-                            if (!retryData) {
-                                $bannerRetryFull.text('Retry Full Check ↻');
-                                return;
-                            }
-                            if (ensureBannerAttached()) {
-                                renderContributionsBannerData(retryData);
-                            }
-                        });
-                    });
-                    $summary.append(document.createTextNode(' \u00b7 '), $bannerRetryFull);
-                }
+                $result.empty().append($summary, $bannerWarning, $detailsWrapper);
 
-                $result.empty().append($summary, $detailsWrapper);
+                if (!isPartialLightResult(bannerData) && shouldAutoRefreshPayload(bannerData, resolvedKey)) {
+                    runBannerRefresh(true);
+                }
             }
 
-            function scheduleFullUpgradeAfterDelay() {
+            function scheduleFullUpgradeAfterDelay(ipForUpgrade, keyForUpgrade) {
                 clearContributionsSchedule();
-                if (fullUpgradeRequested || accessBlocked) {
+                if (fullUpgradeRequestedForKey[keyForUpgrade] || accessBlocked) {
                     return;
                 }
                 function armTimer() {
-                    if (ipContributionsDelayTimer !== null || fullUpgradeRequested || accessBlocked) {
+                    if (ipContributionsDelayTimer !== null || fullUpgradeRequestedForKey[keyForUpgrade] || accessBlocked) {
                         return;
                     }
                     ipContributionsDelayTimer = window.setTimeout(function () {
                         ipContributionsDelayTimer = null;
-                        if (accessBlocked || fullUpgradeRequested) {
+                        if (accessBlocked || fullUpgradeRequestedForKey[keyForUpgrade]) {
                             return;
                         }
                         if (!isDocumentVisible()) {
                             scheduleContributionsOnVisible(armTimer);
                             return;
                         }
-                        fullUpgradeRequested = true;
-                        requestFullIpUpgrade(targetIp, false).then(function (fullData) {
-                            if (fullData && ensureBannerAttached()) {
-                                renderContributionsBannerData(fullData);
+                        fullUpgradeRequestedForKey[keyForUpgrade] = true;
+                        requestFullIpUpgrade(ipForUpgrade, false).then(function (fullData) {
+                            if (fullData && ensureBannerAttached() && currentCanonicalKey === keyForUpgrade) {
+                                renderContributionsBannerData(fullData, false);
                             }
                         }).catch(function (err) {
                             console.warn('[proxycheck] Contributions upgrade failed:', err);
@@ -4113,81 +5248,139 @@
                 }
             }
 
-            if (cachedState && cachedState.isFull) {
-                return fetchIpIntelligence(targetIp, 'full').then(function (data) {
-                    clearLoadingInterval();
-                    ipContributionsPending = false;
-                    if (!ensureBannerAttached()) {
-                        return;
+            function switchInspectedBannerIp(nextIp, immediateFetch) {
+                if (!isValidIp(nextIp)) {
+                    return Promise.resolve(null);
+                }
+                clearLoadingInterval();
+                clearContributionsSchedule();
+                bannerRefreshInFlight = false;
+                currentTargetIp = nextIp;
+                currentCanonicalKey = canonicalizeIpKey(nextIp);
+                bannerLoadSeq += 1;
+                var activeSeq = bannerLoadSeq;
+
+                renderMultiIpSwitcher();
+
+                var cachedNow = peekCachedIpState(nextIp);
+                if (cachedNow && cachedNow.isFull) {
+                    return fetchIpIntelligence(nextIp, 'full').then(function (data) {
+                        if (activeSeq !== bannerLoadSeq || !ensureBannerAttached()) {
+                            return null;
+                        }
+                        if (!data) {
+                            renderBannerFailure(nextIp);
+                            return null;
+                        }
+                        renderContributionsBannerData(data, false);
+                        return data;
+                    });
+                }
+
+                if (cachedNow && cachedNow.data) {
+                    if (ensureBannerAttached()) {
+                        renderContributionsBannerData(cachedNow.data, false);
+                        if (isPartialLightResult(cachedNow.data)) {
+                            if (immediateFetch) {
+                                fullUpgradeRequestedForKey[currentCanonicalKey] = true;
+                                requestFullIpUpgrade(nextIp, false).then(function (fullData) {
+                                    if (fullData && activeSeq === bannerLoadSeq && ensureBannerAttached()) {
+                                        renderContributionsBannerData(fullData, false);
+                                    }
+                                });
+                            } else {
+                                scheduleFullUpgradeAfterDelay(nextIp, currentCanonicalKey);
+                            }
+                        }
                     }
-                    if (!data) {
-                        renderBannerFailure();
-                        return;
-                    }
-                    renderContributionsBannerData(data);
+                    return Promise.resolve(cachedNow.data);
+                }
+
+                var loadingFrames = ['.\u00a0\u00a0', '\u00a0.\u00a0', '\u00a0\u00a0.'];
+                var loadingFrameIndex = 0;
+                $result.text(loadingFrames[0]);
+                activeLoadingInterval = window.setInterval(function () {
+                    $result.text(loadingFrames[loadingFrameIndex]);
+                    loadingFrameIndex = (loadingFrameIndex + 1) % loadingFrames.length;
+                }, 300);
+
+                function runFullFetch() {
+                    return fetchIpIntelligence(nextIp, 'full').then(function (data) {
+                        if (activeSeq !== bannerLoadSeq) {
+                            return null;
+                        }
+                        clearLoadingInterval();
+                        if (!ensureBannerAttached()) {
+                            return null;
+                        }
+                        if (!data) {
+                            renderBannerFailure(nextIp);
+                            return null;
+                        }
+                        renderContributionsBannerData(data, false);
+                        return data;
+                    }).catch(function (err) {
+                        if (activeSeq !== bannerLoadSeq) {
+                            return null;
+                        }
+                        clearLoadingInterval();
+                        console.warn('[proxycheck] Failed to acquire contributions banner data:', err);
+                        if (ensureBannerAttached()) {
+                            renderBannerFailure(nextIp);
+                        }
+                        return null;
+                    });
+                }
+
+                if (immediateFetch) {
+                    return runFullFetch();
+                }
+
+                return new Promise(function (resolve) {
+                    ipContributionsDelayTimer = window.setTimeout(function () {
+                        ipContributionsDelayTimer = null;
+                        if (activeSeq !== bannerLoadSeq) {
+                            resolve(null);
+                            return;
+                        }
+                        if (accessBlocked) {
+                            clearLoadingInterval();
+                            resolve(null);
+                            return;
+                        }
+                        if (!isDocumentVisible()) {
+                            removeUnpopulatedBanner();
+                            registerResumeWhenVisible();
+                            resolve(null);
+                            return;
+                        }
+                        runFullFetch().then(resolve);
+                    }, CONTRIB_FULL_TRIGGER_DELAY_MS);
                 });
             }
 
-            if (cachedState && cachedState.data) {
-                ipContributionsPending = false;
-                if (ensureBannerAttached()) {
-                    renderContributionsBannerData(cachedState.data);
-                    if (isPartialLightResult(cachedState.data)) {
-                        scheduleFullUpgradeAfterDelay();
+            currentDiscoveredSignature = computeDiscoveredSignature(currentDiscoveredList);
+            activeContributionsController = {
+                syncDiscoveredIps: function (nextList) {
+                    if (!Array.isArray(nextList) || nextList.length === 0) {
+                        return;
                     }
+                    var nextSig = computeDiscoveredSignature(nextList);
+                    if (nextSig === currentDiscoveredSignature) {
+                        return;
+                    }
+                    currentDiscoveredSignature = nextSig;
+                    currentDiscoveredList = nextList.slice();
+                    if (!userPinnedKey && currentDiscoveredList[0].canonicalKey !== currentCanonicalKey) {
+                        switchInspectedBannerIp(currentDiscoveredList[0].displayIp, true);
+                        return;
+                    }
+                    renderMultiIpSwitcher();
                 }
-                return null;
-            }
+            };
 
-            var loadingFrames = ['.\u00a0\u00a0', '\u00a0.\u00a0', '\u00a0\u00a0.'];
-            var loadingFrameIndex = 0;
-            clearLoadingInterval();
-            activeLoadingInterval = window.setInterval(function () {
-                $result.text(loadingFrames[loadingFrameIndex]);
-                loadingFrameIndex = (loadingFrameIndex + 1) % loadingFrames.length;
-            }, 300);
-
-            return new Promise(function (resolve) {
-                ipContributionsDelayTimer = window.setTimeout(function () {
-                    ipContributionsDelayTimer = null;
-                    if (accessBlocked) {
-                        clearLoadingInterval();
-                        ipContributionsPending = false;
-                        resolve(null);
-                        return;
-                    }
-                    if (!isDocumentVisible()) {
-                        removeUnpopulatedBanner();
-                        ipContributionsPending = false;
-                        registerResumeWhenVisible();
-                        resolve(null);
-                        return;
-                    }
-                    fetchIpIntelligence(targetIp, 'full').then(function (data) {
-                        clearLoadingInterval();
-                        ipContributionsPending = false;
-                        if (!ensureBannerAttached()) {
-                            resolve(null);
-                            return;
-                        }
-                        if (!data) {
-                            renderBannerFailure();
-                            resolve(null);
-                            return;
-                        }
-                        renderContributionsBannerData(data);
-                        resolve(data);
-                    }).catch(function (err) {
-                        clearLoadingInterval();
-                        ipContributionsPending = false;
-                        console.warn('[proxycheck] Failed to acquire contributions banner data:', err);
-                        if (ensureBannerAttached()) {
-                            renderBannerFailure();
-                        }
-                        resolve(null);
-                    });
-                }, CONTRIB_FULL_TRIGGER_DELAY_MS);
-            });
+            ipContributionsPending = false;
+            return switchInspectedBannerIp(initialTargetIp, Boolean(isTempAccountTarget));
         }).catch(function (err) {
             clearLoadingInterval();
             ipContributionsPending = false;
@@ -4235,19 +5428,29 @@
                 if (!mutation.target || isProxycheckInternalNode(mutation.target)) {
                     continue;
                 }
-                if (matchesSelector(mutation.target, TARGET_SELECTOR)) {
-                    scheduleAnchor(mutation.target);
+                var targetElement = mutation.target.nodeType === 3 ? mutation.target.parentNode : mutation.target;
+                if (!targetElement || targetElement.nodeType !== 1 || isProxycheckInternalNode(targetElement)) {
+                    continue;
                 }
-                for (var j = 0; j < mutation.addedNodes.length; j++) {
-                    var addedNode = mutation.addedNodes[j];
-                    if (!addedNode || addedNode.nodeType !== 1 || isProxycheckInternalNode(addedNode)) {
-                        continue;
-                    }
+                var matchedReveal = matchesSelector(targetElement, TARGET_SELECTOR)
+                    ? targetElement
+                    : closestElement(targetElement, TARGET_SELECTOR);
+                if (matchedReveal) {
                     hasExternalElementMutation = true;
-                    if (!hasIpInfoMutation && isIpInfoPanelMutation(mutation.target, addedNode)) {
-                        hasIpInfoMutation = true;
+                    scheduleAnchor(matchedReveal);
+                }
+                if (mutation.addedNodes) {
+                    for (var j = 0; j < mutation.addedNodes.length; j++) {
+                        var addedNode = mutation.addedNodes[j];
+                        if (!addedNode || addedNode.nodeType !== 1 || isProxycheckInternalNode(addedNode)) {
+                            continue;
+                        }
+                        hasExternalElementMutation = true;
+                        if (!hasIpInfoMutation && isIpInfoPanelMutation(targetElement, addedNode)) {
+                            hasIpInfoMutation = true;
+                        }
+                        scanSubtree(addedNode);
                     }
-                    scanSubtree(addedNode);
                 }
             }
 
@@ -4258,7 +5461,8 @@
 
         observer.observe(document.body, {
             childList: true,
-            subtree: true
+            subtree: true,
+            characterData: true
         });
     });
 })(mediaWiki, jQuery);

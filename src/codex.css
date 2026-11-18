@@ -539,11 +539,65 @@ body {
   width: 100%;
 }
 
+.overview-header-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  width: 100%;
+}
+
 .overview-card-title {
   margin: 0;
   font-size: 16px;
   font-weight: 700;
   color: var(--cdx-color-base);
+}
+
+.overview-cache-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.cache-age-badge {
+  font-size: 12px;
+  padding: 3px 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.cache-age-badge--stale {
+  border-style: dashed;
+}
+
+.overview-refetch-btn {
+  min-height: 28px;
+  padding: 4px 12px;
+  font-size: 12px;
+}
+
+.overview-warning-banner,
+.overview-recheck-banner {
+  margin-bottom: 14px;
+  font-size: 13px;
+}
+
+.inline-refetch-trigger {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--cdx-color-primary);
+  font: inherit;
+  font-weight: 700;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.inline-refetch-trigger:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .overview-body {
@@ -774,6 +828,106 @@ body {
   white-space: nowrap;
 }
 
+.arbitration-cell-content {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.privacy-egress-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  background-color: var(--cdx-bg-info-pill);
+  border: 1px solid var(--cdx-border-info-pill);
+  border-radius: 9999px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--cdx-color-primary);
+  white-space: nowrap;
+}
+
+.privacy-egress-guidance {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--cdx-color-subtle);
+}
+
+.cidr-cell-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.escalation-cidr-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--cdx-color-subtle);
+}
+
+.cgnat-collateral-warning {
+  padding: 8px 12px;
+  background-color: var(--cdx-color-warning-bg);
+  border-left: 3px solid var(--cdx-color-warning);
+  border-top: 1px solid var(--cdx-color-warning-border);
+  border-right: 1px solid var(--cdx-color-warning-border);
+  border-bottom: 1px solid var(--cdx-color-warning-border);
+  border-radius: 2px;
+  color: var(--cdx-color-warning);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.cidr-rationale-note {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--cdx-color-muted);
+}
+
+.cidr-quick-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.quick-verify-link {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  background-color: var(--cdx-bg-pill);
+  border: 1px solid var(--cdx-color-border);
+  border-radius: 9999px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--cdx-color-base);
+  text-decoration: none;
+  white-space: nowrap;
+  transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.quick-verify-link:hover {
+  background-color: var(--cdx-bg-pill-hover);
+  border-color: var(--cdx-color-primary);
+  color: var(--cdx-color-primary);
+}
+
+.quick-verify-link--block {
+  background-color: var(--cdx-bg-info-pill);
+  border-color: var(--cdx-border-info-pill);
+  color: var(--cdx-color-primary);
+}
+
+.copy-wikitext-btn {
+  min-height: 26px;
+  padding: 3px 10px;
+  font-size: 12px;
+}
+
 /* Ground truth comparison table */
 .results-section {
   background: var(--cdx-bg-surface);
@@ -940,12 +1094,13 @@ body {
 
 .footer-left {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
 }
 
-.diagnostic-text {
+.diagnostic-text,
+.footer-attribution-text {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
   font-size: 11px;
   color: var(--cdx-color-diagnostic);
@@ -1071,6 +1226,14 @@ body {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
   font-size: 12px;
   line-height: 1.6;
+}
+
+.about-note-content h2 {
+  margin: 18px 0 8px;
+  font-family: var(--cdx-font-family);
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--cdx-color-emphasized);
 }
 
 .about-note-content p {
@@ -1316,6 +1479,11 @@ body {
 .offline-db-mtime {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+
+.dashboard-cache-section {
+  display: flex;
+  flex-direction: column;
 }
 
 .dashboard-offline-section {

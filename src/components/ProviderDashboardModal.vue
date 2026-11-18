@@ -88,6 +88,55 @@
         </div>
       </div>
 
+      <div v-if="snapshot" class="dashboard-cache-section">
+        <h3 class="dashboard-subsection-title">Dual-Layer Cache &amp; SWR Telemetry</h3>
+        <div class="dashboard-kpi-grid">
+          <div class="dashboard-kpi-card">
+            <span class="kpi-label">Dual-Layer Cache Hit Rate</span>
+            <strong class="kpi-value">{{ cacheTelemetry.dualLayerHitRatePercent.toFixed(1) }}%</strong>
+            <span class="kpi-subtext">
+              L1 Hit: {{ formatCount(cacheTelemetry.l1Hit) }} &middot;
+              Upstream Miss: {{ formatCount(cacheTelemetry.upstreamMiss) }}
+            </span>
+          </div>
+
+          <div class="dashboard-kpi-card">
+            <span class="kpi-label">ToolsDB L2 Hits (Fresh vs Stale)</span>
+            <strong class="kpi-value">
+              {{ formatCount(cacheTelemetry.l2HitFresh + cacheTelemetry.l2HitStaleSwr) }}
+            </strong>
+            <span class="kpi-subtext">
+              Fresh (&le;90d): {{ formatCount(cacheTelemetry.l2HitFresh) }} &middot;
+              Stale SWR (&gt;90d): {{ formatCount(cacheTelemetry.l2HitStaleSwr) }}
+            </span>
+          </div>
+
+          <div class="dashboard-kpi-card">
+            <span class="kpi-label">ToolsDB L2 Estimated Rows</span>
+            <strong class="kpi-value">
+              {{ cacheTelemetry.l2EstimatedRows !== null ? formatCount(cacheTelemetry.l2EstimatedRows) : 'Unavailable' }}
+            </strong>
+            <span class="kpi-subtext">
+              Persistent MariaDB IP intelligence records
+            </span>
+          </div>
+
+          <div class="dashboard-kpi-card">
+            <span class="kpi-label">SWR &amp; Manual Refreshes</span>
+            <strong
+              class="kpi-value"
+              :class="{ 'kpi-value--warning': cacheTelemetry.refreshRateLimited > 0 }"
+            >
+              {{ formatCount(cacheTelemetry.refreshOk) }}
+            </strong>
+            <span class="kpi-subtext">
+              OK: {{ formatCount(cacheTelemetry.refreshOk) }} &middot;
+              429 Rate-Limited: {{ formatCount(cacheTelemetry.refreshRateLimited) }}
+            </span>
+          </div>
+        </div>
+      </div>
+
       <div v-if="snapshot" class="dashboard-table-wrapper">
         <table class="dashboard-table">
           <thead>
@@ -244,6 +293,7 @@ import {
   formatOfflineDbTimestamp,
   formatUpstreamQuotaLabel,
   getQuotaProgressTone,
+  resolveDashboardCacheTelemetry,
   type OfflineDatabaseEntry,
   type ProviderDashboardResponse,
   type ProviderDashboardRow,
@@ -266,6 +316,7 @@ const dialogOpen = computed({
 const isLoading = ref(false);
 const errorMessage = ref('');
 const snapshot = ref<ProviderDashboardResponse | null>(null);
+const cacheTelemetry = computed(() => resolveDashboardCacheTelemetry(snapshot.value));
 let activeController: AbortController | null = null;
 
 function formatCount(value: number | null | undefined): string {

@@ -898,6 +898,7 @@ def compute_cidr_attribution(
     provider_rows: Optional[Iterable[Mapping[str, Any]]] = None,
     is_mobile_or_cgnat: Optional[bool] = None,
     is_hosting: Optional[bool] = None,
+    highly_suspected_residential_proxy: bool = False,
 ) -> Dict[str, Any]:
     """
     Computes the recommended block CIDR and optional IPv6 escalation CIDR for an IP address.
@@ -1000,6 +1001,13 @@ def compute_cidr_attribution(
 
     if shared_privacy_egress is not None:
         cidr_rationale = f"{cidr_rationale}; shared privacy egress ({shared_privacy_egress}) favours soft blocking"
+
+    if highly_suspected_residential_proxy:
+        locked_prefix = 32 if addr.version == 4 else 128
+        recommended_cidr = _format_clamped_cidr(addr, locked_prefix)
+        escalation_cidr = None
+        cidr_note = "Highly suspected residential proxy: use the single IP only and proceed with discretion on CIDR."
+        cidr_rationale = cidr_note
 
     return {
         "recommendedCidr": recommended_cidr,

@@ -882,6 +882,16 @@ body {
   line-height: 1.45;
 }
 
+.residential-proxy-cidr-warning {
+  padding: 8px 12px;
+  background-color: var(--cdx-color-destructive--subtle, #fee7e6);
+  border-left: 3px solid var(--cdx-color-destructive);
+  border-radius: 2px;
+  color: var(--cdx-color-destructive);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .cidr-rationale-note {
   font-size: 12px;
   line-height: 1.4;

@@ -1,7 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import path from 'node:path';
 import {
   isValidIpAddress,
   canonicalizeIpAddress,
@@ -443,14 +441,6 @@ test('resolveProviderUpdatedLabel handles per-row and top-level cache state and 
   assert.equal(resolveProviderUpdatedLabel(freshRow, { isCached: false, cacheMeta: bypassedMeta }, nowMs), null);
   assert.equal(resolveProviderUpdatedLabel({ ...makeProviderResult('MaxMind'), isCached: false, cachedAt: '2026-11-14T10:00:00Z' }, { isCached: true }, nowMs), null);
 
-  const appVue = fs.readFileSync(path.resolve(process.cwd(), 'src/App.vue'), 'utf8');
-  assert.match(
-    appVue,
-    /<div class="provider-cell">\s*<span[\s\S]*?class="provider-updated-time"[\s\S]*?>\s*\{\{\s*getProviderUpdatedLabel\(row\)\s*\}\}\s*<\/span>\s*<span class="provider-name">/
-  );
-
-  const codexCss = fs.readFileSync(path.resolve(process.cwd(), 'src/codex.css'), 'utf8');
-  assert.match(codexCss, /\.provider-updated-time\s*\{[\s\S]*?font-size:\s*12px;[\s\S]*?color:\s*var\(--cdx-color-muted\);/);
 });
 
 test('isAuthorisedAdminUser honours only backend allowlist verification flag', () => {

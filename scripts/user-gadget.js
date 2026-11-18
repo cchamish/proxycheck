@@ -1780,11 +1780,11 @@
         }
 
         const sections = [
-            { label: 'Prediction', entries: collectPredictionEntries(data, risk), isRisk: false, emptyText: 'Unavailable', copyWithSource: true },
-            { label: 'ASN', entries: collectAsnEntries(rows), isRisk: false, emptyText: '-', copyWithSource: false },
-            { label: 'ISP', entries: collectIspEntries(rows), isRisk: false, emptyText: '-', copyWithSource: true },
-            { label: 'Location', entries: collectLocationEntries(rows), isRisk: false, emptyText: '-', copyWithSource: true },
-            { label: 'Risk', entries: collectRiskEntries(data, rows, risk).concat(collectSpurEntriesFromDom()), isRisk: true, emptyText: 'No high-risk signals detected', copyWithSource: true }
+            { label: 'Prediction', entries: collectPredictionEntries(data, risk), isRisk: false, emptyText: 'Unavailable', copyable: false },
+            { label: 'ASN', entries: collectAsnEntries(rows), isRisk: false, emptyText: '-', copyable: true },
+            { label: 'ISP', entries: collectIspEntries(rows), isRisk: false, emptyText: '-', copyable: true },
+            { label: 'Location', entries: collectLocationEntries(rows), isRisk: false, emptyText: '-', copyable: false },
+            { label: 'Risk', entries: collectRiskEntries(data, rows, risk).concat(collectSpurEntriesFromDom()), isRisk: true, emptyText: 'No high-risk signals detected', copyable: false }
         ];
 
         const $panel = $('<div>', { 'class': 'proxycheck-details-panel' });
@@ -1821,17 +1821,21 @@
                 $content.append($('<span>', { 'class': 'proxycheck-details-empty', text: section.emptyText }));
             } else {
                 for (const entry of section.entries) {
-                    const $checkbox = $('<input>', {
-                        type: 'checkbox', 'class': 'proxycheck-result-checkbox',
-                        checked: Boolean(entry.defaultChecked), style: 'margin: 3px 0 0 0; flex-shrink: 0; cursor: pointer;'
-                    });
                     const $body = $('<span>', { style: 'display: block; flex: 1; min-width: 0; line-height: 1.5;' })
                         .append($('<span>', { 'class': 'proxycheck-result-value' + (section.isRisk ? ' proxycheck-result-value-risk' : ''), text: entry.value }));
                     if (entry.showProviders && entry.providers.length > 0) {
                         entry.providers.forEach((p) => $body.append(createSourceBadge(p, providerUpdatedAtMap)));
                     }
-                    $content.append($('<label>', { style: 'display: flex; align-items: flex-start; gap: 6px; margin: 0; cursor: pointer; font-weight: normal;' }).append($checkbox, $body));
-                    checkboxItems.push({ checkbox: $checkbox, copyValue: entry.copyValue || entry.value, providers: entry.providers || [], copyWithSource: section.copyWithSource });
+                    if (section.copyable) {
+                        const $checkbox = $('<input>', {
+                            type: 'checkbox', 'class': 'proxycheck-result-checkbox',
+                            checked: Boolean(entry.defaultChecked), style: 'margin: 3px 0 0 0; flex-shrink: 0; cursor: pointer;'
+                        });
+                        $content.append($('<label>', { style: 'display: flex; align-items: flex-start; gap: 6px; margin: 0; cursor: pointer; font-weight: normal;' }).append($checkbox, $body));
+                        checkboxItems.push({ checkbox: $checkbox, copyValue: entry.copyValue || entry.value });
+                    } else {
+                        $content.append($('<div>', { style: 'display: flex; align-items: flex-start; margin: 0;' }).append($body));
+                    }
                 }
             }
             appendRow(section.label, $content);
@@ -1879,9 +1883,10 @@
         $copyLink.on('click', (e) => {
             e.preventDefault(); e.stopPropagation();
             if (panelDisposed) return;
-            const selected = checkboxItems.filter((item) => item.checkbox.prop('checked')).map((item) =>
-                sanitizeHtmlCommentContent((item.copyWithSource && item.providers.length > 0) ? `${item.providers.join(', ')}: ${item.copyValue}` : item.copyValue)
-            ).filter(Boolean);
+            const selected = checkboxItems
+                .filter((item) => item.checkbox.prop('checked'))
+                .map((item) => sanitizeHtmlCommentContent(item.copyValue))
+                .filter(Boolean);
             if (selected.length === 0) {
                 $copyLink.text('Select at least one item');
                 return scheduleLabelReset(false, 1500, 'Copy result');
@@ -1950,15 +1955,66 @@
         });
     }
 
+    function collectLightBadgeInfo(data, risk) {
+        const rows = getProviderRows(data);
+        const asnEntry = collectAsnEntries(rows)[0];
+        const ispEntry = collectIspEntries(rows)[0];
+        const riskLabels = [];
+        const addRiskLabel = (label) => {
+            const cleaned = typeof label === 'string' ? label.trim() : '';
+            if (cleaned && riskLabels.indexOf(cleaned) === -1) riskLabels.push(cleaned);
+        };
+
+        if (risk.badgePrimaryLabel && !['LIGHT', 'CLEAN', 'N/A'].includes(risk.badgePrimaryLabel)) {
+            addRiskLabel(risk.badgePrimaryLabel);
+        }
+        if (risk.isTor) addRiskLabel(formatTorDescription(risk) || 'Tor');
+        if (risk.hasCloudProvider) addRiskLabel(formatCloudDescription(data) || 'Cloud');
+        if (risk.ptrIsHighRisk) addRiskLabel('PTR-Risk');
+        if (risk.openProxyPorts && risk.openProxyPorts.length > 0) {
+            addRiskLabel(`Shodan:${risk.openProxyPorts.join(',')}`);
+        }
+        for (const row of rows) {
+            if (!row) continue;
+            if (row.provider === 'StopForumSpam' && (row.blacklisted || row.appears)) {
+                addRiskLabel(row.blacklisted ? 'StopForumSpam:Blacklisted' : 'StopForumSpam:Listed');
+            }
+            if ((row.provider === 'Spamhaus ZEN' || row.provider === 'IPsum / DROP') &&
+                (row.isListed || row.inSpamhausDrop || row.isIpsumListed)) {
+                addRiskLabel(row.provider === 'Spamhaus ZEN' ? 'Spamhaus:Listed' : 'IPsum:DROP');
+            }
+            if (row.provider === 'X4BNet VPN' && (row.isVpn || row.isHosting)) {
+                addRiskLabel(row.isVpn ? 'X4BNet:VPN' : 'X4BNet:Hosting');
+            }
+            if (Array.isArray(row.securityFlags)) {
+                for (const flag of row.securityFlags) {
+                    if (flag && flag.isHighRisk && typeof flag.label === 'string') addRiskLabel(`${row.provider}:${flag.label}`);
+                }
+            }
+        }
+        return {
+            asn: asnEntry ? asnEntry.value : '',
+            isp: ispEntry ? ispEntry.value : '',
+            riskLabels
+        };
+    }
+
     function buildBadgeTitleText(data, risk) {
         if (risk.isNonPublic) {
             return `Address Type: ${risk.nonPublicReason} [${risk.nonPublicBadgeCode}]\nStatus: External threat lookups skipped (non-public or reserved IP)`;
         }
         const torDesc = formatTorDescription(risk);
         const cloudDesc = formatCloudDescription(data);
-        const lines = [risk.isLightDeferredClean
+        const lines = [];
+        if (!risk.hasPrediction && isPartialLightResult(data)) {
+            const lightInfo = collectLightBadgeInfo(data, risk);
+            if (lightInfo.asn) lines.push('ASN: ' + lightInfo.asn);
+            if (lightInfo.isp) lines.push('ISP: ' + lightInfo.isp);
+            if (lightInfo.riskLabels.length > 0) lines.push('Light risk: ' + lightInfo.riskLabels.join(', '));
+        }
+        lines.push(risk.isLightDeferredClean
             ? 'Light screening passed (no local/free-tier flags). Click to run full commercial check.'
-            : 'Prediction: ' + risk.predictionTooltip];
+            : 'Prediction: ' + risk.predictionTooltip);
         if (typeof data.arbitrationVerdict === 'string' && data.arbitrationVerdict.trim()) lines.push('Verdict: ' + data.arbitrationVerdict.trim());
         lines.push('Recommended CIDR: ' + (data.recommendedCidr || 'N/A'));
         lines.push('BGP CIDR: ' + (data.bgpPrefix || data.mmdbCidr || 'N/A'));
@@ -2012,9 +2068,20 @@
         const bcast = risk.broadcastIp ? '|BCASTIP' : '';
         const tor = risk.isTor ? '|' + (risk.torLabel ? risk.torLabel.toUpperCase() : 'TOR') : '';
         badge.href = TOOL_BASE_URL + '/?ip=' + encodeURIComponent(resolvedIp);
-        badge.textContent = risk.isNonPublic
-            ? `[${risk.nonPublicBadgeCode}]`
-            : `[${risk.hasPrediction ? risk.predictionText + '%' : risk.badgePrimaryLabel}${bcast}${tor}]`;
+        if (risk.isNonPublic) {
+            badge.textContent = `[${risk.nonPublicBadgeCode}]`;
+        } else if (!risk.hasPrediction && isPartialLightResult(data)) {
+            const lightInfo = collectLightBadgeInfo(data, risk);
+            const lightParts = [];
+            if (lightInfo.asn) lightParts.push(lightInfo.asn);
+            if (lightInfo.isp) lightParts.push(lightInfo.isp);
+            if (lightInfo.riskLabels.length > 0) lightParts.push(lightInfo.riskLabels.join(','));
+            if (bcast) lightParts.push(bcast.slice(1));
+            if (tor) lightParts.push(tor.slice(1));
+            badge.textContent = '[' + (lightParts.length > 0 ? lightParts.join('|') : 'LIGHT') + ']';
+        } else {
+            badge.textContent = `[${risk.hasPrediction ? risk.predictionText + '%' : risk.badgePrimaryLabel}${bcast}${tor}]`;
+        }
 
         let stateClass = '';
         if (!risk.isNonPublic && !risk.hasPrediction) {
@@ -2368,7 +2435,6 @@
         if (isIpContributionsPage && !ipContributionsInvalidTarget) handleIPContributionsPage(true);
         const cacheKey = canonicalizeIpKey(ip);
         if (ipPromiseCache.has(cacheKey) || readPersistedIpResult(cacheKey)) { processAnchor(anchor); return; }
-        if (viewportObserver) { anchor.dataset.proxycheckProcessed = 'observed'; viewportObserver.observe(anchor); return; }
         processAnchor(anchor);
     }
 
@@ -2834,18 +2900,6 @@
 
     $(() => {
         ensureUserscriptStyles();
-        if (typeof window !== 'undefined' && typeof window.IntersectionObserver === 'function') {
-            viewportObserver = new window.IntersectionObserver((entries) => {
-                if (accessBlocked) return;
-                for (const entry of entries) {
-                    if (entry && entry.isIntersecting && entry.target) {
-                        viewportObserver.unobserve(entry.target);
-                        processAnchor(entry.target);
-                    }
-                }
-            }, { rootMargin: '200px 0px' });
-        }
-
         handleIPContributionsPage();
         scanSubtree(document.body);
         if (isIpContributionsPage && mw.hook) mw.hook('wikipage.content').add(() => handleIPContributionsPage());

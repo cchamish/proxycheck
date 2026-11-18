@@ -155,6 +155,30 @@ def reset_redis_circuit_breaker() -> None:
         _redis_circuit_client_ref = _active_redis_client()
 
 
+def _create_redis_client(redis_url: str) -> Any:
+    try:
+        return aioredis.from_url(
+            redis_url,
+            encoding="utf-8",
+            decode_responses=True,
+            socket_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
+            socket_connect_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
+            health_check_interval=30,
+            socket_keepalive=True,
+            retry_on_timeout=True,
+        )
+    except TypeError as redis_loop_err:
+        if "unexpected keyword argument" not in str(redis_loop_err):
+            raise
+        return aioredis.from_url(
+            redis_url,
+            encoding="utf-8",
+            decode_responses=True,
+            socket_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
+            socket_connect_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
+        )
+
+
 def get_redis_client() -> Optional[Any]:
     """Returns an async Redis client bound to the active running event loop."""
     active_client = _active_redis_client()
@@ -193,14 +217,8 @@ def get_redis_client() -> Optional[Any]:
             _redis_clients_by_loop.pop(current_loop, None)
 
         try:
-            loop_client = aioredis.from_url(
-                redis_url,
-                encoding="utf-8",
-                decode_responses=True,
-                socket_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
-                socket_connect_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
-            )
-        except _REDIS_INIT_ERRORS as redis_loop_err:
+            loop_client = _create_redis_client(redis_url)
+        except (*_REDIS_INIT_ERRORS, TypeError) as redis_loop_err:
             logger.warning(f"Redis initialization warning (fault tolerance active): {redis_loop_err}")
             init_err = redis_loop_err
         else:
@@ -597,6 +615,29 @@ async def _run_redis_cache_op(
     try:
         return await operation(client)
     except _REDIS_CIRCUIT_FAILURE_ERRORS as redis_err:
+        if operation_label == "read" and (
+            isinstance(redis_err, ConnectionError) or redis_err.__class__.__name__ == "ConnectionError"
+        ):
+            try:
+                current_loop = asyncio.get_running_loop()
+                with _redis_client_lock:
+                    cached_entry = _redis_clients_by_loop.get(current_loop)
+                    if cached_entry is not None and cached_entry[1] is client:
+                        _redis_clients_by_loop.pop(current_loop, None)
+                aclose_fn = getattr(client, "aclose", None)
+                if callable(aclose_fn):
+                    aclose_result = aclose_fn()
+                    if inspect.isawaitable(aclose_result):
+                        await aclose_result
+            except (*_REDIS_CIRCUIT_FAILURE_ERRORS, RuntimeError):
+                pass
+
+            reconnected_client = _get_redis_client()
+            if reconnected_client is not None:
+                try:
+                    return await operation(reconnected_client)
+                except _REDIS_CIRCUIT_FAILURE_ERRORS as retry_err:
+                    redis_err = retry_err
         mark_redis_failure(redis_err)
         logger.warning(f"Redis cache {operation_label} bypassed for {target_desc} due to error: {redis_err}")
         return default

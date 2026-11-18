@@ -230,7 +230,7 @@ def resolve_query_mode(request: Any, body: Optional[Dict[str, Any]] = None, *, d
 
 def _is_provider_cache_expected(provider_key: str, is_ipv4: bool) -> bool:
     """Returns False for sources that never write a cache entry for this address family or configuration."""
-    if not is_ipv4 and (provider_key in DNSBL_PROVIDER_KEYS or provider_key == "shodan_internetdb"):
+    if not is_ipv4 and (provider_key in DNSBL_PROVIDER_KEYS or provider_key in {"shodan_internetdb", "iphunter"}):
         return False
     if not is_provider_configured(provider_key):
         return False
@@ -428,7 +428,7 @@ async def _evaluate_quota_candidates(
         for spec in candidate_specs
         if (
             spec.key not in OFFLINE_PROVIDER_KEYS
-            and (is_ipv4 or spec.key not in DNSBL_PROVIDER_KEYS)
+            and (is_ipv4 or (spec.key not in DNSBL_PROVIDER_KEYS and spec.key not in {"shodan_internetdb", "iphunter"}))
             and is_provider_configured(spec.key)
         )
     ]

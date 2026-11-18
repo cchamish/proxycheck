@@ -207,7 +207,12 @@ async def query_cloudflare_radar(client: httpx.AsyncClient, ip: str) -> Dict[str
     url = f"https://api.cloudflare.com/client/v4/radar/entities/asns/ip?ip={ip}"
     headers = {"Authorization": f"Bearer {token}"}
     payload, status_code = await _fetch_upstream_json(
-        client, "cloudflare_radar", "Cloudflare Radar", url, headers=headers, timeout=8.0
+        client,
+        "cloudflare_radar",
+        "Cloudflare Radar",
+        url,
+        headers=headers,
+        timeout=httpx.Timeout(connect=4.0, read=12.0, write=5.0, pool=5.0),
     )
     return adapt_cloudflare_radar(payload, True, status_code)
 
@@ -291,6 +296,8 @@ async def query_iphunter(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
     api_key = _get_provider_secret("IPHUNTER_API_KEY")
     if not api_key:
         return adapt_iphunter(None, False)
+    if dns_providers.reverse_ipv4_octets(ip) is None:
+        return adapt_iphunter({"status": "skipped_ipv6"}, True, status_code=200)
 
     url = f"https://www.iphunter.info:8082/v1/ip/{ip}"
     headers = {"X-Key": api_key}

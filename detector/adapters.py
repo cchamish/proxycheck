@@ -844,6 +844,16 @@ def adapt_iphunter(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status
     if not has_api_key:
         return _build_error_row("IPHunter", raw_message="IPHUNTER_API_KEY not configured", extra={"block": None})
 
+    if isinstance(raw_data, dict) and str(raw_data.get("status") or "").strip().lower() == "skipped_ipv6":
+        return _build_error_row(
+            "IPHunter",
+            None,
+            raw_data,
+            status="Skipped (IPv6)",
+            usage_type="IPv4 Only (Skipped for IPv6)",
+            extra={"block": None, "isSkippedIpv6": True},
+        )
+
     raw_data, status_code = _guard_payload(raw_data, status_code)
     data: Dict[str, Any] = {}
     block_val: Optional[int] = None

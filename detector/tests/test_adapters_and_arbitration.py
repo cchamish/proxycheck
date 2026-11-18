@@ -462,9 +462,7 @@ class AggregationAndCacheIntegrityTests(TestCase):
                 ns = cache_backends.get_redis_namespace()
                 written_keys = [c.args[0] for c in mock_redis.set.call_args_list]
                 self.assertFalse(any(k.startswith((f"{ns}:prov:", f"{ns}:snap:")) for k in written_keys))
-                cooldown_calls = [
-                    c for c in mock_redis.set.call_args_list if c.args[0].startswith(f"{ns}:cooldown:")
-                ]
+                cooldown_calls = [c for c in mock_redis.set.call_args_list if c.args[0].startswith(f"{ns}:cooldown:")]
                 self.assertEqual(len(cooldown_calls), 14)
                 for call_obj in cooldown_calls:
                     self.assertEqual(call_obj.kwargs.get("ex"), 120)
@@ -872,7 +870,9 @@ class NewIntelligenceAdapterAndQueryTests(SimpleTestCase):
         self.assertTrue(any(f["isHighRisk"] and "SBL12345" in f["label"] for f in drop_hit["securityFlags"]))
 
         self.assertEqual(adapt_x4bnet_vpn(None, has_db=False)["status"], "Offline DB Missing")
-        x4b_vpn = adapt_x4bnet_vpn({"isListed": True, "isVpn": True, "isHosting": False, "matchedCidr": "198.51.100.0/24"})
+        x4b_vpn = adapt_x4bnet_vpn(
+            {"isListed": True, "isVpn": True, "isHosting": False, "matchedCidr": "198.51.100.0/24"}
+        )
         self.assertTrue(any(f["isHighRisk"] and "VPN" in f["label"] for f in x4b_vpn["securityFlags"]))
         x4b_dc = adapt_x4bnet_vpn({"isListed": True, "isVpn": False, "isDatacenter": True, "isHosting": True})
         self.assertFalse(any(f["isHighRisk"] for f in x4b_dc["securityFlags"]))
@@ -985,7 +985,13 @@ class ConfidenceWeightedArbitrationAndParadoxTests(SimpleTestCase):
 
         cases = (
             ("res_sources_plus_shodan_port", [*base_res, shodan_ports], None, None, True),
-            ("ptr_dynamic_plus_shodan_tag", [self._res_row("IPHub", "unknown"), shodan_tag], "p1.dip0.t-ipconnect.de", None, True),
+            (
+                "ptr_dynamic_plus_shodan_tag",
+                [self._res_row("IPHub", "unknown"), shodan_tag],
+                "p1.dip0.t-ipconnect.de",
+                None,
+                True,
+            ),
             ("res_plus_ipsum3_and_recent_sfs", [*base_res, ipsum_3, sfs_recent], None, None, True),
             ("res_plus_ipsum3_and_recent_dshield", [*base_res, ipsum_3, dshield_recent], None, None, True),
             ("stale_sfs_over_30d_rejected", [*base_res, ipsum_3, sfs_stale], None, None, False),
@@ -994,7 +1000,11 @@ class ConfidenceWeightedArbitrationAndParadoxTests(SimpleTestCase):
             ("privacy_egress_excluded", [*base_res, shodan_ports], None, "icloud_private_relay", False),
             (
                 "tor_excluded",
-                [*base_res, shodan_ports, adapt_tor_onionoo({"relays": [{"a": ["1.2.3.4"], "running": True}]}, 200, "1.2.3.4")],
+                [
+                    *base_res,
+                    shodan_ports,
+                    adapt_tor_onionoo({"relays": [{"a": ["1.2.3.4"], "running": True}]}, 200, "1.2.3.4"),
+                ],
                 None,
                 None,
                 False,

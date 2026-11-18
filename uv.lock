@@ -162,6 +162,7 @@ dependencies = [
     { name = "gunicorn" },
     { name = "httpx" },
     { name = "maxminddb" },
+    { name = "pymysql" },
     { name = "python-dotenv" },
     { name = "redis" },
     { name = "tzdata" },
@@ -183,6 +184,7 @@ requires-dist = [
     { name = "gunicorn", specifier = ">=27.0.1" },
     { name = "httpx", specifier = "==0.28.1" },
     { name = "maxminddb", specifier = "==3.2.0" },
+    { name = "pymysql", specifier = ">=1.1.1" },
     { name = "python-dotenv", specifier = "==1.2.4" },
     { name = "redis", specifier = "==8.1.0" },
     { name = "tzdata", specifier = ">=2026.6" },
@@ -193,6 +195,15 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [{ name = "ruff", specifier = ">=0.17.5" }]
+
+[[package]]
+name = "pymysql"
+version = "1.2.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c8/69/808dc3d9bcc7d2841cdc2909b978c64eb1c450b7cd7b42d5907f7de7567d/pymysql-1.2.4.tar.gz", hash = "sha256:491558165b8e11f3644c5f9cfb30cc9c9111ffd54e53d3aa91b9a0a20be2294f", size = 51598, upload-time = "2026-11-09T09:37:09.356Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a3/60/acffa1e7261fdc68fadf6f196b66058e03dcb3df239f2c0acbfd11165845/pymysql-1.2.4-py3-none-any.whl", hash = "sha256:e169bed906168fffd0088925f45b3df024c2775c6fd128da0df773d47c458840", size = 46892, upload-time = "2026-11-09T09:37:07.987Z" },
+]
 
 [[package]]
 name = "python-dotenv"

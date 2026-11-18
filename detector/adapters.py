@@ -22,7 +22,6 @@ from .cidr_attribution import (
 
 _parse_cloud_cidr_payload = parse_cloud_cidr_payload
 
-_NO_FLAGS: List[Dict[str, Any]] = [{"label": "No Flags", "isHighRisk": False}]
 _ERROR_STATUS_LABELS: Dict[int, str] = {
     401: "401 Unauthorised",
     429: "429 Rate Limited",
@@ -1463,9 +1462,7 @@ def adapt_dshield(raw_data: Optional[Dict[str, Any]], status_code: int = 200) ->
 
 
 SHODAN_HIGH_RISK_PROXY_PORTS: frozenset[int] = frozenset({1080, 1081, 3128, 8080, 8118, 8888, 9050})
-_SHODAN_HIGH_RISK_TAGS: frozenset[str] = frozenset(
-    {"proxy", "vpn", "tor", "compromised", "malware", "botnet", "c2"}
-)
+_SHODAN_HIGH_RISK_TAGS: frozenset[str] = frozenset({"proxy", "vpn", "tor", "compromised", "malware", "botnet", "c2"})
 
 
 def adapt_ipsum_drop(
@@ -1605,9 +1602,7 @@ def adapt_x4bnet_vpn(
         flags.append({"label": "Hosting / Datacentre", "isHighRisk": False})
 
     usage_type = (
-        "vpn"
-        if is_vpn
-        else ("datacenter" if is_datacenter else ("hosting" if is_hosting else "Clean (Not Listed)"))
+        "vpn" if is_vpn else ("datacenter" if is_datacenter else ("hosting" if is_hosting else "Clean (Not Listed)"))
     )
     row_extra: Dict[str, Any] = {
         "isListed": is_listed,

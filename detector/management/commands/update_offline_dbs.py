@@ -1507,9 +1507,7 @@ class Command(BaseCommand):
 
             rule_count = compile_binary_prefix_index(table_entries, bin_target)
             mobile_asns = sorted(
-                asn_num
-                for asn_num, tags in asn_tags.items()
-                if any(tag in MOBILE_BGP_TAG_TOKENS for tag in tags)
+                asn_num for asn_num, tags in asn_tags.items() if any(tag in MOBILE_BGP_TAG_TOKENS for tag in tags)
             )
             tags_payload = {
                 "asn_tags": {str(k): v for k, v in sorted(asn_tags.items())},
@@ -1518,9 +1516,7 @@ class Command(BaseCommand):
             }
             _write_json_atomically(tags_payload, tags_target)
             clear_offline_intelligence_caches()
-            self.stdout.write(
-                self.style.SUCCESS(f"Updated BGP Tools ({bin_target.name}, {rule_count} prefixes).")
-            )
+            self.stdout.write(self.style.SUCCESS(f"Updated BGP Tools ({bin_target.name}, {rule_count} prefixes)."))
             return 0
         except _DOWNLOAD_UPDATE_ERRORS as exc:
             self.stderr.write(self.style.ERROR(_redact_update_error(f"Failed BGP Tools update: {exc}")))
@@ -1549,9 +1545,27 @@ class Command(BaseCommand):
         sources = (
             ("X4BNet VPN IPv4", X4BNET_VPN_IPV4_URL, X4BNET_MASK_VPN, _parse_plaintext_cidrs, False),
             ("X4BNet VPN IPv6", X4BNET_VPN_IPV6_URL, X4BNET_MASK_VPN, _parse_plaintext_cidrs, True),
-            ("X4BNet Datacenter IPv4", X4BNET_DATACENTER_IPV4_URL, X4BNET_MASK_DATACENTER, _parse_plaintext_cidrs, False),
-            ("X4BNet Datacenter IPv6", X4BNET_DATACENTER_IPV6_URL, X4BNET_MASK_DATACENTER, _parse_plaintext_cidrs, True),
-            ("ipapi-is Hosting", hosting_url, X4BNET_MASK_HOSTING, lambda txt, _lbl: _parse_hosting_feed_cidrs(txt), True),
+            (
+                "X4BNet Datacenter IPv4",
+                X4BNET_DATACENTER_IPV4_URL,
+                X4BNET_MASK_DATACENTER,
+                _parse_plaintext_cidrs,
+                False,
+            ),
+            (
+                "X4BNet Datacenter IPv6",
+                X4BNET_DATACENTER_IPV6_URL,
+                X4BNET_MASK_DATACENTER,
+                _parse_plaintext_cidrs,
+                True,
+            ),
+            (
+                "ipapi-is Hosting",
+                hosting_url,
+                X4BNET_MASK_HOSTING,
+                lambda txt, _lbl: _parse_hosting_feed_cidrs(txt),
+                True,
+            ),
         )
 
         any_modified = False

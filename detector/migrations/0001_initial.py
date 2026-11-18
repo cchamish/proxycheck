@@ -4,31 +4,29 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     initial = True
 
-    dependencies = [
-    ]
+    dependencies = []
 
     operations = [
         migrations.CreateModel(
-            name='IpIntelligenceCache',
+            name="IpIntelligenceCache",
             fields=[
-                ('ip_bin', models.BinaryField(max_length=16, primary_key=True, serialize=False)),
-                ('ip_version', models.PositiveSmallIntegerField()),
-                ('canonical_ip', models.CharField(max_length=45, unique=True)),
-                ('schema_version', models.PositiveSmallIntegerField(default=1)),
-                ('query_mode', models.CharField(default='full', max_length=8)),
-                ('payload_compressed', models.BinaryField()),
-                ('provider_fetched_map', models.JSONField(default=dict)),
-                ('valid_commercial_count', models.PositiveSmallIntegerField(default=0)),
-                ('has_degraded_sources', models.BooleanField(default=False)),
-                ('fetched_at', models.DateTimeField()),
-                ('updated_at', models.DateTimeField(auto_now=True)),
+                ("ip_bin", models.BinaryField(max_length=16, primary_key=True, serialize=False)),
+                ("ip_version", models.PositiveSmallIntegerField()),
+                ("canonical_ip", models.CharField(max_length=45, unique=True)),
+                ("schema_version", models.PositiveSmallIntegerField(default=1)),
+                ("query_mode", models.CharField(default="full", max_length=8)),
+                ("payload_compressed", models.BinaryField()),
+                ("provider_fetched_map", models.JSONField(default=dict)),
+                ("valid_commercial_count", models.PositiveSmallIntegerField(default=0)),
+                ("has_degraded_sources", models.BooleanField(default=False)),
+                ("fetched_at", models.DateTimeField()),
+                ("updated_at", models.DateTimeField(auto_now=True)),
             ],
             options={
-                'db_table': 'detector_ip_cache',
-                'indexes': [models.Index(fields=['fetched_at'], name='idx_detector_fetched_at')],
+                "db_table": "detector_ip_cache",
+                "indexes": [models.Index(fields=["fetched_at"], name="idx_detector_fetched_at")],
             },
         ),
     ]

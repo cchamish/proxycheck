@@ -285,7 +285,9 @@ def _sanitize_shodan_row(row: Mapping[str, Any]) -> Dict[str, Any]:
     return sanitization.sanitize_payload(cleaned)
 
 
-def sanitize_provider_row_for_l2(row: Mapping[str, Any], provider_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def sanitize_provider_row_for_l2(
+    row: Mapping[str, Any], provider_key: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     """Applies four-tier compliance stripping to a single provider result row before L2 persistence."""
     resolved_key = provider_key or resolve_provider_key(row)
     if not is_provider_allowed_in_l2(resolved_key):
@@ -424,9 +426,7 @@ def _decode_and_filter_l2_row(
             filtered_fetched_map[pkey] = int(prov_ts if prov_ts is not None else row_fetched_epoch)
 
     snapshot_out = {
-        key: val
-        for key, val in payload.items()
-        if key not in _FORBIDDEN_TOP_LEVEL_SNAPSHOT_KEYS and key != "results"
+        key: val for key, val in payload.items() if key not in _FORBIDDEN_TOP_LEVEL_SNAPSHOT_KEYS and key != "results"
     }
     snapshot_out["ip"] = db_row.canonical_ip
     snapshot_out["queryMode"] = normalize_query_mode(db_row.query_mode)
@@ -565,7 +565,11 @@ def _evaluate_incoming_rows(raw_results: Any) -> Tuple[int, int, bool]:
         if not isinstance(item, Mapping):
             continue
         pkey = resolve_provider_key(item)
-        if pkey in _L2_COMMERCIAL_KEYS and _is_valid_l2_provider_row(item, pkey) and not item.get("isHistoricalFallback"):
+        if (
+            pkey in _L2_COMMERCIAL_KEYS
+            and _is_valid_l2_provider_row(item, pkey)
+            and not item.get("isHistoricalFallback")
+        ):
             new_valid_comm += 1
         elif _is_failed_online_row(item, pkey):
             any_degraded = True
@@ -606,7 +610,11 @@ def _build_merged_l2_rows(
         for prior_item in existing_snapshot.get("results") or ():
             if isinstance(prior_item, Mapping):
                 prior_key = resolve_provider_key(prior_item)
-                if prior_key and is_provider_allowed_in_l2(prior_key) and _is_valid_l2_provider_row(prior_item, prior_key):
+                if (
+                    prior_key
+                    and is_provider_allowed_in_l2(prior_key)
+                    and _is_valid_l2_provider_row(prior_item, prior_key)
+                ):
                     existing_rows_by_key[prior_key] = dict(prior_item)
 
     merged_rows: List[Dict[str, Any]] = []
@@ -708,7 +716,9 @@ def merge_and_upsert_l2_snapshot(
         )
 
         if _should_abort_degraded_overwrite(existing_row, new_valid_comm, failed_comm):
-            preserved_fetched_at = _ensure_utc(existing_row.fetched_at).isoformat() if existing_row is not None else None
+            preserved_fetched_at = (
+                _ensure_utc(existing_row.fetched_at).isoformat() if existing_row is not None else None
+            )
             preserved_comm = int(existing_row.valid_commercial_count) if existing_row is not None else 0
             return L2MergeResult(
                 saved=False,
@@ -863,7 +873,9 @@ def _clean_expired_providers_on_row(
         db_row.valid_commercial_count = _count_valid_commercial_rows(
             [item for item in updated_results if isinstance(item, Mapping)]
         )
-        db_row.save(update_fields=["payload_compressed", "provider_fetched_map", "valid_commercial_count", "updated_at"])
+        db_row.save(
+            update_fields=["payload_compressed", "provider_fetched_map", "valid_commercial_count", "updated_at"]
+        )
     return True, removed_count
 
 

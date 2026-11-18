@@ -175,9 +175,7 @@ async def _fetch_upstream_json(
     payload, parsed_status, parse_error = parse_upstream_json_with_error(resp)
     if treat_404_as_ok and raw_status == 404:
         clean_404_payload = (
-            payload
-            if parse_error is None and isinstance(payload, dict)
-            else {"detail": "No information available"}
+            payload if parse_error is None and isinstance(payload, dict) else {"detail": "No information available"}
         )
         _record_http_status_event(resp, provider_key, 200, 200, clean_404_payload, default_cooldown)
         return clean_404_payload, 404

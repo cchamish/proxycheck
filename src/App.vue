@@ -514,58 +514,6 @@
           &middot; {{ formatDiagnosticSummary(footerDiagnostic) }}
           <span v-if="footerDiagnostic.isCached" class="cached-pill">Cached</span>
         </span>
-        <span class="footer-attribution-text">
-          Data sources:
-          GeoLite2 by
-          <a
-            href="https://www.maxmind.com"
-            target="_blank"
-            rel="noopener noreferrer"
-            class="commit-link"
-          >MaxMind</a>
-          &middot;
-          <a
-            href="https://radar.cloudflare.com/"
-            target="_blank"
-            rel="noopener noreferrer"
-            class="commit-link"
-          >Cloudflare Radar</a>
-          (<a
-            href="https://creativecommons.org/licenses/by-nc/4.0/"
-            target="_blank"
-            rel="noopener noreferrer"
-            class="commit-link"
-          >CC BY-NC 4.0</a>)
-          &middot;
-          <a
-            href="https://www.ip2location.io"
-            target="_blank"
-            rel="noopener noreferrer"
-            class="commit-link"
-          >IP2Location.io</a>
-          &middot;
-          <a
-            href="https://getipintel.net/"
-            target="_blank"
-            rel="noopener noreferrer"
-            class="commit-link"
-          >GetIPIntel</a>
-          &middot;
-          <a
-            href="https://ipdata.co/"
-            target="_blank"
-            rel="noopener noreferrer"
-            class="commit-link"
-          >ipdata.co</a>
-          &middot;
-          <button
-            type="button"
-            class="footer-about-link"
-            @click="isAboutOpen = true"
-          >
-            Attribution &amp; About
-          </button>
-        </span>
       </div>
       <div class="footer-right">
         <div class="footer-banner">

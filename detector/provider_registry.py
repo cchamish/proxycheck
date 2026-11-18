@@ -16,7 +16,6 @@ except ImportError:
     _RedisError = None
 
 USER_AGENT_HEADER = "ProxyCheck/1.0 (https://proxycheck.toolforge.org; tools.proxycheck@toolforge.org)"
-REDIS_KEY_NAMESPACE = "proxycheck:v1"
 
 
 def build_redis_namespace(prefix: str, secret: str) -> str:
@@ -32,6 +31,7 @@ def hash_ip_for_redis(canonical_ip: str, secret: str) -> str:
     secret_bytes = str(secret or "").encode("utf-8")
     ip_bytes = str(canonical_ip or "").strip().encode("utf-8")
     return hmac.new(secret_bytes, ip_bytes, hashlib.sha256).hexdigest()[:24]
+
 
 REDIS_TRANSPORT_ERRORS: Tuple[type[BaseException], ...] = (
     (ConnectionError, TimeoutError, OSError, _RedisError)

@@ -1242,7 +1242,7 @@ test('Special:Block soft-block parameters, verification deep links, threat helpe
   assert.doesNotMatch(wikitext, /98\.765|abuseConfidenceScore|totalReports|88|95%|GetIPIntel|AbuseIPDB/);
 });
 
-test('Dashboard cache telemetry resolver and Vue templates expose dual-layer SWR metrics and source attributions', () => {
+test('Dashboard cache telemetry resolver and Vue templates expose dual-layer SWR metrics', () => {
   const expectedTelemetry = {
     l1Hit: 120, l2HitFresh: 45, l2HitStaleSwr: 12, upstreamMiss: 23,
     refreshOk: 9, refreshRateLimited: 2, dualLayerHitRatePercent: 88.5, l2EstimatedRows: 15_420,
@@ -1264,7 +1264,7 @@ test('Dashboard cache telemetry resolver and Vue templates expose dual-layer SWR
   const appVue = fs.readFileSync(path.resolve(process.cwd(), 'src/App.vue'), 'utf8');
   const dashboardVue = fs.readFileSync(path.resolve(process.cwd(), 'src/components/ProviderDashboardModal.vue'), 'utf8');
 
-  for (const requiredPattern of [/MaxMind/, /Cloudflare Radar/, /CC BY-NC 4\.0/, /IP2Location\.io/, /GetIPIntel/, /ipdata\.co/, /Attribution &amp; About/, /Copy Wikitext Summary/]) {
+  for (const requiredPattern of [/Copy Wikitext Summary/]) {
     assert.match(appVue, requiredPattern);
   }
   for (const requiredModalPattern of [/Dual-Layer Cache Hit Rate/, /ToolsDB L2 Hits/, /ToolsDB L2 Estimated Rows/, /429 Rate-Limited/]) {

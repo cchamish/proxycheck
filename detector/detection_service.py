@@ -388,7 +388,9 @@ def _assemble_detection_payload(
             "missCount": miss_count,
             "cooldownCount": cooldown_count,
             "totalSources": total_active,
-            "cachedAt": earliest_cached_at if earliest_cached_at is not None else (resolved_fetched if is_cached else None),
+            "cachedAt": earliest_cached_at
+            if earliest_cached_at is not None
+            else (resolved_fetched if is_cached else None),
             "fetchedAt": resolved_fetched,
             "ageSeconds": age_seconds,
             "staleThresholdSeconds": stale_threshold,
@@ -783,7 +785,13 @@ async def _execute_detection_with_cache(
     specs_to_execute = [spec for spec in candidate_specs if spec.key not in quota_blocked_entries]
     needs_ptr = cached_ptr is None
     needs_cymru_bgp = needs_ptr and lookup_bgp_tools_offline(ip) is None
-    executed_provider_results, ptr_raw, cymru_bgp_prefix, upstream_events, rdns_state = await _dispatch_upstream_queries(
+    (
+        executed_provider_results,
+        ptr_raw,
+        cymru_bgp_prefix,
+        upstream_events,
+        rdns_state,
+    ) = await _dispatch_upstream_queries(
         ip,
         specs_to_execute,
         needs_http_client=any(spec.uses_http_client and spec.key in cache_expected_keys for spec in specs_to_execute),
@@ -1556,7 +1564,9 @@ async def refresh_single_canonical_ip(
                 resolved_ptr = prior_ptr
 
         active_count = sum(
-            1 for r in merged_rows if isinstance(r, dict) and not is_unconfigured_provider_row(r) and not r.get("isDeferred")
+            1
+            for r in merged_rows
+            if isinstance(r, dict) and not is_unconfigured_provider_row(r) and not r.get("isDeferred")
         )
         final_payload = _assemble_detection_payload(
             ip,

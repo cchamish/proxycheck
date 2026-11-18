@@ -457,7 +457,7 @@ def get_ip_snapshot(
     retention_map = _get_retention_days_map()
     try:
         close_old_connections()
-        db_row = IpIntelligenceCache.objects.filter(pk=ip_bin).first()
+        db_row = IpIntelligenceCache.objects.filter(ip_bin=ip_bin).first()
         if db_row is None:
             return None
         if mode is not None and normalize_query_mode(mode) == "full" and db_row.query_mode == "light":
@@ -708,7 +708,7 @@ def merge_and_upsert_l2_snapshot(
 
     try:
         close_old_connections()
-        existing_row = IpIntelligenceCache.objects.filter(pk=ip_bin).first()
+        existing_row = IpIntelligenceCache.objects.filter(ip_bin=ip_bin).first()
         existing_snapshot = (
             _decode_and_filter_l2_row(existing_row, now_utc=now_utc, retention_days_map=retention_map)
             if existing_row is not None

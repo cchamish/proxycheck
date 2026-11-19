@@ -162,14 +162,20 @@ async def exchange_gadget_token(request):
 
 
 async def _exchange_gadget_token_post(request):
-    rl_res = await check_and_consume_endpoint_rate_limit("gadget_token")
-    if not rl_res.allowed:
-        return _build_rate_limit_response(rl_res, "Gadget token rate limit exceeded. Please wait before retrying.")
+    response = await _handle_gadget_token_post(request)
+    response["Cache-Control"] = "no-store"
+    return response
 
+
+async def _handle_gadget_token_post(request):
     parsed, error_response = parse_gadget_token_payload(request)
     if error_response is not None or parsed is None:
         return error_response
     centralauth_token, wiki_domain = parsed
+
+    global_rl = await check_and_consume_endpoint_rate_limit("gadget_token", scope="global")
+    if not global_rl.allowed:
+        return _build_rate_limit_response(global_rl, "Gadget token rate limit exceeded. Please wait before retrying.")
 
     client = await http_client.get_shared_http_client()
     try:
@@ -192,6 +198,12 @@ async def _exchange_gadget_token_post(request):
         return JsonResponse({"error": "Unable to verify CentralAuth credentials at this time."}, status=503)
 
     username = wiki_userinfo["username"]
+    user_rl = await check_and_consume_endpoint_rate_limit("gadget_token", username, scope="user")
+    if not user_rl.allowed:
+        return _build_rate_limit_response(
+            user_rl, "Too many token requests for this account. Please wait before retrying."
+        )
+
     local_groups = wiki_userinfo.get("local_groups") or []
     local_rights = wiki_userinfo.get("rights")
     local_rights_verified = isinstance(local_rights, list)
@@ -204,6 +216,7 @@ async def _exchange_gadget_token_post(request):
             local_rights if isinstance(local_rights, list) else [],
             wiki_domain=wiki_domain,
             local_rights_verified=local_rights_verified,
+            skip_meta_if_local_granted=True,
         )
     except MetaWikiRightsFetchError as exc:
         if "missing" in str(exc).lower():
@@ -213,15 +226,13 @@ async def _exchange_gadget_token_post(request):
     if not has_access:
         return JsonResponse({"error": "Access denied. Insufficient Wikimedia user rights."}, status=403)
 
-    response = JsonResponse(
+    return JsonResponse(
         {
             "token": issue_gadget_token(username),
             "username": username,
             "expires_in": get_gadget_token_ttl_seconds(),
         }
     )
-    response["Cache-Control"] = "no-store"
-    return response
 
 
 async def detect_ip(request):

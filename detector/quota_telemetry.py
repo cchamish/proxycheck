@@ -261,7 +261,7 @@ _DAILY_RL_SALT_CACHE: Dict[str, Tuple[Any, str]] = {}
 _ENDPOINT_RATE_LIMIT_SPECS: Dict[str, Tuple[int, int, Optional[str], str]] = {
     "detect": (120, 600, "DETECT_USER_RPM_LIMIT", "DETECT_GLOBAL_RPM_LIMIT"),
     "detect_batch": (20, 100, "DETECT_BATCH_USER_RPM_LIMIT", "DETECT_BATCH_GLOBAL_RPM_LIMIT"),
-    "gadget_token": (0, 60, None, "GADGET_TOKEN_GLOBAL_RPM_LIMIT"),
+    "gadget_token": (15, 240, "GADGET_TOKEN_USER_RPM_LIMIT", "GADGET_TOKEN_GLOBAL_RPM_LIMIT"),
 }
 
 
@@ -1074,9 +1074,12 @@ async def check_and_consume_endpoint_rate_limit(
     endpoint: str,
     username: Optional[str] = None,
     *,
+    scope: str = "all",
     now_dt: Optional[datetime] = None,
 ) -> RefreshRateLimitResult:
     """Enforces short-lived volatile Redis per-minute limits for detect, batch, and gadget-token endpoints."""
+    if scope not in {"all", "global", "user"}:
+        raise ValueError(f"Unsupported rate-limit scope: {scope!r}")
     spec = _ENDPOINT_RATE_LIMIT_SPECS.get(endpoint)
     if spec is None:
         return RefreshRateLimitResult(allowed=True)
@@ -1104,7 +1107,7 @@ async def check_and_consume_endpoint_rate_limit(
     incremented_keys: List[Tuple[str, int]] = []
     try:
         windows: List[Tuple[str, int, int, str, int]] = []
-        if user_rpm > 0 and cleaned_user:
+        if scope in {"all", "user"} and user_rpm > 0 and cleaned_user:
             daily_salt = await _get_daily_rate_limit_salt(client, current_dt)
             user_digest = hash_username_for_rate_limit(cleaned_user, salt=daily_salt)
             windows.append(
@@ -1116,7 +1119,7 @@ async def check_and_consume_endpoint_rate_limit(
                     min_retry,
                 )
             )
-        if global_rpm > 0:
+        if scope in {"all", "global"} and global_rpm > 0:
             windows.append(
                 (
                     f"{ns}:rl:{endpoint}:global:min:{minute_bucket}",

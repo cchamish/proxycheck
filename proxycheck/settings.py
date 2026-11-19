@@ -438,6 +438,15 @@ WIKIMEDIA_REDIRECT_URI = os.environ.get(
     "WIKIMEDIA_REDIRECT_URI", "https://proxycheck.toolforge.org/oauth/callback"
 ).strip()
 GADGET_TOKEN_TTL_SECONDS = _parse_positive_int_env("GADGET_TOKEN_TTL_SECONDS", 900)
+DETECT_USER_RPM_LIMIT = _parse_non_negative_int_env("DETECT_USER_RPM_LIMIT", 120)
+DETECT_GLOBAL_RPM_LIMIT = _parse_non_negative_int_env("DETECT_GLOBAL_RPM_LIMIT", 600)
+DETECT_BATCH_USER_RPM_LIMIT = _parse_non_negative_int_env("DETECT_BATCH_USER_RPM_LIMIT", 20)
+DETECT_BATCH_GLOBAL_RPM_LIMIT = _parse_non_negative_int_env("DETECT_BATCH_GLOBAL_RPM_LIMIT", 100)
+GADGET_TOKEN_USER_RPM_LIMIT = _parse_non_negative_int_env("GADGET_TOKEN_USER_RPM_LIMIT", 15)
+GADGET_TOKEN_GLOBAL_RPM_LIMIT = _parse_non_negative_int_env("GADGET_TOKEN_GLOBAL_RPM_LIMIT", 240)
+REFRESH_USER_RPM_LIMIT = _parse_non_negative_int_env("REFRESH_USER_RPM_LIMIT", 6)
+REFRESH_USER_RPH_LIMIT = _parse_non_negative_int_env("REFRESH_USER_RPH_LIMIT", 60)
+REFRESH_GLOBAL_RPM_LIMIT = _parse_non_negative_int_env("REFRESH_GLOBAL_RPM_LIMIT", 30)
 ALLOWED_WIKI_USERS = os.environ.get("ALLOWED_WIKI_USERS", "")
 
 PROVIDER_STATIC_CACHE_TTL_SECONDS = _parse_positive_int_env("PROVIDER_STATIC_CACHE_TTL_SECONDS", 86400)

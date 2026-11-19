@@ -50,7 +50,7 @@ class AsgiSmokeTests(SimpleTestCase):
         self.assertNotIsInstance(application._middleware_chain, SyncToAsync)
 
         async def _send_concurrent_requests(base_url: str):
-            async with httpx.AsyncClient(base_url=base_url, timeout=5.0) as client:
+            async with httpx.AsyncClient(base_url=base_url, timeout=5.0, trust_env=False) as client:
                 return await asyncio.gather(
                     client.get("/", headers={"X-Forwarded-Proto": "https"}),
                     client.get("/"),

@@ -1254,15 +1254,18 @@ test('Shodan ordinary open ports highlight yellow in light mode and list open po
   await flush();
 });
 
-test('Special:Block link prefills three-month expiry and blocked proxy reason synced with selected checkboxes', async () => {
-  const cases: Array<{ ip: string; softBlock: boolean }> = [
-    { ip: '198.51.100.41', softBlock: false },
-    { ip: '100.64.12.41', softBlock: true },
+test('Special:Block single-IP and range links prefill three-month expiry and blocked proxy reason without "other" prefix', async () => {
+  const cases: Array<{ ip: string; recommendedCidr: string | null; expectRange: boolean; softBlock: boolean }> = [
+    { ip: '198.51.100.41', recommendedCidr: '198.51.100.0/24', expectRange: true, softBlock: false },
+    { ip: '100.64.12.41', recommendedCidr: '100.64.12.41/32', expectRange: false, softBlock: true },
+    { ip: '2001:db8::9', recommendedCidr: '2001:db8::9/128', expectRange: false, softBlock: false },
+    { ip: '198.51.100.99', recommendedCidr: null, expectRange: false, softBlock: false },
+    { ip: '2a09:bac2:1234::1', recommendedCidr: '2a09:bac2:1234::/64', expectRange: true, softBlock: true },
   ];
 
   for (const tc of cases) {
     const payload = makeFullPayload(tc.ip, {
-      recommendedCidr: `${tc.ip}/24`,
+      recommendedCidr: tc.recommendedCidr,
       isMobileOrCgnat: tc.softBlock,
       results: [
         makeProviderRow('MaxMind', { asn: 'AS17451', isp: 'metroNET By Biznet' }),
@@ -1276,7 +1279,19 @@ test('Special:Block link prefills three-month expiry and blocked proxy reason sy
     await flush();
 
     const dialog = openDialogs[0].host;
-    const blockLink = dialog.querySelector('.proxycheck-link-block')!;
+    const singleLink = dialog.querySelector('.proxycheck-link-block')!;
+    const rangeLink = dialog.querySelector('.proxycheck-link-block-range');
+    assert.equal(singleLink.textContent, 'Special:Block ↗');
+    assert.ok(singleLink.href.includes(`Special:Block/${tc.ip}`));
+
+    if (tc.expectRange) {
+      assert.ok(rangeLink, `Expected range block link for ${tc.recommendedCidr}`);
+      assert.equal(rangeLink.textContent, 'Special:Block (range) ↗');
+      assert.ok(rangeLink.href.includes(`Special:Block/${tc.recommendedCidr}`));
+    } else {
+      assert.equal(rangeLink, null);
+    }
+
     const checkboxes = dialog.querySelectorAll('.proxycheck-result-checkbox');
     assert.equal(checkboxes.length, 3);
     assert.equal(checkboxes[0].checked, true);
@@ -1284,40 +1299,37 @@ test('Special:Block link prefills three-month expiry and blocked proxy reason sy
     assert.equal(checkboxes[2].checked, false);
 
     const parseParams = (href: string) => new URL(`https://zh.wikipedia.org${href}`).searchParams;
+    const assertBlockParams = (href: string, expectedReason: string) => {
+      const params = parseParams(href);
+      assert.equal(params.get('wpExpiry'), '3 months');
+      assert.equal(params.get('wpReason'), null);
+      assert.equal(params.get('wpReason-other'), expectedReason);
+      if (tc.softBlock) {
+        assert.equal(params.get('wpAnonOnly'), '1');
+        assert.equal(params.get('wpHardBlock'), '0');
+        assert.equal(params.get('wpDisableUTEdit'), '0');
+      } else {
+        assert.equal(params.get('wpAnonOnly'), null);
+      }
+    };
 
-    let params = parseParams(blockLink.href);
-    assert.equal(params.get('wpExpiry'), '3 months');
-    assert.equal(params.get('wpReason'), 'other');
-    assert.equal(
-      params.get('wpReason-other'),
-      '{{blocked proxy}}<!-- AS17451 ([[:m:User:Hamish/proxycheck.js|proxycheck]]) -->'
-    );
-    if (tc.softBlock) {
-      assert.equal(params.get('wpAnonOnly'), '1');
-      assert.equal(params.get('wpHardBlock'), '0');
-      assert.equal(params.get('wpDisableUTEdit'), '0');
-    } else {
-      assert.equal(params.get('wpAnonOnly'), null);
-    }
+    const initialReason = '{{blocked proxy}}<!-- AS17451 ([[:m:User:Hamish/proxycheck.js|proxycheck]]) -->';
+    assertBlockParams(singleLink.href, initialReason);
+    if (rangeLink) assertBlockParams(rangeLink.href, initialReason);
 
     checkboxes[1].click();
     checkboxes[2].click();
-    params = parseParams(blockLink.href);
-    assert.equal(params.get('wpExpiry'), '3 months');
-    assert.equal(params.get('wpReason'), 'other');
-    assert.equal(
-      params.get('wpReason-other'),
-      '{{blocked proxy}}<!-- AS17451, metroNET By Biznet, BIZNET-AS-AP BIZNET NETWORKS ([[:m:User:Hamish/proxycheck.js|proxycheck]]) -->'
-    );
+    const fullReason =
+      '{{blocked proxy}}<!-- AS17451, metroNET By Biznet, BIZNET-AS-AP BIZNET NETWORKS ([[:m:User:Hamish/proxycheck.js|proxycheck]]) -->';
+    assertBlockParams(singleLink.href, fullReason);
+    if (rangeLink) assertBlockParams(rangeLink.href, fullReason);
 
     checkboxes[0].click();
     checkboxes[1].click();
     checkboxes[2].click();
-    params = parseParams(blockLink.href);
-    assert.equal(
-      params.get('wpReason-other'),
-      '{{blocked proxy}}<!-- ([[:m:User:Hamish/proxycheck.js|proxycheck]]) -->'
-    );
+    const bareReason = '{{blocked proxy}}<!-- ([[:m:User:Hamish/proxycheck.js|proxycheck]]) -->';
+    assertBlockParams(singleLink.href, bareReason);
+    if (rangeLink) assertBlockParams(rangeLink.href, bareReason);
 
     openDialogs[0].close();
     await flush();

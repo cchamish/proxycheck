@@ -1032,20 +1032,42 @@ function normaliseSafeIpWithoutZone(rawIp?: string | null): string | null {
   return canonical.split('%')[0] || null;
 }
 
-function normaliseSafeCidrOrIp(rawTarget?: string | null, fallbackIp?: string | null): string | null {
+function parseSafeCidr(rawTarget?: string | null): { addr: string; prefix: number; maxPrefix: number } | null {
   const trimmed = String(rawTarget || '').trim();
-  if (trimmed.includes('/')) {
-    const [addrPart, prefixPart, ...extra] = trimmed.split('/');
-    if (extra.length === 0 && /^\d{1,3}$/.test(prefixPart || '')) {
-      const safeAddr = normaliseSafeIpWithoutZone(addrPart);
-      const prefixNum = Number(prefixPart);
-      const maxPrefix = safeAddr?.includes(':') ? 128 : 32;
-      if (safeAddr && prefixNum >= 1 && prefixNum <= maxPrefix) {
-        return `${safeAddr}/${prefixNum}`;
-      }
-    }
+  if (!trimmed.includes('/')) {
+    return null;
   }
+  const [addrPart, prefixPart, ...extra] = trimmed.split('/');
+  if (extra.length !== 0 || !/^\d{1,3}$/.test(prefixPart || '')) {
+    return null;
+  }
+  const safeAddr = normaliseSafeIpWithoutZone(addrPart);
+  if (!safeAddr) {
+    return null;
+  }
+  const prefix = Number(prefixPart);
+  const maxPrefix = safeAddr.includes(':') ? 128 : 32;
+  if (prefix < 1 || prefix > maxPrefix) {
+    return null;
+  }
+  return { addr: safeAddr, prefix, maxPrefix };
+}
+
+function normaliseSafeCidrOrIp(rawTarget?: string | null, fallbackIp?: string | null): string | null {
+  const parsed = parseSafeCidr(rawTarget);
+  if (parsed) {
+    return `${parsed.addr}/${parsed.prefix}`;
+  }
+  const trimmed = String(rawTarget || '').trim();
   return normaliseSafeIpWithoutZone(trimmed) ?? normaliseSafeIpWithoutZone(fallbackIp);
+}
+
+function normaliseSafeRangeCidr(rawTarget?: string | null): string | null {
+  const parsed = parseSafeCidr(rawTarget);
+  if (!parsed || parsed.prefix >= parsed.maxPrefix) {
+    return null;
+  }
+  return `${parsed.addr}/${parsed.prefix}`;
 }
 
 function normaliseWikiBaseUrl(wikiBaseUrl?: string | null): string {
@@ -1054,6 +1076,26 @@ function normaliseWikiBaseUrl(wikiBaseUrl?: string | null): string {
     return trimmed;
   }
   return 'https://meta.wikimedia.org';
+}
+
+function buildSpecialBlockTargetUrl(
+  target: string,
+  base: string,
+  useSoftBlock: boolean
+): string {
+  const encodedPathTarget = target
+    .split('/')
+    .map((segment) => encodeURIComponent(segment).replaceAll('%3A', ':'))
+    .join('/');
+  const blockBase = `${base}/wiki/Special:Block/${encodedPathTarget}`;
+  if (!useSoftBlock) {
+    return blockBase;
+  }
+  const params = new URLSearchParams({
+    wpHardBlock: '0',
+    wpDisableUTEdit: '0',
+  });
+  return `${blockBase}?${params.toString()}`;
 }
 
 /**
@@ -1071,20 +1113,7 @@ export function buildSpecialBlockUrl(
   if (!target) {
     return null;
   }
-  const base = normaliseWikiBaseUrl(wikiBaseUrl);
-  const encodedPathTarget = target
-    .split('/')
-    .map((segment) => encodeURIComponent(segment).replaceAll('%3A', ':'))
-    .join('/');
-  const blockBase = `${base}/wiki/Special:Block/${encodedPathTarget}`;
-  if (!shouldUseSoftBlockDefaults(data)) {
-    return blockBase;
-  }
-  const params = new URLSearchParams({
-    wpHardBlock: '0',
-    wpDisableUTEdit: '0',
-  });
-  return `${blockBase}?${params.toString()}`;
+  return buildSpecialBlockTargetUrl(target, normaliseWikiBaseUrl(wikiBaseUrl), shouldUseSoftBlockDefaults(data));
 }
 
 export interface VerificationLinks {
@@ -1092,6 +1121,8 @@ export interface VerificationLinks {
   rangeblockFinderUrl: string;
   whoisGatewayUrl: string;
   specialBlockUrl: string;
+  singleIpBlockUrl: string;
+  rangeBlockUrl: string | null;
   isSoftBlockRecommended: boolean;
 }
 
@@ -1109,15 +1140,20 @@ export function buildVerificationLinks(
   const base = normaliseWikiBaseUrl(wikiBaseUrl);
   const pathSafeIp = encodeURIComponent(safeIp).replaceAll('%3A', ':');
   const querySafeIp = encodeURIComponent(safeIp);
-  const specialBlockUrl =
-    buildSpecialBlockUrl(data, base) ?? `${base}/wiki/Special:Block/${pathSafeIp}`;
+  const isSoftBlockRecommended = shouldUseSoftBlockDefaults(data);
+  const singleIpBlockUrl = buildSpecialBlockTargetUrl(safeIp, base, isSoftBlockRecommended);
+  const rangeCidr = normaliseSafeRangeCidr(data.recommendedCidr);
+  const rangeBlockUrl = rangeCidr ? buildSpecialBlockTargetUrl(rangeCidr, base, isSoftBlockRecommended) : null;
+  const specialBlockUrl = buildSpecialBlockUrl(data, base) ?? singleIpBlockUrl;
 
   return {
     globalContributionsUrl: `${base}/wiki/Special:GlobalContributions/${pathSafeIp}`,
     rangeblockFinderUrl: `https://rangeblockfinder.toolforge.org/?ip=${querySafeIp}`,
     whoisGatewayUrl: `https://whois.toolforge.org/gateway.py?lookup=true&ip=${querySafeIp}`,
     specialBlockUrl,
-    isSoftBlockRecommended: shouldUseSoftBlockDefaults(data),
+    singleIpBlockUrl,
+    rangeBlockUrl,
+    isSoftBlockRecommended,
   };
 }
 

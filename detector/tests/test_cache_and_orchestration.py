@@ -629,6 +629,8 @@ class HttpClientLifecycleTests(TestCase):
 
         client = http_client.build_cookieless_http_client()
         try:
+            # Clear proxy transport mounts inherited from environment variables so MockTransport handles all URLs
+            client._mounts = {}
             client._transport = httpx.MockTransport(_handler)
             await client.get("https://zh.wikipedia.org/w/api.php", headers={"Cookie": "injected=1"})
             userinfo, meta_rights, project_rights = await asyncio.gather(

@@ -1443,9 +1443,20 @@ test('Details panel renders privacy relay, CGNAT, residential proxy signals, sof
     assert.equal(dialog.querySelector('.proxycheck-link-rangeblock')!.href, `https://rangeblockfinder.toolforge.org/?ip=${encodeURIComponent(tc.ip)}`);
     assert.equal(dialog.querySelector('.proxycheck-link-whois')!.href, `https://whois.toolforge.org/gateway.py?lookup=true&ip=${encodeURIComponent(tc.ip)}`);
 
-    const blockHref = dialog.querySelector('.proxycheck-link-block')!.href;
+    const singleLink = dialog.querySelector('.proxycheck-link-block')!;
+    const blockHref = singleLink.href;
     const expectedCidr = String(tc.overrides.recommendedCidr);
-    assert.ok(blockHref.includes(`Special:Block/${expectedCidr}`));
+    assert.equal(singleLink.textContent, 'Special:Block ↗');
+    assert.ok(blockHref.includes(`Special:Block/${tc.ip}`));
+    assert.equal(blockHref.includes('wpReason=other'), false);
+    const rangeLink = dialog.querySelector('.proxycheck-link-block-range');
+    if (expectedCidr.endsWith('/32') || expectedCidr.endsWith('/128')) {
+      assert.equal(rangeLink, null);
+    } else {
+      assert.ok(rangeLink);
+      assert.equal(rangeLink.textContent, 'Special:Block (range) ↗');
+      assert.ok(rangeLink.href.includes(`Special:Block/${expectedCidr}`));
+    }
     if (tc.expectSoftBlock) {
       assert.ok(blockHref.includes('wpAnonOnly=1'));
       assert.ok(blockHref.includes('wpHardBlock=0'));

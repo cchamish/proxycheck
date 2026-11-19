@@ -44,6 +44,7 @@ _LOCAL_DEV_ORIGIN_RE = re.compile(r"^https?://(?:localhost|127\.0\.0\.1)(?::\d{1
 
 GADGET_TOKEN_SALT = "proxycheck.gadget.auth.v1"  # noqa: S105
 DEFAULT_GADGET_TOKEN_TTL_SECONDS = 900
+_MAX_GADGET_TOKEN_BODY_BYTES = 8192
 
 _MAX_MERGED_PROJECT_RIGHTS_LOOKUPS = 15
 _MERGED_PROJECT_RIGHTS_BATCH_SIZE = 5
@@ -114,6 +115,7 @@ def apply_detect_cors_headers(request, response, methods: str = "GET, OPTIONS"):
         response["Access-Control-Allow-Origin"] = origin.strip()
         response["Access-Control-Allow-Methods"] = methods
         response["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+        response["Access-Control-Expose-Headers"] = "Retry-After"
         response["Access-Control-Max-Age"] = "86400"
         vary_existing = response.get("Vary")
         if not vary_existing:
@@ -208,6 +210,7 @@ async def resolve_wikimedia_access(
     *,
     wiki_domain: str = "meta.wikimedia.org",
     local_rights_verified: bool = True,
+    skip_meta_if_local_granted: bool = False,
 ) -> Tuple[bool, str, List[str], List[str]]:
     """
     Resolves Wikimedia temporary-account IP reveal access from local rights,
@@ -226,6 +229,8 @@ async def resolve_wikimedia_access(
         return evaluate_wikimedia_rights(base_info)
 
     local_eval = evaluate_wikimedia_rights(base_info)
+    if skip_meta_if_local_granted and local_eval[0]:
+        return local_eval
     try:
         meta_rights = await oauth.fetch_user_rights_from_meta(
             client,
@@ -543,11 +548,17 @@ TEST_ROLE_PROFILES: Dict[str, Dict[str, Any]] = {
 
 def parse_gadget_token_payload(request) -> Tuple[Optional[Tuple[str, str]], Optional[JsonResponse]]:
     """Parses and validates the CentralAuth token and Wikimedia domain from a gadget token request."""
+    raw_bytes = request.body or b""
+    if len(raw_bytes) > _MAX_GADGET_TOKEN_BODY_BYTES:
+        return None, JsonResponse(
+            {"error": f"Request body exceeds maximum allowed size of {_MAX_GADGET_TOKEN_BODY_BYTES} bytes."},
+            status=413,
+        )
     try:
-        raw_body = request.body.decode("utf-8-sig") if request.body else ""
+        raw_body = raw_bytes.decode("utf-8-sig") if raw_bytes else ""
         body = json.loads(raw_body) if raw_body.strip() else None
     except UnicodeDecodeError, ValueError:
-        logger.warning("Invalid JSON request body received in exchange_gadget_token.", exc_info=True)
+        logger.warning("Invalid JSON request body received in exchange_gadget_token.")
         return None, JsonResponse({"error": "Invalid JSON request body."}, status=400)
 
     if not isinstance(body, dict):

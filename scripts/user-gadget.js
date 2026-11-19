@@ -29,6 +29,11 @@
     const TOKEN_KEY = 'proxycheck-gadget-token';
     const TOKEN_USER_KEY = 'proxycheck-gadget-token-user';
     const TOKEN_EXPIRY_KEY = 'proxycheck-gadget-token-exp';
+    const TOKEN_COOLDOWN_UNTIL_KEY = 'proxycheck-gadget-token-cooldown-until';
+    const TOKEN_COOLDOWN_MIN_SECONDS = 5;
+    const TOKEN_COOLDOWN_MAX_SECONDS = 120;
+    const TOKEN_COOLDOWN_DEFAULT_SECONDS = 15;
+    const TOKEN_COOLDOWN_JITTER_RATIO = 0.2;
     const RESULT_CACHE_STORAGE_KEY = 'proxycheck-ip-result-cache-v1';
     const RESULT_CACHE_TTL_MS = 30 * 60 * 1000;
     const DEGRADED_CACHE_TTL_MS = 60 * 1000;
@@ -80,6 +85,9 @@
     let authPromise = null;
     let memoryToken = null;
     let memoryTokenExpiry = null;
+    let memoryTokenCooldownUntil = 0;
+    let tokenExchangeVisibilityHandler = null;
+    let tokenExchangeVisibilityResolve = null;
     let memoryAutoSwrTimestamps = [];
 
     function isContributionsSpecialPage() {
@@ -132,9 +140,22 @@
         }
     }
 
+    function clearTokenExchangeVisibilityWait() {
+        if (tokenExchangeVisibilityHandler && typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+            document.removeEventListener('visibilitychange', tokenExchangeVisibilityHandler);
+        }
+        tokenExchangeVisibilityHandler = null;
+        if (tokenExchangeVisibilityResolve) {
+            const resolvePending = tokenExchangeVisibilityResolve;
+            tokenExchangeVisibilityResolve = null;
+            resolvePending(false);
+        }
+    }
+
     function blockAccess() {
         accessBlocked = true;
         activeLoadingInterval = clearTimer(activeLoadingInterval, true);
+        clearTokenExchangeVisibilityWait();
         clearContributionsSchedule();
         ipContributionsObserverTimer = clearTimer(ipContributionsObserverTimer, false);
         ipContributionsFallbackTimer = clearTimer(ipContributionsFallbackTimer, false);
@@ -459,12 +480,70 @@
         return consentPromise;
     }
 
-    function performGadgetTokenExchange() {
-        if (accessBlocked) return Promise.resolve(null);
+    function readTokenExchangeCooldownUntil() {
+        const now = Date.now();
+        const maxAllowedUntil = now + (TOKEN_COOLDOWN_MAX_SECONDS * (1 + TOKEN_COOLDOWN_JITTER_RATIO) + 5) * 1000;
+        let until = memoryTokenCooldownUntil;
+        if (until > maxAllowedUntil) memoryTokenCooldownUntil = until = 0;
+        if (mw && mw.storage && typeof mw.storage.get === 'function') {
+            const raw = mwStoreOp(mw.storage, 'get', TOKEN_COOLDOWN_UNTIL_KEY);
+            if (typeof raw === 'string' && raw.trim() !== '') {
+                const parsed = Number(raw);
+                if (!isFinite(parsed) || parsed <= now || parsed > maxAllowedUntil) {
+                    mwStoreOp(mw.storage, 'remove', TOKEN_COOLDOWN_UNTIL_KEY);
+                } else if (parsed > until) {
+                    until = parsed;
+                }
+            }
+        }
+        if (until <= now) {
+            memoryTokenCooldownUntil = 0;
+            return 0;
+        }
+        memoryTokenCooldownUntil = until;
+        return until;
+    }
+
+    function setTokenExchangeCooldown(retryAfterSeconds) {
+        const rawSec = typeof retryAfterSeconds === 'number' && isFinite(retryAfterSeconds)
+            ? retryAfterSeconds : TOKEN_COOLDOWN_DEFAULT_SECONDS;
+        const clampedSec = Math.min(TOKEN_COOLDOWN_MAX_SECONDS, Math.max(TOKEN_COOLDOWN_MIN_SECONDS, rawSec));
+        const jitterMs = Math.round(clampedSec * Math.random() * TOKEN_COOLDOWN_JITTER_RATIO * 1000);
+        const until = Date.now() + clampedSec * 1000 + jitterMs;
+        memoryTokenCooldownUntil = Math.max(memoryTokenCooldownUntil, until);
+        if (mw && mw.storage && typeof mw.storage.set === 'function') {
+            mwStoreOp(mw.storage, 'set', TOKEN_COOLDOWN_UNTIL_KEY, String(memoryTokenCooldownUntil));
+        }
+    }
+
+    function waitForVisibleBeforeTokenExchange() {
+        if (accessBlocked) return Promise.resolve(false);
+        if (isDocumentVisible()) return Promise.resolve(true);
+        if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return Promise.resolve(true);
+        return new Promise((resolve) => {
+            clearTokenExchangeVisibilityWait();
+            tokenExchangeVisibilityResolve = resolve;
+            tokenExchangeVisibilityHandler = () => {
+                if (accessBlocked) { clearTokenExchangeVisibilityWait(); return; }
+                if (!isDocumentVisible()) return;
+                const finish = tokenExchangeVisibilityResolve;
+                tokenExchangeVisibilityResolve = null;
+                if (typeof document.removeEventListener === 'function') {
+                    document.removeEventListener('visibilitychange', tokenExchangeVisibilityHandler);
+                }
+                tokenExchangeVisibilityHandler = null;
+                if (finish) finish(true);
+            };
+            document.addEventListener('visibilitychange', tokenExchangeVisibilityHandler);
+        });
+    }
+
+    function executeGadgetTokenExchange() {
+        if (accessBlocked || readTokenExchangeCooldownUntil() > 0) return Promise.resolve(null);
         clearStoredToken();
         const wikiDomain = mw.config.get('wgServerName');
         return Promise.resolve(mw.loader.using('mediawiki.api')).then(() => {
-            if (accessBlocked) return null;
+            if (accessBlocked || readTokenExchangeCooldownUntil() > 0) return null;
             return new mw.Api().get({ action: 'centralauthtoken' }).then((d) => d, (code, details) => { warn('centralauthtoken request failed:', { code, details }); return null; });
         }).then((apiData) => {
             const cat = !accessBlocked && apiData && apiData.centralauthtoken && apiData.centralauthtoken.centralauthtoken;
@@ -473,11 +552,39 @@
                 method: 'POST', mode: 'cors', credentials: 'omit', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ centralauthtoken: cat, domain: wikiDomain })
             }).then((res) => {
-                if (!res.ok) return res.text().then((txt) => {
-                    warn(`Gadget token HTTP ${res.status}:`, txt);
-                    if (res.status === 403) { clearStoredToken(); blockAccess(); } else if (res.status === 401) clearStoredToken();
-                    return null;
-                });
+                if (!res.ok) {
+                    const readErrorText = typeof res.text === 'function'
+                        ? res.text()
+                        : (typeof res.json === 'function' ? res.json().then((obj) => JSON.stringify(obj)) : Promise.resolve(''));
+                    if (res.status === 429) {
+                        const headerRetry = res.headers && typeof res.headers.get === 'function' ? res.headers.get('Retry-After') : null;
+                        return readErrorText.then((txt) => {
+                            let bodyRetry = null;
+                            if (txt) {
+                                try {
+                                    const parsed = JSON.parse(txt);
+                                    if (parsed && typeof parsed.retryAfterSeconds === 'number' && isFinite(parsed.retryAfterSeconds)) {
+                                        bodyRetry = parsed.retryAfterSeconds;
+                                    }
+                                } catch (_) {
+                                    // Fall back to header or default cooldown when the 429 body is not JSON.
+                                }
+                            }
+                            const parsedHeader = headerRetry !== null ? parseInt(headerRetry, 10) : NaN;
+                            const resolvedRetry = bodyRetry !== null
+                                ? bodyRetry
+                                : (isFinite(parsedHeader) ? parsedHeader : TOKEN_COOLDOWN_DEFAULT_SECONDS);
+                            setTokenExchangeCooldown(resolvedRetry);
+                            warn('Gadget token HTTP 429:', txt);
+                            return null;
+                        });
+                    }
+                    return readErrorText.then((txt) => {
+                        warn(`Gadget token HTTP ${res.status}:`, txt);
+                        if (res.status === 403) { clearStoredToken(); blockAccess(); } else if (res.status === 401) clearStoredToken();
+                        return null;
+                    });
+                }
                 return res.json().then((payload) => {
                     const tok = payload && payload.token;
                     if (!tok || typeof tok !== 'string') { warn('Token missing in response:', payload); return null; }
@@ -488,12 +595,25 @@
         }).catch((err) => { warn('CentralAuth token exchange failed:', err); return null; });
     }
 
+    function performGadgetTokenExchange(failedToken) {
+        if (accessBlocked) return Promise.resolve(null);
+        if (!isDocumentVisible()) {
+            return waitForVisibleBeforeTokenExchange().then((canProceed) => {
+                if (!canProceed || accessBlocked) return null;
+                const latest = readStoredToken();
+                if (latest && (!failedToken || latest !== failedToken)) return latest;
+                return executeGadgetTokenExchange();
+            });
+        }
+        return executeGadgetTokenExchange();
+    }
+
     function refreshGadgetToken(failedToken) {
         if (accessBlocked) return Promise.resolve(null);
         if (authPromise) return authPromise;
         const latest = readStoredToken();
         if (latest && (!failedToken || latest !== failedToken)) return Promise.resolve(latest);
-        const tracked = performGadgetTokenExchange().then(
+        const tracked = performGadgetTokenExchange(failedToken).then(
             (tok) => { if (authPromise === tracked) authPromise = null; return tok; },
             (err) => { if (authPromise === tracked) authPromise = null; throw err; }
         );

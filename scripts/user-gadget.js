@@ -1186,6 +1186,66 @@
         return promise;
     }
 
+    function rowHasHighRiskFlag(row) {
+        return Boolean(row && Array.isArray(row.securityFlags) && row.securityFlags.some((f) => Boolean(f && f.isHighRisk)));
+    }
+
+    function extractNonEmptyStrings(list) {
+        if (!Array.isArray(list)) return [];
+        return list.map((item) => (typeof item === 'string' ? item.trim() : '')).filter(Boolean);
+    }
+
+    function isSpamhausNonPblListed(row) {
+        if (!row || row.provider !== 'Spamhaus ZEN') return false;
+        const codes = extractNonEmptyStrings(row.listedCodes);
+        const isListed = Boolean(row.isListed || codes.length > 0);
+        if (!isListed) return false;
+        if (codes.length > 0) return codes.some((code) => code !== '127.0.0.10' && code !== '127.0.0.11');
+        return !row.isPolicyRange || rowHasHighRiskFlag(row);
+    }
+
+    function isSpamhausPolicyOnlyListed(row) {
+        if (!row || row.provider !== 'Spamhaus ZEN') return false;
+        const codes = extractNonEmptyStrings(row.listedCodes);
+        const isListed = Boolean(row.isListed || row.isPolicyRange || codes.length > 0);
+        return isListed && !isSpamhausNonPblListed(row);
+    }
+
+    function isMaxmindHostingRow(row) {
+        if (!row || row.provider !== 'MaxMind') return false;
+        const usage = typeof row.usageType === 'string' ? row.usageType.trim().toLowerCase() : '';
+        return Boolean(
+            (typeof row.hostingProvider === 'string' && row.hostingProvider.trim()) ||
+            (typeof row.cloudProvider === 'string' && row.cloudProvider.trim()) ||
+            usage === 'hosting' || usage === 'datacenter' || usage === 'data center'
+        );
+    }
+
+    function hasDshieldActivity(row) {
+        if (!row || row.provider !== 'DShield') return false;
+        const threatfeeds = extractNonEmptyStrings(row.threatfeeds);
+        return Boolean((Number(row.attacks) || 0) > 0 || (Number(row.count) || 0) > 0 || threatfeeds.length > 0 || rowHasHighRiskFlag(row));
+    }
+
+    function hasSpamcopListing(row) {
+        if (!row || row.provider !== 'SpamCop') return false;
+        return Boolean(row.isListed || extractNonEmptyStrings(row.listedCodes).length > 0 || rowHasHighRiskFlag(row));
+    }
+
+    function collectNumericPorts(target, list) {
+        if (!Array.isArray(list)) return;
+        for (const item of list) {
+            const n = Number(item);
+            if (isFinite(n) && n > 0 && target.indexOf(n) === -1) target.push(n);
+        }
+    }
+
+    function rowHasOpenPortsFlag(row) {
+        return Boolean(row && row.provider === 'Shodan InternetDB' &&
+            ((Array.isArray(row.ports) && row.ports.length > 0) ||
+            (Array.isArray(row.securityFlags) && row.securityFlags.some((f) => f && f.label === 'Open Ports'))));
+    }
+
     function evaluateRisk(data) {
         const isNonPublic = Boolean(data.isNonPublic);
         const nonPublicCategory = typeof data.nonPublicCategory === 'string' ? data.nonPublicCategory.trim().toLowerCase() : '';
@@ -1204,12 +1264,16 @@
         const arbitrationVerdict = typeof data.arbitrationVerdict === 'string' ? data.arbitrationVerdict.trim() : '';
         const torLabel = typeof data.torLabel === 'string' && data.torLabel.trim() ? data.torLabel.trim() : (isTor ? 'Tor Node' : '');
         const torSummary = typeof data.torSummary === 'string' && data.torSummary.trim() ? data.torSummary.trim() : '';
-        const torFlags = Array.isArray(data.torFlags) ? data.torFlags.map((f) => typeof f === 'string' ? f.trim() : '').filter(Boolean) : [];
+        const torFlags = extractNonEmptyStrings(data.torFlags);
 
         const rows = Array.isArray(data.results) ? data.results : [];
         let getipintelRow = null, stopforumspamRow = null;
         let hasQuotaGuardedProvider = false, hasCooldownProvider = false;
         let validCommercialCount = 0, positiveCommercialVotes = 0, validTotalSourceCount = 0;
+        let hasSpamhausNonPbl = false, hasSpamhausPolicy = false, hasDshieldSignal = false;
+        let hasSpamcopSignal = false, hasIpsumDropSignal = false, hasX4bnetSignal = false;
+        let hasMaxmindHosting = false, hasMaxmindRiskFlag = false, hasShodanOpenPortsSignal = false;
+        let hasOtherNonCommercialRiskFlag = false, hasLightCommercialRiskFlag = false;
 
         for (const r of rows) {
             if (!r || typeof r !== 'object') continue;
@@ -1217,33 +1281,69 @@
             else if (r.provider === 'StopForumSpam') stopforumspamRow = r;
             if (isRowQuotaGuarded(r)) hasQuotaGuardedProvider = true;
             else if (r.isCooldown) hasCooldownProvider = true;
-            if (isValidProviderRow(r)) {
-                validTotalSourceCount += 1;
-                if (Object.prototype.hasOwnProperty.call(COMMERCIAL_PROVIDERS, r.provider)) {
-                    validCommercialCount += 1;
-                    const flags = Array.isArray(r.securityFlags) ? r.securityFlags : [];
-                    const hasRiskFlag = flags.some((f) => f && f.isHighRisk) ||
-                        (typeof r.usageType === 'string' && /datacenter|data center|hosting|cloud|transit|cdn/i.test(r.usageType));
-                    if (hasRiskFlag) positiveCommercialVotes += 1;
+            if (!isValidProviderRow(r)) continue;
+
+            validTotalSourceCount += 1;
+            const isCommercial = Object.prototype.hasOwnProperty.call(COMMERCIAL_PROVIDERS, r.provider);
+            if (isCommercial) {
+                validCommercialCount += 1;
+                const hasRiskFlag = rowHasHighRiskFlag(r) ||
+                    (typeof r.usageType === 'string' && /datacenter|data center|hosting|cloud|transit|cdn/i.test(r.usageType));
+                if (hasRiskFlag) positiveCommercialVotes += 1;
+                if (r.provider !== 'GetIPIntel' && rowHasHighRiskFlag(r)) hasLightCommercialRiskFlag = true;
+                continue;
+            }
+            if (r.provider === 'Spamhaus ZEN') {
+                if (isSpamhausNonPblListed(r)) hasSpamhausNonPbl = true;
+                else if (isSpamhausPolicyOnlyListed(r)) hasSpamhausPolicy = true;
+            } else if (r.provider === 'DShield') {
+                if (hasDshieldActivity(r)) hasDshieldSignal = true;
+            } else if (r.provider === 'SpamCop') {
+                if (hasSpamcopListing(r)) hasSpamcopSignal = true;
+            } else if (r.provider === 'IPsum / DROP') {
+                if (r.inSpamhausDrop || r.isIpsumListed || r.isListed || (Number(r.ipsumScore) || 0) >= 2 || rowHasHighRiskFlag(r)) {
+                    hasIpsumDropSignal = true;
                 }
+            } else if (r.provider === 'X4BNet VPN') {
+                if (r.isVpn || r.isHosting || r.isDatacenter || r.isListed || rowHasHighRiskFlag(r)) {
+                    hasX4bnetSignal = true;
+                }
+            } else if (r.provider === 'MaxMind') {
+                if (isMaxmindHostingRow(r)) hasMaxmindHosting = true;
+                if (rowHasHighRiskFlag(r)) hasMaxmindRiskFlag = true;
+            } else if (r.provider === 'Shodan InternetDB') {
+                if (rowHasOpenPortsFlag(r)) hasShodanOpenPortsSignal = true;
+                if (rowHasHighRiskFlag(r)) hasOtherNonCommercialRiskFlag = true;
+            } else if (r.provider !== 'StopForumSpam' && rowHasHighRiskFlag(r)) {
+                hasOtherNonCommercialRiskFlag = true;
             }
         }
 
         const isSfsBlacklisted = Boolean(stopforumspamRow && (stopforumspamRow.blacklisted || stopforumspamRow.toxicCidr));
-        const isSfsListed = Boolean(stopforumspamRow && (stopforumspamRow.appears || (stopforumspamRow.frequency && Number(stopforumspamRow.frequency) > 0)));
+        const isSfsListed = Boolean(stopforumspamRow && (stopforumspamRow.appears || (stopforumspamRow.frequency && Number(stopforumspamRow.frequency) > 0) || rowHasHighRiskFlag(stopforumspamRow)));
         const suspectedResidentialProxy = Boolean(data.suspectedResidentialProxy);
         const highlySuspectedResidentialProxy = Boolean(data.highlySuspectedResidentialProxy);
         const sharedPrivacyEgress = typeof data.sharedPrivacyEgress === 'string' && data.sharedPrivacyEgress.trim()
             ? data.sharedPrivacyEgress.trim().toLowerCase() : '';
         const isMobileOrCgnat = isMobileOrCgnatPayload(data);
         const openProxyPorts = extractShodanOpenProxyPorts(data);
+        const shodanOpenPorts = extractShodanOpenPorts(data);
         const isPartialLight = Boolean(data.isPartialMode || String(data.queryMode || '').trim().toLowerCase() === 'light');
         const isGetIpIntelDeferred = Boolean(getipintelRow && (getipintelRow.isDeferred || getipintelRow.status === 'Deferred (Light Mode)'));
+        // Spamhaus PBL flags dynamic consumer ISP ranges, so only elevate it to yellow before commercial scoring runs.
+        const isLightScreeningMode = Boolean(!hasPrediction && (isPartialLight || isGetIpIntelDeferred));
+        const hasActiveSpamhausSignal = hasSpamhausNonPbl || (isLightScreeningMode && hasSpamhausPolicy);
+        const hasProviderRiskSignal = Boolean(
+            hasActiveSpamhausSignal || hasDshieldSignal || hasSpamcopSignal || hasIpsumDropSignal ||
+            hasX4bnetSignal || hasMaxmindHosting || hasMaxmindRiskFlag || hasShodanOpenPortsSignal ||
+            shodanOpenPorts.length > 0 || hasOtherNonCommercialRiskFlag || (isLightScreeningMode && hasLightCommercialRiskFlag)
+        );
 
         const hasHighOrMediumSignals = Boolean(
             isTor || isMajorityProxyVpn || highlySuspectedResidentialProxy || suspectedResidentialProxy ||
             openProxyPorts.length > 0 || sharedPrivacyEgress || arbitrationTier === 'destructive' ||
-            hasCloudProvider || ptrIsHighRisk || arbitrationTier === 'warning' || broadcastIp || isSfsBlacklisted || isSfsListed
+            hasCloudProvider || ptrIsHighRisk || arbitrationTier === 'warning' || broadcastIp ||
+            isSfsBlacklisted || isSfsListed || hasProviderRiskSignal
         );
         const isLightDeferredClean = Boolean(!hasPrediction && !hasHighOrMediumSignals && !hasQuotaGuardedProvider && !hasCooldownProvider && (isPartialLight || isGetIpIntelDeferred));
         const hasValidNonPredictionClean = Boolean(!hasPrediction && !hasHighOrMediumSignals && !isLightDeferredClean &&
@@ -1252,7 +1352,7 @@
         let riskTier = 'low';
         if (isNonPublic) riskTier = 'nonpublic';
         else if ((hasPrediction && prediction > 80) || isTor || isMajorityProxyVpn || highlySuspectedResidentialProxy || arbitrationTier === 'destructive' || isSfsBlacklisted) riskTier = 'high';
-        else if ((hasPrediction && prediction >= 30) || broadcastIp || suspectedResidentialProxy || openProxyPorts.length > 0 || sharedPrivacyEgress || arbitrationTier === 'warning' || ptrIsHighRisk || hasCloudProvider || isSfsListed) riskTier = 'medium';
+        else if ((hasPrediction && prediction >= 30) || broadcastIp || suspectedResidentialProxy || openProxyPorts.length > 0 || sharedPrivacyEgress || arbitrationTier === 'warning' || ptrIsHighRisk || hasCloudProvider || isSfsListed || hasProviderRiskSignal) riskTier = 'medium';
 
         const predictionText = hasPrediction ? String(Number(prediction.toFixed(2))) : '';
         const giiStatus = getipintelRow && getipintelRow.status ? ` (${getipintelRow.status})` : '';
@@ -1276,6 +1376,13 @@
         else if (ptrIsHighRisk) badgePrimaryLabel = 'PTR-RISK';
         else if (isSfsListed) badgePrimaryLabel = 'SPAM';
         else if (arbitrationTier === 'warning') badgePrimaryLabel = 'REVIEW';
+        else if (hasDshieldSignal) badgePrimaryLabel = 'DSHIELD';
+        else if (hasSpamcopSignal) badgePrimaryLabel = 'SPAMCOP';
+        else if (hasActiveSpamhausSignal) badgePrimaryLabel = 'SPAMHAUS';
+        else if (hasIpsumDropSignal) badgePrimaryLabel = 'IPSUM';
+        else if (hasMaxmindHosting || hasX4bnetSignal) badgePrimaryLabel = 'HOSTING';
+        else if (hasShodanOpenPortsSignal || shodanOpenPorts.length > 0) badgePrimaryLabel = 'OPEN-PORTS';
+        else if (hasMaxmindRiskFlag || hasOtherNonCommercialRiskFlag || (isLightScreeningMode && hasLightCommercialRiskFlag)) badgePrimaryLabel = 'FLAGGED';
         else if (isLightDeferredClean) badgePrimaryLabel = 'LIGHT';
         else if (hasValidNonPredictionClean) badgePrimaryLabel = validCommercialCount > 0 ? `OK ${positiveCommercialVotes}/${validCommercialCount}` : 'CLEAN';
         else if (hasQuotaGuardedProvider) badgePrimaryLabel = 'QUOTA';
@@ -1285,9 +1392,9 @@
             isNonPublic, nonPublicCategory, nonPublicReason, nonPublicBadgeCode,
             prediction, hasPrediction, broadcastIp, isTor, isMajorityProxyVpn,
             suspectedResidentialProxy, highlySuspectedResidentialProxy, sharedPrivacyEgress,
-            isMobileOrCgnat, openProxyPorts, arbitrationTier, ptrIsHighRisk, hasCloudProvider,
+            isMobileOrCgnat, openProxyPorts, shodanOpenPorts, arbitrationTier, ptrIsHighRisk, hasCloudProvider,
             isSfsBlacklisted, isSfsListed, hasQuotaGuardedProvider, hasCooldownProvider,
-            isLightDeferredClean, validCommercialCount, positiveCommercialVotes, validTotalSourceCount,
+            isLightScreeningMode, isLightDeferredClean, validCommercialCount, positiveCommercialVotes, validTotalSourceCount,
             torLabel, torFlags, torSummary, riskTier, predictionText, predictionTooltip, badgePrimaryLabel
         };
     }
@@ -1363,15 +1470,21 @@
 
     function extractShodanOpenProxyPorts(data) {
         const ports = [];
-        const addPort = (p) => {
-            const n = Number(p);
-            if (isFinite(n) && n > 0 && ports.indexOf(n) === -1) ports.push(n);
-        };
-        if (data && Array.isArray(data.openProxyPorts)) data.openProxyPorts.forEach(addPort);
+        if (data) collectNumericPorts(ports, data.openProxyPorts);
         if (data && Array.isArray(data.results)) {
-            data.results.forEach((r) => {
-                if (r && r.provider === 'Shodan InternetDB' && Array.isArray(r.openProxyPorts)) r.openProxyPorts.forEach(addPort);
-            });
+            for (const r of data.results) {
+                if (r && r.provider === 'Shodan InternetDB') collectNumericPorts(ports, r.openProxyPorts);
+            }
+        }
+        return ports;
+    }
+
+    function extractShodanOpenPorts(data) {
+        const ports = [];
+        if (data && Array.isArray(data.results)) {
+            for (const r of data.results) {
+                if (r && r.provider === 'Shodan InternetDB' && isValidProviderRow(r)) collectNumericPorts(ports, r.ports);
+            }
         }
         return ports;
     }
@@ -1580,13 +1693,32 @@
         };
         if (risk.isTor) addEntry(risk.torLabel || (data.torIsExit ? 'Tor Exit' : 'Tor Node'), 'Tor Onionoo');
         for (const row of rows) {
-            if (!row || !Array.isArray(row.securityFlags) || row.provider === 'GetIPIntel') continue;
+            if (!row || row.provider === 'GetIPIntel') continue;
             const provider = row.provider || 'Provider';
-            for (const flag of row.securityFlags) {
-                if (flag && flag.isHighRisk && typeof flag.label === 'string') {
-                    const lbl = flag.label.trim();
-                    addEntry(lbl.toLowerCase() === 'tor exit node' ? 'Tor Exit' : lbl, provider);
+            let addedRowFlag = false;
+            if (Array.isArray(row.securityFlags)) {
+                for (const flag of row.securityFlags) {
+                    if (flag && flag.isHighRisk && typeof flag.label === 'string') {
+                        const lbl = flag.label.trim();
+                        if (lbl) {
+                            addEntry(lbl.toLowerCase() === 'tor exit node' ? 'Tor Exit' : lbl, provider);
+                            addedRowFlag = true;
+                        }
+                    }
                 }
+            }
+            if (row.provider === 'X4BNet VPN' && (row.isHosting || row.isDatacenter) && !row.isVpn && !addedRowFlag) {
+                addEntry('Hosting / Datacentre', provider);
+            } else if (row.provider === 'IPsum / DROP' && !row.inSpamhausDrop && (row.isIpsumListed || (Number(row.ipsumScore) || 0) === 2) && !addedRowFlag) {
+                addEntry(`IPsum Moderate (${Number(row.ipsumScore) || 2} lists)`, provider);
+            } else if (row.provider === 'Spamhaus ZEN' && risk.isLightScreeningMode && isSpamhausPolicyOnlyListed(row) && !addedRowFlag) {
+                addEntry('Policy/Dynamic ISP Range (PBL)', provider);
+            } else if (row.provider === 'MaxMind' && isMaxmindHostingRow(row) && !addedRowFlag) {
+                addEntry('Hosting', provider);
+            } else if (row.provider === 'DShield' && hasDshieldActivity(row) && !addedRowFlag) {
+                addEntry('Malicious Activity', provider);
+            } else if (row.provider === 'SpamCop' && hasSpamcopListing(row) && !addedRowFlag) {
+                addEntry('SpamCop Listed', provider);
             }
         }
         const cloudProvider = typeof data.cloudProvider === 'string' ? data.cloudProvider.trim() : '';
@@ -1600,6 +1732,11 @@
         if (data.highlySuspectedResidentialProxy) addEntry('Highly Suspected Residential Proxy', 'GetIPIntel ResidentialProxy');
         const ports = extractShodanOpenProxyPorts(data);
         if (ports.length > 0) addEntry(`Open Proxy Ports (${ports.join(', ')})`, 'Shodan InternetDB');
+        else {
+            const shodanPorts = extractShodanOpenPorts(data);
+            if (shodanPorts.length > 0) addEntry(`Open Ports (${shodanPorts.join(', ')})`, 'Shodan InternetDB');
+            else if (rows.some((r) => r && rowHasOpenPortsFlag(r))) addEntry('Open Ports', 'Shodan InternetDB');
+        }
         const shared = getSharedPrivacyEgressLabel(data);
         if (shared) addEntry(`Shared Privacy Egress (${shared})`, 'Privacy Relay');
         return entries;
@@ -1880,18 +2017,24 @@
             if (isWikitext) wikitextResetTimerId = id; else resetTimerId = id;
         };
 
+        const getSelectedCommentValues = () => checkboxItems
+            .filter((item) => item.checkbox.prop('checked'))
+            .map((item) => sanitizeHtmlCommentContent(item.copyValue))
+            .filter(Boolean);
+        const buildAttributionComment = (selectedValues) => {
+            const body = sanitizeHtmlCommentContent(selectedValues.join(', '));
+            return `<!-- ${(body ? body + ' ' : '') + BLOCK_REASON_ATTRIBUTION} -->`;
+        };
+
         $copyLink.on('click', (e) => {
             e.preventDefault(); e.stopPropagation();
             if (panelDisposed) return;
-            const selected = checkboxItems
-                .filter((item) => item.checkbox.prop('checked'))
-                .map((item) => sanitizeHtmlCommentContent(item.copyValue))
-                .filter(Boolean);
+            const selected = getSelectedCommentValues();
             if (selected.length === 0) {
                 $copyLink.text('Select at least one item');
                 return scheduleLabelReset(false, 1500, 'Copy result');
             }
-            const comment = `<!-- ${(sanitizeHtmlCommentContent(selected.join(', ')) + ' ' + BLOCK_REASON_ATTRIBUTION).trim()} -->`;
+            const comment = buildAttributionComment(selected);
             copyText(comment).then(() => {
                 if (!panelDisposed) { $copyLink.text('Copied'); scheduleLabelReset(false, 1500, 'Copy result'); }
             }).catch((err) => {
@@ -1916,12 +2059,38 @@
         if (resolvedIp) {
             const blockTarget = recCidr !== 'N/A' ? recCidr : resolvedIp;
             const softBlock = isSoftBlockAdvised(data);
+            const buildBlockParams = () => {
+                const params = {
+                    wpExpiry: '3 months',
+                    wpReason: 'other',
+                    'wpReason-other': '{{blocked proxy}}' + buildAttributionComment(getSelectedCommentValues())
+                };
+                if (softBlock) {
+                    params.wpAnonOnly = '1';
+                    params.wpHardBlock = '0';
+                    params.wpDisableUTEdit = '0';
+                }
+                return params;
+            };
             const mkLink = (cls, href, text) => $('<a>', { 'class': cls, href, target: '_blank', rel: 'noopener noreferrer', text });
+            const $blockLink = mkLink(
+                'proxycheck-link-block',
+                buildWikiPageUrl('Special:Block/' + blockTarget, buildBlockParams()),
+                softBlock ? 'Special:Block (soft) ↗' : 'Special:Block ↗'
+            );
+            const syncBlockLinkHref = () => {
+                if (!panelDisposed) $blockLink.attr('href', buildWikiPageUrl('Special:Block/' + blockTarget, buildBlockParams()));
+            };
+            for (const item of checkboxItems) {
+                item.checkbox.on('change', syncBlockLinkHref).on('click', syncBlockLinkHref);
+            }
+            $blockLink.on('click', syncBlockLinkHref);
+
             $panel.append($('<div>', { 'class': 'proxycheck-quick-links' }).append(
                 mkLink('proxycheck-link-globalcontribs', buildWikiPageUrl('Special:GlobalContributions/' + resolvedIp, null), 'GlobalContributions ↗'),
                 mkLink('proxycheck-link-rangeblock', 'https://rangeblockfinder.toolforge.org/?ip=' + encodeURIComponent(resolvedIp), 'Rangeblock Finder ↗'),
                 mkLink('proxycheck-link-whois', 'https://whois.toolforge.org/gateway.py?lookup=true&ip=' + encodeURIComponent(resolvedIp), 'WHOIS ↗'),
-                mkLink('proxycheck-link-block', buildWikiPageUrl('Special:Block/' + blockTarget, softBlock ? { wpAnonOnly: '1', wpHardBlock: '0', wpDisableUTEdit: '0' } : null), softBlock ? 'Special:Block (soft) ↗' : 'Special:Block ↗')
+                $blockLink
             ));
         }
 
@@ -1960,38 +2129,74 @@
         const asnEntry = collectAsnEntries(rows)[0];
         const ispEntry = collectIspEntries(rows)[0];
         const riskLabels = [];
-        const addRiskLabel = (label) => {
+        const providerRiskLabels = [];
+        const addLabelTo = (target, label) => {
             const cleaned = typeof label === 'string' ? label.trim() : '';
-            if (cleaned && riskLabels.indexOf(cleaned) === -1) riskLabels.push(cleaned);
+            if (cleaned && target.indexOf(cleaned) === -1) target.push(cleaned);
         };
 
-        if (risk.badgePrimaryLabel && !['LIGHT', 'CLEAN', 'N/A'].includes(risk.badgePrimaryLabel)) {
-            addRiskLabel(risk.badgePrimaryLabel);
-        }
-        if (risk.isTor) addRiskLabel(formatTorDescription(risk) || 'Tor');
-        if (risk.hasCloudProvider) addRiskLabel(formatCloudDescription(data) || 'Cloud');
-        if (risk.ptrIsHighRisk) addRiskLabel('PTR-Risk');
-        if (risk.openProxyPorts && risk.openProxyPorts.length > 0) {
-            addRiskLabel(`Shodan:${risk.openProxyPorts.join(',')}`);
-        }
         for (const row of rows) {
             if (!row) continue;
             if (row.provider === 'StopForumSpam' && (row.blacklisted || row.appears)) {
-                addRiskLabel(row.blacklisted ? 'StopForumSpam:Blacklisted' : 'StopForumSpam:Listed');
+                addLabelTo(providerRiskLabels, row.blacklisted ? 'StopForumSpam:Blacklisted' : 'StopForumSpam:Listed');
             }
-            if ((row.provider === 'Spamhaus ZEN' || row.provider === 'IPsum / DROP') &&
-                (row.isListed || row.inSpamhausDrop || row.isIpsumListed)) {
-                addRiskLabel(row.provider === 'Spamhaus ZEN' ? 'Spamhaus:Listed' : 'IPsum:DROP');
+            if (row.provider === 'Spamhaus ZEN' && (row.isListed || row.isPolicyRange || extractNonEmptyStrings(row.listedCodes).length > 0)) {
+                addLabelTo(providerRiskLabels, 'Spamhaus:Listed');
             }
-            if (row.provider === 'X4BNet VPN' && (row.isVpn || row.isHosting)) {
-                addRiskLabel(row.isVpn ? 'X4BNet:VPN' : 'X4BNet:Hosting');
+            if (row.provider === 'IPsum / DROP') {
+                const ipsumScore = Number(row.ipsumScore) || 0;
+                if (row.inSpamhausDrop) addLabelTo(providerRiskLabels, 'IPsum:DROP');
+                else if (row.isIpsumListed || row.isListed || ipsumScore >= 2) {
+                    addLabelTo(providerRiskLabels, ipsumScore > 0 ? `IPsum:${ipsumScore} lists` : 'IPsum:Listed');
+                }
             }
+            if (row.provider === 'X4BNet VPN' && (row.isVpn || row.isHosting || row.isDatacenter || row.isListed)) {
+                addLabelTo(providerRiskLabels, row.isVpn ? 'X4BNet:VPN' : 'X4BNet:Hosting');
+            }
+            let addedHighRiskFlag = false;
             if (Array.isArray(row.securityFlags)) {
                 for (const flag of row.securityFlags) {
-                    if (flag && flag.isHighRisk && typeof flag.label === 'string') addRiskLabel(`${row.provider}:${flag.label}`);
+                    if (flag && flag.isHighRisk && typeof flag.label === 'string') {
+                        addLabelTo(providerRiskLabels, `${row.provider}:${flag.label}`);
+                        addedHighRiskFlag = true;
+                    }
+                }
+            }
+            if (!addedHighRiskFlag) {
+                if (row.provider === 'DShield' && hasDshieldActivity(row)) {
+                    const attacks = Number(row.attacks) || 0;
+                    addLabelTo(providerRiskLabels, attacks > 0 ? `DShield:Attack Activity (${attacks} attacks)` : 'DShield:Threat Feed');
+                } else if (row.provider === 'SpamCop' && hasSpamcopListing(row)) {
+                    addLabelTo(providerRiskLabels, 'SpamCop:Listed');
+                } else if (row.provider === 'MaxMind' && isMaxmindHostingRow(row)) {
+                    addLabelTo(providerRiskLabels, 'MaxMind:Hosting');
+                }
+            }
+            if (row.provider === 'Shodan InternetDB' && !(risk.openProxyPorts && risk.openProxyPorts.length > 0) && rowHasOpenPortsFlag(row)) {
+                const rowPorts = [];
+                collectNumericPorts(rowPorts, row.ports);
+                if (rowPorts.length > 0) {
+                    const preview = rowPorts.length > 4 ? rowPorts.slice(0, 4).join(',') + '...' : rowPorts.join(',');
+                    addLabelTo(providerRiskLabels, `Shodan:Open Ports (${preview})`);
+                } else {
+                    addLabelTo(providerRiskLabels, 'Shodan:Open Ports');
                 }
             }
         }
+
+        const redundantProviderBadges = ['SPAMHAUS', 'DSHIELD', 'SPAMCOP', 'IPSUM', 'HOSTING', 'OPEN-PORTS', 'FLAGGED'];
+        if (risk.badgePrimaryLabel && !['LIGHT', 'CLEAN', 'N/A'].includes(risk.badgePrimaryLabel) &&
+            !(providerRiskLabels.length > 0 && redundantProviderBadges.includes(risk.badgePrimaryLabel))) {
+            addLabelTo(riskLabels, risk.badgePrimaryLabel);
+        }
+        if (risk.isTor) addLabelTo(riskLabels, formatTorDescription(risk) || 'Tor');
+        if (risk.hasCloudProvider) addLabelTo(riskLabels, formatCloudDescription(data) || 'Cloud');
+        if (risk.ptrIsHighRisk) addLabelTo(riskLabels, 'PTR-Risk');
+        if (risk.openProxyPorts && risk.openProxyPorts.length > 0) {
+            addLabelTo(riskLabels, `Shodan:${risk.openProxyPorts.join(',')}`);
+        }
+        for (const label of providerRiskLabels) addLabelTo(riskLabels, label);
+
         return {
             asn: asnEntry ? asnEntry.value : '',
             isp: ispEntry ? ispEntry.value : '',

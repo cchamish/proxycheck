@@ -1500,6 +1500,20 @@
         return Boolean(getSharedPrivacyEgressLabel(data) || isMobileOrCgnatPayload(data));
     }
 
+    function resolveRangeBlockTarget(cidr) {
+        const trimmed = typeof cidr === 'string' ? cidr.trim() : '';
+        if (!trimmed || trimmed === 'N/A' || !trimmed.includes('/') || trimmed.includes('%')) return '';
+        const parts = trimmed.split('/');
+        if (parts.length !== 2) return '';
+        const addr = parts[0].trim();
+        const prefixStr = parts[1].trim();
+        if (!/^\d{1,3}$/.test(prefixStr) || !isValidIp(addr)) return '';
+        const prefix = Number(prefixStr);
+        const maxPrefix = addr.includes(':') ? 128 : 32;
+        if (prefix < 1 || prefix >= maxPrefix) return '';
+        return `${canonicalizeIpKey(addr)}/${prefix}`;
+    }
+
     function buildWikiPageUrl(pageTitle, queryParams) {
         let baseUrl = '';
         if (mw && mw.util && typeof mw.util.getUrl === 'function') baseUrl = mw.util.getUrl(pageTitle);
@@ -2057,12 +2071,12 @@
         $panel.append($table, $('<div>', { style: 'margin-top: 8px; display: flex; align-items: center; flex-wrap: wrap; gap: 12px;' }).append($copyLink, $copyWikitextBtn));
 
         if (resolvedIp) {
-            const blockTarget = recCidr !== 'N/A' ? recCidr : resolvedIp;
             const softBlock = isSoftBlockAdvised(data);
+            const rangeTarget = resolveRangeBlockTarget(recCidr);
             const buildBlockParams = () => {
                 const params = {
                     wpExpiry: '3 months',
-                    wpReason: 'other',
+                    // Omit wpReason so Codex Special:Block does not prepend "other:" to wpReason-other.
                     'wpReason-other': '{{blocked proxy}}' + buildAttributionComment(getSelectedCommentValues())
                 };
                 if (softBlock) {
@@ -2073,25 +2087,43 @@
                 return params;
             };
             const mkLink = (cls, href, text) => $('<a>', { 'class': cls, href, target: '_blank', rel: 'noopener noreferrer', text });
-            const $blockLink = mkLink(
+            const $singleBlockLink = mkLink(
                 'proxycheck-link-block',
-                buildWikiPageUrl('Special:Block/' + blockTarget, buildBlockParams()),
-                softBlock ? 'Special:Block (soft) ↗' : 'Special:Block ↗'
+                buildWikiPageUrl('Special:Block/' + resolvedIp, buildBlockParams()),
+                'Special:Block ↗'
             );
-            const syncBlockLinkHref = () => {
-                if (!panelDisposed) $blockLink.attr('href', buildWikiPageUrl('Special:Block/' + blockTarget, buildBlockParams()));
+            const blockLinks = [{ el: $singleBlockLink, target: resolvedIp }];
+            let $rangeBlockLink = null;
+            if (rangeTarget) {
+                $rangeBlockLink = mkLink(
+                    'proxycheck-link-block-range',
+                    buildWikiPageUrl('Special:Block/' + rangeTarget, buildBlockParams()),
+                    'Special:Block (range) ↗'
+                );
+                blockLinks.push({ el: $rangeBlockLink, target: rangeTarget });
+            }
+            const syncBlockLinkHrefs = () => {
+                if (panelDisposed) return;
+                const params = buildBlockParams();
+                for (const entry of blockLinks) {
+                    entry.el.attr('href', buildWikiPageUrl('Special:Block/' + entry.target, params));
+                }
             };
             for (const item of checkboxItems) {
-                item.checkbox.on('change', syncBlockLinkHref).on('click', syncBlockLinkHref);
+                item.checkbox.on('change', syncBlockLinkHrefs).on('click', syncBlockLinkHrefs);
             }
-            $blockLink.on('click', syncBlockLinkHref);
+            for (const entry of blockLinks) {
+                entry.el.on('click', syncBlockLinkHrefs);
+            }
 
-            $panel.append($('<div>', { 'class': 'proxycheck-quick-links' }).append(
+            const $quickLinks = $('<div>', { 'class': 'proxycheck-quick-links' }).append(
                 mkLink('proxycheck-link-globalcontribs', buildWikiPageUrl('Special:GlobalContributions/' + resolvedIp, null), 'GlobalContributions ↗'),
                 mkLink('proxycheck-link-rangeblock', 'https://rangeblockfinder.toolforge.org/?ip=' + encodeURIComponent(resolvedIp), 'Rangeblock Finder ↗'),
                 mkLink('proxycheck-link-whois', 'https://whois.toolforge.org/gateway.py?lookup=true&ip=' + encodeURIComponent(resolvedIp), 'WHOIS ↗'),
-                $blockLink
-            ));
+                $singleBlockLink
+            );
+            if ($rangeBlockLink) $quickLinks.append($rangeBlockLink);
+            $panel.append($quickLinks);
         }
 
         $panel._proxycheckDispose = () => {

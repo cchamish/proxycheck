@@ -660,16 +660,32 @@ test('Special:Block soft-block parameters, verification deep links, threat helpe
   assert.equal(standardLinks.rangeblockFinderUrl, 'https://rangeblockfinder.toolforge.org/?ip=198.51.100.77');
   assert.equal(standardLinks.whoisGatewayUrl, 'https://whois.toolforge.org/gateway.py?lookup=true&ip=198.51.100.77');
   assert.equal(standardLinks.specialBlockUrl, 'https://meta.wikimedia.org/wiki/Special:Block/198.51.100.77/24');
+  assert.equal(standardLinks.singleIpBlockUrl, 'https://meta.wikimedia.org/wiki/Special:Block/198.51.100.77');
+  assert.equal(standardLinks.rangeBlockUrl, 'https://meta.wikimedia.org/wiki/Special:Block/198.51.100.77/24');
   assert.equal(standardLinks.isSoftBlockRecommended, false);
 
-  const softBlockCases: Array<{ label: string; data: Partial<DetectionResponse>; expectedTarget: string }> = [
-    { label: 'iCloud Private Relay IPv6', data: { ip: '2a09:bac2:1234::1', recommendedCidr: '2a09:bac2:1234::/64', sharedPrivacyEgress: 'icloud_private_relay' }, expectedTarget: '2a09:bac2:1234::/64' },
-    { label: 'Mobile CGNAT IPv4', data: { ip: '100.64.12.34', recommendedCidr: '100.64.12.34/32', isMobileOrCgnat: true }, expectedTarget: '100.64.12.34/32' },
-    { label: 'PTR mobile_or_cgnat fallback', data: { ip: '203.0.113.99', recommendedCidr: '203.0.113.99/32', ptrCategory: 'mobile_or_cgnat' }, expectedTarget: '203.0.113.99/32' },
+  const softBlockCases: Array<{ label: string; data: Partial<DetectionResponse>; expectedTarget: string; expectRange: boolean }> = [
+    { label: 'iCloud Private Relay IPv6', data: { ip: '2a09:bac2:1234::1', recommendedCidr: '2a09:bac2:1234::/64', sharedPrivacyEgress: 'icloud_private_relay' }, expectedTarget: '2a09:bac2:1234::/64', expectRange: true },
+    { label: 'Mobile CGNAT IPv4', data: { ip: '100.64.12.34', recommendedCidr: '100.64.12.34/32', isMobileOrCgnat: true }, expectedTarget: '100.64.12.34/32', expectRange: false },
+    { label: 'PTR mobile_or_cgnat fallback', data: { ip: '203.0.113.99', recommendedCidr: '203.0.113.99/32', ptrCategory: 'mobile_or_cgnat' }, expectedTarget: '203.0.113.99/32', expectRange: false },
   ];
-  for (const { label, data, expectedTarget } of softBlockCases) {
+  for (const { label, data, expectedTarget, expectRange } of softBlockCases) {
     assert.equal(shouldUseSoftBlockDefaults(data), true, label);
     assert.equal(buildSpecialBlockUrl(data), `https://meta.wikimedia.org/wiki/Special:Block/${expectedTarget}?wpHardBlock=0&wpDisableUTEdit=0`, label);
+    const links = buildVerificationLinks(data);
+    assert.ok(links, label);
+    assert.equal(links.singleIpBlockUrl, `https://meta.wikimedia.org/wiki/Special:Block/${data.ip}?wpHardBlock=0&wpDisableUTEdit=0`, label);
+    assert.equal(links.rangeBlockUrl, expectRange ? `https://meta.wikimedia.org/wiki/Special:Block/${expectedTarget}?wpHardBlock=0&wpDisableUTEdit=0` : null, label);
+  }
+
+  for (const singleOnlyCase of [
+    { ip: '2001:db8::1', recommendedCidr: '2001:db8::1/128' },
+    { ip: '198.51.100.55', recommendedCidr: null },
+  ]) {
+    const links = buildVerificationLinks(singleOnlyCase);
+    assert.ok(links);
+    assert.equal(links.singleIpBlockUrl, `https://meta.wikimedia.org/wiki/Special:Block/${singleOnlyCase.ip}`);
+    assert.equal(links.rangeBlockUrl, null);
   }
 
   const ipv6EscalationPayload = buildCachedDetectionPayload(

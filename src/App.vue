@@ -398,13 +398,21 @@
                               WHOIS Gateway
                             </a>
                             <a
-                              :href="verificationLinks.specialBlockUrl"
+                              :href="verificationLinks.singleIpBlockUrl"
                               target="_blank"
                               rel="noopener noreferrer"
                               class="quick-verify-link quick-verify-link--block"
-                              :title="verificationLinks.isSoftBlockRecommended ? 'Pre-filled with anon-only soft-block parameters (wpHardBlock=0, wpDisableUTEdit=0)' : 'Open Special:Block for the recommended CIDR'"
                             >
-                              {{ verificationLinks.isSoftBlockRecommended ? 'Special:Block (Soft / Anon-only)' : 'Special:Block' }}
+                              Special:Block
+                            </a>
+                            <a
+                              v-if="verificationLinks.rangeBlockUrl"
+                              :href="verificationLinks.rangeBlockUrl"
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              class="quick-verify-link quick-verify-link--block"
+                            >
+                              Special:Block (range)
                             </a>
                             <cdx-button
                               type="button"

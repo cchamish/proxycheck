@@ -15,6 +15,7 @@ from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.core import signing
 from django.http import JsonResponse
+from django.middleware.csrf import CsrfViewMiddleware
 
 from . import oauth
 from .intelligence import canonicalize_ip
@@ -35,14 +36,14 @@ from .quota_telemetry import is_admin_user
 
 logger = logging.getLogger("detector.views")
 
-_WIKIMEDIA_ORIGIN_RE = re.compile(
-    rf"^https://([a-z0-9-]+\.)*(?:{WIKIMEDIA_HOST_SUFFIXES})\.org$"
-    rf"|^https://([a-z0-9-]+\.)*(?:{WIKIMEDIA_BETA_SUFFIXES})\.beta\.wm(?:cloud|flabs)\.org$"
+_WIKIMEDIA_ORIGIN_RE = re.compile(rf"^https://([a-z0-9-]+\.)*(?:{WIKIMEDIA_HOST_SUFFIXES})\.org$")
+_WIKIMEDIA_BETA_ORIGIN_RE = re.compile(
+    rf"^https://([a-z0-9-]+\.)*(?:{WIKIMEDIA_BETA_SUFFIXES})\.beta\.wm(?:cloud|flabs)\.org$"
 )
 _LOCAL_DEV_ORIGIN_RE = re.compile(r"^https?://(?:localhost|127\.0\.0\.1)(?::\d{1,5})?$")
 
 GADGET_TOKEN_SALT = "proxycheck.gadget.auth.v1"  # noqa: S105
-DEFAULT_GADGET_TOKEN_TTL_SECONDS = 3600
+DEFAULT_GADGET_TOKEN_TTL_SECONDS = 900
 
 _MAX_MERGED_PROJECT_RIGHTS_LOOKUPS = 15
 _MERGED_PROJECT_RIGHTS_BATCH_SIZE = 5
@@ -101,6 +102,8 @@ def _is_allowed_wikimedia_origin(origin: Optional[str]) -> bool:
         return False
     candidate = origin.strip()
     if _WIKIMEDIA_ORIGIN_RE.match(candidate):
+        return True
+    if oauth.is_wikimedia_beta_origins_allowed() and _WIKIMEDIA_BETA_ORIGIN_RE.match(candidate):
         return True
     return bool(getattr(settings, "DEBUG", False) and _LOCAL_DEV_ORIGIN_RE.match(candidate))
 
@@ -389,6 +392,18 @@ def persist_authenticated_session(
     payload = dict(user_data)
     if "rights_updated_at" not in payload:
         payload["rights_updated_at"] = time.time()
+    try:
+        request.session.cycle_key()
+    except Exception as exc:
+        if not is_session_backend_error(exc):
+            raise
+        request.session.modified = False
+        logger.warning(
+            "Session key rotation skipped during %s due to cache backend unavailability (%s)",
+            context,
+            type(exc).__name__,
+        )
+        return False
     request.session["wikimedia_user"] = payload
     request.session.modified = True
     if not _safe_save_session(request, context=context):
@@ -396,6 +411,24 @@ def persist_authenticated_session(
         request.session.modified = False
         return False
     return True
+
+
+def _csrf_protected_sentinel(_request):
+    return None
+
+
+def validate_session_csrf(request) -> Optional[JsonResponse]:
+    """Enforces Django CSRF verification for session-authenticated POST endpoints."""
+    middleware = CsrfViewMiddleware(lambda _req: None)
+    if "CSRF_COOKIE" not in request.META:
+        middleware.process_request(request)
+    rejection = middleware.process_view(request, _csrf_protected_sentinel, (), {})
+    if rejection is not None:
+        return JsonResponse(
+            {"error": "csrf_failed", "message": "CSRF verification failed."},
+            status=403,
+        )
+    return None
 
 
 @sync_to_async(thread_sensitive=True)
@@ -407,7 +440,11 @@ def flush_session_async(request, *, context: str) -> bool:
     return flushed
 
 
-async def authenticate_detect_request(request) -> Tuple[Optional[str], Optional[JsonResponse]]:
+async def authenticate_detect_request(
+    request,
+    *,
+    require_csrf_for_session: bool = False,
+) -> Tuple[Optional[str], Optional[JsonResponse]]:
     """Validates gadget Bearer token or Wikimedia session credentials for IP detection endpoints."""
     auth_header = request.headers.get("Authorization")
     if auth_header is not None and str(auth_header).strip():
@@ -435,6 +472,10 @@ async def authenticate_detect_request(request) -> Tuple[Optional[str], Optional[
             {"error": "Access denied. Insufficient Wikimedia user rights."},
             status=403,
         )
+    if require_csrf_for_session:
+        csrf_error = validate_session_csrf(request)
+        if csrf_error is not None:
+            return None, csrf_error
     return "session", None
 
 

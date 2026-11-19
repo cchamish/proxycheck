@@ -303,7 +303,7 @@ def _build_runtime_and_path_env_specs() -> Tuple[EnvVarSpec, ...]:
             "Wikimedia OAuth 2.0 base endpoint",
             False,
         ),
-        ("GADGET_TOKEN_TTL_SECONDS", "3600", "Signed userscript gadget token lifetime in seconds", False),
+        ("GADGET_TOKEN_TTL_SECONDS", "900", "Signed userscript gadget token lifetime in seconds", False),
         (
             "RESTRICT_TO_ALLOWED_WIKI_USERS",
             "False",

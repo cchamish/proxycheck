@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 from dataclasses import dataclass
-from typing import Dict, FrozenSet, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Optional, Tuple
 
 try:
     from redis.exceptions import RedisError as _RedisError
@@ -31,6 +32,24 @@ def hash_ip_for_redis(canonical_ip: str, secret: str) -> str:
     secret_bytes = str(secret or "").encode("utf-8")
     ip_bytes = str(canonical_ip or "").strip().encode("utf-8")
     return hmac.new(secret_bytes, ip_bytes, hashlib.sha256).hexdigest()[:24]
+
+
+class JsonRedisSerializer:
+    """JSON-based Redis cache serializer replacing Pickle to prevent unsafe deserialisation."""
+
+    def dumps(self, obj: Any) -> bytes | int:
+        if type(obj) is int:
+            return obj
+        return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+    def loads(self, data: bytes | bytearray | str) -> Any:
+        if isinstance(data, (bytes, bytearray)):
+            text = bytes(data).decode("utf-8")
+        elif isinstance(data, str):
+            text = data
+        else:
+            raise ValueError(f"Unsupported Redis payload type: {type(data).__name__}")
+        return json.loads(text)
 
 
 REDIS_TRANSPORT_ERRORS: Tuple[type[BaseException], ...] = (

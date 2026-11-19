@@ -624,6 +624,7 @@ import {
   formatDiagnosticSummary,
   measureInitialLoadDurationSeconds,
   measureElapsedSeconds,
+  readCsrfTokenFromDocumentCookie,
   type DiagnosticMetrics,
   type DetectionCoordinatorState,
   type ProviderDisplayRow,
@@ -939,7 +940,16 @@ function handleLogin() {
 async function handleLogout() {
   const requestStart = nowPerfMs();
   try {
-    const res = await fetch('/api/v1/auth/logout/');
+    const csrfToken = readCsrfTokenFromDocumentCookie();
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (csrfToken) {
+      headers['X-CSRFToken'] = csrfToken;
+    }
+    const res = await fetch('/api/v1/auth/logout/', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers,
+    });
     const fallbackDuration = measureElapsedSeconds(requestStart);
     if (!res.ok) {
       console.error('Logout failed with HTTP status:', res.status);

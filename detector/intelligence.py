@@ -70,13 +70,20 @@ def get_process_memory_mb() -> Optional[float]:
         return None
 
 
-def attach_request_diagnostics(payload: Dict[str, Any], start_time: float) -> Dict[str, Any]:
-    """Returns a copy of payload annotated with execution duration in seconds and worker memory in megabytes."""
-    return {
+def attach_request_diagnostics(
+    payload: Dict[str, Any],
+    start_time: float,
+    *,
+    include_memory: bool = True,
+) -> Dict[str, Any]:
+    """Returns a copy of payload annotated with execution duration and optional worker RSS memory."""
+    annotated = {
         **payload,
         "durationSeconds": round(time.perf_counter() - start_time, 3),
-        "memoryMb": get_process_memory_mb(),
     }
+    if include_memory:
+        annotated["memoryMb"] = get_process_memory_mb()
+    return annotated
 
 
 def strip_raw_json_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:

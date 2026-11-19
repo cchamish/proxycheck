@@ -14,6 +14,7 @@ from urllib.parse import urlencode
 
 from django.conf import settings
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
+from django.middleware.csrf import get_token
 from django.views.decorators.csrf import csrf_exempt
 
 from . import http_client, oauth
@@ -39,7 +40,9 @@ from .oauth import (
 from .offline_dbs import collect_offline_databases_status
 from .provider_registry import USER_AGENT_HEADER
 from .quota_telemetry import (
+    RefreshRateLimitResult,
     build_dashboard_snapshot,
+    check_and_consume_endpoint_rate_limit,
     is_admin_user,
 )
 from .sanitization import (
@@ -134,6 +137,21 @@ async def _dispatch_cors_endpoint(
     return apply_detect_cors_headers(request, response, methods=allowed_methods)
 
 
+def _build_rate_limit_response(rl_res: RefreshRateLimitResult, message: str) -> JsonResponse:
+    response = JsonResponse(
+        {
+            "error": "rate_limited",
+            "reason": rl_res.reason,
+            "message": message,
+            "retryAfterSeconds": rl_res.retry_after_seconds,
+        },
+        status=429,
+    )
+    response["Retry-After"] = str(rl_res.retry_after_seconds)
+    response["Cache-Control"] = "no-store"
+    return response
+
+
 @csrf_exempt
 async def exchange_gadget_token(request):
     """
@@ -144,6 +162,10 @@ async def exchange_gadget_token(request):
 
 
 async def _exchange_gadget_token_post(request):
+    rl_res = await check_and_consume_endpoint_rate_limit("gadget_token")
+    if not rl_res.allowed:
+        return _build_rate_limit_response(rl_res, "Gadget token rate limit exceeded. Please wait before retrying.")
+
     parsed, error_response = parse_gadget_token_payload(request)
     if error_response is not None or parsed is None:
         return error_response
@@ -191,13 +213,15 @@ async def _exchange_gadget_token_post(request):
     if not has_access:
         return JsonResponse({"error": "Access denied. Insufficient Wikimedia user rights."}, status=403)
 
-    return JsonResponse(
+    response = JsonResponse(
         {
             "token": issue_gadget_token(username),
             "username": username,
             "expires_in": get_gadget_token_ttl_seconds(),
         }
     )
+    response["Cache-Control"] = "no-store"
+    return response
 
 
 async def detect_ip(request):
@@ -214,6 +238,11 @@ async def _detect_ip_get(request):
     auth_mode, auth_error_response = await authenticate_detect_request(request)
     if auth_error_response is not None or auth_mode is None:
         return auth_error_response
+
+    username, _ = await _resolve_authenticated_identity(request, auth_mode)
+    rl_res = await check_and_consume_endpoint_rate_limit("detect", username)
+    if not rl_res.allowed:
+        return _build_rate_limit_response(rl_res, "Detection rate limit exceeded. Please wait before retrying.")
 
     raw_ip = request.GET.get("ip")
     if raw_ip is None or not str(raw_ip).strip():
@@ -260,7 +289,8 @@ async def _resolve_authenticated_identity(request, auth_mode: str) -> tuple[str,
     if auth_mode == "gadget":
         token_user, _ = _verify_gadget_bearer_token(str(request.headers.get("Authorization") or ""))
         cleaned = str(token_user or "").strip()
-        return cleaned, bool(cleaned and oauth.is_allowlisted_wiki_user(cleaned))
+        # Gadget Bearer tokens never bypass refresh rate limits regardless of username allowlist status.
+        return cleaned, False
     session_user = await get_session_user(request)
     if not isinstance(session_user, dict):
         return "", False
@@ -271,7 +301,7 @@ async def _resolve_authenticated_identity(request, auth_mode: str) -> tuple[str,
 async def _refresh_ip_detection_post(request):
     start_time = time.perf_counter()
 
-    auth_mode, auth_error_response = await authenticate_detect_request(request)
+    auth_mode, auth_error_response = await authenticate_detect_request(request, require_csrf_for_session=True)
     if auth_error_response is not None or auth_mode is None:
         return auth_error_response
 
@@ -289,7 +319,7 @@ async def _refresh_ip_detection_post(request):
             )
         body = parsed_body
 
-    raw_ip = body.get("ip") if "ip" in body else request.GET.get("ip")
+    raw_ip = body.get("ip")
     if raw_ip is None or not isinstance(raw_ip, str) or not raw_ip.strip():
         return JsonResponse(
             {
@@ -338,9 +368,14 @@ async def detect_ip_batch(request):
 async def _detect_ip_batch_post(request):
     start_time = time.perf_counter()
 
-    auth_mode, auth_error_response = await authenticate_detect_request(request)
+    auth_mode, auth_error_response = await authenticate_detect_request(request, require_csrf_for_session=True)
     if auth_error_response is not None or auth_mode is None:
         return auth_error_response
+
+    username, _ = await _resolve_authenticated_identity(request, auth_mode)
+    rl_res = await check_and_consume_endpoint_rate_limit("detect_batch", username)
+    if not rl_res.allowed:
+        return _build_rate_limit_response(rl_res, "Batch detection rate limit exceeded. Please wait before retrying.")
 
     try:
         raw_body = request.body.decode("utf-8-sig") if request.body else ""
@@ -367,7 +402,7 @@ async def _detect_ip_batch_post(request):
         query_mode=query_mode,
     )
 
-    return JsonResponse(
+    response = JsonResponse(
         attach_request_diagnostics(
             {
                 "results": results_by_ip,
@@ -378,19 +413,26 @@ async def _detect_ip_batch_post(request):
             start_time,
         )
     )
+    response["Cache-Control"] = "private, no-cache"
+    return response
 
 
 async def get_current_user(request):
     start_time = time.perf_counter()
+    get_token(request)
     session_user = await get_session_user(request, context="get_current_user")
 
     if not isinstance(session_user, dict) or not session_user:
         payload = _build_unauthenticated_user_payload()
+        include_memory = False
     else:
         payload = dict(session_user)
         payload["isAdmin"] = is_admin_user(session_user)
+        include_memory = bool(session_user.get("isLoggedIn"))
 
-    return JsonResponse(attach_request_diagnostics(payload, start_time))
+    response = JsonResponse(attach_request_diagnostics(payload, start_time, include_memory=include_memory))
+    response["Cache-Control"] = "no-store"
+    return response
 
 
 async def admin_provider_dashboard(request):
@@ -578,8 +620,24 @@ async def oauth_callback(request):
 
 async def oauth_logout(request):
     start_time = time.perf_counter()
+    if request.method != "POST":
+        response = JsonResponse({"error": "Method not allowed"}, status=405)
+        response["Cache-Control"] = "no-store"
+        return response
+    session_user = await get_session_user(request, context="oauth_logout")
+    include_memory = isinstance(session_user, dict) and bool(session_user.get("isLoggedIn"))
     await flush_session_async(request, context="oauth_logout")
-    return JsonResponse(attach_request_diagnostics({"status": "logged_out"}, start_time))
+    response = JsonResponse(
+        attach_request_diagnostics({"status": "logged_out"}, start_time, include_memory=include_memory)
+    )
+    response["Cache-Control"] = "no-store"
+    response.delete_cookie(
+        settings.SESSION_COOKIE_NAME,
+        path=getattr(settings, "SESSION_COOKIE_PATH", "/"),
+        domain=getattr(settings, "SESSION_COOKIE_DOMAIN", None),
+        samesite=settings.SESSION_COOKIE_SAMESITE,
+    )
+    return response
 
 
 @csrf_exempt

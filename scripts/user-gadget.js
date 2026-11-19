@@ -24,15 +24,11 @@
     const IPINFO_FALLBACK_DELAY_MS = 400;
     const MAX_CONCURRENT_REQUESTS = 4;
     const BATCH_DEBOUNCE_MS = 40;
-    const MAX_BATCH_IPS = 25;
+    const MAX_BATCH_IPS = 10;
     const CONSENT_KEY = 'proxycheck-ip-policy-consent';
     const TOKEN_KEY = 'proxycheck-gadget-token';
     const TOKEN_USER_KEY = 'proxycheck-gadget-token-user';
     const TOKEN_EXPIRY_KEY = 'proxycheck-gadget-token-exp';
-    const TOKEN_REFRESH_LOCK_KEY = 'proxycheck-gadget-token-refresh-lock';
-    const TOKEN_REFRESH_LOCK_TTL_MS = 8000;
-    const TOKEN_REFRESH_POLL_INTERVAL_MS = 250;
-    const TOKEN_REFRESH_WAIT_TIMEOUT_MS = 4000;
     const RESULT_CACHE_STORAGE_KEY = 'proxycheck-ip-result-cache-v1';
     const RESULT_CACHE_TTL_MS = 30 * 60 * 1000;
     const DEGRADED_CACHE_TTL_MS = 60 * 1000;
@@ -46,59 +42,30 @@
 
     const IPV4_PATTERN = /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
     const IPV6_PATTERN = /^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))$/;
-    var COMMERCIAL_PROVIDERS = {
-        'AbuseIPDB': true,
-        'IPData': true,
-        'IPRegistry': true,
-        'IP2Location': true,
-        'GetIPIntel': true,
-        'Proxycheck': true,
-        'IPHub': true,
-        'IPHunter': true
-    };
-    var PROVIDER_BADGE_PALETTES = {
-        'MaxMind': { bg: '#e6f2ff', border: '#a3ccf5', color: '#0b4f8a', darkBg: '#162a42', darkBorder: '#2f5a8a', darkColor: '#8ec5ff' },
-        'IP2Location': { bg: '#e3f8fc', border: '#99dfec', color: '#0b5d6b', darkBg: '#133038', darkBorder: '#296878', darkColor: '#7fd8e8' },
-        'IPData': { bg: '#eaedff', border: '#b3bdf5', color: '#2c3e99', darkBg: '#1d2345', darkBorder: '#3e4a8f', darkColor: '#a3b3ff' },
-        'IPRegistry': { bg: '#f0ebff', border: '#c5b6f2', color: '#4b2d8f', darkBg: '#271e42', darkBorder: '#55418c', darkColor: '#c3b0ff' },
-        'Proxycheck': { bg: '#e4f7f2', border: '#9cd9cb', color: '#0d5e4e', darkBg: '#13332b', darkBorder: '#296b5b', darkColor: '#7be0c8' },
-        'Cloudflare Radar': { bg: '#e8f0fe', border: '#a6c4f7', color: '#174ea6', darkBg: '#182947', darkBorder: '#355794', darkColor: '#94bfff' },
-        'AbuseIPDB': { bg: '#e8eff5', border: '#aec2d4', color: '#294661', darkBg: '#1d2936', darkBorder: '#3e5773', darkColor: '#a3c2e0' },
-        'IPHub': { bg: '#e5f5fa', border: '#9dd4e6', color: '#0d536b', darkBg: '#142e3b', darkBorder: '#2b637d', darkColor: '#84d0ed' },
-        'IPHunter': { bg: '#ebf0f5', border: '#b8c6d6', color: '#324a63', darkBg: '#1f2a36', darkBorder: '#425870', darkColor: '#adc4db' },
-        'GetIPIntel': { bg: '#eeeafd', border: '#bfb4f5', color: '#46328a', darkBg: '#252045', darkBorder: '#4f458f', darkColor: '#bdb2ff' },
-        'Tor Onionoo': { bg: '#f1ecf8', border: '#c9bce3', color: '#4e3475', darkBg: '#29203d', darkBorder: '#574480', darkColor: '#cbb8f2' },
-        'DShield': { bg: '#e7f3f3', border: '#a7cfd1', color: '#1f5357', darkBg: '#172e2f', darkBorder: '#316163', darkColor: '#8cd4d6' },
-        'StopForumSpam': { bg: '#e6f8f5', border: '#9fdcd2', color: '#125c51', darkBg: '#13332e', darkBorder: '#286b60', darkColor: '#7ee0d1' },
-        'Spamhaus ZEN': { bg: '#eaedf7', border: '#b5c0de', color: '#2e3f6e', darkBg: '#1e243b', darkBorder: '#404d7d', darkColor: '#a8b8eb' },
-        'SpamCop': { bg: '#eaf4fb', border: '#add2ec', color: '#1c537d', darkBg: '#172c3d', darkBorder: '#315c80', darkColor: '#91c6f2' },
-        'IPsum / DROP': { bg: '#f4ecfb', border: '#ceb3ea', color: '#512b78', darkBg: '#2a1d3b', darkBorder: '#5d4180', darkColor: '#d4b8f8' },
-        'X4BNet VPN': { bg: '#e6f4f8', border: '#9fd0df', color: '#0e5266', darkBg: '#132d36', darkBorder: '#285f70', darkColor: '#82d2e8' },
-        'Shodan InternetDB': { bg: '#fbeee8', border: '#e8bca8', color: '#783416', darkBg: '#361f16', darkBorder: '#734330', darkColor: '#f5bba3' },
-        'Privacy Relay': { bg: '#eef0ff', border: '#b5bff7', color: '#2b3a94', darkBg: '#1c2247', darkBorder: '#3f4d96', darkColor: '#a8b5ff' },
-        'Cloud CIDR': { bg: '#e8f6ff', border: '#a8d8f8', color: '#0e527d', darkBg: '#152c3d', darkBorder: '#2c5c80', darkColor: '#8ac7f5' },
-        'Multi-Source': { bg: '#eef2f6', border: '#b9c6d4', color: '#3b4f66', darkBg: '#222830', darkBorder: '#475466', darkColor: '#b3c2d4' },
-        'Reverse DNS': { bg: '#e8f7f7', border: '#a6dada', color: '#185b5e', darkBg: '#153030', darkBorder: '#2c6666', darkColor: '#87dbdb' },
-        'Spur': { bg: '#e3f1f8', border: '#95cce6', color: '#0f4c6e', darkBg: '#152b38', darkBorder: '#2c5973', darkColor: '#8bc8eb' }
+    const COMMERCIAL_PROVIDERS = { AbuseIPDB: 1, IPData: 1, IPRegistry: 1, IP2Location: 1, GetIPIntel: 1, Proxycheck: 1, IPHub: 1, IPHunter: 1 };
+    const PROVIDER_BADGE_PALETTES = {
+        MaxMind: ['#e6f2ff', '#a3ccf5', '#0b4f8a', '#162a42', '#2f5a8a', '#8ec5ff'], IP2Location: ['#e3f8fc', '#99dfec', '#0b5d6b', '#133038', '#296878', '#7fd8e8'],
+        IPData: ['#eaedff', '#b3bdf5', '#2c3e99', '#1d2345', '#3e4a8f', '#a3b3ff'], IPRegistry: ['#f0ebff', '#c5b6f2', '#4b2d8f', '#271e42', '#55418c', '#c3b0ff'],
+        Proxycheck: ['#e4f7f2', '#9cd9cb', '#0d5e4e', '#13332b', '#296b5b', '#7be0c8'], 'Cloudflare Radar': ['#e8f0fe', '#a6c4f7', '#174ea6', '#182947', '#355794', '#94bfff'],
+        AbuseIPDB: ['#e8eff5', '#aec2d4', '#294661', '#1d2936', '#3e5773', '#a3c2e0'], IPHub: ['#e5f5fa', '#9dd4e6', '#0d536b', '#142e3b', '#2b637d', '#84d0ed'],
+        IPHunter: ['#ebf0f5', '#b8c6d6', '#324a63', '#1f2a36', '#425870', '#adc4db'], GetIPIntel: ['#eeeafd', '#bfb4f5', '#46328a', '#252045', '#4f458f', '#bdb2ff'],
+        'Tor Onionoo': ['#f1ecf8', '#c9bce3', '#4e3475', '#29203d', '#574480', '#cbb8f2'], DShield: ['#e7f3f3', '#a7cfd1', '#1f5357', '#172e2f', '#316163', '#8cd4d6'],
+        StopForumSpam: ['#e6f8f5', '#9fdcd2', '#125c51', '#13332e', '#286b60', '#7ee0d1'], 'Spamhaus ZEN': ['#eaedf7', '#b5c0de', '#2e3f6e', '#1e243b', '#404d7d', '#a8b8eb'],
+        SpamCop: ['#eaf4fb', '#add2ec', '#1c537d', '#172c3d', '#315c80', '#91c6f2'], 'IPsum / DROP': ['#f4ecfb', '#ceb3ea', '#512b78', '#2a1d3b', '#5d4180', '#d4b8f8'],
+        'X4BNet VPN': ['#e6f4f8', '#9fd0df', '#0e5266', '#132d36', '#285f70', '#82d2e8'], 'Shodan InternetDB': ['#fbeee8', '#e8bca8', '#783416', '#361f16', '#734330', '#f5bba3'],
+        'Privacy Relay': ['#eef0ff', '#b5bff7', '#2b3a94', '#1c2247', '#3f4d96', '#a8b5ff'], 'Cloud CIDR': ['#e8f6ff', '#a8d8f8', '#0e527d', '#152c3d', '#2c5c80', '#8ac7f5'],
+        'Multi-Source': ['#eef2f6', '#b9c6d4', '#3b4f66', '#222830', '#475466', '#b3c2d4'], 'Reverse DNS': ['#e8f7f7', '#a6dada', '#185b5e', '#153030', '#2c6666', '#87dbdb'],
+        Spur: ['#e3f1f8', '#95cce6', '#0f4c6e', '#152b38', '#2c5973', '#8bc8eb']
     };
     const FALLBACK_COOL_PALETTES = [
-        { bg: '#e6f2ff', border: '#a3ccf5', color: '#0b4f8a', darkBg: '#162a42', darkBorder: '#2f5a8a', darkColor: '#8ec5ff' },
-        { bg: '#e3f8fc', border: '#99dfec', color: '#0b5d6b', darkBg: '#133038', darkBorder: '#296878', darkColor: '#7fd8e8' },
-        { bg: '#eaedff', border: '#b3bdf5', color: '#2c3e99', darkBg: '#1d2345', darkBorder: '#3e4a8f', darkColor: '#a3b3ff' },
-        { bg: '#e4f7f2', border: '#9cd9cb', color: '#0d5e4e', darkBg: '#13332b', darkBorder: '#296b5b', darkColor: '#7be0c8' },
-        { bg: '#f0ebff', border: '#c5b6f2', color: '#4b2d8f', darkBg: '#271e42', darkBorder: '#55418c', darkColor: '#c3b0ff' },
-        { bg: '#e8eff5', border: '#aec2d4', color: '#294661', darkBg: '#1d2936', darkBorder: '#3e5773', darkColor: '#a3c2e0' }
+        PROVIDER_BADGE_PALETTES.MaxMind, PROVIDER_BADGE_PALETTES.IP2Location, PROVIDER_BADGE_PALETTES.IPData,
+        PROVIDER_BADGE_PALETTES.Proxycheck, PROVIDER_BADGE_PALETTES.IPRegistry, PROVIDER_BADGE_PALETTES.AbuseIPDB
     ];
 
-    const ipPromiseCache = new Map();
-    const ipFullPromiseCache = new Map();
-    const inflightFullPromisesByIp = new Map();
-    const inflightRefreshByIp = new Map();
-    const latestResultByIp = new Map();
-    const fullResultMetaByIp = new Map();
+    const ipStateMap = new Map();
     const renderedBadgeEntriesByIp = new Map();
-    const batchOriginatedPayloads = typeof WeakSet === 'function' ? new WeakSet() : null;
     const autoSwrAttemptedKeys = new Set();
+    const signalCache = typeof WeakMap === 'function' ? new WeakMap() : null;
 
     let activeContributionsController = null;
     let persistedCacheRaw = null;
@@ -106,14 +73,11 @@
     let storageFailureWarned = false;
     let stylesInjected = false;
     let observer = null;
-    let viewportObserver = null;
     let accessBlocked = false;
     let consentGranted = false;
     let consentDeclined = false;
     let consentPromise = null;
     let authPromise = null;
-    let tokenRefreshWaitTimer = null;
-    let tokenRefreshWaitCancel = null;
     let memoryToken = null;
     let memoryTokenExpiry = null;
     let memoryAutoSwrTimestamps = [];
@@ -150,27 +114,12 @@
     }
 
     function clearTimer(id, isInterval) {
-        if (id !== null) {
-            (isInterval ? window.clearInterval : window.clearTimeout)(id);
-        }
+        if (id !== null) (isInterval ? window.clearInterval : window.clearTimeout)(id);
         return null;
     }
 
-    function clearLoadingInterval() { activeLoadingInterval = clearTimer(activeLoadingInterval, true); }
-    function clearBatchDebounceTimer() { batchDebounceTimer = clearTimer(batchDebounceTimer, false); }
-    function clearContributionsFallbackTimer() { ipContributionsFallbackTimer = clearTimer(ipContributionsFallbackTimer, false); }
-
-    function clearTokenRefreshWait() {
-        tokenRefreshWaitTimer = clearTimer(tokenRefreshWaitTimer, false);
-        if (typeof tokenRefreshWaitCancel === 'function') {
-            const cancelFn = tokenRefreshWaitCancel;
-            tokenRefreshWaitCancel = null;
-            cancelFn();
-        }
-    }
-
     function clearRequestQueue() {
-        clearBatchDebounceTimer();
+        batchDebounceTimer = clearTimer(batchDebounceTimer, false);
         while (pendingBatchQueue.length > 0) pendingBatchQueue.shift().resolve(null);
         while (requestQueue.length > 0) requestQueue.shift().resolve(null);
     }
@@ -185,70 +134,74 @@
 
     function blockAccess() {
         accessBlocked = true;
-        clearLoadingInterval();
-        clearTokenRefreshWait();
+        activeLoadingInterval = clearTimer(activeLoadingInterval, true);
         clearContributionsSchedule();
         ipContributionsObserverTimer = clearTimer(ipContributionsObserverTimer, false);
-        clearContributionsFallbackTimer();
-        pendingContributionsPageCheck = false;
-        pendingSpurRefresh = false;
+        ipContributionsFallbackTimer = clearTimer(ipContributionsFallbackTimer, false);
+        pendingContributionsPageCheck = pendingSpurRefresh = false;
         clearRequestQueue();
         if (observer) observer.disconnect();
-        if (viewportObserver) viewportObserver.disconnect();
+        if (typeof document !== 'undefined' && document.body && typeof document.body.querySelectorAll === 'function') {
+            for (const el of document.body.querySelectorAll('.' + BADGE_CLASS + '.proxycheck-ip-badge-loading')) {
+                const prev = el.previousElementSibling;
+                if (prev && prev.dataset && prev.dataset.proxycheckProcessed === 'pending') delete prev.dataset.proxycheckProcessed;
+                if (el.parentNode) el.parentNode.removeChild(el);
+            }
+        }
+    }
+
+    function warnPersistedCacheOnce(context, err) {
+        if (storageFailureWarned) return;
+        storageFailureWarned = true;
+        warn('Persisted cache ' + context + ':', err);
+    }
+
+    function mwStoreOp(store, op, key, val) {
+        try {
+            if (store && typeof store[op] === 'function') return op === 'set' ? store.set(key, val) : store[op](key);
+        } catch (err) {
+            warnPersistedCacheOnce(op + ' failed', err);
+        }
+        return null;
+    }
+
+    function getSessionTokenStore() {
+        return mw && mw.storage && mw.storage.session && typeof mw.storage.session.get === 'function' ? mw.storage.session : null;
     }
 
     function clearStoredToken() {
-        memoryToken = null;
-        memoryTokenExpiry = null;
-        mw.storage.remove(TOKEN_KEY);
-        mw.storage.remove(TOKEN_USER_KEY);
-        mw.storage.remove(TOKEN_EXPIRY_KEY);
+        memoryToken = memoryTokenExpiry = null;
+        const store = getSessionTokenStore();
+        [TOKEN_KEY, TOKEN_USER_KEY, TOKEN_EXPIRY_KEY].forEach((k) => mwStoreOp(store, 'remove', k));
     }
 
     function readStoredToken() {
-        const storedUser = mw.storage.get(TOKEN_USER_KEY);
-        const token = mw.storage.get(TOKEN_KEY);
-        const storedExpiry = mw.storage.get(TOKEN_EXPIRY_KEY);
-        const hasStoredExpiry = (typeof storedExpiry === 'string' && storedExpiry.trim() !== '') ||
-            (typeof storedExpiry === 'number' && isFinite(storedExpiry));
-        if (hasStoredExpiry) {
-            const expiryMs = Number(storedExpiry);
-            if (!isFinite(expiryMs) || Date.now() >= expiryMs) {
-                clearStoredToken();
-                return null;
-            }
-        }
+        const store = getSessionTokenStore();
+        const storedUser = mwStoreOp(store, 'get', TOKEN_USER_KEY), token = mwStoreOp(store, 'get', TOKEN_KEY), storedExpiry = mwStoreOp(store, 'get', TOKEN_EXPIRY_KEY);
+        const hasExpiry = (typeof storedExpiry === 'string' && storedExpiry.trim() !== '') || (typeof storedExpiry === 'number' && isFinite(storedExpiry));
+        if (hasExpiry && (!isFinite(Number(storedExpiry)) || Date.now() >= Number(storedExpiry))) { clearStoredToken(); return null; }
         if (typeof token === 'string' && token) {
-            if (storedUser !== username) {
-                clearStoredToken();
-                return null;
-            }
+            if (storedUser !== username) { clearStoredToken(); return null; }
             memoryToken = token;
-            memoryTokenExpiry = hasStoredExpiry ? Number(storedExpiry) : null;
+            memoryTokenExpiry = hasExpiry ? Number(storedExpiry) : null;
             return token;
         }
-        if (typeof storedUser === 'string' && storedUser && storedUser !== username) {
-            clearStoredToken();
-            return null;
-        }
-        if (memoryToken && memoryTokenExpiry !== null && Date.now() >= memoryTokenExpiry) {
-            clearStoredToken();
-            return null;
-        }
+        if (typeof storedUser === 'string' && storedUser && storedUser !== username) { clearStoredToken(); return null; }
+        if (memoryToken && memoryTokenExpiry !== null && Date.now() >= memoryTokenExpiry) { clearStoredToken(); return null; }
         return memoryToken;
     }
 
     function storeToken(token, expiresInSeconds) {
         memoryToken = token;
         memoryTokenExpiry = null;
-        mw.storage.set(TOKEN_KEY, token);
-        mw.storage.set(TOKEN_USER_KEY, username);
+        const store = getSessionTokenStore();
+        mwStoreOp(store, 'set', TOKEN_KEY, token);
+        mwStoreOp(store, 'set', TOKEN_USER_KEY, username);
         if (typeof expiresInSeconds === 'number' && isFinite(expiresInSeconds) && expiresInSeconds > 0 && Math.floor(expiresInSeconds) === expiresInSeconds) {
-            const expiryMs = Date.now() + Math.max(0, expiresInSeconds - 60) * 1000;
-            memoryTokenExpiry = expiryMs;
-            mw.storage.set(TOKEN_EXPIRY_KEY, String(expiryMs));
+            memoryTokenExpiry = Date.now() + Math.max(0, expiresInSeconds - 60) * 1000;
+            mwStoreOp(store, 'set', TOKEN_EXPIRY_KEY, String(memoryTokenExpiry));
         } else {
-            mw.storage.remove(TOKEN_EXPIRY_KEY);
+            mwStoreOp(store, 'remove', TOKEN_EXPIRY_KEY);
         }
     }
 
@@ -264,7 +217,7 @@
         for (const p of parts) {
             if (!/^\d{1,3}$/.test(p)) return null;
             const num = parseInt(p, 10);
-            if (isNaN(num) || num < 0 || num > 255) return null;
+            if (num < 0 || num > 255) return null;
             octets.push(num);
         }
         return octets;
@@ -272,196 +225,61 @@
 
     function canonicalizeIpKey(rawIp) {
         if (rawIp === null || rawIp === undefined) return '';
-        let normalized = String(rawIp).trim().toLowerCase();
-        if (!normalized) return '';
-        if (normalized.includes(':')) {
-            const zoneIdx = normalized.indexOf('%');
-            if (zoneIdx !== -1) normalized = normalized.slice(0, zoneIdx);
-            if (!normalized) return '';
+        let norm = String(rawIp).trim().toLowerCase();
+        if (!norm) return '';
+        if (norm.includes(':')) {
+            const z = norm.indexOf('%');
+            if (z !== -1) norm = norm.slice(0, z);
+            if (!norm) return '';
         }
-        const v4 = parseIpv4Octets(normalized);
+        const v4 = parseIpv4Octets(norm);
         if (v4) return v4.join('.');
-        if (!normalized.includes(':')) return normalized;
-
-        const halves = normalized.split('::');
-        if (halves.length > 2) return normalized;
-        const hasComp = halves.length === 2;
-        const left = halves[0] ? halves[0].split(':') : [];
-        const right = hasComp && halves[1] ? halves[1].split(':') : [];
-        const tail = hasComp ? right : left;
+        if (!norm.includes(':')) return norm;
+        const halves = norm.split('::');
+        if (halves.length > 2) return norm;
+        const hasComp = halves.length === 2, left = halves[0] ? halves[0].split(':') : [], right = hasComp && halves[1] ? halves[1].split(':') : [], tail = hasComp ? right : left;
         if (tail.length > 0 && tail[tail.length - 1].includes('.')) {
             const emb = parseIpv4Octets(tail[tail.length - 1]);
-            if (!emb) return normalized;
+            if (!emb) return norm;
             tail.pop();
             tail.push(((emb[0] << 8) | emb[1]).toString(16), ((emb[2] << 8) | emb[3]).toString(16));
         }
         const total = left.length + right.length;
-        if ((hasComp && total >= 8) || (!hasComp && total !== 8)) return normalized;
-
-        const expanded = [
-            ...left,
-            ...(hasComp ? Array(8 - total).fill('0') : []),
-            ...right
-        ];
+        if ((hasComp && total >= 8) || (!hasComp && total !== 8)) return norm;
+        const expanded = [...left, ...(hasComp ? Array(8 - total).fill('0') : []), ...right];
         for (let i = 0; i < 8; i++) {
-            if (!/^[0-9a-f]{1,4}$/.test(expanded[i])) return normalized;
+            if (!/^[0-9a-f]{1,4}$/.test(expanded[i])) return norm;
             expanded[i] = expanded[i].replace(/^0+/, '') || '0';
         }
-        if (expanded[0] === '0' && expanded[1] === '0' && expanded[2] === '0' && expanded[3] === '0' && expanded[4] === '0' && expanded[5] === 'ffff') {
-            const hi = parseInt(expanded[6], 16);
-            const lo = parseInt(expanded[7], 16);
+        if (expanded.slice(0, 5).every((g) => g === '0') && expanded[5] === 'ffff') {
+            const hi = parseInt(expanded[6], 16), lo = parseInt(expanded[7], 16);
             return `::ffff:${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
         }
         let bestStart = -1, bestLen = 0, curStart = -1, curLen = 0;
         for (let i = 0; i < 8; i++) {
-            if (expanded[i] === '0') {
-                if (curStart === -1) { curStart = i; curLen = 1; } else { curLen += 1; }
-                if (curLen > bestLen) { bestStart = curStart; bestLen = curLen; }
-            } else {
-                curStart = -1; curLen = 0;
-            }
+            if (expanded[i] === '0') { curStart = curStart === -1 ? i : curStart; curLen += 1; if (curLen > bestLen) { bestStart = curStart; bestLen = curLen; } }
+            else { curStart = -1; curLen = 0; }
         }
         if (bestLen <= 1) return expanded.join(':');
-        if (bestLen === 8) return '::';
-        return expanded.slice(0, bestStart).join(':') + '::' + expanded.slice(bestStart + bestLen).join(':');
-    }
-
-    function warnPersistedCacheOnce(context, err) {
-        if (storageFailureWarned) return;
-        storageFailureWarned = true;
-        warn('Persisted cache ' + context + ':', err);
-    }
-
-    function wrapWebStorage(name) {
-        try {
-            const s = typeof window !== 'undefined' ? window[name] : null;
-            if (!s || typeof s.getItem !== 'function' || typeof s.setItem !== 'function') return null;
-            return {
-                get: (k) => s.getItem(k),
-                set: (k, v) => { s.setItem(k, v); return true; },
-                remove: (k) => { if (typeof s.removeItem === 'function') s.removeItem(k); }
-            };
-        } catch (err) {
-            warnPersistedCacheOnce('storage access failed for ' + name, err);
-            return null;
-        }
-    }
-
-    function wrapMwStorage(contextLabel) {
-        try {
-            if (mw && mw.storage && typeof mw.storage.get === 'function' && typeof mw.storage.set === 'function') {
-                return {
-                    get: (k) => mw.storage.get(k),
-                    set: (k, v) => mw.storage.set(k, v) !== false,
-                    remove: (k) => { if (typeof mw.storage.remove === 'function') mw.storage.remove(k); }
-                };
-            }
-        } catch (err) {
-            warnPersistedCacheOnce(contextLabel + ' for mw.storage', err);
-        }
-        return null;
-    }
-
-    function getResultStorageBackend() {
-        return wrapWebStorage('localStorage') || wrapMwStorage('storage access failed') || wrapWebStorage('sessionStorage');
-    }
-
-    function getAutoSwrStorageBackend() {
-        return wrapMwStorage('auto-refresh limiter access failed') || wrapWebStorage('localStorage');
+        return bestLen === 8 ? '::' : expanded.slice(0, bestStart).join(':') + '::' + expanded.slice(bestStart + bestLen).join(':');
     }
 
     function tryConsumeAutoSwrBudget() {
-        const now = Date.now();
-        const backend = getAutoSwrStorageBackend();
-        let recent = [];
-        let raw = null;
-        if (backend) {
-            try { raw = backend.get(AUTO_SWR_STORAGE_KEY); } catch (err) { warnPersistedCacheOnce('auto-refresh limiter read failed', err); }
-        }
+        const now = Date.now(), hasStore = Boolean(mw && mw.storage && typeof mw.storage.get === 'function');
+        const raw = hasStore ? mwStoreOp(mw.storage, 'get', AUTO_SWR_STORAGE_KEY) : null;
+        let recent = memoryAutoSwrTimestamps;
         if (typeof raw === 'string' && raw) {
-            try {
-                const parsed = JSON.parse(raw);
-                if (Array.isArray(parsed)) {
-                    recent = parsed.filter((ts) => typeof ts === 'number' && isFinite(ts) && (now - ts) > -5000 && (now - ts) < AUTO_SWR_WINDOW_MS);
-                }
-            } catch (err) {
-                warnPersistedCacheOnce('auto-refresh limiter parse failed', err);
-                recent = [];
-            }
-        } else if (!backend) {
-            recent = memoryAutoSwrTimestamps.filter((ts) => (now - ts) > -5000 && (now - ts) < AUTO_SWR_WINDOW_MS);
+            try { recent = JSON.parse(raw); } catch (err) { warnPersistedCacheOnce('auto-refresh limiter parse failed', err); recent = []; }
         }
-
-        const persist = (list, label) => {
+        recent = Array.isArray(recent) ? recent.filter((ts) => typeof ts === 'number' && isFinite(ts) && (now - ts) > -5000 && (now - ts) < AUTO_SWR_WINDOW_MS) : [];
+        const persist = (list) => {
             memoryAutoSwrTimestamps = list.slice();
-            if (backend) {
-                try { backend.set(AUTO_SWR_STORAGE_KEY, JSON.stringify(list)); } catch (err) { warnPersistedCacheOnce(label, err); }
-            }
+            if (mw && mw.storage && typeof mw.storage.set === 'function') mwStoreOp(mw.storage, 'set', AUTO_SWR_STORAGE_KEY, JSON.stringify(list));
         };
-
-        if (recent.length >= AUTO_SWR_MAX_REQUESTS) {
-            persist(recent, 'auto-refresh limiter trim failed');
-            return false;
-        }
+        if (recent.length >= AUTO_SWR_MAX_REQUESTS) { persist(recent); return false; }
         recent.push(now);
-        persist(recent, 'auto-refresh limiter write failed');
+        persist(recent);
         return true;
-    }
-
-    function compactIpResultForStorage(data) {
-        if (!data || typeof data !== 'object') return null;
-        const copy = {};
-        for (const [k, v] of Object.entries(data)) {
-            if (k === 'results' && Array.isArray(v)) {
-                copy.results = v.map((row) => {
-                    if (!row || typeof row !== 'object') return row;
-                    const compactRow = {};
-                    for (const [rk, rv] of Object.entries(row)) {
-                        if (rk !== 'rawJson') compactRow[rk] = rv;
-                    }
-                    return compactRow;
-                });
-            } else {
-                copy[k] = v;
-            }
-        }
-        return copy;
-    }
-
-    function clearCorruptPersistedStore(backend) {
-        persistedCacheRaw = null;
-        persistedCacheStore = null;
-        try { backend.remove(RESULT_CACHE_STORAGE_KEY); } catch (err) { warnPersistedCacheOnce('cleanup failed', err); }
-    }
-
-    function readPersistedResultStore(backend) {
-        if (!backend) return null;
-        let raw = null;
-        try { raw = backend.get(RESULT_CACHE_STORAGE_KEY); } catch (err) {
-            persistedCacheRaw = null;
-            persistedCacheStore = null;
-            warnPersistedCacheOnce('read failed', err);
-            return null;
-        }
-        if (typeof raw !== 'string' || !raw) {
-            persistedCacheRaw = null;
-            persistedCacheStore = null;
-            return null;
-        }
-        if (raw === persistedCacheRaw && persistedCacheStore) return persistedCacheStore;
-        let parsed = null;
-        try { parsed = JSON.parse(raw); } catch (err) {
-            warnPersistedCacheOnce('parse failed', err);
-            clearCorruptPersistedStore(backend);
-            return null;
-        }
-        if (!parsed || typeof parsed !== 'object' || !parsed.entries || typeof parsed.entries !== 'object' || Array.isArray(parsed.entries)) {
-            clearCorruptPersistedStore(backend);
-            return null;
-        }
-        persistedCacheRaw = raw;
-        persistedCacheStore = parsed;
-        return parsed;
     }
 
     function isRowQuotaGuarded(row) {
@@ -469,17 +287,12 @@
     }
 
     function hasDegradedQuotaOrCooldown(data) {
-        if (!data || typeof data !== 'object' || !Array.isArray(data.results)) return false;
-        return data.results.some((row) => row && typeof row === 'object' && (
-            isRowQuotaGuarded(row) ||
-            (row.isCooldown && (!row.provider || Object.prototype.hasOwnProperty.call(COMMERCIAL_PROVIDERS, row.provider)))
-        ));
+        return Boolean(data && Array.isArray(data.results) && data.results.some((r) => r && typeof r === 'object' &&
+            (isRowQuotaGuarded(r) || (r.isCooldown && (!r.provider || Object.prototype.hasOwnProperty.call(COMMERCIAL_PROVIDERS, r.provider))))));
     }
 
     function getResultEntryTtlMs(entry) {
-        if (entry && typeof entry.ttlMs === 'number' && isFinite(entry.ttlMs) && entry.ttlMs > 0) {
-            return Math.min(entry.ttlMs, RESULT_CACHE_TTL_MS);
-        }
+        if (entry && typeof entry.ttlMs === 'number' && isFinite(entry.ttlMs) && entry.ttlMs > 0) return Math.min(entry.ttlMs, RESULT_CACHE_TTL_MS);
         return entry && entry.data && hasDegradedQuotaOrCooldown(entry.data) ? DEGRADED_CACHE_TTL_MS : RESULT_CACHE_TTL_MS;
     }
 
@@ -488,156 +301,118 @@
             (now - entry.ts < getResultEntryTtlMs(entry)) && entry.data && typeof entry.data === 'object');
     }
 
-    function cloneEntriesExcluding(sourceEntries, excludedKey) {
-        const nextEntries = Object.create(null);
-        if (!sourceEntries) return nextEntries;
-        for (const [k, v] of Object.entries(sourceEntries)) {
-            if (k !== excludedKey) nextEntries[k] = v;
-        }
-        return nextEntries;
+    function readPersistedResultStore() {
+        if (!mw || !mw.storage || typeof mw.storage.get !== 'function') return null;
+        const raw = mwStoreOp(mw.storage, 'get', RESULT_CACHE_STORAGE_KEY);
+        if (typeof raw !== 'string' || !raw) { persistedCacheRaw = persistedCacheStore = null; return null; }
+        if (raw === persistedCacheRaw && persistedCacheStore) return persistedCacheStore;
+        try {
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === 'object' && parsed.entries && typeof parsed.entries === 'object' && !Array.isArray(parsed.entries)) {
+                persistedCacheRaw = raw;
+                return (persistedCacheStore = parsed);
+            }
+        } catch (err) { warnPersistedCacheOnce('parse failed', err); }
+        persistedCacheRaw = persistedCacheStore = null;
+        mwStoreOp(mw.storage, 'remove', RESULT_CACHE_STORAGE_KEY);
+        return null;
     }
 
-    function pruneExpiredResultEntries(entries, now) {
-        for (const k of Object.keys(entries)) {
-            if (!isResultEntryValid(entries[k], now)) delete entries[k];
-        }
-    }
-
-    function evictOldestResultEntries(entries, maxEntries, protectedKey) {
-        const keys = Object.keys(entries);
-        if (keys.length <= maxEntries) return;
-        const sortable = keys.map((key, order) => ({
-            key,
-            ts: entries[key].ts,
-            order,
-            isProtected: Boolean(protectedKey && key === protectedKey)
-        })).sort((a, b) => (a.isProtected !== b.isProtected ? (a.isProtected ? 1 : -1) : (a.ts !== b.ts ? a.ts - b.ts : a.order - b.order)));
-        for (let i = 0; i < sortable.length - maxEntries; i++) delete entries[sortable[i].key];
-    }
-
-    function writePersistedResultStore(backend, store, protectedKey) {
-        if (!backend || !store) return false;
-        persistedCacheRaw = null;
-        persistedCacheStore = null;
+    function writePersistedResultStore(store, protectedKey) {
+        if (!mw || !mw.storage || typeof mw.storage.set !== 'function' || !store) return false;
+        persistedCacheRaw = persistedCacheStore = null;
         const count = Object.keys(store.entries).length;
         const limits = count === 0 ? [0] : [count, Math.floor(RESULT_CACHE_MAX_ENTRIES / 2), 20, 1];
         const tried = Object.create(null);
-        let lastErr = null;
         for (const limit of limits) {
             if (tried[limit]) continue;
             tried[limit] = true;
-            evictOldestResultEntries(store.entries, limit, protectedKey);
+            const keys = Object.keys(store.entries);
+            if (keys.length > limit) {
+                const sortable = keys.map((key, order) => ({ key, ts: store.entries[key].ts, order, isProtected: Boolean(protectedKey && key === protectedKey) }))
+                    .sort((a, b) => (a.isProtected !== b.isProtected ? (a.isProtected ? 1 : -1) : (a.ts !== b.ts ? a.ts - b.ts : a.order - b.order)));
+                for (let i = 0; i < sortable.length - limit; i++) delete store.entries[sortable[i].key];
+            }
             let serialized;
             try { serialized = JSON.stringify(store); } catch (err) { warnPersistedCacheOnce('serialization failed', err); return false; }
-            try {
-                if (backend.set(RESULT_CACHE_STORAGE_KEY, serialized)) {
-                    persistedCacheRaw = serialized;
-                    persistedCacheStore = store;
-                    return true;
-                }
-            } catch (err) { lastErr = err; }
+            const ok = mwStoreOp(mw.storage, 'set', RESULT_CACHE_STORAGE_KEY, serialized);
+            if (ok !== false && ok !== null) { persistedCacheRaw = serialized; persistedCacheStore = store; return true; }
         }
-        if (lastErr) warnPersistedCacheOnce('write failed', lastErr);
         return false;
     }
 
-    function normalizeQueryMode(mode) {
-        return String(mode || 'light').trim().toLowerCase() === 'full' ? 'full' : 'light';
+    function normalizeQueryMode(mode) { return String(mode || 'light').trim().toLowerCase() === 'full' ? 'full' : 'light'; }
+    function isPartialLightResult(data) { return Boolean(data && typeof data === 'object' && data.queryMode === 'light' && data.isPartialMode); }
+
+    function getOrCreateIpState(key) {
+        let entry = ipStateMap.get(key);
+        if (!entry) ipStateMap.set(key, (entry = { lightPromise: null, fullPromise: null, inflightFull: null, inflightRefresh: null, data: null, fullTs: 0, fullTtlMs: 0 }));
+        return entry;
     }
 
-    function isPartialLightResult(data) {
-        return Boolean(data && typeof data === 'object' && data.queryMode === 'light' && data.isPartialMode);
-    }
-
-    function recordFullResultMeta(cacheKey, data, timestampMs) {
-        if (!cacheKey || !data || typeof data !== 'object' || isPartialLightResult(data)) return;
-        const ts = typeof timestampMs === 'number' && isFinite(timestampMs) ? timestampMs : Date.now();
-        fullResultMetaByIp.set(cacheKey, { ts, ttlMs: hasDegradedQuotaOrCooldown(data) ? DEGRADED_CACHE_TTL_MS : RESULT_CACHE_TTL_MS });
-    }
+    function getIpData(key) { const entry = key ? ipStateMap.get(key) : null; return entry ? entry.data : null; }
 
     function isMemoryFullResultFresh(cacheKey, data) {
         if (!cacheKey || !data || typeof data !== 'object' || isPartialLightResult(data)) return false;
-        const meta = fullResultMetaByIp.get(cacheKey);
-        return meta ? (Date.now() - meta.ts) < meta.ttlMs : !hasDegradedQuotaOrCooldown(data);
+        const st = ipStateMap.get(cacheKey);
+        return st && st.fullTs > 0 ? (Date.now() - st.fullTs) < st.fullTtlMs : !hasDegradedQuotaOrCooldown(data);
     }
 
-    function recordLatestIpResult(cacheKey, data) {
+    function recordIpResult(cacheKey, data, includeFullMeta, timestampMs) {
         if (!cacheKey || !data || typeof data !== 'object') return;
-        const existing = latestResultByIp.get(cacheKey);
-        if (existing && !isPartialLightResult(existing) && isPartialLightResult(data)) return;
-        latestResultByIp.set(cacheKey, data);
+        const st = getOrCreateIpState(cacheKey);
+        if (!(st.data && !isPartialLightResult(st.data) && isPartialLightResult(data))) st.data = data;
+        if (includeFullMeta && !isPartialLightResult(data)) {
+            st.fullTs = typeof timestampMs === 'number' && isFinite(timestampMs) ? timestampMs : Date.now();
+            st.fullTtlMs = hasDegradedQuotaOrCooldown(data) ? DEGRADED_CACHE_TTL_MS : RESULT_CACHE_TTL_MS;
+        }
     }
 
-    function deleteKeyFromPersistedStore(backend, store, cacheKey, now) {
-        const nextEntries = cloneEntriesExcluding(store.entries, cacheKey);
-        pruneExpiredResultEntries(nextEntries, now);
-        writePersistedResultStore(backend, { entries: nextEntries }, null);
+    function updatePersistedEntries(excludeKey, newEntryKey, newData) {
+        if (!mw || !mw.storage || typeof mw.storage.set !== 'function') return;
+        const store = readPersistedResultStore(), now = Date.now(), nextEntries = Object.create(null);
+        if (newEntryKey && store && store.entries) {
+            const cur = store.entries[newEntryKey];
+            if (isPartialLightResult(newData) && isResultEntryValid(cur, now) && !isPartialLightResult(cur.data)) return;
+        }
+        if (store && store.entries) {
+            for (const [k, v] of Object.entries(store.entries)) {
+                if (k !== excludeKey && k !== newEntryKey && isResultEntryValid(v, now)) nextEntries[k] = v;
+            }
+        }
+        if (newEntryKey && newData) {
+            nextEntries[newEntryKey] = {
+                ts: now, ttlMs: hasDegradedQuotaOrCooldown(newData) ? DEGRADED_CACHE_TTL_MS : RESULT_CACHE_TTL_MS, data: newData
+            };
+        }
+        writePersistedResultStore({ entries: nextEntries }, newEntryKey || null);
     }
 
     function readPersistedIpResultEntry(cacheKey) {
         if (!cacheKey || typeof cacheKey !== 'string') return null;
-        const backend = getResultStorageBackend();
-        const store = readPersistedResultStore(backend);
+        const store = readPersistedResultStore();
         if (!store || !Object.prototype.hasOwnProperty.call(store.entries, cacheKey)) return null;
-        const now = Date.now();
         const entry = store.entries[cacheKey];
-        if (!isResultEntryValid(entry, now)) {
-            deleteKeyFromPersistedStore(backend, store, cacheKey, now);
-            return null;
-        }
+        if (!isResultEntryValid(entry, Date.now())) { updatePersistedEntries(cacheKey); return null; }
         return entry;
     }
 
-    function readPersistedIpResult(cacheKey) {
-        const entry = readPersistedIpResultEntry(cacheKey);
-        return entry ? entry.data : null;
-    }
-
-    function removePersistedIpResult(cacheKey) {
-        if (!cacheKey || typeof cacheKey !== 'string') return;
-        const backend = getResultStorageBackend();
-        const store = readPersistedResultStore(backend);
-        if (store && Object.prototype.hasOwnProperty.call(store.entries, cacheKey)) {
-            deleteKeyFromPersistedStore(backend, store, cacheKey, Date.now());
-        }
-    }
-
     function invalidateIpResultCache(ip) {
-        const cacheKey = canonicalizeIpKey(ip);
-        const rawLower = typeof ip === 'string' ? ip.trim().toLowerCase() : '';
-        const keys = [cacheKey, rawLower].filter((k, idx, arr) => k && arr.indexOf(k) === idx);
-        for (const key of keys) {
-            ipPromiseCache.delete(key);
-            ipFullPromiseCache.delete(key);
-            latestResultByIp.delete(key);
-            fullResultMetaByIp.delete(key);
-            removePersistedIpResult(key);
-        }
+        const cacheKey = canonicalizeIpKey(ip), rawLower = typeof ip === 'string' ? ip.trim().toLowerCase() : '';
+        [cacheKey, rawLower].filter((k, i, arr) => k && arr.indexOf(k) === i).forEach((key) => {
+            ipStateMap.delete(key);
+            const store = readPersistedResultStore();
+            if (store && Object.prototype.hasOwnProperty.call(store.entries, key)) updatePersistedEntries(key);
+        });
     }
 
     function writePersistedIpResult(cacheKey, data) {
-        if (!cacheKey || typeof cacheKey !== 'string' || !data || typeof data !== 'object') return;
-        const compactData = compactIpResultForStorage(data);
-        const backend = compactData ? getResultStorageBackend() : null;
-        if (!backend) return;
-        const now = Date.now();
-        const existingStore = readPersistedResultStore(backend);
-        const existingEntry = existingStore && existingStore.entries ? existingStore.entries[cacheKey] : null;
-        if (isPartialLightResult(compactData) && isResultEntryValid(existingEntry, now) && !isPartialLightResult(existingEntry.data)) return;
-        const nextEntries = cloneEntriesExcluding(existingStore && existingStore.entries, cacheKey);
-        pruneExpiredResultEntries(nextEntries, now);
-        nextEntries[cacheKey] = {
-            ts: now,
-            ttlMs: hasDegradedQuotaOrCooldown(compactData) ? DEGRADED_CACHE_TTL_MS : RESULT_CACHE_TTL_MS,
-            data: compactData
-        };
-        evictOldestResultEntries(nextEntries, RESULT_CACHE_MAX_ENTRIES, cacheKey);
-        writePersistedResultStore(backend, { entries: nextEntries }, cacheKey);
+        if (cacheKey && typeof cacheKey === 'string' && data && typeof data === 'object') updatePersistedEntries(null, cacheKey, data);
     }
 
     function ensureConsent(forcePrompt) {
         if (accessBlocked) return Promise.resolve(false);
-        if (consentGranted || mw.storage.get(CONSENT_KEY) === '1') {
+        if (consentGranted || mwStoreOp(mw.storage, 'get', CONSENT_KEY) === '1') {
             consentGranted = true;
             consentDeclined = false;
             return Promise.resolve(true);
@@ -670,7 +445,7 @@
             if (agreed) {
                 consentGranted = true;
                 consentDeclined = false;
-                mw.storage.set(CONSENT_KEY, '1');
+                mwStoreOp(mw.storage, 'set', CONSENT_KEY, '1');
                 return true;
             }
             consentDeclined = true;
@@ -684,103 +459,33 @@
         return consentPromise;
     }
 
-    function isTokenRefreshLockActive() {
-        const raw = mw.storage.get(TOKEN_REFRESH_LOCK_KEY);
-        if (raw === false || raw === null || raw === undefined || raw === '') return false;
-        const ts = Number(raw);
-        if (!isFinite(ts) || ts <= 0) return false;
-        const age = Date.now() - ts;
-        return age >= -5000 && age < TOKEN_REFRESH_LOCK_TTL_MS;
-    }
-
-    function acquireTokenRefreshLock() {
-        const lockVal = String(Date.now());
-        mw.storage.set(TOKEN_REFRESH_LOCK_KEY, lockVal);
-        return lockVal;
-    }
-
-    function releaseTokenRefreshLock(lockVal) {
-        if (!lockVal) { mw.storage.remove(TOKEN_REFRESH_LOCK_KEY); return; }
-        const cur = mw.storage.get(TOKEN_REFRESH_LOCK_KEY);
-        if (cur !== null && cur !== undefined && cur !== false && String(cur) === String(lockVal)) {
-            mw.storage.remove(TOKEN_REFRESH_LOCK_KEY);
-        }
-    }
-
-    function waitForCrossTabTokenRefresh(failedToken) {
-        return new Promise((resolve) => {
-            const startedAt = Date.now();
-            let settled = false;
-            const finish = (token) => {
-                if (settled) return;
-                settled = true;
-                tokenRefreshWaitTimer = clearTimer(tokenRefreshWaitTimer, false);
-                if (tokenRefreshWaitCancel === cancelWait) tokenRefreshWaitCancel = null;
-                resolve(token || null);
-            };
-            const cancelWait = () => finish(null);
-            tokenRefreshWaitCancel = cancelWait;
-
-            const poll = () => {
-                if (accessBlocked) return finish(null);
-                const stored = readStoredToken();
-                if (stored && (!failedToken || stored !== failedToken)) return finish(stored);
-                if (!isTokenRefreshLockActive() || Date.now() - startedAt >= TOKEN_REFRESH_WAIT_TIMEOUT_MS) return finish(null);
-                tokenRefreshWaitTimer = window.setTimeout(poll, TOKEN_REFRESH_POLL_INTERVAL_MS);
-            };
-            tokenRefreshWaitTimer = window.setTimeout(poll, TOKEN_REFRESH_POLL_INTERVAL_MS);
-        });
-    }
-
     function performGadgetTokenExchange() {
         if (accessBlocked) return Promise.resolve(null);
-        const lockVal = acquireTokenRefreshLock();
         clearStoredToken();
         const wikiDomain = mw.config.get('wgServerName');
-
         return Promise.resolve(mw.loader.using('mediawiki.api')).then(() => {
             if (accessBlocked) return null;
-            return new mw.Api().get({ action: 'centralauthtoken' }).then((d) => d, (code, details) => {
-                warn('centralauthtoken request failed:', { code, details });
-                return null;
-            });
+            return new mw.Api().get({ action: 'centralauthtoken' }).then((d) => d, (code, details) => { warn('centralauthtoken request failed:', { code, details }); return null; });
         }).then((apiData) => {
-            if (!apiData || accessBlocked) return null;
-            const cat = apiData.centralauthtoken && apiData.centralauthtoken.centralauthtoken;
-            if (!cat || typeof cat !== 'string') {
-                warn('Missing centralauthtoken:', apiData);
-                return null;
-            }
+            const cat = !accessBlocked && apiData && apiData.centralauthtoken && apiData.centralauthtoken.centralauthtoken;
+            if (!cat || typeof cat !== 'string') { if (apiData && !accessBlocked) warn('Missing centralauthtoken:', apiData); return null; }
             return fetch(TOOL_BASE_URL + '/api/v1/auth/gadget-token', {
-                method: 'POST', mode: 'cors', credentials: 'omit',
-                headers: { 'Content-Type': 'application/json' },
+                method: 'POST', mode: 'cors', credentials: 'omit', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ centralauthtoken: cat, domain: wikiDomain })
             }).then((res) => {
-                if (!res.ok) {
-                    return res.text().then((txt) => {
-                        warn(`Gadget token HTTP ${res.status}:`, txt);
-                        if (res.status === 403) { clearStoredToken(); blockAccess(); }
-                        else if (res.status === 401) clearStoredToken();
-                        return null;
-                    });
-                }
+                if (!res.ok) return res.text().then((txt) => {
+                    warn(`Gadget token HTTP ${res.status}:`, txt);
+                    if (res.status === 403) { clearStoredToken(); blockAccess(); } else if (res.status === 401) clearStoredToken();
+                    return null;
+                });
                 return res.json().then((payload) => {
                     const tok = payload && payload.token;
-                    if (!tok || typeof tok !== 'string') {
-                        warn('Token missing in response:', payload);
-                        return null;
-                    }
+                    if (!tok || typeof tok !== 'string') { warn('Token missing in response:', payload); return null; }
                     storeToken(tok, payload.expires_in);
                     return tok;
                 });
             });
-        }).catch((err) => {
-            warn('CentralAuth token exchange failed:', err);
-            return null;
-        }).then((tok) => {
-            releaseTokenRefreshLock(lockVal);
-            return tok;
-        });
+        }).catch((err) => { warn('CentralAuth token exchange failed:', err); return null; });
     }
 
     function refreshGadgetToken(failedToken) {
@@ -788,26 +493,11 @@
         if (authPromise) return authPromise;
         const latest = readStoredToken();
         if (latest && (!failedToken || latest !== failedToken)) return Promise.resolve(latest);
-
-        const pending = isTokenRefreshLockActive()
-            ? waitForCrossTabTokenRefresh(failedToken).then((shared) => {
-                if (accessBlocked) return null;
-                if (shared && (!failedToken || shared !== failedToken)) return shared;
-                const cur = readStoredToken();
-                if (cur && (!failedToken || cur !== failedToken)) return cur;
-                return performGadgetTokenExchange();
-            })
-            : performGadgetTokenExchange();
-
-        const tracked = pending.then((tok) => {
-            if (authPromise === tracked) authPromise = null;
-            return tok;
-        }, (err) => {
-            if (authPromise === tracked) authPromise = null;
-            throw err;
-        });
-        authPromise = tracked;
-        return tracked;
+        const tracked = performGadgetTokenExchange().then(
+            (tok) => { if (authPromise === tracked) authPromise = null; return tok; },
+            (err) => { if (authPromise === tracked) authPromise = null; throw err; }
+        );
+        return (authPromise = tracked);
     }
 
     function ensureGadgetToken() {
@@ -816,71 +506,34 @@
         return stored ? Promise.resolve(stored) : refreshGadgetToken(null);
     }
 
-    function handleDetectAuthStatus(status, token, hasRetried, retryFn) {
-        if (status === 403 || (status === 401 && hasRetried)) {
-            clearStoredToken();
-            blockAccess();
-            return null;
-        }
-        return refreshGadgetToken(token).then((fresh) => (!fresh || accessBlocked) ? null : retryFn(fresh));
-    }
-
     function apiFetchWithAuth(path, opts, token, hasRetried) {
-        const headers = Object.assign({ 'Authorization': 'Bearer ' + token }, opts.headers || {});
-        return fetch(TOOL_BASE_URL + path, Object.assign({ mode: 'cors', credentials: 'omit' }, opts, { headers }))
-            .then((response) => {
-                if (response.status === 401 || response.status === 403) {
-                    return handleDetectAuthStatus(response.status, token, hasRetried, (fresh) =>
-                        apiFetchWithAuth(path, opts, fresh, true)
-                    );
-                }
-                return response;
-            });
+        const headers = Object.assign({ Authorization: 'Bearer ' + token }, opts.headers || {});
+        return fetch(TOOL_BASE_URL + path, Object.assign({ mode: 'cors', credentials: 'omit' }, opts, { headers })).then((res) => {
+            if (res.status !== 401 && res.status !== 403) return res;
+            if (res.status === 403 || hasRetried) { clearStoredToken(); blockAccess(); return null; }
+            return refreshGadgetToken(token).then((fresh) => (!fresh || accessBlocked) ? null : apiFetchWithAuth(path, opts, fresh, true));
+        });
     }
 
     function fetchDetectWithToken(ip, token, hasRetried, mode) {
         if (!isValidIp(ip)) return Promise.resolve(null);
-        const resolvedMode = normalizeQueryMode(mode);
-        return apiFetchWithAuth(
-            `/api/v1/detect?ip=${encodeURIComponent(ip)}&compact=1&mode=${encodeURIComponent(resolvedMode)}`,
-            { method: 'GET' },
-            token,
-            hasRetried
-        ).then((res) => {
-            if (!res) return null;
-            if (!res.ok) { warn(`Detection API HTTP ${res.status} for ${ip}`); return null; }
-            return res.json();
-        });
+        return apiFetchWithAuth(`/api/v1/detect?ip=${encodeURIComponent(ip)}&compact=1&mode=${encodeURIComponent(normalizeQueryMode(mode))}`,
+            { method: 'GET' }, token, hasRetried).then((res) => (!res ? null : (!res.ok ? (warn(`Detection API HTTP ${res.status} for ${ip}`), null) : res.json())));
     }
 
     function fetchRefreshDetectWithToken(ip, token, hasRetried, mode) {
         if (!isValidIp(ip)) return Promise.resolve({ ok: false, status: 0, rateLimited: false, data: null });
-        const resolvedMode = normalizeQueryMode(mode || 'full');
-        return apiFetchWithAuth(
-            '/api/v1/detect/refresh',
-            {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ip, mode: resolvedMode, compact: false })
-            },
-            token,
-            hasRetried
-        ).then((res) => {
+        return apiFetchWithAuth('/api/v1/detect/refresh', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ip, mode: normalizeQueryMode(mode || 'full'), compact: true })
+        }, token, hasRetried).then((res) => {
             if (!res) return { ok: false, status: 401, rateLimited: false, data: null };
-            if (res.status === 429) {
-                return res.json().catch(() => ({})).then((errBody) => ({
-                    ok: false,
-                    status: 429,
-                    rateLimited: true,
-                    retryAfterSeconds: errBody && typeof errBody.retryAfterSeconds === 'number' ? errBody.retryAfterSeconds : null,
-                    message: errBody && typeof errBody.message === 'string' ? errBody.message : '',
-                    data: null
-                }));
-            }
-            if (!res.ok) {
-                warn(`Refresh API HTTP ${res.status} for ${ip}`);
-                return { ok: false, status: res.status, rateLimited: false, data: null };
-            }
+            if (res.status === 429) return res.json().catch(() => ({})).then((b) => ({
+                ok: false, status: 429, rateLimited: true,
+                retryAfterSeconds: b && typeof b.retryAfterSeconds === 'number' ? b.retryAfterSeconds : null,
+                message: b && typeof b.message === 'string' ? b.message : '', data: null
+            }));
+            if (!res.ok) { warn(`Refresh API HTTP ${res.status} for ${ip}`); return { ok: false, status: res.status, rateLimited: false, data: null }; }
             return res.json().then((payload) => ({ ok: true, status: 200, rateLimited: false, data: payload }));
         });
     }
@@ -894,12 +547,12 @@
     }
 
     function runQueuedNetworkTask(taskFn, resolve, reject) {
-        if (accessBlocked) { clearRequestQueue(); resolve(null); return; }
+        if (accessBlocked) { clearRequestQueue(); return resolve(null); }
         activeRequestCount += 1;
         let p;
         try { p = Promise.resolve(taskFn()); } catch (err) { p = Promise.reject(err); }
         p.then((res) => { activeRequestCount -= 1; pumpRequestQueue(); resolve(res); },
-               (err) => { activeRequestCount -= 1; pumpRequestQueue(); reject(err); });
+            (err) => { activeRequestCount -= 1; pumpRequestQueue(); reject(err); });
     }
 
     function enqueueNetworkTask(taskFn) {
@@ -911,10 +564,7 @@
     }
 
     function runWithToken(fn) {
-        return enqueueNetworkTask(() => {
-            if (accessBlocked) return null;
-            return ensureGadgetToken().then((token) => (!token || accessBlocked) ? null : fn(token));
-        });
+        return enqueueNetworkTask(() => (accessBlocked ? null : ensureGadgetToken().then((token) => (!token || accessBlocked) ? null : fn(token))));
     }
 
     function enqueueSingleIpDetection(ip, mode) {
@@ -922,19 +572,13 @@
         return runWithToken((token) => fetchDetectWithToken(ip, token, false, resolvedMode));
     }
 
-    function fetchBatchDetectWithToken(ips, token, hasRetried, mode) {
+    function fetchBatchDetectWithToken(ips, token, hasRetried) {
         const validIps = Array.isArray(ips) ? ips.filter(isValidIp) : [];
         if (validIps.length === 0) return Promise.resolve(null);
-        return apiFetchWithAuth(
-            '/api/v1/detect/batch?compact=1',
-            {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ips: validIps, mode: normalizeQueryMode(mode) })
-            },
-            token,
-            hasRetried
-        ).then((res) => {
+        return apiFetchWithAuth('/api/v1/detect/batch?compact=1', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ips: validIps, mode: 'light' })
+        }, token, hasRetried).then((res) => {
             if (!res) return null;
             if (res.status === 404 || res.status === 405) { batchEndpointSupported = false; return { fallbackSingle: true }; }
             if (!res.ok) { warn(`Batch API HTTP ${res.status}`); return null; }
@@ -942,84 +586,64 @@
         });
     }
 
-    function markBatchOriginatedPayload(entry) {
-        if (batchOriginatedPayloads && entry && typeof entry === 'object') batchOriginatedPayloads.add(entry);
-        return entry;
-    }
-
     function extractIpResultFromBatch(batchPayload, rawIp) {
-        if (!batchPayload || typeof batchPayload !== 'object') return null;
-        const results = batchPayload.results;
+        const results = batchPayload && typeof batchPayload === 'object' ? batchPayload.results : null;
         if (!results || typeof results !== 'object') return null;
-        const trimmed = String(rawIp || '').trim();
-        const lower = trimmed.toLowerCase();
-        const canonical = canonicalizeIpKey(trimmed);
+        const trimmed = String(rawIp || '').trim(), lower = trimmed.toLowerCase(), canonical = canonicalizeIpKey(trimmed);
         for (const k of [trimmed, lower, canonical]) {
-            if (k && Object.prototype.hasOwnProperty.call(results, k) && results[k]) return markBatchOriginatedPayload(results[k]);
+            if (k && Object.prototype.hasOwnProperty.call(results, k) && results[k]) return results[k];
         }
         const inputMap = batchPayload.inputMap;
         if (inputMap && typeof inputMap === 'object') {
             const mapped = inputMap[rawIp] || inputMap[trimmed] || inputMap[lower] || (canonical ? inputMap[canonical] : '');
-            if (mapped && Object.prototype.hasOwnProperty.call(results, mapped) && results[mapped]) {
-                return markBatchOriginatedPayload(results[mapped]);
-            }
+            if (mapped && Object.prototype.hasOwnProperty.call(results, mapped) && results[mapped]) return results[mapped];
         }
         for (const [k, entry] of Object.entries(results)) {
-            if (k.toLowerCase() === lower || (canonical && canonicalizeIpKey(k) === canonical)) return markBatchOriginatedPayload(entry);
-            if (entry && typeof entry.ip === 'string' && (entry.ip.toLowerCase() === lower || (canonical && canonicalizeIpKey(entry.ip) === canonical))) {
-                return markBatchOriginatedPayload(entry);
-            }
+            if ((canonical && canonicalizeIpKey(k) === canonical) || (entry && typeof entry.ip === 'string' && canonical && canonicalizeIpKey(entry.ip) === canonical)) return entry;
         }
         return null;
     }
 
-    function fallbackBatchItemsToSingle(batchItems) {
-        for (const item of batchItems) enqueueSingleIpDetection(item.ip, item.mode).then(item.resolve, item.reject);
-    }
-
-    function dispatchBatchBucket(bucketItems, bucketMode) {
-        if (!bucketItems || bucketItems.length === 0) return;
-        const uniqueIps = [];
-        const seen = Object.create(null);
-        for (const item of bucketItems) {
-            const key = canonicalizeIpKey(item.ip) || item.ip.toLowerCase();
-            if (!seen[key]) { seen[key] = true; uniqueIps.push(item.ip); }
-        }
-        runWithToken((token) => batchEndpointSupported ? fetchBatchDetectWithToken(uniqueIps, token, false, bucketMode) : { fallbackSingle: true })
-            .then((batchPayload) => {
-                if (batchPayload && batchPayload.fallbackSingle) {
-                    clearBatchDebounceTimer();
-                    fallbackBatchItemsToSingle(bucketItems.concat(pendingBatchQueue.splice(0, pendingBatchQueue.length)));
-                    return;
-                }
-                for (const item of bucketItems) item.resolve(extractIpResultFromBatch(batchPayload, item.ip));
-            }, (err) => {
-                for (const item of bucketItems) item.reject(err);
-            });
+    function settleInflight(st, field, promise, aliasIp) {
+        if (st[field] === promise) st[field] = null;
+        const alias = typeof aliasIp === 'string' ? canonicalizeIpKey(aliasIp) : '';
+        const aliasSt = alias ? ipStateMap.get(alias) : null;
+        if (aliasSt && aliasSt[field] === promise) aliasSt[field] = null;
+        return alias;
     }
 
     function dispatchBatchItems(batchItems) {
         if (!batchItems || batchItems.length === 0) return;
         if (accessBlocked) { batchItems.forEach((i) => i.resolve(null)); return; }
-        if (!batchEndpointSupported) { fallbackBatchItemsToSingle(batchItems); return; }
-        const light = [], full = [];
-        for (const item of batchItems) (normalizeQueryMode(item.mode) === 'full' ? full : light).push(item);
-        dispatchBatchBucket(light, 'light');
-        dispatchBatchBucket(full, 'full');
+        if (!batchEndpointSupported) { batchItems.forEach((item) => enqueueSingleIpDetection(item.ip, 'light').then(item.resolve, item.reject)); return; }
+        const uniqueIps = [], seen = Object.create(null);
+        for (const item of batchItems) {
+            const key = canonicalizeIpKey(item.ip) || item.ip.toLowerCase();
+            if (!seen[key]) { seen[key] = true; uniqueIps.push(item.ip); }
+        }
+        runWithToken((token) => batchEndpointSupported ? fetchBatchDetectWithToken(uniqueIps, token, false) : { fallbackSingle: true })
+            .then((batchPayload) => {
+                if (batchPayload && batchPayload.fallbackSingle) {
+                    batchDebounceTimer = clearTimer(batchDebounceTimer, false);
+                    batchItems.concat(pendingBatchQueue.splice(0, pendingBatchQueue.length))
+                        .forEach((item) => enqueueSingleIpDetection(item.ip, 'light').then(item.resolve, item.reject));
+                    return;
+                }
+                batchItems.forEach((item) => item.resolve(extractIpResultFromBatch(batchPayload, item.ip)));
+            }, (err) => batchItems.forEach((item) => item.reject(err)));
     }
 
     function flushPendingBatch() {
-        clearBatchDebounceTimer();
+        batchDebounceTimer = clearTimer(batchDebounceTimer, false);
         if (accessBlocked) { clearRequestQueue(); return; }
         while (pendingBatchQueue.length > 0) dispatchBatchItems(pendingBatchQueue.splice(0, MAX_BATCH_IPS));
     }
 
-    function enqueueBatchIpDetection(ip, mode) {
-        const resolvedMode = normalizeQueryMode(mode);
+    function enqueueBatchIpDetection(ip) {
         if (accessBlocked) return Promise.resolve(null);
-        if (!batchEndpointSupported) return enqueueSingleIpDetection(ip, resolvedMode);
+        if (!batchEndpointSupported) return enqueueSingleIpDetection(ip, 'light');
         return new Promise((resolve, reject) => {
-            pendingBatchQueue.push({ ip, mode: resolvedMode, resolve, reject });
+            pendingBatchQueue.push({ ip, resolve, reject });
             if (pendingBatchQueue.length >= MAX_BATCH_IPS) flushPendingBatch();
             else if (batchDebounceTimer === null) {
                 batchDebounceTimer = window.setTimeout(() => { batchDebounceTimer = null; flushPendingBatch(); }, BATCH_DEBOUNCE_MS);
@@ -1030,30 +654,16 @@
     function syncResolvedIpAliases(cacheKey, data, promise, includeFullCache, recordedTs) {
         const resolvedTs = typeof recordedTs === 'number' && isFinite(recordedTs) ? recordedTs : Date.now();
         const writeAlias = (k) => {
-            recordLatestIpResult(k, data);
-            if (includeFullCache) recordFullResultMeta(k, data, resolvedTs);
+            const st = getOrCreateIpState(k);
+            recordIpResult(k, data, includeFullCache, resolvedTs);
+            if (!st.lightPromise || includeFullCache) st.lightPromise = promise;
+            if (includeFullCache && !st.fullPromise) st.fullPromise = promise;
             writePersistedIpResult(k, data);
         };
         writeAlias(cacheKey);
         if (typeof data.ip !== 'string') return;
         const resolvedKey = canonicalizeIpKey(data.ip);
-        if (!resolvedKey || resolvedKey === cacheKey) return;
-        writeAlias(resolvedKey);
-        if (!ipPromiseCache.has(resolvedKey) || includeFullCache) ipPromiseCache.set(resolvedKey, promise);
-        if (includeFullCache && !ipFullPromiseCache.has(resolvedKey)) ipFullPromiseCache.set(resolvedKey, promise);
-    }
-
-    function pruneExpiredFullMemoryCache(cacheKey) {
-        if (!ipFullPromiseCache.has(cacheKey)) return false;
-        const cachedLatest = latestResultByIp.get(cacheKey);
-        if (cachedLatest && fullResultMetaByIp.has(cacheKey) && !isMemoryFullResultFresh(cacheKey, cachedLatest)) {
-            const expired = ipFullPromiseCache.get(cacheKey);
-            ipFullPromiseCache.delete(cacheKey);
-            fullResultMetaByIp.delete(cacheKey);
-            if (ipPromiseCache.get(cacheKey) === expired) ipPromiseCache.delete(cacheKey);
-            return true;
-        }
-        return false;
+        if (resolvedKey && resolvedKey !== cacheKey) writeAlias(resolvedKey);
     }
 
     function executeIpRefresh(ip) {
@@ -1061,175 +671,94 @@
         if (accessBlocked || !isValidIp(ip)) return Promise.resolve(failOutcome());
         const cacheKey = canonicalizeIpKey(ip);
         if (!cacheKey) return Promise.resolve(failOutcome());
-        if (inflightRefreshByIp.has(cacheKey)) return inflightRefreshByIp.get(cacheKey);
+        const st = getOrCreateIpState(cacheKey);
+        if (st.inflightRefresh) return st.inflightRefresh;
 
         const refreshPromise = runWithToken((token) => fetchRefreshDetectWithToken(ip, token, false, 'full'))
             .then((res) => {
-                if (inflightRefreshByIp.get(cacheKey) === refreshPromise) inflightRefreshByIp.delete(cacheKey);
+                const aliasKey = settleInflight(st, 'inflightRefresh', refreshPromise, res && res.data && res.data.ip);
                 autoSwrAttemptedKeys.add(cacheKey);
+                if (aliasKey) autoSwrAttemptedKeys.add(aliasKey);
                 if (!res || !res.ok || !res.data || typeof res.data !== 'object') {
-                    return failOutcome({
-                        rateLimited: Boolean(res && res.rateLimited),
-                        retryAfterSeconds: res && typeof res.retryAfterSeconds === 'number' ? res.retryAfterSeconds : null
-                    });
-                }
-                const aliasKey = typeof res.data.ip === 'string' ? canonicalizeIpKey(res.data.ip) : '';
-                if (aliasKey) {
-                    autoSwrAttemptedKeys.add(aliasKey);
-                    if (inflightRefreshByIp.get(aliasKey) === refreshPromise) inflightRefreshByIp.delete(aliasKey);
+                    return failOutcome({ rateLimited: Boolean(res && res.rateLimited), retryAfterSeconds: res && typeof res.retryAfterSeconds === 'number' ? res.retryAfterSeconds : null });
                 }
                 const meta = res.data.cacheMeta && typeof res.data.cacheMeta === 'object' ? res.data.cacheMeta : null;
                 if (meta && meta.degradedRefreshFallback === true) {
-                    const existingCached = latestResultByIp.get(cacheKey) || readPersistedIpResult(cacheKey);
+                    const persisted = readPersistedIpResultEntry(cacheKey);
+                    const existingCached = st.data || (persisted && persisted.data);
                     if (!existingCached) {
-                        const fallbackPromise = Promise.resolve(res.data);
-                        ipFullPromiseCache.set(cacheKey, fallbackPromise);
-                        ipPromiseCache.set(cacheKey, fallbackPromise);
-                        syncResolvedIpAliases(cacheKey, res.data, fallbackPromise, true, Date.now());
+                        st.fullPromise = st.lightPromise = Promise.resolve(res.data);
+                        syncResolvedIpAliases(cacheKey, res.data, st.fullPromise, true, Date.now());
                     }
                     return failOutcome({ degradedFallback: true, data: existingCached || res.data });
                 }
                 const freshPromise = Promise.resolve(res.data);
-                ipFullPromiseCache.set(cacheKey, freshPromise);
-                ipPromiseCache.set(cacheKey, freshPromise);
+                st.fullPromise = st.lightPromise = freshPromise;
                 syncResolvedIpAliases(cacheKey, res.data, freshPromise, true, Date.now());
                 refreshRenderedBadgesForIp(res.data.ip || ip, res.data);
                 return { ok: true, rateLimited: false, retryAfterSeconds: null, degradedFallback: false, data: res.data };
             }).catch((err) => {
-                if (inflightRefreshByIp.get(cacheKey) === refreshPromise) inflightRefreshByIp.delete(cacheKey);
+                settleInflight(st, 'inflightRefresh', refreshPromise);
                 autoSwrAttemptedKeys.add(cacheKey);
                 warn(`Refresh failed for ${ip}:`, err);
                 return failOutcome();
             });
-
-        inflightRefreshByIp.set(cacheKey, refreshPromise);
-        return refreshPromise;
+        return (st.inflightRefresh = refreshPromise);
     }
 
     function fetchIpIntelligence(ip, mode, options) {
         if (accessBlocked || !isValidIp(ip)) return Promise.resolve(null);
         const cacheKey = canonicalizeIpKey(ip);
         if (!cacheKey) return Promise.resolve(null);
+        const st = getOrCreateIpState(cacheKey), resolvedMode = normalizeQueryMode(mode);
+        if (resolvedMode === 'full' && options && options.forceRefresh) return executeIpRefresh(ip).then((o) => (o && o.ok ? o.data : null));
+        if (st.inflightFull) return st.inflightFull;
+        if (st.fullPromise && st.data && st.fullTs > 0 && !isMemoryFullResultFresh(cacheKey, st.data)) {
+            if (st.lightPromise === st.fullPromise) st.lightPromise = null;
+            st.fullPromise = null; st.fullTs = st.fullTtlMs = 0;
+        }
+        if (st.fullPromise) return st.fullPromise;
 
-        const resolvedMode = normalizeQueryMode(mode);
         if (resolvedMode === 'full') {
-            if (options && options.forceRefresh) {
-                return executeIpRefresh(ip).then((o) => (o && o.ok ? o.data : null));
-            }
-            if (inflightFullPromisesByIp.has(cacheKey)) return inflightFullPromisesByIp.get(cacheKey);
-            pruneExpiredFullMemoryCache(cacheKey);
-            if (ipFullPromiseCache.has(cacheKey)) return ipFullPromiseCache.get(cacheKey);
-
-            const cachedLatest = latestResultByIp.get(cacheKey);
-            if (cachedLatest && !isPartialLightResult(cachedLatest) && isMemoryFullResultFresh(cacheKey, cachedLatest)) {
-                const p = Promise.resolve(cachedLatest);
-                ipFullPromiseCache.set(cacheKey, p);
-                return p;
-            }
-            const persistedFull = readPersistedIpResultEntry(cacheKey);
-            if (persistedFull && persistedFull.data && !isPartialLightResult(persistedFull.data)) {
-                recordLatestIpResult(cacheKey, persistedFull.data);
-                recordFullResultMeta(cacheKey, persistedFull.data, persistedFull.ts);
-                const p = Promise.resolve(persistedFull.data);
-                ipFullPromiseCache.set(cacheKey, p);
-                ipPromiseCache.set(cacheKey, p);
-                return p;
+            if (st.data && !isPartialLightResult(st.data) && isMemoryFullResultFresh(cacheKey, st.data)) return (st.fullPromise = Promise.resolve(st.data));
+            const persisted = readPersistedIpResultEntry(cacheKey);
+            if (persisted && persisted.data && !isPartialLightResult(persisted.data)) {
+                recordIpResult(cacheKey, persisted.data, true, persisted.ts);
+                return (st.fullPromise = st.lightPromise = Promise.resolve(persisted.data));
             }
             const fullPromise = enqueueSingleIpDetection(ip, 'full').then((data) => {
-                if (inflightFullPromisesByIp.get(cacheKey) === fullPromise) inflightFullPromisesByIp.delete(cacheKey);
+                settleInflight(st, 'inflightFull', fullPromise, data && data.ip);
                 if (!data || typeof data !== 'object') return null;
-                const alias = typeof data.ip === 'string' ? canonicalizeIpKey(data.ip) : '';
-                if (alias && inflightFullPromisesByIp.get(alias) === fullPromise) inflightFullPromisesByIp.delete(alias);
-                ipFullPromiseCache.set(cacheKey, fullPromise);
-                ipPromiseCache.set(cacheKey, fullPromise);
+                st.fullPromise = st.lightPromise = fullPromise;
                 syncResolvedIpAliases(cacheKey, data, fullPromise, true, Date.now());
                 return data;
-            }).catch((err) => {
-                if (inflightFullPromisesByIp.get(cacheKey) === fullPromise) inflightFullPromisesByIp.delete(cacheKey);
-                warn(`Full detection failed for ${ip}:`, err);
-                return null;
-            });
-            inflightFullPromisesByIp.set(cacheKey, fullPromise);
-            return fullPromise;
+            }).catch((err) => { settleInflight(st, 'inflightFull', fullPromise); warn(`Full detection failed for ${ip}:`, err); return null; });
+            return (st.inflightFull = fullPromise);
         }
 
-        if (inflightFullPromisesByIp.has(cacheKey)) return inflightFullPromisesByIp.get(cacheKey);
-        pruneExpiredFullMemoryCache(cacheKey);
-        if (ipFullPromiseCache.has(cacheKey)) return ipFullPromiseCache.get(cacheKey);
-        if (ipPromiseCache.has(cacheKey)) return ipPromiseCache.get(cacheKey);
-
-        const persistedEntry = readPersistedIpResultEntry(cacheKey);
-        if (persistedEntry && persistedEntry.data) {
-            recordLatestIpResult(cacheKey, persistedEntry.data);
-            if (!isPartialLightResult(persistedEntry.data)) recordFullResultMeta(cacheKey, persistedEntry.data, persistedEntry.ts);
-            const p = Promise.resolve(persistedEntry.data);
-            ipPromiseCache.set(cacheKey, p);
-            if (!isPartialLightResult(persistedEntry.data)) ipFullPromiseCache.set(cacheKey, p);
+        if (st.lightPromise) return st.lightPromise;
+        const persisted = readPersistedIpResultEntry(cacheKey);
+        if (persisted && persisted.data) {
+            const isFull = !isPartialLightResult(persisted.data);
+            recordIpResult(cacheKey, persisted.data, isFull, persisted.ts);
+            const p = Promise.resolve(persisted.data);
+            st.lightPromise = p;
+            if (isFull) st.fullPromise = p;
             return p;
         }
-
-        const promise = enqueueBatchIpDetection(ip, 'light').then((data) => {
-            if (!data || typeof data !== 'object') {
-                if (ipPromiseCache.get(cacheKey) === promise) ipPromiseCache.delete(cacheKey);
-                return null;
-            }
+        const promise = enqueueBatchIpDetection(ip).then((data) => {
+            if (!data || typeof data !== 'object') { if (st.lightPromise === promise) st.lightPromise = null; return null; }
             const isFullReady = !isPartialLightResult(data);
-            if (isFullReady && !ipFullPromiseCache.has(cacheKey)) ipFullPromiseCache.set(cacheKey, promise);
+            if (isFullReady && !st.fullPromise) st.fullPromise = promise;
             syncResolvedIpAliases(cacheKey, data, promise, isFullReady, Date.now());
             return data;
-        }).catch((err) => {
-            warn(`Detection failed for ${ip}:`, err);
-            if (ipPromiseCache.get(cacheKey) === promise) ipPromiseCache.delete(cacheKey);
-            return null;
-        });
-        ipPromiseCache.set(cacheKey, promise);
-        return promise;
-    }
-
-    function rowHasHighRiskFlag(row) {
-        return Boolean(row && Array.isArray(row.securityFlags) && row.securityFlags.some((f) => Boolean(f && f.isHighRisk)));
+        }).catch((err) => { warn(`Detection failed for ${ip}:`, err); if (st.lightPromise === promise) st.lightPromise = null; return null; });
+        return (st.lightPromise = promise);
     }
 
     function extractNonEmptyStrings(list) {
         if (!Array.isArray(list)) return [];
         return list.map((item) => (typeof item === 'string' ? item.trim() : '')).filter(Boolean);
-    }
-
-    function isSpamhausNonPblListed(row) {
-        if (!row || row.provider !== 'Spamhaus ZEN') return false;
-        const codes = extractNonEmptyStrings(row.listedCodes);
-        const isListed = Boolean(row.isListed || codes.length > 0);
-        if (!isListed) return false;
-        if (codes.length > 0) return codes.some((code) => code !== '127.0.0.10' && code !== '127.0.0.11');
-        return !row.isPolicyRange || rowHasHighRiskFlag(row);
-    }
-
-    function isSpamhausPolicyOnlyListed(row) {
-        if (!row || row.provider !== 'Spamhaus ZEN') return false;
-        const codes = extractNonEmptyStrings(row.listedCodes);
-        const isListed = Boolean(row.isListed || row.isPolicyRange || codes.length > 0);
-        return isListed && !isSpamhausNonPblListed(row);
-    }
-
-    function isMaxmindHostingRow(row) {
-        if (!row || row.provider !== 'MaxMind') return false;
-        const usage = typeof row.usageType === 'string' ? row.usageType.trim().toLowerCase() : '';
-        return Boolean(
-            (typeof row.hostingProvider === 'string' && row.hostingProvider.trim()) ||
-            (typeof row.cloudProvider === 'string' && row.cloudProvider.trim()) ||
-            usage === 'hosting' || usage === 'datacenter' || usage === 'data center'
-        );
-    }
-
-    function hasDshieldActivity(row) {
-        if (!row || row.provider !== 'DShield') return false;
-        const threatfeeds = extractNonEmptyStrings(row.threatfeeds);
-        return Boolean((Number(row.attacks) || 0) > 0 || (Number(row.count) || 0) > 0 || threatfeeds.length > 0 || rowHasHighRiskFlag(row));
-    }
-
-    function hasSpamcopListing(row) {
-        if (!row || row.provider !== 'SpamCop') return false;
-        return Boolean(row.isListed || extractNonEmptyStrings(row.listedCodes).length > 0 || rowHasHighRiskFlag(row));
     }
 
     function collectNumericPorts(target, list) {
@@ -1240,34 +769,27 @@
         }
     }
 
-    function rowHasOpenPortsFlag(row) {
-        return Boolean(row && row.provider === 'Shodan InternetDB' &&
-            ((Array.isArray(row.ports) && row.ports.length > 0) ||
-            (Array.isArray(row.securityFlags) && row.securityFlags.some((f) => f && f.label === 'Open Ports'))));
+    function isValidProviderRow(row) {
+        return Boolean(row && typeof row === 'object' && !row.isCooldown && !isRowQuotaGuarded(row) &&
+            (row.status === '200 OK' || row.statusCode === 200));
     }
 
-    function evaluateRisk(data) {
-        const isNonPublic = Boolean(data.isNonPublic);
-        const nonPublicCategory = typeof data.nonPublicCategory === 'string' ? data.nonPublicCategory.trim().toLowerCase() : '';
-        const nonPublicReason = typeof data.nonPublicReason === 'string' && data.nonPublicReason.trim()
-            ? data.nonPublicReason.trim() : 'Non-Public / Reserved IP';
-        const nonPublicBadgeCode = (nonPublicCategory === 'private' || nonPublicCategory === 'loopback' || nonPublicCategory === 'link_local') ? 'LOCAL' : 'RESERVED';
+    function formatOfflineDbDateShort(iso) {
+        if (typeof iso !== 'string' || !iso.trim()) return '';
+        const ms = Date.parse(iso.trim());
+        return isNaN(ms) ? iso.trim() : new Date(ms).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+    }
 
-        const prediction = Number(data.prediction_score) || 0;
-        const hasPrediction = data.getipintel_chance !== null && data.getipintel_chance !== undefined && !isNaN(Number(data.getipintel_chance));
-        const broadcastIp = Boolean(data.is_broadcast_ip);
-        const isTor = Boolean(data.isTor);
-        const isMajorityProxyVpn = Boolean(data.isMajorityProxyVpn);
-        const arbitrationTier = typeof data.arbitrationTier === 'string' ? data.arbitrationTier.trim().toLowerCase() : '';
-        const ptrIsHighRisk = Boolean(data.ptrIsHighRisk);
-        const hasCloudProvider = Boolean(typeof data.cloudProvider === 'string' && data.cloudProvider.trim());
-        const arbitrationVerdict = typeof data.arbitrationVerdict === 'string' ? data.arbitrationVerdict.trim() : '';
-        const torLabel = typeof data.torLabel === 'string' && data.torLabel.trim() ? data.torLabel.trim() : (isTor ? 'Tor Node' : '');
-        const torSummary = typeof data.torSummary === 'string' && data.torSummary.trim() ? data.torSummary.trim() : '';
-        const torFlags = extractNonEmptyStrings(data.torFlags);
+    function analyzeProviderSignals(data) {
+        if (data && typeof data === 'object' && signalCache && signalCache.has(data)) return signalCache.get(data);
+        const rows = Array.isArray(data && data.results) ? data.results : [];
+        const maxmindRows = [], ip2locRows = [], otherRows = [];
+        const openProxyPorts = [], shodanOpenPorts = [], dbBaselines = [], dbUpdatedAtMap = {};
+        const rowRiskItems = [], lightProviderLabels = [];
+        const addLightLbl = (lbl) => { const c = typeof lbl === 'string' ? lbl.trim() : ''; if (c && lightProviderLabels.indexOf(c) === -1) lightProviderLabels.push(c); };
+        if (data) collectNumericPorts(openProxyPorts, data.openProxyPorts);
 
-        const rows = Array.isArray(data.results) ? data.results : [];
-        let getipintelRow = null, stopforumspamRow = null;
+        let getipintelRow = null, stopforumspamRow = null, sfsTitleLine = '', dropRow = null, shodanOpenPortRow = null;
         let hasQuotaGuardedProvider = false, hasCooldownProvider = false;
         let validCommercialCount = 0, positiveCommercialVotes = 0, validTotalSourceCount = 0;
         let hasSpamhausNonPbl = false, hasSpamhausPolicy = false, hasDshieldSignal = false;
@@ -1278,132 +800,210 @@
         for (const r of rows) {
             if (!r || typeof r !== 'object') continue;
             if (r.provider === 'GetIPIntel') getipintelRow = r;
-            else if (r.provider === 'StopForumSpam') stopforumspamRow = r;
+            else if (r.provider === 'StopForumSpam') {
+                stopforumspamRow = r;
+                if (r.status === '200 OK') {
+                    if (r.blacklisted) sfsTitleLine = 'StopForumSpam: Blacklisted Toxic CIDR' + (r.toxicCidr ? ` (${r.toxicCidr})` : '');
+                    else if (r.appears) sfsTitleLine = `StopForumSpam: Reported (${r.frequency || 0}x)`;
+                }
+            }
+            if (r.provider === 'Shodan InternetDB') collectNumericPorts(openProxyPorts, r.openProxyPorts);
+            if (r.provider && typeof r.offlineDbUpdatedAt === 'string' && r.offlineDbUpdatedAt.trim()) {
+                const iso = r.offlineDbUpdatedAt.trim(), d = formatOfflineDbDateShort(iso);
+                dbUpdatedAtMap[r.provider] = iso;
+                if (d) dbBaselines.push(`${r.provider} ${d}`);
+            }
             if (isRowQuotaGuarded(r)) hasQuotaGuardedProvider = true;
             else if (r.isCooldown) hasCooldownProvider = true;
             if (!isValidProviderRow(r)) continue;
 
+            if (r.provider === 'MaxMind') maxmindRows.push(r);
+            else if (r.provider === 'IP2Location') ip2locRows.push(r);
+            else otherRows.push(r);
+
             validTotalSourceCount += 1;
-            const isCommercial = Object.prototype.hasOwnProperty.call(COMMERCIAL_PROVIDERS, r.provider);
-            if (isCommercial) {
+            const provider = r.provider || 'Provider';
+            const highRiskFlags = Array.isArray(r.securityFlags)
+                ? r.securityFlags.filter((f) => f && f.isHighRisk && typeof f.label === 'string' && f.label.trim()).map((f) => f.label.trim())
+                : [];
+            const hasHighRiskFlag = highRiskFlags.length > 0;
+            if (r.provider !== 'GetIPIntel') {
+                highRiskFlags.forEach((lbl) => {
+                    rowRiskItems.push([lbl.toLowerCase() === 'tor exit node' ? 'Tor Exit' : lbl, provider]);
+                    addLightLbl(`${provider}:${lbl}`);
+                });
+            }
+
+            if (Object.prototype.hasOwnProperty.call(COMMERCIAL_PROVIDERS, r.provider)) {
                 validCommercialCount += 1;
-                const hasRiskFlag = rowHasHighRiskFlag(r) ||
-                    (typeof r.usageType === 'string' && /datacenter|data center|hosting|cloud|transit|cdn/i.test(r.usageType));
-                if (hasRiskFlag) positiveCommercialVotes += 1;
-                if (r.provider !== 'GetIPIntel' && rowHasHighRiskFlag(r)) hasLightCommercialRiskFlag = true;
+                if (hasHighRiskFlag || (typeof r.usageType === 'string' && /datacenter|data center|hosting|cloud|transit|cdn/i.test(r.usageType))) positiveCommercialVotes += 1;
+                if (r.provider !== 'GetIPIntel' && hasHighRiskFlag) hasLightCommercialRiskFlag = true;
                 continue;
             }
-            if (r.provider === 'Spamhaus ZEN') {
-                if (isSpamhausNonPblListed(r)) hasSpamhausNonPbl = true;
-                else if (isSpamhausPolicyOnlyListed(r)) hasSpamhausPolicy = true;
+            if (r.provider === 'StopForumSpam') {
+                if (r.blacklisted || r.appears) addLightLbl(r.blacklisted ? 'StopForumSpam:Blacklisted' : 'StopForumSpam:Listed');
+            } else if (r.provider === 'Spamhaus ZEN') {
+                const codes = extractNonEmptyStrings(r.listedCodes), isListed = Boolean(r.isListed || codes.length > 0);
+                const isNonPbl = isListed && (codes.length > 0 ? codes.some((c) => c !== '127.0.0.10' && c !== '127.0.0.11') : (!r.isPolicyRange || hasHighRiskFlag));
+                if (isListed || r.isPolicyRange) addLightLbl('Spamhaus:Listed');
+                if (isNonPbl) hasSpamhausNonPbl = true;
+                else if (isListed || r.isPolicyRange) hasSpamhausPolicy = true;
             } else if (r.provider === 'DShield') {
-                if (hasDshieldActivity(r)) hasDshieldSignal = true;
+                if ((Number(r.attacks) || 0) > 0 || (Number(r.count) || 0) > 0 || extractNonEmptyStrings(r.threatfeeds).length > 0 || hasHighRiskFlag) {
+                    hasDshieldSignal = true;
+                    if (!hasHighRiskFlag) {
+                        const attacks = Number(r.attacks) || 0;
+                        rowRiskItems.push(['Malicious Activity', provider]);
+                        addLightLbl(attacks > 0 ? `DShield:Attack Activity (${attacks} attacks)` : 'DShield:Threat Feed');
+                    }
+                }
             } else if (r.provider === 'SpamCop') {
-                if (hasSpamcopListing(r)) hasSpamcopSignal = true;
+                if (r.isListed || extractNonEmptyStrings(r.listedCodes).length > 0 || hasHighRiskFlag) {
+                    hasSpamcopSignal = true;
+                    if (!hasHighRiskFlag) { rowRiskItems.push(['SpamCop Listed', provider]); addLightLbl('SpamCop:Listed'); }
+                }
             } else if (r.provider === 'IPsum / DROP') {
-                if (r.inSpamhausDrop || r.isIpsumListed || r.isListed || (Number(r.ipsumScore) || 0) >= 2 || rowHasHighRiskFlag(r)) {
-                    hasIpsumDropSignal = true;
-                }
+                const ipsumScore = Number(r.ipsumScore) || 0;
+                if (r.inSpamhausDrop) { dropRow = r; addLightLbl('IPsum:DROP'); }
+                else if (r.isIpsumListed || r.isListed || ipsumScore >= 2) addLightLbl(ipsumScore > 0 ? `IPsum:${ipsumScore} lists` : 'IPsum:Listed');
+                if (r.inSpamhausDrop || r.isIpsumListed || r.isListed || ipsumScore >= 2 || hasHighRiskFlag) hasIpsumDropSignal = true;
+                if (!hasHighRiskFlag && !r.inSpamhausDrop && (r.isIpsumListed || ipsumScore === 2)) rowRiskItems.push([`IPsum Moderate (${ipsumScore || 2} lists)`, provider]);
             } else if (r.provider === 'X4BNet VPN') {
-                if (r.isVpn || r.isHosting || r.isDatacenter || r.isListed || rowHasHighRiskFlag(r)) {
-                    hasX4bnetSignal = true;
-                }
+                if (r.isVpn || r.isHosting || r.isDatacenter || r.isListed) addLightLbl(r.isVpn ? 'X4BNet:VPN' : 'X4BNet:Hosting');
+                if (r.isVpn || r.isHosting || r.isDatacenter || r.isListed || hasHighRiskFlag) hasX4bnetSignal = true;
+                if (!hasHighRiskFlag && (r.isHosting || r.isDatacenter) && !r.isVpn) rowRiskItems.push(['Hosting / Datacentre', provider]);
             } else if (r.provider === 'MaxMind') {
-                if (isMaxmindHostingRow(r)) hasMaxmindHosting = true;
-                if (rowHasHighRiskFlag(r)) hasMaxmindRiskFlag = true;
+                const usage = typeof r.usageType === 'string' ? r.usageType.trim().toLowerCase() : '';
+                const isHosting = Boolean((typeof r.hostingProvider === 'string' && r.hostingProvider.trim()) ||
+                    (typeof r.cloudProvider === 'string' && r.cloudProvider.trim()) || usage === 'hosting' || usage === 'datacenter' || usage === 'data center');
+                if (isHosting) { hasMaxmindHosting = true; if (!hasHighRiskFlag) { rowRiskItems.push(['Hosting', provider]); addLightLbl('MaxMind:Hosting'); } }
+                if (hasHighRiskFlag) hasMaxmindRiskFlag = true;
             } else if (r.provider === 'Shodan InternetDB') {
-                if (rowHasOpenPortsFlag(r)) hasShodanOpenPortsSignal = true;
-                if (rowHasHighRiskFlag(r)) hasOtherNonCommercialRiskFlag = true;
-            } else if (r.provider !== 'StopForumSpam' && rowHasHighRiskFlag(r)) {
+                collectNumericPorts(shodanOpenPorts, r.ports);
+                if ((Array.isArray(r.ports) && r.ports.length > 0) || (Array.isArray(r.securityFlags) && r.securityFlags.some((f) => f && f.label === 'Open Ports'))) {
+                    hasShodanOpenPortsSignal = true; shodanOpenPortRow = r;
+                }
+                if (hasHighRiskFlag) hasOtherNonCommercialRiskFlag = true;
+            } else if (hasHighRiskFlag) {
                 hasOtherNonCommercialRiskFlag = true;
             }
         }
 
-        const isSfsBlacklisted = Boolean(stopforumspamRow && (stopforumspamRow.blacklisted || stopforumspamRow.toxicCidr));
-        const isSfsListed = Boolean(stopforumspamRow && (stopforumspamRow.appears || (stopforumspamRow.frequency && Number(stopforumspamRow.frequency) > 0) || rowHasHighRiskFlag(stopforumspamRow)));
-        const suspectedResidentialProxy = Boolean(data.suspectedResidentialProxy);
-        const highlySuspectedResidentialProxy = Boolean(data.highlySuspectedResidentialProxy);
-        const sharedPrivacyEgress = typeof data.sharedPrivacyEgress === 'string' && data.sharedPrivacyEgress.trim()
-            ? data.sharedPrivacyEgress.trim().toLowerCase() : '';
-        const isMobileOrCgnat = isMobileOrCgnatPayload(data);
-        const openProxyPorts = extractShodanOpenProxyPorts(data);
-        const shodanOpenPorts = extractShodanOpenPorts(data);
+        const sig = {
+            orderedRows: maxmindRows.concat(ip2locRows, otherRows),
+            rowRiskItems, lightProviderLabels, shodanOpenPortRow,
+            openProxyPorts, shodanOpenPorts, dbBaselines, dbUpdatedAtMap, sfsTitleLine, dropRow,
+            getipintelRow, stopforumspamRow, hasQuotaGuardedProvider, hasCooldownProvider,
+            validCommercialCount, positiveCommercialVotes, validTotalSourceCount,
+            hasSpamhausNonPbl, hasSpamhausPolicy, hasDshieldSignal, hasSpamcopSignal,
+            hasIpsumDropSignal, hasX4bnetSignal, hasMaxmindHosting, hasMaxmindRiskFlag,
+            hasShodanOpenPortsSignal, hasOtherNonCommercialRiskFlag, hasLightCommercialRiskFlag
+        };
+        if (data && typeof data === 'object' && signalCache) signalCache.set(data, sig);
+        return sig;
+    }
+
+    function evaluateRisk(data) {
+        const sig = analyzeProviderSignals(data);
+        const isNonPublic = Boolean(data.isNonPublic);
+        const nonPublicCategory = typeof data.nonPublicCategory === 'string' ? data.nonPublicCategory.trim().toLowerCase() : '';
+        const nonPublicReason = typeof data.nonPublicReason === 'string' && data.nonPublicReason.trim() ? data.nonPublicReason.trim() : 'Non-Public / Reserved IP';
+        const nonPublicBadgeCode = (nonPublicCategory === 'private' || nonPublicCategory === 'loopback' || nonPublicCategory === 'link_local') ? 'LOCAL' : 'RESERVED';
+        const prediction = Number(data.prediction_score) || 0;
+        const hasPrediction = data.getipintel_chance !== null && data.getipintel_chance !== undefined && !isNaN(Number(data.getipintel_chance));
+        const broadcastIp = Boolean(data.is_broadcast_ip), isTor = Boolean(data.isTor), isMajorityProxyVpn = Boolean(data.isMajorityProxyVpn);
+        const arbitrationTier = typeof data.arbitrationTier === 'string' ? data.arbitrationTier.trim().toLowerCase() : '';
+        const ptrIsHighRisk = Boolean(data.ptrIsHighRisk), hasCloudProvider = Boolean(typeof data.cloudProvider === 'string' && data.cloudProvider.trim());
+        const arbitrationVerdict = typeof data.arbitrationVerdict === 'string' ? data.arbitrationVerdict.trim() : '';
+        const torLabel = typeof data.torLabel === 'string' && data.torLabel.trim() ? data.torLabel.trim() : (isTor ? 'Tor Node' : '');
+        const torSummary = typeof data.torSummary === 'string' && data.torSummary.trim() ? data.torSummary.trim() : '';
+        const torFlags = extractNonEmptyStrings(data.torFlags);
+
+        const sfsRow = sig.stopforumspamRow;
+        const isSfsBlacklisted = Boolean(sfsRow && (sfsRow.blacklisted || sfsRow.toxicCidr));
+        const isSfsListed = Boolean(sfsRow && (sfsRow.appears || (sfsRow.frequency && Number(sfsRow.frequency) > 0) ||
+            (Array.isArray(sfsRow.securityFlags) && sfsRow.securityFlags.some((f) => f && f.isHighRisk))));
+        const suspectedResidentialProxy = Boolean(data.suspectedResidentialProxy), highlySuspectedResidentialProxy = Boolean(data.highlySuspectedResidentialProxy);
+        const sharedPrivacyEgress = typeof data.sharedPrivacyEgress === 'string' && data.sharedPrivacyEgress.trim() ? data.sharedPrivacyEgress.trim().toLowerCase() : '';
         const isPartialLight = Boolean(data.isPartialMode || String(data.queryMode || '').trim().toLowerCase() === 'light');
-        const isGetIpIntelDeferred = Boolean(getipintelRow && (getipintelRow.isDeferred || getipintelRow.status === 'Deferred (Light Mode)'));
+        const giiRow = sig.getipintelRow, isGetIpIntelDeferred = Boolean(giiRow && (giiRow.isDeferred || giiRow.status === 'Deferred (Light Mode)'));
         // Spamhaus PBL flags dynamic consumer ISP ranges, so only elevate it to yellow before commercial scoring runs.
         const isLightScreeningMode = Boolean(!hasPrediction && (isPartialLight || isGetIpIntelDeferred));
-        const hasActiveSpamhausSignal = hasSpamhausNonPbl || (isLightScreeningMode && hasSpamhausPolicy);
+        const hasActiveSpamhausSignal = sig.hasSpamhausNonPbl || (isLightScreeningMode && sig.hasSpamhausPolicy);
         const hasProviderRiskSignal = Boolean(
-            hasActiveSpamhausSignal || hasDshieldSignal || hasSpamcopSignal || hasIpsumDropSignal ||
-            hasX4bnetSignal || hasMaxmindHosting || hasMaxmindRiskFlag || hasShodanOpenPortsSignal ||
-            shodanOpenPorts.length > 0 || hasOtherNonCommercialRiskFlag || (isLightScreeningMode && hasLightCommercialRiskFlag)
+            hasActiveSpamhausSignal || sig.hasDshieldSignal || sig.hasSpamcopSignal || sig.hasIpsumDropSignal ||
+            sig.hasX4bnetSignal || sig.hasMaxmindHosting || sig.hasMaxmindRiskFlag || sig.hasShodanOpenPortsSignal ||
+            sig.shodanOpenPorts.length > 0 || sig.hasOtherNonCommercialRiskFlag || (isLightScreeningMode && sig.hasLightCommercialRiskFlag)
         );
-
         const hasHighOrMediumSignals = Boolean(
             isTor || isMajorityProxyVpn || highlySuspectedResidentialProxy || suspectedResidentialProxy ||
-            openProxyPorts.length > 0 || sharedPrivacyEgress || arbitrationTier === 'destructive' ||
+            sig.openProxyPorts.length > 0 || sharedPrivacyEgress || arbitrationTier === 'destructive' ||
             hasCloudProvider || ptrIsHighRisk || arbitrationTier === 'warning' || broadcastIp ||
             isSfsBlacklisted || isSfsListed || hasProviderRiskSignal
         );
-        const isLightDeferredClean = Boolean(!hasPrediction && !hasHighOrMediumSignals && !hasQuotaGuardedProvider && !hasCooldownProvider && (isPartialLight || isGetIpIntelDeferred));
+        const isLightDeferredClean = Boolean(!hasPrediction && !hasHighOrMediumSignals && !sig.hasQuotaGuardedProvider && !sig.hasCooldownProvider && (isPartialLight || isGetIpIntelDeferred));
         const hasValidNonPredictionClean = Boolean(!hasPrediction && !hasHighOrMediumSignals && !isLightDeferredClean &&
-            (validCommercialCount > 0 || (!hasQuotaGuardedProvider && !hasCooldownProvider && (validTotalSourceCount > 0 || arbitrationTier === 'success'))));
+            (sig.validCommercialCount > 0 || (!sig.hasQuotaGuardedProvider && !sig.hasCooldownProvider && (sig.validTotalSourceCount > 0 || arbitrationTier === 'success'))));
 
-        let riskTier = 'low';
-        if (isNonPublic) riskTier = 'nonpublic';
-        else if ((hasPrediction && prediction > 80) || isTor || isMajorityProxyVpn || highlySuspectedResidentialProxy || arbitrationTier === 'destructive' || isSfsBlacklisted) riskTier = 'high';
-        else if ((hasPrediction && prediction >= 30) || broadcastIp || suspectedResidentialProxy || openProxyPorts.length > 0 || sharedPrivacyEgress || arbitrationTier === 'warning' || ptrIsHighRisk || hasCloudProvider || isSfsListed || hasProviderRiskSignal) riskTier = 'medium';
+        const riskTier = isNonPublic ? 'nonpublic'
+            : ((hasPrediction && prediction > 80) || isTor || isMajorityProxyVpn || highlySuspectedResidentialProxy || arbitrationTier === 'destructive' || isSfsBlacklisted) ? 'high'
+            : ((hasPrediction && prediction >= 30) || broadcastIp || suspectedResidentialProxy || sig.openProxyPorts.length > 0 || sharedPrivacyEgress || arbitrationTier === 'warning' || ptrIsHighRisk || hasCloudProvider || isSfsListed || hasProviderRiskSignal) ? 'medium'
+            : 'low';
 
         const predictionText = hasPrediction ? String(Number(prediction.toFixed(2))) : '';
-        const giiStatus = getipintelRow && getipintelRow.status ? ` (${getipintelRow.status})` : '';
-        const commSuffix = validCommercialCount > 0 ? `; ${validCommercialCount} commercial sources OK` : '';
-        let predictionTooltip = '';
-        if (hasPrediction) predictionTooltip = predictionText + '%';
-        else if (isLightDeferredClean) predictionTooltip = 'Light screening passed (no local/free-tier flags). Click to run full commercial check.';
-        else if (isPartialLight || isGetIpIntelDeferred) predictionTooltip = 'Light Mode (commercial sources deferred; click for full check)';
-        else if (hasQuotaGuardedProvider) predictionTooltip = 'Quota Guard Active' + giiStatus + commSuffix;
-        else if (hasCooldownProvider) predictionTooltip = 'Provider Cooldown' + giiStatus + commSuffix;
-        else if (validCommercialCount > 0) predictionTooltip = `Unavailable (${positiveCommercialVotes}/${validCommercialCount} commercial sources flagged)`;
-        else predictionTooltip = 'Unavailable' + (data.predictionLabel ? ` (${data.predictionLabel})` : '');
+        const giiStatus = giiRow && giiRow.status ? ` (${giiRow.status})` : '';
+        const commSuffix = sig.validCommercialCount > 0 ? `; ${sig.validCommercialCount} commercial sources OK` : '';
+        const predictionTooltip = hasPrediction ? predictionText + '%'
+            : isLightDeferredClean ? 'Light screening passed (no local/free-tier flags). Click to run full commercial check.'
+            : (isPartialLight || isGetIpIntelDeferred) ? 'Light Mode (commercial sources deferred; click for full check)'
+            : sig.hasQuotaGuardedProvider ? 'Quota Guard Active' + giiStatus + commSuffix
+            : sig.hasCooldownProvider ? 'Provider Cooldown' + giiStatus + commSuffix
+            : sig.validCommercialCount > 0 ? `Unavailable (${sig.positiveCommercialVotes}/${sig.validCommercialCount} commercial sources flagged)`
+            : 'Unavailable' + (data.predictionLabel ? ` (${data.predictionLabel})` : '');
 
-        let badgePrimaryLabel = 'N/A';
-        if (highlySuspectedResidentialProxy || suspectedResidentialProxy) badgePrimaryLabel = 'RES-PROXY';
-        else if (isMajorityProxyVpn || arbitrationTier === 'destructive') badgePrimaryLabel = /datacenter|hosting/i.test(arbitrationVerdict) ? 'HOSTING' : 'PROXY';
-        else if (isSfsBlacklisted) badgePrimaryLabel = 'BLACKLIST';
-        else if (openProxyPorts.length > 0) badgePrimaryLabel = 'PROXY-PORT';
-        else if (sharedPrivacyEgress) badgePrimaryLabel = 'RELAY';
-        else if (hasCloudProvider) badgePrimaryLabel = 'CLOUD';
-        else if (ptrIsHighRisk) badgePrimaryLabel = 'PTR-RISK';
-        else if (isSfsListed) badgePrimaryLabel = 'SPAM';
-        else if (arbitrationTier === 'warning') badgePrimaryLabel = 'REVIEW';
-        else if (hasDshieldSignal) badgePrimaryLabel = 'DSHIELD';
-        else if (hasSpamcopSignal) badgePrimaryLabel = 'SPAMCOP';
-        else if (hasActiveSpamhausSignal) badgePrimaryLabel = 'SPAMHAUS';
-        else if (hasIpsumDropSignal) badgePrimaryLabel = 'IPSUM';
-        else if (hasMaxmindHosting || hasX4bnetSignal) badgePrimaryLabel = 'HOSTING';
-        else if (hasShodanOpenPortsSignal || shodanOpenPorts.length > 0) badgePrimaryLabel = 'OPEN-PORTS';
-        else if (hasMaxmindRiskFlag || hasOtherNonCommercialRiskFlag || (isLightScreeningMode && hasLightCommercialRiskFlag)) badgePrimaryLabel = 'FLAGGED';
-        else if (isLightDeferredClean) badgePrimaryLabel = 'LIGHT';
-        else if (hasValidNonPredictionClean) badgePrimaryLabel = validCommercialCount > 0 ? `OK ${positiveCommercialVotes}/${validCommercialCount}` : 'CLEAN';
-        else if (hasQuotaGuardedProvider) badgePrimaryLabel = 'QUOTA';
-        else if (hasCooldownProvider) badgePrimaryLabel = 'COOLDOWN';
+        const primaryRules = [
+            [highlySuspectedResidentialProxy || suspectedResidentialProxy, 'RES-PROXY'],
+            [isMajorityProxyVpn || arbitrationTier === 'destructive', /datacenter|hosting/i.test(arbitrationVerdict) ? 'HOSTING' : 'PROXY'],
+            [isSfsBlacklisted, 'BLACKLIST'],
+            [sig.openProxyPorts.length > 0, 'PROXY-PORT'],
+            [sharedPrivacyEgress, 'RELAY'],
+            [hasCloudProvider, 'CLOUD'],
+            [ptrIsHighRisk, 'PTR-RISK'],
+            [isSfsListed, 'SPAM'],
+            [arbitrationTier === 'warning', 'REVIEW'],
+            [sig.hasDshieldSignal, 'DSHIELD'],
+            [sig.hasSpamcopSignal, 'SPAMCOP'],
+            [hasActiveSpamhausSignal, 'SPAMHAUS'],
+            [sig.hasIpsumDropSignal, 'IPSUM'],
+            [sig.hasMaxmindHosting || sig.hasX4bnetSignal, 'HOSTING'],
+            [sig.hasShodanOpenPortsSignal || sig.shodanOpenPorts.length > 0, 'OPEN-PORTS'],
+            [sig.hasMaxmindRiskFlag || sig.hasOtherNonCommercialRiskFlag || (isLightScreeningMode && sig.hasLightCommercialRiskFlag), 'FLAGGED'],
+            [isLightDeferredClean, 'LIGHT'],
+            [hasValidNonPredictionClean, sig.validCommercialCount > 0 ? `OK ${sig.positiveCommercialVotes}/${sig.validCommercialCount}` : 'CLEAN'],
+            [sig.hasQuotaGuardedProvider, 'QUOTA'],
+            [sig.hasCooldownProvider, 'COOLDOWN']
+        ];
+        const matchedRule = primaryRules.find(([cond]) => cond);
+        const badgePrimaryLabel = matchedRule ? matchedRule[1] : 'N/A';
 
         return {
-            isNonPublic, nonPublicCategory, nonPublicReason, nonPublicBadgeCode,
+            sig, isNonPublic, nonPublicCategory, nonPublicReason, nonPublicBadgeCode,
             prediction, hasPrediction, broadcastIp, isTor, isMajorityProxyVpn,
             suspectedResidentialProxy, highlySuspectedResidentialProxy, sharedPrivacyEgress,
-            isMobileOrCgnat, openProxyPorts, shodanOpenPorts, arbitrationTier, ptrIsHighRisk, hasCloudProvider,
-            isSfsBlacklisted, isSfsListed, hasQuotaGuardedProvider, hasCooldownProvider,
-            isLightScreeningMode, isLightDeferredClean, validCommercialCount, positiveCommercialVotes, validTotalSourceCount,
+            isMobileOrCgnat: isMobileOrCgnatPayload(data), openProxyPorts: sig.openProxyPorts, shodanOpenPorts: sig.shodanOpenPorts,
+            arbitrationTier, ptrIsHighRisk, hasCloudProvider, isSfsBlacklisted, isSfsListed,
+            hasQuotaGuardedProvider: sig.hasQuotaGuardedProvider, hasCooldownProvider: sig.hasCooldownProvider,
+            isLightScreeningMode, isLightDeferredClean, validCommercialCount: sig.validCommercialCount,
+            positiveCommercialVotes: sig.positiveCommercialVotes, validTotalSourceCount: sig.validTotalSourceCount,
             torLabel, torFlags, torSummary, riskTier, predictionText, predictionTooltip, badgePrimaryLabel
         };
     }
 
     function formatTorDescription(risk) {
         if (!risk.isTor) return '';
-        const label = risk.torLabel || 'Tor Node';
-        if (risk.torFlags.length > 0) return `${label} (Flags: ${risk.torFlags.join(', ')})`;
-        return risk.torSummary && risk.torSummary !== label ? `${label} (${risk.torSummary})` : label;
+        const lbl = risk.torLabel || 'Tor Node';
+        return risk.torFlags.length > 0 ? `${lbl} (Flags: ${risk.torFlags.join(', ')})`
+            : (risk.torSummary && risk.torSummary !== lbl ? `${lbl} (${risk.torSummary})` : lbl);
     }
 
     function formatCloudDescription(data) {
@@ -1412,17 +1012,12 @@
         return typeof data.cloudCidr === 'string' && data.cloudCidr.trim() ? `${p} (${data.cloudCidr.trim()})` : p;
     }
 
-    function getCacheMeta(data) {
-        return data && typeof data === 'object' && data.cacheMeta && typeof data.cacheMeta === 'object' ? data.cacheMeta : null;
-    }
+    function getCacheMeta(data) { return data && typeof data === 'object' && data.cacheMeta && typeof data.cacheMeta === 'object' ? data.cacheMeta : null; }
 
     function getCacheAgeSeconds(data) {
         const meta = getCacheMeta(data);
-        if (meta && typeof meta.ageSeconds === 'number' && isFinite(meta.ageSeconds) && meta.ageSeconds >= 0) {
-            return Math.floor(meta.ageSeconds);
-        }
-        const tsRaw = (meta && (meta.fetchedAt || meta.cachedAt)) || (data && data.fetchedAt);
-        const ms = tsRaw ? Date.parse(tsRaw) : NaN;
+        if (meta && typeof meta.ageSeconds === 'number' && isFinite(meta.ageSeconds) && meta.ageSeconds >= 0) return Math.floor(meta.ageSeconds);
+        const tsRaw = (meta && (meta.fetchedAt || meta.cachedAt)) || (data && data.fetchedAt), ms = tsRaw ? Date.parse(tsRaw) : NaN;
         return isNaN(ms) ? null : Math.max(0, Math.floor((Date.now() - ms) / 1000));
     }
 
@@ -1430,10 +1025,7 @@
         if (typeof ageSeconds !== 'number' || !isFinite(ageSeconds) || ageSeconds < 0) return '';
         const mins = Math.floor(ageSeconds / 60);
         if (mins < 1) return 'Cached just now';
-        const d = Math.floor(mins / 1440);
-        const h = Math.floor((mins % 1440) / 60);
-        const m = mins % 60;
-        const parts = [];
+        const d = Math.floor(mins / 1440), h = Math.floor((mins % 1440) / 60), m = mins % 60, parts = [];
         if (d > 0) parts.push(`${d}d`);
         if (h > 0) parts.push(`${h}h`);
         if (m > 0 || parts.length === 0) parts.push(`${m}m`);
@@ -1441,82 +1033,45 @@
     }
 
     function formatCacheStatusLabel(data, isJustUpdated) {
-        if (isJustUpdated) return 'Just updated';
-        const meta = getCacheMeta(data);
-        if (meta && meta.status === 'miss') return 'Just updated';
+        if (isJustUpdated || (getCacheMeta(data) && getCacheMeta(data).status === 'miss')) return 'Just updated';
         const ageSec = getCacheAgeSeconds(data);
-        if (ageSec !== null) return formatRelativeCacheAge(ageSec);
-        return data && data.isCached ? 'Cached' : 'Just updated';
+        return ageSec !== null ? formatRelativeCacheAge(ageSec) : (data && data.isCached ? 'Cached' : 'Just updated');
     }
 
     function shouldAutoRefreshPayload(data, cacheKey) {
-        const meta = getCacheMeta(data);
-        if (!meta || meta.shouldAutoRefresh !== true) return false;
-        const key = cacheKey || canonicalizeIpKey(data && data.ip);
-        return !(key && autoSwrAttemptedKeys.has(key));
+        const meta = getCacheMeta(data), key = cacheKey || canonicalizeIpKey(data && data.ip);
+        return Boolean(meta && meta.shouldAutoRefresh === true && !(key && autoSwrAttemptedKeys.has(key)));
     }
 
     function isMobileOrCgnatPayload(data) {
-        return Boolean(data && (data.isMobileOrCgnat === true ||
-            (typeof data.ptrCategory === 'string' && data.ptrCategory.trim().toLowerCase() === 'mobile_or_cgnat')));
+        return Boolean(data && (data.isMobileOrCgnat === true || (typeof data.ptrCategory === 'string' && data.ptrCategory.trim().toLowerCase() === 'mobile_or_cgnat')));
     }
 
     function getSharedPrivacyEgressLabel(data) {
         const val = data && typeof data.sharedPrivacyEgress === 'string' ? data.sharedPrivacyEgress.trim().toLowerCase() : '';
-        if (val === 'icloud_private_relay') return 'Apple iCloud Private Relay';
-        if (val === 'cloudflare_warp') return 'Cloudflare WARP';
-        return val ? data.sharedPrivacyEgress.trim() : '';
-    }
-
-    function extractShodanOpenProxyPorts(data) {
-        const ports = [];
-        if (data) collectNumericPorts(ports, data.openProxyPorts);
-        if (data && Array.isArray(data.results)) {
-            for (const r of data.results) {
-                if (r && r.provider === 'Shodan InternetDB') collectNumericPorts(ports, r.openProxyPorts);
-            }
-        }
-        return ports;
-    }
-
-    function extractShodanOpenPorts(data) {
-        const ports = [];
-        if (data && Array.isArray(data.results)) {
-            for (const r of data.results) {
-                if (r && r.provider === 'Shodan InternetDB' && isValidProviderRow(r)) collectNumericPorts(ports, r.ports);
-            }
-        }
-        return ports;
+        return val === 'icloud_private_relay' ? 'Apple iCloud Private Relay' : (val === 'cloudflare_warp' ? 'Cloudflare WARP' : (val ? data.sharedPrivacyEgress.trim() : ''));
     }
 
     function shouldRecommendFreshResidentialRecheck(data) {
-        const meta = getCacheMeta(data);
-        if (meta && meta.recommendFreshRecheck === true) return true;
-        const age = getCacheAgeSeconds(data);
-        return Boolean(data && data.suspectedResidentialProxy && age !== null && age > RESIDENTIAL_RECHECK_THRESHOLD_SECONDS);
+        const meta = getCacheMeta(data), age = getCacheAgeSeconds(data);
+        return Boolean((meta && meta.recommendFreshRecheck === true) || (data && data.suspectedResidentialProxy && age !== null && age > RESIDENTIAL_RECHECK_THRESHOLD_SECONDS));
     }
 
-    function isSoftBlockAdvised(data) {
-        return Boolean(getSharedPrivacyEgressLabel(data) || isMobileOrCgnatPayload(data));
-    }
+    function isSoftBlockAdvised(data) { return Boolean(getSharedPrivacyEgressLabel(data) || isMobileOrCgnatPayload(data)); }
 
     function resolveRangeBlockTarget(cidr) {
         const trimmed = typeof cidr === 'string' ? cidr.trim() : '';
         if (!trimmed || trimmed === 'N/A' || !trimmed.includes('/') || trimmed.includes('%')) return '';
         const parts = trimmed.split('/');
         if (parts.length !== 2) return '';
-        const addr = parts[0].trim();
-        const prefixStr = parts[1].trim();
+        const addr = parts[0].trim(), prefixStr = parts[1].trim();
         if (!/^\d{1,3}$/.test(prefixStr) || !isValidIp(addr)) return '';
-        const prefix = Number(prefixStr);
-        const maxPrefix = addr.includes(':') ? 128 : 32;
-        if (prefix < 1 || prefix >= maxPrefix) return '';
-        return `${canonicalizeIpKey(addr)}/${prefix}`;
+        const prefix = Number(prefixStr), maxPrefix = addr.includes(':') ? 128 : 32;
+        return (prefix >= 1 && prefix < maxPrefix) ? `${canonicalizeIpKey(addr)}/${prefix}` : '';
     }
 
     function buildWikiPageUrl(pageTitle, queryParams) {
-        let baseUrl = '';
-        if (mw && mw.util && typeof mw.util.getUrl === 'function') baseUrl = mw.util.getUrl(pageTitle);
+        let baseUrl = (mw && mw.util && typeof mw.util.getUrl === 'function') ? mw.util.getUrl(pageTitle) : '';
         if (!baseUrl) {
             const pathTpl = (mw && mw.config && mw.config.get('wgArticlePath')) || '/wiki/$1';
             baseUrl = pathTpl.replace('$1', encodeURIComponent(pageTitle).replace(/%2F/g, '/').replace(/%3A/g, ':'));
@@ -1541,7 +1096,7 @@
         return String(value || '').replace(/[\r\n]+/g, ' ').replace(/<!--|-->|\{\{|\}\}|\[\[|\]\]/g, '').trim();
     }
 
-    function buildDesensitisedWikitextSummary(data, rows, fallbackIp) {
+    function buildDesensitisedWikitextSummary(data, rows, fallbackIp, sig) {
         const targetIp = sanitizeWikitextFragment((data && data.ip) || fallbackIp || '');
         const cidr = sanitizeWikitextFragment((data && data.recommendedCidr) || targetIp);
         const esc = data && !data.highlySuspectedResidentialProxy && typeof data.escalationCidr === 'string' && data.escalationCidr.trim()
@@ -1554,19 +1109,13 @@
         const shared = getSharedPrivacyEgressLabel(data);
         if (shared) signals.push(sanitizeWikitextFragment(shared));
         if (isMobileOrCgnatPayload(data)) signals.push('Mobile/CGNAT');
-        const ports = extractShodanOpenProxyPorts(data);
+        const ports = sig.openProxyPorts;
         if (ports.length > 0) signals.push(`Open proxy ports: ${ports.join(', ')}`);
-        for (const r of rows) {
-            if (r && r.provider === 'IPsum / DROP' && r.inSpamhausDrop) {
-                signals.push(r.dropSblId ? `Spamhaus DROP (${sanitizeWikitextFragment(r.dropSblId)})` : 'Spamhaus DROP');
-                break;
-            }
+        if (sig.dropRow) {
+            signals.push(sig.dropRow.dropSblId ? `Spamhaus DROP (${sanitizeWikitextFragment(sig.dropRow.dropSblId)})` : 'Spamhaus DROP');
         }
         const net = [asn, isp].filter(Boolean).join(' / ');
-        const parts = [
-            `<code>${targetIp}</code>`,
-            `CIDR <code>${cidr}</code>${esc ? ` (escalation: <code>${esc}</code>)` : ''}`
-        ];
+        const parts = [`<code>${targetIp}</code>`, `CIDR <code>${cidr}</code>${esc ? ` (escalation: <code>${esc}</code>)` : ''}`];
         if (net) parts.push(net);
         parts.push(verdict);
         if (signals.length > 0) parts.push(signals.join('; '));
@@ -1582,28 +1131,8 @@
 
     function isUsableProviderValue(value) {
         if (value === null || value === undefined) return false;
-        const text = String(value).trim();
-        const lower = text.toLowerCase();
+        const text = String(value).trim(), lower = text.toLowerCase();
         return Boolean(text) && text !== '-' && lower !== 'n/a' && lower !== 'unknown';
-    }
-
-    function isValidProviderRow(row) {
-        return Boolean(row && typeof row === 'object' && !row.isCooldown && !isRowQuotaGuarded(row) &&
-            (row.status === '200 OK' || row.statusCode === 200));
-    }
-
-    function getProviderRows(data) {
-        const results = Array.isArray(data && data.results) ? data.results : [];
-        const ordered = [];
-        for (const name of ['MaxMind', 'IP2Location']) {
-            for (const row of results) {
-                if (isValidProviderRow(row) && row.provider === name && ordered.indexOf(row) === -1) ordered.push(row);
-            }
-        }
-        for (const row of results) {
-            if (isValidProviderRow(row) && ordered.indexOf(row) === -1) ordered.push(row);
-        }
-        return ordered;
     }
 
     function stripTrailingMetadataParens(value, stripTrailingAsn) {
@@ -1619,26 +1148,15 @@
         return text.replace(/,\s*$/, '').trim();
     }
 
-    function normalizeAsnValue(value) {
-        if (!isUsableProviderValue(value)) return '';
-        const text = String(value).trim();
-        const match = text.match(/^(?:as\s*)?(\d+)$/i);
-        return match ? 'AS' + match[1] : text.toUpperCase();
-    }
-
     function collectAsnEntries(rows) {
-        const byAsn = new Map();
-        const entries = [];
+        const byAsn = new Map(), entries = [];
         rows.forEach((row, idx) => {
-            const asn = normalizeAsnValue(row && row.asn);
-            if (!asn) return;
+            if (!isUsableProviderValue(row && row.asn)) return;
+            const text = String(row.asn).trim(), m = text.match(/^(?:as\s*)?(\d+)$/i);
+            const asn = m ? 'AS' + m[1] : text.toUpperCase();
             const provider = (row && row.provider) || 'Provider';
             let entry = byAsn.get(asn);
-            if (!entry) {
-                entry = { value: asn, providers: [], voteCount: 0, firstIndex: idx };
-                byAsn.set(asn, entry);
-                entries.push(entry);
-            }
+            if (!entry) { entry = { value: asn, providers: [], voteCount: 0, firstIndex: idx }; byAsn.set(asn, entry); entries.push(entry); }
             entry.voteCount += 1;
             if (entry.providers.indexOf(provider) === -1) entry.providers.push(provider);
         });
@@ -1648,17 +1166,12 @@
 
     function upsertProviderEntry(byKey, entries, key, value, provider) {
         let entry = byKey.get(key);
-        if (!entry) {
-            entry = { value, providers: [], showProviders: true, defaultChecked: false };
-            byKey.set(key, entry);
-            entries.push(entry);
-        }
+        if (!entry) { entry = { value, providers: [], showProviders: true, defaultChecked: false }; byKey.set(key, entry); entries.push(entry); }
         if (provider && entry.providers.indexOf(provider) === -1) entry.providers.push(provider);
     }
 
     function collectGroupedProviderValues(rows, extractItem) {
-        const byKey = new Map();
-        const entries = [];
+        const byKey = new Map(), entries = [];
         for (const row of rows) {
             const ext = row ? extractItem(row) : null;
             if (ext && ext.key && ext.value) upsertProviderEntry(byKey, entries, ext.key, ext.value, row.provider || 'Provider');
@@ -1669,10 +1182,10 @@
     function collectIspEntries(rows) {
         return collectGroupedProviderValues(rows, (row) => {
             const raw = isUsableProviderValue(row.isp) ? row.isp : (isUsableProviderValue(row.organisation) ? row.organisation : '');
-            if (!raw) return null;
-            const cleaned = stripTrailingMetadataParens(raw, true);
-            if (!isUsableProviderValue(cleaned)) return null;
-            return { key: cleaned.toLowerCase().replace(/\./g, '').replace(/[,;:]+/g, ' ').replace(/\s+/g, ' ').trim(), value: cleaned };
+            const cleaned = raw ? stripTrailingMetadataParens(raw, true) : '';
+            return isUsableProviderValue(cleaned)
+                ? { key: cleaned.toLowerCase().replace(/\./g, '').replace(/[,;:]+/g, ' ').replace(/\s+/g, ' ').trim(), value: cleaned }
+                : null;
         });
     }
 
@@ -1680,61 +1193,30 @@
         return collectGroupedProviderValues(rows, (row) => {
             if (!isUsableProviderValue(row.location)) return null;
             const parts = stripTrailingMetadataParens(row.location, false).split(',').map((p) => p.trim()).filter(Boolean);
-            const collapsed = parts.filter((p, i) => i === 0 || parts[i - 1].toLowerCase() !== p.toLowerCase());
-            const norm = collapsed.join(', ');
-            if (!isUsableProviderValue(norm)) return null;
-            return { key: norm.toLowerCase().replace(/\s*,\s*/g, ', ').replace(/\s+/g, ' ').trim(), value: norm };
+            const norm = parts.filter((p, i) => i === 0 || parts[i - 1].toLowerCase() !== p.toLowerCase()).join(', ');
+            return isUsableProviderValue(norm)
+                ? { key: norm.toLowerCase().replace(/\s*,\s*/g, ', ').replace(/\s+/g, ' ').trim(), value: norm }
+                : null;
         });
     }
 
     function collectPredictionEntries(data, risk) {
         if (data.getipintel_chance === null || data.getipintel_chance === undefined) return [];
         return [{
-            value: `Prediction ${risk.predictionText}%`,
-            copyValue: `${risk.predictionText}% Prediction`,
-            providers: ['GetIPIntel'],
-            showProviders: true,
-            defaultChecked: true
+            value: `Prediction ${risk.predictionText}%`, copyValue: `${risk.predictionText}% Prediction`,
+            providers: ['GetIPIntel'], showProviders: true, defaultChecked: true
         }];
     }
 
     function collectRiskEntries(data, rows, risk) {
-        const byKey = new Map();
-        const entries = [];
+        const sig = risk.sig, byKey = new Map(), entries = [];
         const addEntry = (val, provider) => {
             const text = typeof val === 'string' ? val.trim() : '';
             if (text) upsertProviderEntry(byKey, entries, text.toLowerCase(), text, provider);
         };
         if (risk.isTor) addEntry(risk.torLabel || (data.torIsExit ? 'Tor Exit' : 'Tor Node'), 'Tor Onionoo');
-        for (const row of rows) {
-            if (!row || row.provider === 'GetIPIntel') continue;
-            const provider = row.provider || 'Provider';
-            let addedRowFlag = false;
-            if (Array.isArray(row.securityFlags)) {
-                for (const flag of row.securityFlags) {
-                    if (flag && flag.isHighRisk && typeof flag.label === 'string') {
-                        const lbl = flag.label.trim();
-                        if (lbl) {
-                            addEntry(lbl.toLowerCase() === 'tor exit node' ? 'Tor Exit' : lbl, provider);
-                            addedRowFlag = true;
-                        }
-                    }
-                }
-            }
-            if (row.provider === 'X4BNet VPN' && (row.isHosting || row.isDatacenter) && !row.isVpn && !addedRowFlag) {
-                addEntry('Hosting / Datacentre', provider);
-            } else if (row.provider === 'IPsum / DROP' && !row.inSpamhausDrop && (row.isIpsumListed || (Number(row.ipsumScore) || 0) === 2) && !addedRowFlag) {
-                addEntry(`IPsum Moderate (${Number(row.ipsumScore) || 2} lists)`, provider);
-            } else if (row.provider === 'Spamhaus ZEN' && risk.isLightScreeningMode && isSpamhausPolicyOnlyListed(row) && !addedRowFlag) {
-                addEntry('Policy/Dynamic ISP Range (PBL)', provider);
-            } else if (row.provider === 'MaxMind' && isMaxmindHostingRow(row) && !addedRowFlag) {
-                addEntry('Hosting', provider);
-            } else if (row.provider === 'DShield' && hasDshieldActivity(row) && !addedRowFlag) {
-                addEntry('Malicious Activity', provider);
-            } else if (row.provider === 'SpamCop' && hasSpamcopListing(row) && !addedRowFlag) {
-                addEntry('SpamCop Listed', provider);
-            }
-        }
+        sig.rowRiskItems.forEach(([lbl, provider]) => addEntry(lbl, provider));
+        if (risk.isLightScreeningMode && sig.hasSpamhausPolicy) addEntry('Policy/Dynamic ISP Range (PBL)', 'Spamhaus ZEN');
         const cloudProvider = typeof data.cloudProvider === 'string' ? data.cloudProvider.trim() : '';
         if (cloudProvider) {
             const matchRow = rows.find((r) => r && r.cloudProvider === cloudProvider && r.provider);
@@ -1744,34 +1226,36 @@
         if (data.ptrIsHighRisk && typeof data.ptrLabel === 'string' && data.ptrLabel.trim()) addEntry(`PTR (${data.ptrLabel.trim()})`, 'Reverse DNS');
         if (data.suspectedResidentialProxy) addEntry('Suspected Residential Proxy / Compromised Host', 'Multi-Source');
         if (data.highlySuspectedResidentialProxy) addEntry('Highly Suspected Residential Proxy', 'GetIPIntel ResidentialProxy');
-        const ports = extractShodanOpenProxyPorts(data);
-        if (ports.length > 0) addEntry(`Open Proxy Ports (${ports.join(', ')})`, 'Shodan InternetDB');
-        else {
-            const shodanPorts = extractShodanOpenPorts(data);
-            if (shodanPorts.length > 0) addEntry(`Open Ports (${shodanPorts.join(', ')})`, 'Shodan InternetDB');
-            else if (rows.some((r) => r && rowHasOpenPortsFlag(r))) addEntry('Open Ports', 'Shodan InternetDB');
-        }
+        if (sig.openProxyPorts.length > 0) addEntry(`Open Proxy Ports (${sig.openProxyPorts.join(', ')})`, 'Shodan InternetDB');
+        else if (sig.shodanOpenPorts.length > 0) addEntry(`Open Ports (${sig.shodanOpenPorts.join(', ')})`, 'Shodan InternetDB');
+        else if (sig.hasShodanOpenPortsSignal) addEntry('Open Ports', 'Shodan InternetDB');
         const shared = getSharedPrivacyEgressLabel(data);
         if (shared) addEntry(`Shared Privacy Egress (${shared})`, 'Privacy Relay');
         return entries;
     }
 
-    function extractDomLines(element) {
-        if (!element) return [];
-        const chunks = [];
-        const walk = (node) => {
-            if (!node) return;
-            if (node.nodeType === 3) { chunks.push(node.nodeValue || ''); return; }
-            if (node.nodeType !== 1) return;
-            const tag = (node.tagName || '').toUpperCase();
-            if (tag === 'BR') { chunks.push('\n'); return; }
-            const isBlock = tag === 'DIV' || tag === 'P' || tag === 'LI';
-            if (isBlock) chunks.push('\n');
-            for (const child of (node.childNodes || [])) walk(child);
-            if (isBlock) chunks.push('\n');
+    function collectLightBadgeInfo(data, risk) {
+        const sig = risk.sig, rows = sig.orderedRows;
+        const asnEntry = collectAsnEntries(rows)[0], ispEntry = collectIspEntries(rows)[0];
+        const riskLabels = [], providerRiskLabels = sig.lightProviderLabels.slice();
+        const addLabelTo = (target, label) => {
+            const cleaned = typeof label === 'string' ? label.trim() : '';
+            if (cleaned && target.indexOf(cleaned) === -1) target.push(cleaned);
         };
-        walk(element);
-        return chunks.join('').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+        if (sig.shodanOpenPortRow && !(risk.openProxyPorts && risk.openProxyPorts.length > 0)) {
+            const rowPorts = [];
+            collectNumericPorts(rowPorts, sig.shodanOpenPortRow.ports);
+            addLabelTo(providerRiskLabels, rowPorts.length > 0 ? `Shodan:Open Ports (${rowPorts.length > 4 ? rowPorts.slice(0, 4).join(',') + '...' : rowPorts.join(',')})` : 'Shodan:Open Ports');
+        }
+        const redundant = ['SPAMHAUS', 'DSHIELD', 'SPAMCOP', 'IPSUM', 'HOSTING', 'OPEN-PORTS', 'FLAGGED'];
+        if (risk.badgePrimaryLabel && !['LIGHT', 'CLEAN', 'N/A'].includes(risk.badgePrimaryLabel) &&
+            !(providerRiskLabels.length > 0 && redundant.includes(risk.badgePrimaryLabel))) addLabelTo(riskLabels, risk.badgePrimaryLabel);
+        if (risk.isTor) addLabelTo(riskLabels, formatTorDescription(risk) || 'Tor');
+        if (risk.hasCloudProvider) addLabelTo(riskLabels, formatCloudDescription(data) || 'Cloud');
+        if (risk.ptrIsHighRisk) addLabelTo(riskLabels, 'PTR-Risk');
+        if (risk.openProxyPorts && risk.openProxyPorts.length > 0) addLabelTo(riskLabels, `Shodan:${risk.openProxyPorts.join(',')}`);
+        providerRiskLabels.forEach((lbl) => addLabelTo(riskLabels, lbl));
+        return { asn: asnEntry ? asnEntry.value : '', isp: ispEntry ? ispEntry.value : '', riskLabels };
     }
 
     function getSpurProxyText() {
@@ -1780,20 +1264,15 @@
         if ($panel.length === 0) return '';
         const $nodes = $panel.find('.ext-ipinfo-widget-property[data-property="proxies"]:not(.ext-ipinfo-widget-property-no-data) .ext-ipinfo-widget-property-value');
         if ($nodes.length === 0) return '';
-        const seen = Object.create(null);
-        const lines = [];
+        const seen = Object.create(null), lines = [];
         $nodes.each(function () {
             if ($(this).closest('.ext-ipinfo-widget-error, .ext-ipinfo-contains-error').length > 0) return;
-            for (const line of extractDomLines(this)) {
+            const raw = (this.innerText || this.textContent || '');
+            for (const line of raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)) {
                 if (!seen[line]) { seen[line] = true; lines.push(line); }
             }
         });
         return lines.join(', ');
-    }
-
-    function collectSpurEntriesFromDom() {
-        const text = getSpurProxyText();
-        return text ? [{ value: text, providers: ['Spur'], showProviders: true, defaultChecked: true }] : [];
     }
 
     function buildDarkThemeRuleBlock(scope) {
@@ -1811,11 +1290,14 @@
         const allTiers = ['high', 'medium', 'nonpublic', 'low'];
         return [
             ':root { --proxycheck-surface-bg: var(--background-color-interactive-subtle, #f8f9fa); --proxycheck-surface-color: var(--color-base, #202122); --proxycheck-subtle-color: var(--color-subtle, #54595d); --proxycheck-muted-color: var(--color-placeholder, #72777d); --proxycheck-border-color: var(--border-color-subtle, #c8ccd1); --proxycheck-divider-color: var(--border-color-subtle, #eaecf0); --proxycheck-link-color: var(--color-progressive, #3366cc); --proxycheck-high-bg: #ffe6e6; --proxycheck-high-color: #990000; --proxycheck-high-border: #f5b7b1; --proxycheck-medium-bg: #fff8e1; --proxycheck-medium-color: #856404; --proxycheck-medium-border: #ffe082; --proxycheck-nonpublic-bg: #eef2f6; --proxycheck-nonpublic-color: #3b4f66; --proxycheck-nonpublic-border: #b9c6d4; --proxycheck-low-bg: var(--background-color-interactive-subtle, #f8f9fa); --proxycheck-low-color: var(--color-subtle, #54595d); --proxycheck-low-border: var(--border-color-subtle, #c8ccd1); --proxycheck-error-border: #a2a9b1; --proxycheck-banner-high-bg: #fffafa; --proxycheck-banner-high-accent: #d33; --proxycheck-banner-medium-bg: #fffdf5; --proxycheck-banner-medium-accent: #fc3; --proxycheck-banner-nonpublic-bg: #f4f6f8; --proxycheck-banner-nonpublic-accent: #72777d; --proxycheck-banner-low-bg: var(--background-color-interactive-subtle, #f8f9fa); --proxycheck-banner-low-accent: var(--color-progressive, #36c); --proxycheck-banner-low-badge-bg: var(--background-color-base, #ffffff); --proxycheck-code-bg: var(--background-color-neutral-subtle, rgba(0, 0, 0, 0.04)); }',
-            'a.proxycheck-ip-badge, a.proxycheck-ip-badge:visited { margin-left: 4px; font-size: 0.85em; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; padding: 1px 5px; border-radius: 3px; text-decoration: none; white-space: nowrap; }',
+            'a.proxycheck-anchor-risk-high, a.proxycheck-anchor-risk-high:visited, .proxycheck-anchor-risk-high { background-color: #ffcccc; color: #990000; font-weight: bold; padding: 1px 4px; border-radius: 3px; }',
+            'a.proxycheck-anchor-risk-medium, a.proxycheck-anchor-risk-medium:visited, .proxycheck-anchor-risk-medium { background-color: #fff3cd; color: #856404; font-weight: bold; padding: 1px 4px; border-radius: 3px; }',
+            'a.proxycheck-ip-badge, a.proxycheck-ip-badge:visited { margin-left: 4px; font-size: 0.85em; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; padding: 1px 5px; border-radius: 3px; text-decoration: none; white-space: nowrap; cursor: pointer; }',
             ...boldTiers.map((t) => `a.proxycheck-ip-badge.proxycheck-tier-${t}, a.proxycheck-ip-badge.proxycheck-tier-${t}:visited { background-color: var(--proxycheck-${t}-bg); color: var(--proxycheck-${t}-color) !important; border: 1px solid var(--proxycheck-${t}-border); font-weight: bold; }`),
             'a.proxycheck-ip-badge.proxycheck-tier-low, a.proxycheck-ip-badge.proxycheck-tier-low:visited { background-color: var(--proxycheck-low-bg); color: var(--proxycheck-low-color) !important; border: 1px solid var(--proxycheck-low-border); font-weight: normal; }',
             'a.proxycheck-ip-badge.proxycheck-badge-lite, a.proxycheck-ip-badge.proxycheck-badge-lite:visited { background-color: var(--proxycheck-low-bg); color: var(--proxycheck-subtle-color) !important; border: 1px solid var(--proxycheck-low-border); opacity: 0.9; }',
             'a.proxycheck-ip-badge.proxycheck-badge-quota, a.proxycheck-ip-badge.proxycheck-badge-quota:visited { background-color: var(--proxycheck-medium-bg); color: var(--proxycheck-medium-color) !important; border: 1px dashed var(--proxycheck-medium-border); }',
+            'a.proxycheck-ip-badge.proxycheck-ip-badge-loading, a.proxycheck-ip-badge.proxycheck-ip-badge-loading:visited { background-color: var(--proxycheck-low-bg); color: var(--proxycheck-muted-color) !important; border: 1px solid var(--proxycheck-low-border); cursor: default; opacity: 0.8; }',
             'a.proxycheck-ip-badge.proxycheck-ip-badge-error, a.proxycheck-ip-badge.proxycheck-ip-badge-error:visited { background-color: var(--proxycheck-low-bg); color: var(--proxycheck-muted-color) !important; border: 1px dashed var(--proxycheck-error-border); }',
             'a.proxycheck-ip-badge.proxycheck-ip-badge-consent, a.proxycheck-ip-badge.proxycheck-ip-badge-consent:visited { background-color: var(--proxycheck-low-bg); color: var(--proxycheck-low-color) !important; border: 1px solid var(--proxycheck-low-border); }',
             'a.proxycheck-ip-badge.proxycheck-badge-stale, a.proxycheck-ip-badge.proxycheck-badge-stale:visited { border-style: dashed; }',
@@ -1865,11 +1347,9 @@
         const el = document.createElement(tag);
         if (className) el.className = className;
         if (text !== undefined && text !== null) el.textContent = String(text);
-        if (attrs && typeof attrs === 'object') {
+        if (attrs) {
             for (const [k, v] of Object.entries(attrs)) {
-                if (v === undefined || v === null || /^on/i.test(k)) continue;
-                if (k === 'href' || k === 'title' || k === 'target' || k === 'rel' || k === 'id' || k === 'type') el[k] = String(v);
-                else if (typeof el.setAttribute === 'function') el.setAttribute(k, String(v));
+                if (v !== undefined && v !== null && !/^on/i.test(k)) el.setAttribute(k, String(v));
             }
         }
         return el;
@@ -1877,19 +1357,10 @@
 
     function ensureUserscriptStyles() {
         if (stylesInjected || typeof document === 'undefined') return;
-        if (typeof document.getElementById === 'function' && document.getElementById(STYLE_ELEMENT_ID)) {
-            stylesInjected = true;
-            return;
-        }
+        if (document.getElementById(STYLE_ELEMENT_ID)) { stylesInjected = true; return; }
         const cssText = buildUserscriptCss();
         const parent = document.head || document.body || document.documentElement;
-        if (parent && typeof document.createElement === 'function' && typeof parent.appendChild === 'function') {
-            parent.appendChild(createEl('style', '', cssText, { id: STYLE_ELEMENT_ID, type: 'text/css' }));
-            stylesInjected = true;
-        } else if (mw && mw.util && typeof mw.util.addCSS === 'function') {
-            mw.util.addCSS(cssText);
-            stylesInjected = true;
-        }
+        if (parent) { parent.appendChild(createEl('style', '', cssText, { id: STYLE_ELEMENT_ID, type: 'text/css' })); stylesInjected = true; }
     }
 
     function getProviderBadgePalette(provider) {
@@ -1900,19 +1371,13 @@
         return FALLBACK_COOL_PALETTES[Math.abs(hash) % FALLBACK_COOL_PALETTES.length];
     }
 
-    function formatOfflineDbDateShort(iso) {
-        if (typeof iso !== 'string' || !iso.trim()) return '';
-        const ms = Date.parse(iso.trim());
-        return isNaN(ms) ? iso.trim() : new Date(ms).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
-    }
-
     function createSourceBadge(provider, providerUpdatedAtMap) {
-        const p = getProviderBadgePalette(provider);
+        const [bg, border, color, darkBg, darkBorder, darkColor] = getProviderBadgePalette(provider);
         const updatedIso = providerUpdatedAtMap && providerUpdatedAtMap[provider];
         const formatted = updatedIso ? formatOfflineDbDateShort(updatedIso) : '';
         const attrs = {
-            'class': 'proxycheck-source-tag',
-            style: `--proxycheck-tag-bg: ${p.bg}; --proxycheck-tag-border: ${p.border}; --proxycheck-tag-color: ${p.color}; --proxycheck-tag-dark-bg: ${p.darkBg}; --proxycheck-tag-dark-border: ${p.darkBorder}; --proxycheck-tag-dark-color: ${p.darkColor};`,
+            class: 'proxycheck-source-tag',
+            style: `--proxycheck-tag-bg: ${bg}; --proxycheck-tag-border: ${border}; --proxycheck-tag-color: ${color}; --proxycheck-tag-dark-bg: ${darkBg}; --proxycheck-tag-dark-border: ${darkBorder}; --proxycheck-tag-dark-color: ${darkColor};`,
             text: provider
         };
         if (formatted) attrs.title = 'Offline DB updated: ' + formatted;
@@ -1921,46 +1386,38 @@
 
     function buildResultDetailsPanel(data, risk, fallbackIp) {
         ensureUserscriptStyles();
-        const rows = getProviderRows(data);
+        const sig = risk.sig, rows = sig.orderedRows;
         const resolvedIp = isValidIp(data && data.ip) ? String(data.ip).trim() : (isValidIp(fallbackIp) ? String(fallbackIp).trim() : '');
-        const providerUpdatedAtMap = {};
-        for (const r of rows) {
-            if (r && r.provider && typeof r.offlineDbUpdatedAt === 'string' && r.offlineDbUpdatedAt.trim()) {
-                providerUpdatedAtMap[r.provider] = r.offlineDbUpdatedAt.trim();
-            }
-        }
+        const spurText = getSpurProxyText();
+        const spurEntries = spurText ? [{ value: spurText, providers: ['Spur'], showProviders: true, defaultChecked: true }] : [];
 
         const sections = [
             { label: 'Prediction', entries: collectPredictionEntries(data, risk), isRisk: false, emptyText: 'Unavailable', copyable: false },
             { label: 'ASN', entries: collectAsnEntries(rows), isRisk: false, emptyText: '-', copyable: true },
             { label: 'ISP', entries: collectIspEntries(rows), isRisk: false, emptyText: '-', copyable: true },
             { label: 'Location', entries: collectLocationEntries(rows), isRisk: false, emptyText: '-', copyable: false },
-            { label: 'Risk', entries: collectRiskEntries(data, rows, risk).concat(collectSpurEntriesFromDom()), isRisk: true, emptyText: 'No high-risk signals detected', copyable: false }
+            { label: 'Risk', entries: collectRiskEntries(data, rows, risk).concat(spurEntries), isRisk: true, emptyText: 'No high-risk signals detected', copyable: false }
         ];
 
-        const $panel = $('<div>', { 'class': 'proxycheck-details-panel' });
+        const $panel = $('<div>', { class: 'proxycheck-details-panel' });
         const sharedEgressLabel = getSharedPrivacyEgressLabel(data);
-        const mobileOrCgnat = isMobileOrCgnatPayload(data);
-        const residentialParadox = Boolean(data && data.suspectedResidentialProxy);
         const highlySuspectedResidentialProxy = Boolean(data && data.highlySuspectedResidentialProxy);
-        const shodanPorts = extractShodanOpenProxyPorts(data);
-
         const bannerPills = [];
         if (sharedEgressLabel) bannerPills.push(['proxycheck-signal-privacy', `Shared Privacy Egress: ${sharedEgressLabel} \u2014 Soft / anon-only block recommended to avoid collateral impact on logged-in editors.`]);
-        if (mobileOrCgnat) bannerPills.push(['proxycheck-signal-cgnat', 'Mobile / CGNAT Network: Collateral-damage warning \u2014 recommended block locked to /32 (IPv4) or /64 (IPv6); prefer soft / anon-only block.']);
-        if (residentialParadox) bannerPills.push(['proxycheck-signal-danger', 'Suspected Residential Proxy / Compromised Host' + (shouldRecommendFreshResidentialRecheck(data) ? ' \u2014 Cached signal is older than 7 days; click Refetch to verify current DHCP assignment before issuing a long-term block.' : '')]);
+        if (isMobileOrCgnatPayload(data)) bannerPills.push(['proxycheck-signal-cgnat', 'Mobile / CGNAT Network: Collateral-damage warning \u2014 recommended block locked to /32 (IPv4) or /64 (IPv6); prefer soft / anon-only block.']);
+        if (data && data.suspectedResidentialProxy) bannerPills.push(['proxycheck-signal-danger', 'Suspected Residential Proxy / Compromised Host' + (shouldRecommendFreshResidentialRecheck(data) ? ' \u2014 Cached signal is older than 7 days; click Refetch to verify current DHCP assignment before issuing a long-term block.' : '')]);
         if (highlySuspectedResidentialProxy) bannerPills.push(['proxycheck-signal-danger', 'Highly Suspected Residential Proxy']);
-        if (shodanPorts.length > 0) bannerPills.push(['proxycheck-signal-danger', `Shodan Open Proxy Ports: ${shodanPorts.join(', ')}`]);
+        if (sig.openProxyPorts.length > 0) bannerPills.push(['proxycheck-signal-danger', `Shodan Open Proxy Ports: ${sig.openProxyPorts.join(', ')}`]);
         if (bannerPills.length > 0) {
-            const $banners = $('<div>', { 'class': 'proxycheck-signal-banners' });
-            bannerPills.forEach(([cls, text]) => $banners.append($('<div>', { 'class': 'proxycheck-signal-pill ' + cls, text })));
+            const $banners = $('<div>', { class: 'proxycheck-signal-banners' });
+            bannerPills.forEach(([cls, text]) => $banners.append($('<div>', { class: 'proxycheck-signal-pill ' + cls, text })));
             $panel.append($banners);
         }
 
         const $table = $('<table>', { style: 'width: 100%; border-collapse: collapse;' });
         const appendRow = (label, $cell) => {
             $('<tr>').append(
-                $('<th>', { 'class': 'proxycheck-details-label', style: 'text-align: left; vertical-align: top; padding: 4px 12px 4px 0; width: 78px; font-weight: 600; white-space: nowrap;' }).text(label),
+                $('<th>', { class: 'proxycheck-details-label', style: 'text-align: left; vertical-align: top; padding: 4px 12px 4px 0; width: 78px; font-weight: 600; white-space: nowrap;' }).text(label),
                 $('<td>', { style: 'padding: 4px 0; vertical-align: top;' }).append($cell)
             ).appendTo($table);
         };
@@ -1969,17 +1426,17 @@
         for (const section of sections) {
             const $content = $('<div>', { style: 'display: flex; flex-direction: column; gap: 3px;' });
             if (section.entries.length === 0) {
-                $content.append($('<span>', { 'class': 'proxycheck-details-empty', text: section.emptyText }));
+                $content.append($('<span>', { class: 'proxycheck-details-empty', text: section.emptyText }));
             } else {
                 for (const entry of section.entries) {
                     const $body = $('<span>', { style: 'display: block; flex: 1; min-width: 0; line-height: 1.5;' })
-                        .append($('<span>', { 'class': 'proxycheck-result-value' + (section.isRisk ? ' proxycheck-result-value-risk' : ''), text: entry.value }));
+                        .append($('<span>', { class: 'proxycheck-result-value' + (section.isRisk ? ' proxycheck-result-value-risk' : ''), text: entry.value }));
                     if (entry.showProviders && entry.providers.length > 0) {
-                        entry.providers.forEach((p) => $body.append(createSourceBadge(p, providerUpdatedAtMap)));
+                        entry.providers.forEach((p) => $body.append(createSourceBadge(p, sig.dbUpdatedAtMap)));
                     }
                     if (section.copyable) {
                         const $checkbox = $('<input>', {
-                            type: 'checkbox', 'class': 'proxycheck-result-checkbox',
+                            type: 'checkbox', class: 'proxycheck-result-checkbox',
                             checked: Boolean(entry.defaultChecked), style: 'margin: 3px 0 0 0; flex-shrink: 0; cursor: pointer;'
                         });
                         $content.append($('<label>', { style: 'display: flex; align-items: flex-start; gap: 6px; margin: 0; cursor: pointer; font-weight: normal;' }).append($checkbox, $body));
@@ -1993,7 +1450,7 @@
         }
 
         const verdictText = data && typeof data.arbitrationVerdict === 'string' ? data.arbitrationVerdict.trim() : '';
-        if (verdictText) appendRow('Verdict', $('<span>', { 'class': 'proxycheck-result-value', text: verdictText }));
+        if (verdictText) appendRow('Verdict', $('<span>', { class: 'proxycheck-result-value', text: verdictText }));
 
         const recCidr = data && typeof data.recommendedCidr === 'string' && data.recommendedCidr.trim() ? data.recommendedCidr.trim() : 'N/A';
         const escCidr = data && typeof data.escalationCidr === 'string' ? data.escalationCidr.trim() : '';
@@ -2002,121 +1459,74 @@
 
         const $cidrLine = $('<div>').append($('<code>').text(recCidr));
         if (!highlySuspectedResidentialProxy) {
-            if (escCidr) $cidrLine.append($('<span>', { 'class': 'proxycheck-inline-pill', text: 'Escalation: ' + escCidr }));
-            if (bgpCidr) $cidrLine.append($('<span>', { 'class': 'proxycheck-inline-pill', text: 'BGP: ' + bgpCidr }));
+            if (escCidr) $cidrLine.append($('<span>', { class: 'proxycheck-inline-pill', text: 'Escalation: ' + escCidr }));
+            if (bgpCidr) $cidrLine.append($('<span>', { class: 'proxycheck-inline-pill', text: 'BGP: ' + bgpCidr }));
         }
         const $cidrCell = $('<div>').append($cidrLine);
         if (highlySuspectedResidentialProxy) {
             $cidrCell.append($('<div>', {
-                'class': 'proxycheck-cidr-rationale proxycheck-residential-proxy-warning',
+                class: 'proxycheck-cidr-rationale proxycheck-residential-proxy-warning',
                 text: 'Highly Suspected Residential Proxy: this IP is highly likely to use residential proxy infrastructure. Restrict CIDR blocking to this single IP and proceed with discretion on CIDR.'
             }));
         } else if (cidrRationale) {
-            $cidrCell.append($('<div>', { 'class': 'proxycheck-cidr-rationale', text: cidrRationale }));
+            $cidrCell.append($('<div>', { class: 'proxycheck-cidr-rationale', text: cidrRationale }));
         }
         appendRow('CIDR', $cidrCell);
 
-        const $copyLink = $('<a>', { href: '#', role: 'button', 'class': 'proxycheck-copy-result', text: 'Copy result' });
-        const $copyWikitextBtn = $('<a>', { href: '#', role: 'button', 'class': 'proxycheck-copy-wikitext', text: 'Copy Wikitext' });
-        let resetTimerId = null, wikitextResetTimerId = null, panelDisposed = false;
-
-        const scheduleLabelReset = (isWikitext, delayMs, label) => {
-            if (isWikitext) wikitextResetTimerId = clearTimer(wikitextResetTimerId, false);
-            else resetTimerId = clearTimer(resetTimerId, false);
-            if (panelDisposed) return;
-            const id = window.setTimeout(() => {
-                if (isWikitext) wikitextResetTimerId = null; else resetTimerId = null;
-                if (!panelDisposed) (isWikitext ? $copyWikitextBtn : $copyLink).text(label);
-            }, delayMs);
-            if (isWikitext) wikitextResetTimerId = id; else resetTimerId = id;
+        const $copyLink = $('<a>', { href: '#', role: 'button', class: 'proxycheck-copy-result', text: 'Copy result' });
+        const $copyWikitextBtn = $('<a>', { href: '#', role: 'button', class: 'proxycheck-copy-wikitext', text: 'Copy Wikitext' });
+        let panelDisposed = false;
+        const copyTimers = { res: null, wiki: null };
+        const getSelectedCommentValues = () => checkboxItems.filter((item) => item.checkbox.prop('checked'))
+            .map((item) => sanitizeHtmlCommentContent(item.copyValue)).filter(Boolean);
+        const buildAttributionComment = (vals) => `<!-- ${(vals.length ? sanitizeHtmlCommentContent(vals.join(', ')) + ' ' : '') + BLOCK_REASON_ATTRIBUTION} -->`;
+        const bindCopy = ($btn, key, baseLabel, copiedLabel, getPayload) => {
+            const scheduleReset = (delayMs) => {
+                copyTimers[key] = clearTimer(copyTimers[key], false);
+                if (!panelDisposed) copyTimers[key] = window.setTimeout(() => { copyTimers[key] = null; if (!panelDisposed) $btn.text(baseLabel); }, delayMs);
+            };
+            $btn.on('click', (e) => {
+                e.preventDefault(); e.stopPropagation();
+                if (panelDisposed) return;
+                const payload = getPayload();
+                if (!payload) { $btn.text('Select at least one item'); return scheduleReset(1500); }
+                copyText(payload).then(
+                    () => { if (!panelDisposed) { $btn.text(copiedLabel); scheduleReset(1500); } },
+                    (err) => { warn(baseLabel + ' failed:', err); if (!panelDisposed) { $btn.text('Copy failed'); scheduleReset(2000); } }
+                );
+            });
         };
-
-        const getSelectedCommentValues = () => checkboxItems
-            .filter((item) => item.checkbox.prop('checked'))
-            .map((item) => sanitizeHtmlCommentContent(item.copyValue))
-            .filter(Boolean);
-        const buildAttributionComment = (selectedValues) => {
-            const body = sanitizeHtmlCommentContent(selectedValues.join(', '));
-            return `<!-- ${(body ? body + ' ' : '') + BLOCK_REASON_ATTRIBUTION} -->`;
-        };
-
-        $copyLink.on('click', (e) => {
-            e.preventDefault(); e.stopPropagation();
-            if (panelDisposed) return;
+        bindCopy($copyLink, 'res', 'Copy result', 'Copied', () => {
             const selected = getSelectedCommentValues();
-            if (selected.length === 0) {
-                $copyLink.text('Select at least one item');
-                return scheduleLabelReset(false, 1500, 'Copy result');
-            }
-            const comment = buildAttributionComment(selected);
-            copyText(comment).then(() => {
-                if (!panelDisposed) { $copyLink.text('Copied'); scheduleLabelReset(false, 1500, 'Copy result'); }
-            }).catch((err) => {
-                warn('Copy result failed:', err);
-                if (!panelDisposed) { $copyLink.text('Copy failed'); scheduleLabelReset(false, 2000, 'Copy result'); }
-            });
+            return selected.length ? buildAttributionComment(selected) : '';
         });
-
-        $copyWikitextBtn.on('click', (e) => {
-            e.preventDefault(); e.stopPropagation();
-            if (panelDisposed) return;
-            copyText(buildDesensitisedWikitextSummary(data, rows, resolvedIp)).then(() => {
-                if (!panelDisposed) { $copyWikitextBtn.text('Copied Wikitext'); scheduleLabelReset(true, 1500, 'Copy Wikitext'); }
-            }).catch((err) => {
-                warn('Copy Wikitext failed:', err);
-                if (!panelDisposed) { $copyWikitextBtn.text('Copy failed'); scheduleLabelReset(true, 2000, 'Copy Wikitext'); }
-            });
-        });
-
+        bindCopy($copyWikitextBtn, 'wiki', 'Copy Wikitext', 'Copied Wikitext', () => buildDesensitisedWikitextSummary(data, rows, resolvedIp, sig));
         $panel.append($table, $('<div>', { style: 'margin-top: 8px; display: flex; align-items: center; flex-wrap: wrap; gap: 12px;' }).append($copyLink, $copyWikitextBtn));
 
         if (resolvedIp) {
-            const softBlock = isSoftBlockAdvised(data);
-            const rangeTarget = resolveRangeBlockTarget(recCidr);
+            const softBlock = isSoftBlockAdvised(data), rangeTarget = resolveRangeBlockTarget(recCidr);
             const buildBlockParams = () => {
-                const params = {
-                    wpExpiry: '3 months',
-                    // Omit wpReason so Codex Special:Block does not prepend "other:" to wpReason-other.
-                    'wpReason-other': '{{blocked proxy}}' + buildAttributionComment(getSelectedCommentValues())
-                };
-                if (softBlock) {
-                    params.wpAnonOnly = '1';
-                    params.wpHardBlock = '0';
-                    params.wpDisableUTEdit = '0';
-                }
+                // Omit wpReason so Codex Special:Block does not prepend "other:" to wpReason-other.
+                const params = { wpExpiry: '3 months', 'wpReason-other': '{{blocked proxy}}' + buildAttributionComment(getSelectedCommentValues()) };
+                if (softBlock) { params.wpAnonOnly = '1'; params.wpHardBlock = '0'; params.wpDisableUTEdit = '0'; }
                 return params;
             };
-            const mkLink = (cls, href, text) => $('<a>', { 'class': cls, href, target: '_blank', rel: 'noopener noreferrer', text });
-            const $singleBlockLink = mkLink(
-                'proxycheck-link-block',
-                buildWikiPageUrl('Special:Block/' + resolvedIp, buildBlockParams()),
-                'Special:Block ↗'
-            );
+            const mkLink = (cls, href, text) => $('<a>', { class: cls, href, target: '_blank', rel: 'noopener noreferrer', text });
+            const $singleBlockLink = mkLink('proxycheck-link-block', buildWikiPageUrl('Special:Block/' + resolvedIp, buildBlockParams()), 'Special:Block ↗');
             const blockLinks = [{ el: $singleBlockLink, target: resolvedIp }];
-            let $rangeBlockLink = null;
-            if (rangeTarget) {
-                $rangeBlockLink = mkLink(
-                    'proxycheck-link-block-range',
-                    buildWikiPageUrl('Special:Block/' + rangeTarget, buildBlockParams()),
-                    'Special:Block (range) ↗'
-                );
-                blockLinks.push({ el: $rangeBlockLink, target: rangeTarget });
-            }
+            const $rangeBlockLink = rangeTarget
+                ? mkLink('proxycheck-link-block-range', buildWikiPageUrl('Special:Block/' + rangeTarget, buildBlockParams()), 'Special:Block (range) ↗')
+                : null;
+            if ($rangeBlockLink) blockLinks.push({ el: $rangeBlockLink, target: rangeTarget });
             const syncBlockLinkHrefs = () => {
                 if (panelDisposed) return;
                 const params = buildBlockParams();
-                for (const entry of blockLinks) {
-                    entry.el.attr('href', buildWikiPageUrl('Special:Block/' + entry.target, params));
-                }
+                blockLinks.forEach((entry) => entry.el.attr('href', buildWikiPageUrl('Special:Block/' + entry.target, params)));
             };
-            for (const item of checkboxItems) {
-                item.checkbox.on('change', syncBlockLinkHrefs).on('click', syncBlockLinkHrefs);
-            }
-            for (const entry of blockLinks) {
-                entry.el.on('click', syncBlockLinkHrefs);
-            }
+            checkboxItems.forEach((item) => item.checkbox.on('change', syncBlockLinkHrefs).on('click', syncBlockLinkHrefs));
+            blockLinks.forEach((entry) => entry.el.on('click', syncBlockLinkHrefs));
 
-            const $quickLinks = $('<div>', { 'class': 'proxycheck-quick-links' }).append(
+            const $quickLinks = $('<div>', { class: 'proxycheck-quick-links' }).append(
                 mkLink('proxycheck-link-globalcontribs', buildWikiPageUrl('Special:GlobalContributions/' + resolvedIp, null), 'GlobalContributions ↗'),
                 mkLink('proxycheck-link-rangeblock', 'https://rangeblockfinder.toolforge.org/?ip=' + encodeURIComponent(resolvedIp), 'Rangeblock Finder ↗'),
                 mkLink('proxycheck-link-whois', 'https://whois.toolforge.org/gateway.py?lookup=true&ip=' + encodeURIComponent(resolvedIp), 'WHOIS ↗'),
@@ -2128,8 +1538,8 @@
 
         $panel._proxycheckDispose = () => {
             panelDisposed = true;
-            resetTimerId = clearTimer(resetTimerId, false);
-            wikitextResetTimerId = clearTimer(wikitextResetTimerId, false);
+            copyTimers.res = clearTimer(copyTimers.res, false);
+            copyTimers.wiki = clearTimer(copyTimers.wiki, false);
         };
         return $panel;
     }
@@ -2139,9 +1549,7 @@
     }
 
     function copyText(text) {
-        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-            return navigator.clipboard.writeText(text);
-        }
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') return navigator.clipboard.writeText(text);
         return new Promise((resolve, reject) => {
             const ta = createEl('textarea', '', null, { readonly: '' });
             ta.value = text;
@@ -2156,92 +1564,11 @@
         });
     }
 
-    function collectLightBadgeInfo(data, risk) {
-        const rows = getProviderRows(data);
-        const asnEntry = collectAsnEntries(rows)[0];
-        const ispEntry = collectIspEntries(rows)[0];
-        const riskLabels = [];
-        const providerRiskLabels = [];
-        const addLabelTo = (target, label) => {
-            const cleaned = typeof label === 'string' ? label.trim() : '';
-            if (cleaned && target.indexOf(cleaned) === -1) target.push(cleaned);
-        };
-
-        for (const row of rows) {
-            if (!row) continue;
-            if (row.provider === 'StopForumSpam' && (row.blacklisted || row.appears)) {
-                addLabelTo(providerRiskLabels, row.blacklisted ? 'StopForumSpam:Blacklisted' : 'StopForumSpam:Listed');
-            }
-            if (row.provider === 'Spamhaus ZEN' && (row.isListed || row.isPolicyRange || extractNonEmptyStrings(row.listedCodes).length > 0)) {
-                addLabelTo(providerRiskLabels, 'Spamhaus:Listed');
-            }
-            if (row.provider === 'IPsum / DROP') {
-                const ipsumScore = Number(row.ipsumScore) || 0;
-                if (row.inSpamhausDrop) addLabelTo(providerRiskLabels, 'IPsum:DROP');
-                else if (row.isIpsumListed || row.isListed || ipsumScore >= 2) {
-                    addLabelTo(providerRiskLabels, ipsumScore > 0 ? `IPsum:${ipsumScore} lists` : 'IPsum:Listed');
-                }
-            }
-            if (row.provider === 'X4BNet VPN' && (row.isVpn || row.isHosting || row.isDatacenter || row.isListed)) {
-                addLabelTo(providerRiskLabels, row.isVpn ? 'X4BNet:VPN' : 'X4BNet:Hosting');
-            }
-            let addedHighRiskFlag = false;
-            if (Array.isArray(row.securityFlags)) {
-                for (const flag of row.securityFlags) {
-                    if (flag && flag.isHighRisk && typeof flag.label === 'string') {
-                        addLabelTo(providerRiskLabels, `${row.provider}:${flag.label}`);
-                        addedHighRiskFlag = true;
-                    }
-                }
-            }
-            if (!addedHighRiskFlag) {
-                if (row.provider === 'DShield' && hasDshieldActivity(row)) {
-                    const attacks = Number(row.attacks) || 0;
-                    addLabelTo(providerRiskLabels, attacks > 0 ? `DShield:Attack Activity (${attacks} attacks)` : 'DShield:Threat Feed');
-                } else if (row.provider === 'SpamCop' && hasSpamcopListing(row)) {
-                    addLabelTo(providerRiskLabels, 'SpamCop:Listed');
-                } else if (row.provider === 'MaxMind' && isMaxmindHostingRow(row)) {
-                    addLabelTo(providerRiskLabels, 'MaxMind:Hosting');
-                }
-            }
-            if (row.provider === 'Shodan InternetDB' && !(risk.openProxyPorts && risk.openProxyPorts.length > 0) && rowHasOpenPortsFlag(row)) {
-                const rowPorts = [];
-                collectNumericPorts(rowPorts, row.ports);
-                if (rowPorts.length > 0) {
-                    const preview = rowPorts.length > 4 ? rowPorts.slice(0, 4).join(',') + '...' : rowPorts.join(',');
-                    addLabelTo(providerRiskLabels, `Shodan:Open Ports (${preview})`);
-                } else {
-                    addLabelTo(providerRiskLabels, 'Shodan:Open Ports');
-                }
-            }
-        }
-
-        const redundantProviderBadges = ['SPAMHAUS', 'DSHIELD', 'SPAMCOP', 'IPSUM', 'HOSTING', 'OPEN-PORTS', 'FLAGGED'];
-        if (risk.badgePrimaryLabel && !['LIGHT', 'CLEAN', 'N/A'].includes(risk.badgePrimaryLabel) &&
-            !(providerRiskLabels.length > 0 && redundantProviderBadges.includes(risk.badgePrimaryLabel))) {
-            addLabelTo(riskLabels, risk.badgePrimaryLabel);
-        }
-        if (risk.isTor) addLabelTo(riskLabels, formatTorDescription(risk) || 'Tor');
-        if (risk.hasCloudProvider) addLabelTo(riskLabels, formatCloudDescription(data) || 'Cloud');
-        if (risk.ptrIsHighRisk) addLabelTo(riskLabels, 'PTR-Risk');
-        if (risk.openProxyPorts && risk.openProxyPorts.length > 0) {
-            addLabelTo(riskLabels, `Shodan:${risk.openProxyPorts.join(',')}`);
-        }
-        for (const label of providerRiskLabels) addLabelTo(riskLabels, label);
-
-        return {
-            asn: asnEntry ? asnEntry.value : '',
-            isp: ispEntry ? ispEntry.value : '',
-            riskLabels
-        };
-    }
-
     function buildBadgeTitleText(data, risk) {
         if (risk.isNonPublic) {
             return `Address Type: ${risk.nonPublicReason} [${risk.nonPublicBadgeCode}]\nStatus: External threat lookups skipped (non-public or reserved IP)`;
         }
-        const torDesc = formatTorDescription(risk);
-        const cloudDesc = formatCloudDescription(data);
+        const sig = risk.sig, torDesc = formatTorDescription(risk), cloudDesc = formatCloudDescription(data);
         const lines = [];
         if (!risk.hasPrediction && isPartialLightResult(data)) {
             const lightInfo = collectLightBadgeInfo(data, risk);
@@ -2258,22 +1585,9 @@
         if (cloudDesc) lines.push('Cloud: ' + cloudDesc);
         lines.push('Broadcast IP: ' + (risk.broadcastIp ? 'At-risk' : 'No'));
         lines.push('Tor Node: ' + (risk.isTor ? torDesc : 'No'));
-
-        const dbBaselines = [];
-        for (const r of (Array.isArray(data.results) ? data.results : [])) {
-            if (!r) continue;
-            if (r.provider === 'StopForumSpam' && r.status === '200 OK') {
-                if (r.blacklisted) lines.push('StopForumSpam: Blacklisted Toxic CIDR' + (r.toxicCidr ? ` (${r.toxicCidr})` : ''));
-                else if (r.appears) lines.push(`StopForumSpam: Reported (${r.frequency || 0}x)`);
-            }
-            if (r.provider && typeof r.offlineDbUpdatedAt === 'string' && r.offlineDbUpdatedAt) {
-                const d = formatOfflineDbDateShort(r.offlineDbUpdatedAt);
-                if (d) dbBaselines.push(`${r.provider} ${d}`);
-            }
-        }
-        if (dbBaselines.length > 0) lines.push('Offline DB Baseline: ' + dbBaselines.join(', '));
-        const meta = getCacheMeta(data);
-        const ageSec = getCacheAgeSeconds(data);
+        if (sig.sfsTitleLine) lines.push(sig.sfsTitleLine);
+        if (sig.dbBaselines.length > 0) lines.push('Offline DB Baseline: ' + sig.dbBaselines.join(', '));
+        const meta = getCacheMeta(data), ageSec = getCacheAgeSeconds(data);
         if (ageSec !== null) {
             const ageText = formatRelativeCacheAge(ageSec);
             if (ageText) lines.push(meta && meta.isStale ? `${ageText} (stale >90d)` : ageText);
@@ -2281,7 +1595,7 @@
         return lines.join('\n');
     }
 
-    function applyRiskStylingToAnchorAndBadge(anchor, badge, data, fallbackIp, isRefresh) {
+    function applyRiskStylingToAnchorAndBadge(anchor, badge, data, fallbackIp) {
         ensureUserscriptStyles();
         const risk = evaluateRisk(data);
         const resolvedIp = (data && data.ip) || fallbackIp;
@@ -2290,16 +1604,7 @@
 
         if (anchor.classList) {
             anchor.classList.remove('proxycheck-anchor-risk-high', 'proxycheck-anchor-risk-medium');
-        }
-        if (risk.riskTier === 'high' || risk.riskTier === 'medium') {
-            if (anchor.classList) anchor.classList.add('proxycheck-anchor-risk-' + risk.riskTier);
-            Object.assign(anchor.style, {
-                backgroundColor: risk.riskTier === 'high' ? '#ffcccc' : '#fff3cd',
-                color: risk.riskTier === 'high' ? '#990000' : '#856404',
-                fontWeight: 'bold', padding: '1px 4px', borderRadius: '3px'
-            });
-        } else if (isRefresh && anchor.style && anchor.style.backgroundColor) {
-            Object.assign(anchor.style, { backgroundColor: '', color: '', fontWeight: '', padding: '', borderRadius: '' });
+            if (risk.riskTier === 'high' || risk.riskTier === 'medium') anchor.classList.add('proxycheck-anchor-risk-' + risk.riskTier);
         }
 
         const bcast = risk.broadcastIp ? '|BCASTIP' : '';
@@ -2308,8 +1613,7 @@
         if (risk.isNonPublic) {
             badge.textContent = `[${risk.nonPublicBadgeCode}]`;
         } else if (!risk.hasPrediction && isPartialLightResult(data)) {
-            const lightInfo = collectLightBadgeInfo(data, risk);
-            const lightParts = [];
+            const lightInfo = collectLightBadgeInfo(data, risk), lightParts = [];
             if (lightInfo.asn) lightParts.push(lightInfo.asn);
             if (lightInfo.isp) lightParts.push(lightInfo.isp);
             if (lightInfo.riskLabels.length > 0) lightParts.push(lightInfo.riskLabels.join(','));
@@ -2327,16 +1631,12 @@
         }
         if (isStale) stateClass += ' proxycheck-badge-stale';
         badge.className = `${BADGE_CLASS} proxycheck-tier-${risk.riskTier}${stateClass}`;
-
-        applyBaseBadgeStyle(badge);
-        badge.style.fontWeight = risk.riskTier === 'low' ? '' : 'bold';
-        badge.style.borderStyle = isStale ? 'dashed' : '';
         badge.title = buildBadgeTitleText(data, risk);
     }
 
     function isBadgeDetached(badge) {
         return !badge || badge.isConnected === false ||
-            Boolean(typeof document !== 'undefined' && document.body && typeof document.body.contains === 'function' && !document.body.contains(badge));
+            Boolean(typeof document !== 'undefined' && document.body && !document.body.contains(badge));
     }
 
     function filterConnectedBadgeEntries(entries) {
@@ -2369,7 +1669,7 @@
         if (!cacheKey || !fullData || typeof fullData !== 'object') return;
         const active = filterConnectedBadgeEntries(renderedBadgeEntriesByIp.get(cacheKey));
         if (active.length === 0) { renderedBadgeEntriesByIp.delete(cacheKey); return; }
-        active.forEach((e) => applyRiskStylingToAnchorAndBadge(e.anchor, e.badge, fullData, fullData.ip || e.ip, true));
+        active.forEach((e) => applyRiskStylingToAnchorAndBadge(e.anchor, e.badge, fullData, fullData.ip || e.ip));
         renderedBadgeEntriesByIp.set(cacheKey, active);
     }
 
@@ -2392,32 +1692,70 @@
             : 'Refresh temporarily unavailable. Preserving cached intelligence.';
     }
 
+    function createRefreshControl(opts) {
+        const $ageSpan = $('<span>', { class: 'proxycheck-cache-age' });
+        const $btn = $('<button>', { type: 'button', class: 'proxycheck-refetch-btn', text: 'Refetch' });
+        const $warning = $('<div>', { class: 'proxycheck-refresh-warning', style: 'display: none;' });
+        let inFlight = false;
+
+        const sync = (data, isJustUpdated) => {
+            const meta = getCacheMeta(data);
+            const isStale = Boolean(!isJustUpdated && meta && meta.isStale === true);
+            $ageSpan.text(formatCacheStatusLabel(data, Boolean(isJustUpdated)))
+                [isStale ? 'addClass' : 'removeClass']('proxycheck-cache-age-stale');
+            if (!inFlight) $btn.prop('disabled', false).text('Refetch');
+        };
+
+        const run = (isAutoSwr) => {
+            const ip = opts.getIp();
+            if (inFlight || !opts.isActive() || accessBlocked || !isValidIp(ip)) return;
+            if (isAutoSwr && !tryConsumeAutoSwrBudget()) return;
+            const guardToken = opts.getGuard ? opts.getGuard() : null;
+            inFlight = true;
+            $warning.css('display', 'none').text('');
+            $btn.prop('disabled', true).text('Updating...');
+            executeIpRefresh(ip).then((outcome) => {
+                if (opts.getGuard && opts.getGuard() !== guardToken) return;
+                inFlight = false;
+                if (!opts.isActive()) return;
+                if (!outcome || !outcome.ok || !outcome.data) {
+                    $btn.prop('disabled', false).text('Refetch');
+                    $warning.text(formatRefreshWarningText(outcome)).css('display', 'block');
+                    return;
+                }
+                $warning.css('display', 'none').text('');
+                opts.onSuccess(outcome.data);
+            });
+        };
+
+        $btn.on('click', (e) => { e.preventDefault(); e.stopPropagation(); run(false); });
+        return {
+            $ageSpan, $btn, $warning, sync, run,
+            resetFlight: () => { inFlight = false; }
+        };
+    }
+
+    function attachLightUpgrade($container, targetIp, isActive, onUpgraded) {
+        let $notice = $('<p>', { class: 'proxycheck-light-upgrade-notice', style: 'margin-top: 8px; margin-bottom: 0; font-size: 12px;' })
+            .text('Loading full commercial provider intelligence...');
+        $container.append($notice);
+        return requestFullIpUpgrade(targetIp, false).then((fullData) => {
+            if (!isActive()) return null;
+            if (!fullData) { if ($notice) $notice.text('Full commercial intelligence unavailable right now.'); return null; }
+            if ($notice) { $notice.remove(); $notice = null; }
+            onUpgraded(fullData);
+            return fullData;
+        }).catch(() => { if (isActive() && $notice) $notice.text('Full commercial intelligence unavailable right now.'); return null; });
+    }
+
     function showInfoDialog(data, ip) {
         if (infoDialogPromise) return infoDialogPromise;
         ensureUserscriptStyles();
         infoDialogPromise = mw.loader.using('oojs-ui-windows').then(() => {
-            const targetIp = ip || (data && data.ip) || '';
-            const cacheKey = canonicalizeIpKey(targetIp);
-            let activeData = (cacheKey && latestResultByIp.get(cacheKey)) || data;
+            const targetIp = ip || (data && data.ip) || '', cacheKey = canonicalizeIpKey(targetIp);
+            let activeData = (cacheKey && getIpData(cacheKey)) || data, activeDetailsPanel = null, dialogClosed = false;
             const initialRisk = evaluateRisk(activeData);
-
-            const $cacheAgeSpan = $('<span>', { 'class': 'proxycheck-cache-age' });
-            const $refetchBtn = $('<button>', { type: 'button', 'class': 'proxycheck-refetch-btn', text: 'Refetch' });
-            const $cacheBar = $('<div>', { 'class': 'proxycheck-dialog-cache-bar' }).append($cacheAgeSpan, $refetchBtn);
-            const $warningNotice = $('<div>', { 'class': 'proxycheck-refresh-warning', style: 'display: none;' });
-            const $panelContainer = $('<div>', { 'class': 'proxycheck-dialog-content' });
-            let activeDetailsPanel = null, dialogClosed = false, refreshInFlight = false;
-
-            const syncControls = (d, risk, isJustUpdated) => {
-                if (risk.isNonPublic) { $cacheBar.css('display', 'none'); $warningNotice.css('display', 'none'); return; }
-                $cacheBar.css('display', 'flex');
-                const meta = getCacheMeta(d);
-                const isStale = Boolean(!isJustUpdated && meta && meta.isStale === true);
-                $cacheAgeSpan.text(formatCacheStatusLabel(d, Boolean(isJustUpdated)));
-                if (isStale) $cacheAgeSpan.addClass('proxycheck-cache-age-stale');
-                else $cacheAgeSpan.removeClass('proxycheck-cache-age-stale');
-                if (!refreshInFlight) $refetchBtn.prop('disabled', false).text('Refetch');
-            };
+            const $panelContainer = $('<div>', { class: 'proxycheck-dialog-content' });
 
             const renderBody = (d, risk) => {
                 disposeDetailsPanel(activeDetailsPanel);
@@ -2434,55 +1772,34 @@
                 }
             };
 
-            const runDialogRefresh = (isAutoSwr) => {
-                if (refreshInFlight || dialogClosed || accessBlocked || !isValidIp(targetIp)) return;
-                if (isAutoSwr && !tryConsumeAutoSwrBudget()) return;
-                refreshInFlight = true;
-                $warningNotice.css('display', 'none').text('');
-                $refetchBtn.prop('disabled', true).text('Updating...');
-                executeIpRefresh(targetIp).then((outcome) => {
-                    refreshInFlight = false;
-                    if (dialogClosed) return;
-                    if (!outcome || !outcome.ok || !outcome.data) {
-                        $refetchBtn.prop('disabled', false).text('Refetch');
-                        $warningNotice.text(formatRefreshWarningText(outcome)).css('display', 'block');
-                        return;
-                    }
-                    activeData = outcome.data;
-                    const freshRisk = evaluateRisk(activeData);
-                    renderBody(activeData, freshRisk);
-                    syncControls(activeData, freshRisk, true);
-                    $warningNotice.css('display', 'none').text('');
-                });
+            const refreshCtrl = createRefreshControl({
+                getIp: () => targetIp, isActive: () => !dialogClosed,
+                onSuccess: (freshData) => { activeData = freshData; const r = evaluateRisk(activeData); renderBody(activeData, r); syncBar(activeData, r, true); }
+            });
+            const $cacheBar = $('<div>', { class: 'proxycheck-dialog-cache-bar' }).append(refreshCtrl.$ageSpan, refreshCtrl.$btn);
+            const syncBar = (d, risk, isJustUpdated) => {
+                if (risk.isNonPublic) { $cacheBar.css('display', 'none'); refreshCtrl.$warning.css('display', 'none'); return; }
+                $cacheBar.css('display', 'flex');
+                refreshCtrl.sync(d, isJustUpdated);
             };
 
-            $refetchBtn.on('click', (e) => { e.preventDefault(); e.stopPropagation(); runDialogRefresh(false); });
             renderBody(activeData, initialRisk);
-            syncControls(activeData, initialRisk, false);
-
-            const $message = $('<div>').append(
-                $cacheBar, $warningNotice, $panelContainer,
+            syncBar(activeData, initialRisk, false);
+            const $message = $('<div>').append($cacheBar, refreshCtrl.$warning, $panelContainer,
                 $('<p>', { style: 'margin-top: 8px; margin-bottom: 0;' }).append(
-                    $('<a>', { 'class': 'proxycheck-dialog-link', href: TOOL_BASE_URL + '/?ip=' + encodeURIComponent(targetIp), target: '_blank', rel: 'noopener noreferrer', text: 'Open full report ↗' })
-                )
-            );
+                    $('<a>', { class: 'proxycheck-dialog-link', href: TOOL_BASE_URL + '/?ip=' + encodeURIComponent(targetIp), target: '_blank', rel: 'noopener noreferrer', text: 'Open full report ↗' })
+                ));
 
             if (!initialRisk.isNonPublic && isPartialLightResult(activeData)) {
-                let $upgradeNotice = $('<p>', { 'class': 'proxycheck-light-upgrade-notice', style: 'margin-top: 8px; margin-bottom: 0; font-size: 12px;' })
-                    .text('Loading full commercial provider intelligence...');
-                $message.append($upgradeNotice);
-                requestFullIpUpgrade(targetIp, false).then((fullData) => {
-                    if (!fullData) { if (!dialogClosed && $upgradeNotice) $upgradeNotice.text('Full commercial intelligence unavailable right now.'); return; }
+                attachLightUpgrade($message, targetIp, () => !dialogClosed, (fullData) => {
                     activeData = fullData;
-                    if (dialogClosed) return;
-                    const updatedRisk = evaluateRisk(fullData);
-                    renderBody(fullData, updatedRisk);
-                    syncControls(fullData, updatedRisk, false);
-                    if ($upgradeNotice) { $upgradeNotice.remove(); $upgradeNotice = null; }
-                    if (shouldAutoRefreshPayload(fullData, cacheKey)) runDialogRefresh(true);
-                }).catch(() => { if (!dialogClosed && $upgradeNotice) $upgradeNotice.text('Full commercial intelligence unavailable right now.'); });
+                    const r = evaluateRisk(fullData);
+                    renderBody(fullData, r);
+                    syncBar(fullData, r, false);
+                    if (shouldAutoRefreshPayload(fullData, cacheKey)) refreshCtrl.run(true);
+                });
             } else if (!initialRisk.isNonPublic && shouldAutoRefreshPayload(activeData, cacheKey)) {
-                runDialogRefresh(true);
+                refreshCtrl.run(true);
             }
 
             return Promise.resolve(OO.ui.alert($message, { title: targetIp, size: 'large' })).then(
@@ -2495,62 +1812,39 @@
         return infoDialogPromise;
     }
 
-    function applyBaseBadgeStyle(badge) {
-        Object.assign(badge.style, {
-            marginLeft: '4px', fontSize: '0.85em',
-            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
-            padding: '1px 5px', borderRadius: '3px', textDecoration: 'none', whiteSpace: 'nowrap'
-        });
+    function attachBadgeClick(badge, fn) {
+        if (!badge._pcBound) {
+            badge._pcBound = true;
+            badge.addEventListener('click', (e) => {
+                e.preventDefault(); e.stopPropagation();
+                if (!accessBlocked && typeof badge._pcClick === 'function') badge._pcClick(badge);
+            });
+        }
+        badge._pcClick = fn || null;
     }
 
-    function createActionBadge(anchor, options) {
-        if (accessBlocked || !anchor || !anchor.parentNode) return null;
-        const nextEl = anchor.nextElementSibling;
-        if (nextEl && nextEl.classList && nextEl.classList.contains(BADGE_CLASS)) return null;
-        ensureUserscriptStyles();
-        const badge = createEl('a', BADGE_CLASS + (options.extraClass ? ' ' + options.extraClass : ''), options.text, { href: '#', role: 'button', title: options.title });
-        applyBaseBadgeStyle(badge);
-        badge.style.cursor = 'pointer';
-        badge.addEventListener('click', (e) => {
-            e.preventDefault(); e.stopPropagation();
-            if (!accessBlocked) options.onClick(badge);
-        });
-        anchor.parentNode.insertBefore(badge, anchor.nextSibling);
-        return badge;
-    }
-
-    function createErrorRetryBadge(anchor, ip) {
-        createActionBadge(anchor, {
-            extraClass: 'proxycheck-ip-badge-error',
-            text: '[Retry]',
-            title: 'ProxyCheck lookup failed. Click to retry.',
-            onClick: (badge) => {
-                if (badge.parentNode) badge.parentNode.removeChild(badge);
-                invalidateIpResultCache(ip);
-                if (anchor.dataset) delete anchor.dataset.proxycheckProcessed;
-                processAnchor(anchor);
-            }
-        });
-    }
-
-    function matchesSelector(el, sel) {
-        return Boolean(el && el.nodeType === 1 && typeof el.matches === 'function' && el.matches(sel));
-    }
-
-    function closestElement(el, sel) {
-        return el && el.nodeType === 1 && typeof el.closest === 'function' ? el.closest(sel) : null;
+    function updateActionBadge(badge, options) {
+        badge.className = BADGE_CLASS + (options.extraClass ? ' ' + options.extraClass : '');
+        badge.textContent = options.text;
+        badge.title = options.title || '';
+        badge.href = '#';
+        badge.setAttribute('role', 'button');
+        badge.removeAttribute('aria-busy');
+        badge.removeAttribute('target');
+        badge.removeAttribute('rel');
+        attachBadgeClick(badge, options.onClick);
     }
 
     function isProxycheckInternalNode(node) {
         if (!node) return false;
         if (node.nodeType === 8) return true;
-        if (node.nodeType === 3) return !node.parentNode || Boolean(closestElement(node.parentNode, INTERNAL_NODE_SELECTOR));
-        return node.nodeType === 1 && Boolean(closestElement(node, INTERNAL_NODE_SELECTOR));
+        if (node.nodeType === 3) return !node.parentNode || Boolean(node.parentNode.closest && node.parentNode.closest(INTERNAL_NODE_SELECTOR));
+        return node.nodeType === 1 && Boolean(node.closest && node.closest(INTERNAL_NODE_SELECTOR));
     }
 
     function shouldSkipRevealTarget(el) {
         return !el || el.nodeType !== 1 || Boolean(
-            matchesSelector(el, REVEAL_CONTAINER_SELECTOR) && !matchesSelector(el, REVEAL_ANCHOR_SELECTOR) &&
+            el.matches && el.matches(REVEAL_CONTAINER_SELECTOR) && !el.matches(REVEAL_ANCHOR_SELECTOR) &&
             el.querySelector && el.querySelector(REVEAL_ANCHOR_SELECTOR)
         );
     }
@@ -2561,7 +1855,7 @@
         if (el.childNodes && el.childNodes.length > 0) {
             const chunks = [];
             for (const c of el.childNodes) {
-                if (c && c.nodeType === 1 && matchesSelector(c, '.' + BADGE_CLASS)) continue;
+                if (c && c.nodeType === 1 && c.matches && c.matches('.' + BADGE_CLASS)) continue;
                 chunks.push(c.textContent || c.nodeValue || '');
             }
             rawText = chunks.join('');
@@ -2591,63 +1885,63 @@
         scanSubtree(document.body);
     }
 
-    function createConsentTriggerBadge(anchor) {
-        createActionBadge(anchor, {
-            extraClass: 'proxycheck-ip-badge-consent',
-            text: '[ProxyCheck]',
-            title: 'ProxyCheck consent required. Click to review policy and enable.',
-            onClick: () => ensureConsent(true).then((agreed) => { if (agreed && !accessBlocked) resumeAfterConsent(); })
-        });
-    }
-
     function processAnchor(anchor) {
-        if (accessBlocked || !anchor || !anchor.dataset || shouldSkipRevealTarget(anchor) ||
-            (anchor.dataset.proxycheckProcessed && anchor.dataset.proxycheckProcessed !== 'observed')) return;
+        if (accessBlocked || !anchor || !anchor.dataset || !anchor.parentNode || shouldSkipRevealTarget(anchor) || anchor.dataset.proxycheckProcessed) return;
         const ip = extractIpFromRevealElement(anchor);
         if (!ip) return;
+        const existingNext = anchor.nextElementSibling;
+        if (existingNext && existingNext.classList && existingNext.classList.contains(BADGE_CLASS)) { anchor.dataset.proxycheckProcessed = 'true'; return; }
+
+        ensureUserscriptStyles();
         anchor.dataset.proxycheckProcessed = 'pending';
+        const badge = createEl('a', `${BADGE_CLASS} proxycheck-ip-badge-loading`, '[…]', { title: 'Checking IP intelligence...', 'aria-busy': 'true' });
+        attachBadgeClick(badge, null);
+        anchor.parentNode.insertBefore(badge, anchor.nextSibling);
+        const removePlaceholder = () => { if (badge.parentNode) badge.parentNode.removeChild(badge); delete anchor.dataset.proxycheckProcessed; };
 
         ensureConsent(false).then((agreed) => {
-            if (!agreed) {
-                if (!accessBlocked && anchor.dataset.proxycheckProcessed === 'pending') {
-                    anchor.dataset.proxycheckProcessed = 'consent-declined';
-                    createConsentTriggerBadge(anchor);
-                } else delete anchor.dataset.proxycheckProcessed;
-                return null;
-            }
-            return fetchIpIntelligence(ip, 'light');
+            if (agreed) return fetchIpIntelligence(ip, 'light');
+            if (accessBlocked || anchor.dataset.proxycheckProcessed !== 'pending') { removePlaceholder(); return null; }
+            anchor.dataset.proxycheckProcessed = 'consent-declined';
+            updateActionBadge(badge, {
+                extraClass: 'proxycheck-ip-badge-consent', text: '[ProxyCheck]',
+                title: 'ProxyCheck consent required. Click to review policy and enable.',
+                onClick: () => ensureConsent(true).then((ok) => { if (ok && !accessBlocked) resumeAfterConsent(); })
+            });
+            return null;
         }).then((data) => {
             if (!data) {
-                if (!accessBlocked && anchor.dataset.proxycheckProcessed === 'pending') {
-                    anchor.dataset.proxycheckProcessed = 'error';
-                    createErrorRetryBadge(anchor, ip);
-                }
+                if (anchor.dataset.proxycheckProcessed === 'consent-declined') return;
+                if (accessBlocked || !anchor.parentNode || anchor.dataset.proxycheckProcessed !== 'pending') { removePlaceholder(); return; }
+                anchor.dataset.proxycheckProcessed = 'error';
+                updateActionBadge(badge, {
+                    extraClass: 'proxycheck-ip-badge-error', text: '[Retry]', title: 'ProxyCheck lookup failed. Click to retry.',
+                    onClick: (el) => { if (el.parentNode) el.parentNode.removeChild(el); invalidateIpResultCache(ip); delete anchor.dataset.proxycheckProcessed; processAnchor(anchor); }
+                });
                 return;
             }
-            if (!anchor.parentNode || shouldSkipRevealTarget(anchor)) { delete anchor.dataset.proxycheckProcessed; return; }
+            if (!anchor.parentNode || shouldSkipRevealTarget(anchor)) { removePlaceholder(); return; }
             if (anchor.dataset.proxycheckProcessed === 'true') return;
-            const nextEl = anchor.nextElementSibling;
-            if (nextEl && nextEl.classList && nextEl.classList.contains(BADGE_CLASS)) { anchor.dataset.proxycheckProcessed = 'true'; return; }
-
             const resolvedIp = data.ip || ip;
-            const badge = createEl('a', BADGE_CLASS, null, { target: '_blank', rel: 'noopener noreferrer' });
-            badge.addEventListener('click', (e) => {
-                e.preventDefault(); e.stopPropagation();
-                const currentKey = canonicalizeIpKey(resolvedIp) || canonicalizeIpKey(ip);
-                const activeData = (currentKey && latestResultByIp.get(currentKey)) || data;
-                showInfoDialog(activeData, activeData.ip || resolvedIp);
+            badge.removeAttribute('aria-busy');
+            badge.removeAttribute('role');
+            badge.target = '_blank';
+            badge.rel = 'noopener noreferrer';
+            attachBadgeClick(badge, () => {
+                const k = canonicalizeIpKey(resolvedIp) || canonicalizeIpKey(ip), cur = (k && getIpData(k)) || data;
+                showInfoDialog(cur, cur.ip || resolvedIp);
             });
-            applyRiskStylingToAnchorAndBadge(anchor, badge, data, resolvedIp, false);
+            applyRiskStylingToAnchorAndBadge(anchor, badge, data, resolvedIp);
             registerRenderedBadge(canonicalizeIpKey(resolvedIp) || canonicalizeIpKey(ip), anchor, badge, resolvedIp);
-            anchor.parentNode.insertBefore(badge, anchor.nextSibling);
+            if (badge.parentNode !== anchor.parentNode || anchor.nextElementSibling !== badge) anchor.parentNode.insertBefore(badge, anchor.nextSibling);
             anchor.dataset.proxycheckProcessed = 'true';
         });
     }
 
     function isIpInfoPanelMutation(target, addedNode) {
-        if (closestElement(target, IPINFO_PANEL_SELECTOR)) return true;
+        if (target && target.closest && target.closest(IPINFO_PANEL_SELECTOR)) return true;
         return Boolean(addedNode && addedNode.nodeType === 1 &&
-            (matchesSelector(addedNode, IPINFO_PANEL_SELECTOR) || (addedNode.querySelector && addedNode.querySelector(IPINFO_PANEL_SELECTOR))));
+            ((addedNode.matches && addedNode.matches(IPINFO_PANEL_SELECTOR)) || (addedNode.querySelector && addedNode.querySelector(IPINFO_PANEL_SELECTOR))));
     }
 
     function scheduleIpContributionsUpdate(shouldRefreshSpur) {
@@ -2657,8 +1951,7 @@
         ipContributionsObserverTimer = window.setTimeout(() => {
             ipContributionsObserverTimer = null;
             const runPage = pendingContributionsPageCheck, runSpur = pendingSpurRefresh;
-            pendingContributionsPageCheck = false;
-            pendingSpurRefresh = false;
+            pendingContributionsPageCheck = pendingSpurRefresh = false;
             if (accessBlocked || !isIpContributionsPage) return;
             if (runPage) handleIPContributionsPage();
             if (runSpur && typeof refreshPageInfoSpur === 'function') refreshPageInfoSpur();
@@ -2667,35 +1960,14 @@
 
     function scheduleAnchor(anchor) {
         if (accessBlocked || !anchor || !anchor.dataset || anchor.dataset.proxycheckProcessed || shouldSkipRevealTarget(anchor)) return;
-        const ip = extractIpFromRevealElement(anchor);
-        if (!ip) return;
         if (isIpContributionsPage && !ipContributionsInvalidTarget) handleIPContributionsPage(true);
-        const cacheKey = canonicalizeIpKey(ip);
-        if (ipPromiseCache.has(cacheKey) || readPersistedIpResult(cacheKey)) { processAnchor(anchor); return; }
         processAnchor(anchor);
     }
 
     function scanSubtree(root) {
         if (accessBlocked || !root || root.nodeType !== 1 || isProxycheckInternalNode(root)) return;
-        if (matchesSelector(root, TARGET_SELECTOR)) scheduleAnchor(root);
+        if (root.matches && root.matches(TARGET_SELECTOR)) scheduleAnchor(root);
         for (const anchor of root.querySelectorAll(TARGET_SELECTOR)) scheduleAnchor(anchor);
-    }
-
-    function getTargetQueryParam() {
-        if (mw.util && typeof mw.util.getParamValue === 'function') return mw.util.getParamValue('target');
-        try {
-            const q = typeof window !== 'undefined' && window.location && typeof window.location.search === 'string'
-                ? window.location.search.replace(/^\?/, '') : '';
-            if (!q) return null;
-            for (const pair of q.split('&')) {
-                const eq = pair.indexOf('=');
-                const k = eq === -1 ? pair : pair.slice(0, eq);
-                if (decodeURIComponent(k.replace(/\+/g, ' ')) === 'target') {
-                    return decodeURIComponent((eq === -1 ? '' : pair.slice(eq + 1)).replace(/\+/g, ' '));
-                }
-            }
-        } catch (err) { warn('Failed to parse query target:', err); }
-        return null;
     }
 
     function extractContributionsTargetIp() {
@@ -2704,7 +1976,11 @@
             const parts = (mw.config.get('wgTitle') || '').split('/');
             if (parts.length > 1) target = parts.slice(1).join('/');
         }
-        if (!target) target = getTargetQueryParam();
+        if (!target) {
+            target = (mw.util && typeof mw.util.getParamValue === 'function')
+                ? mw.util.getParamValue('target')
+                : new URLSearchParams(typeof window !== 'undefined' && window.location ? window.location.search : '').get('target');
+        }
         return typeof target === 'string' ? target.trim() : '';
     }
 
@@ -2712,17 +1988,15 @@
         if (typeof userText !== 'string' || !userText.trim()) return false;
         const trimmed = userText.trim();
         return mw && mw.util && typeof mw.util.isTemporaryUser === 'function'
-            ? Boolean(mw.util.isTemporaryUser(trimmed))
-            : /^~\d{4}-/.test(trimmed);
+            ? Boolean(mw.util.isTemporaryUser(trimmed)) : /^~\d{4}-/.test(trimmed);
     }
 
     function collectRevealedIpsInDom() {
-        if (typeof document === 'undefined' || !document.body || typeof document.body.querySelectorAll !== 'function') return [];
+        if (typeof document === 'undefined' || !document.body) return [];
         const discovered = [], seen = Object.create(null);
         for (const el of document.body.querySelectorAll(TARGET_SELECTOR)) {
             if (!el || isProxycheckInternalNode(el) || shouldSkipRevealTarget(el)) continue;
-            const ip = extractIpFromRevealElement(el);
-            const canonical = ip ? canonicalizeIpKey(ip) : '';
+            const ip = extractIpFromRevealElement(el), canonical = ip ? canonicalizeIpKey(ip) : '';
             if (canonical && !seen[canonical]) { seen[canonical] = true; discovered.push({ canonicalKey: canonical, displayIp: ip }); }
         }
         return discovered;
@@ -2738,15 +2012,11 @@
         }
         if (!allowFallback) return null;
         const candidates = [
-            ['#mw-content-text .mw-contributions-header', 'before'],
-            ['#mw-content-text .mw-contributions-list', 'before'],
-            ['.mw-contributions-header', 'before'],
-            ['.mw-contributions-list', 'before'],
-            ['#mw-content-text .mw-contributions-form', 'after'],
-            ['.mw-contributions-form', 'after'],
+            ['#mw-content-text .mw-contributions-header, .mw-contributions-header', 'before'],
+            ['#mw-content-text .mw-contributions-list, .mw-contributions-list', 'before'],
+            ['#mw-content-text .mw-contributions-form, .mw-contributions-form', 'after'],
             ['#contentSub', 'after'],
-            ['#mw-content-text', 'prepend'],
-            ['#contentSub', 'prepend']
+            ['#mw-content-text, #contentSub', 'prepend']
         ];
         for (const [sel, method] of candidates) {
             const $node = $(sel).first();
@@ -2764,7 +2034,7 @@
     function peekCachedIpState(ip) {
         const key = canonicalizeIpKey(ip);
         if (!key) return null;
-        const latest = latestResultByIp.get(key);
+        const latest = getIpData(key);
         if (latest && !isPartialLightResult(latest) && isMemoryFullResultFresh(key, latest)) return { data: latest, isFull: true };
         const persisted = readPersistedIpResultEntry(key);
         if (persisted && persisted.data) return { data: persisted.data, isFull: !isPartialLightResult(persisted.data) };
@@ -2817,11 +2087,11 @@
             return;
         }
 
-        clearContributionsFallbackTimer();
+        ipContributionsFallbackTimer = clearTimer(ipContributionsFallbackTimer, false);
         ipContributionsPending = true;
         let $box = null, $switcher = null, $result = null;
-
-        const isNodeInDoc = (node) => Boolean(node) && (typeof document === 'undefined' || !document.body || typeof document.body.contains !== 'function' || document.body.contains(node));
+        const stopLoading = () => { activeLoadingInterval = clearTimer(activeLoadingInterval, true); };
+        const isNodeInDoc = (node) => Boolean(node) && (typeof document === 'undefined' || !document.body || document.body.contains(node));
         const mountBanner = (target) => {
             if (!$box || $box.length === 0 || !target || !target.$element || target.$element.length === 0) return false;
             const existing = document.getElementById('proxycheck-pageinfo');
@@ -2829,12 +2099,10 @@
             target.$element[target.method]($box);
             return true;
         };
-        const ensureBannerAttached = () => {
-            if (!$box || $box.length === 0 || !$box[0]) return false;
-            return isNodeInDoc($box[0]) || mountBanner(resolveContributionsMountTarget(effectiveAllowFallback) || resolveContributionsMountTarget(true));
-        };
+        const ensureBannerAttached = () => Boolean($box && $box.length > 0 && $box[0] &&
+            (isNodeInDoc($box[0]) || mountBanner(resolveContributionsMountTarget(effectiveAllowFallback) || resolveContributionsMountTarget(true))));
         const removeUnpopulatedBanner = () => {
-            clearLoadingInterval();
+            stopLoading();
             if ($box && $box.length > 0 && $box[0] && $box[0].parentNode) $box[0].parentNode.removeChild($box[0]);
             $box = $switcher = $result = activeContributionsController = null;
         };
@@ -2855,15 +2123,15 @@
             }
             if (!activeTarget) { ipContributionsPending = false; return null; }
 
-            $box = $('<div>', { id: 'proxycheck-pageinfo', 'class': 'proxycheck-pageinfo-banner' });
-            $switcher = $('<div>', { 'class': 'proxycheck-temp-ip-switcher', style: 'display: none;' });
+            $box = $('<div>', { id: 'proxycheck-pageinfo', class: 'proxycheck-pageinfo-banner' });
+            $switcher = $('<div>', { class: 'proxycheck-temp-ip-switcher', style: 'display: none;' });
             $result = $('<span>', { id: 'proxycheck_result', text: '.' });
             $box.append($switcher, $result);
             mountBanner(activeTarget);
 
             let currentTargetIp = initialTargetIp, currentCanonicalKey = canonicalizeIpKey(currentTargetIp);
             let userPinnedKey = null, currentDiscoveredList = discoveredTempIps.slice(), currentDiscoveredSig = '';
-            let isStatsExpanded = false, activeBannerDetailsPanel = null, bannerLoadSeq = 0, bannerRefreshInFlight = false;
+            let isStatsExpanded = false, activeBannerDetailsPanel = null, bannerLoadSeq = 0;
             const fullUpgradeRequestedForKey = Object.create(null);
             const computeSig = (list) => list.map((e) => e.canonicalKey).join('|');
 
@@ -2871,31 +2139,26 @@
                 if (!$switcher) return;
                 $switcher.empty();
                 if (!isTempAccountTarget || currentDiscoveredList.length <= 1) { $switcher.css('display', 'none'); return; }
-                $switcher.css('display', 'flex').append($('<span>', { 'class': 'proxycheck-temp-ip-subtitle', text: `${currentDiscoveredList.length} distinct revealed IPs on this page:` }));
+                $switcher.css('display', 'flex').append($('<span>', { class: 'proxycheck-temp-ip-subtitle', text: `${currentDiscoveredList.length} distinct revealed IPs on this page:` }));
                 for (const entry of currentDiscoveredList) {
                     const selected = entry.canonicalKey === currentCanonicalKey;
-                    const $pill = $('<button>', {
-                        type: 'button',
-                        'class': 'proxycheck-ip-pill' + (selected ? ' proxycheck-ip-pill-active' : ''),
-                        'aria-pressed': selected ? 'true' : 'false',
-                        text: entry.displayIp
+                    $switcher.append($('<button>', {
+                        type: 'button', class: 'proxycheck-ip-pill' + (selected ? ' proxycheck-ip-pill-active' : ''),
+                        'aria-pressed': selected ? 'true' : 'false', text: entry.displayIp
                     }).on('click', (e) => {
                         e.preventDefault(); e.stopPropagation();
-                        if (accessBlocked || entry.canonicalKey === currentCanonicalKey) return;
-                        userPinnedKey = entry.canonicalKey;
-                        switchInspectedBannerIp(entry.displayIp, true);
-                    });
-                    $switcher.append($pill);
+                        if (!accessBlocked && entry.canonicalKey !== currentCanonicalKey) { userPinnedKey = entry.canonicalKey; switchInspectedBannerIp(entry.displayIp, true); }
+                    }));
                 }
             };
 
             const renderBannerFailure = (failedIp) => {
                 if (!$result || $result.length === 0) return;
                 if (accessBlocked) { $result.text('[ProxyCheck] Access denied or disabled'); return; }
-                const $retry = $('<a>', { href: '#', role: 'button', 'class': 'proxycheck-banner-retry', text: 'Retry ↻' }).on('click', (e) => {
+                const $retry = $('<a>', { href: '#', role: 'button', class: 'proxycheck-banner-retry', text: 'Retry ↻' }).on('click', (e) => {
                     e.preventDefault(); e.stopPropagation();
                     if (accessBlocked) return;
-                    clearLoadingInterval(); clearContributionsSchedule();
+                    stopLoading(); clearContributionsSchedule();
                     invalidateIpResultCache(failedIp);
                     switchInspectedBannerIp(failedIp, true);
                 });
@@ -2905,9 +2168,7 @@
             const renderBannerData = (bannerData, isJustUpdated) => {
                 disposeDetailsPanel(activeBannerDetailsPanel);
                 activeBannerDetailsPanel = null;
-                const risk = evaluateRisk(bannerData);
-                const resolvedIp = bannerData.ip || currentTargetIp;
-                const resolvedKey = canonicalizeIpKey(resolvedIp) || currentCanonicalKey;
+                const risk = evaluateRisk(bannerData), resolvedIp = bannerData.ip || currentTargetIp, resolvedKey = canonicalizeIpKey(resolvedIp) || currentCanonicalKey;
                 const $activeBox = ($box && $box.length > 0) ? $box : $('#proxycheck-pageinfo');
                 if ($activeBox && $activeBox.length > 0 && $activeBox[0] && $activeBox[0].classList) {
                     $activeBox[0].classList.remove('proxycheck-banner-tier-high', 'proxycheck-banner-tier-medium', 'proxycheck-banner-tier-nonpublic', 'proxycheck-banner-tier-low');
@@ -2915,23 +2176,20 @@
                 }
                 renderMultiIpSwitcher();
                 const badgeClass = 'proxycheck-banner-badge proxycheck-tier-' + risk.riskTier;
-
                 if (risk.isNonPublic) {
                     $result.empty().append(
-                        $('<span>', { 'class': badgeClass, text: `ProxyCheck [${risk.nonPublicBadgeCode}]` }),
+                        $('<span>', { class: badgeClass, text: `ProxyCheck [${risk.nonPublicBadgeCode}]` }),
                         $('<span>').append(document.createTextNode(' \u00b7 '), $('<b>').text('Address Type:'), document.createTextNode(` ${risk.nonPublicReason} \u00b7 `), $('<b>').text('Status:'), document.createTextNode(' External threat lookups skipped (non-public or reserved IP) \u00b7 ')),
                         $('<a>', { href: TOOL_BASE_URL + '/?ip=' + encodeURIComponent(resolvedIp), target: '_blank', rel: 'noopener noreferrer', text: 'Full Report ↗' })
                     );
                     return;
                 }
 
-                const torDesc = formatTorDescription(risk), cloudDesc = formatCloudDescription(bannerData);
-                const sharedEgress = getSharedPrivacyEgressLabel(bannerData);
+                const torDesc = formatTorDescription(risk), cloudDesc = formatCloudDescription(bannerData), sharedEgress = getSharedPrivacyEgressLabel(bannerData);
                 const verdictText = typeof bannerData.arbitrationVerdict === 'string' ? bannerData.arbitrationVerdict.trim() : '';
                 const ptrHost = typeof bannerData.ptrHostname === 'string' ? bannerData.ptrHostname.trim() : '';
                 const ptrLbl = typeof bannerData.ptrLabel === 'string' ? bannerData.ptrLabel.trim() : '';
-
-                const $summary = $('<div>', { 'class': 'proxycheck-summary-line' }).append($('<span>', { 'class': badgeClass, text: 'ProxyCheck' }));
+                const $summary = $('<div>', { class: 'proxycheck-summary-line' }).append($('<span>', { class: badgeClass, text: 'ProxyCheck' }));
                 const addItem = (lbl, valNode) => $summary.append(document.createTextNode(' \u00b7 '), $('<b>').text(lbl + ': '), valNode);
 
                 if (isTempAccountTarget) addItem('IP', $('<code>').text(resolvedIp));
@@ -2943,33 +2201,30 @@
                     const $ptr = $('<span>');
                     if (ptrHost) {
                         $ptr.append($('<code>').text(ptrHost));
-                        if (ptrLbl) $ptr.append(document.createTextNode(' '), $('<span>', { 'class': bannerData.ptrIsHighRisk ? 'proxycheck-ptr-label-risk' : 'proxycheck-ptr-label-normal', text: `(${ptrLbl})` }));
+                        if (ptrLbl) $ptr.append(document.createTextNode(' '), $('<span>', { class: bannerData.ptrIsHighRisk ? 'proxycheck-ptr-label-risk' : 'proxycheck-ptr-label-normal', text: `(${ptrLbl})` }));
                     } else $ptr.text(ptrLbl);
                     addItem('PTR', $ptr);
                 }
                 if (cloudDesc) addItem('Cloud', document.createTextNode(cloudDesc));
-                if (sharedEgress) addItem('Shared Egress', $('<strong>', { 'class': 'proxycheck-banner-warning-text', text: `${sharedEgress} (soft block recommended)` }));
-                if (isMobileOrCgnatPayload(bannerData)) addItem('Network', $('<strong>', { 'class': 'proxycheck-banner-warning-text', text: 'Mobile / CGNAT (/32 IPv4, /64 IPv6 lock)' }));
-                addItem('Broadcast IP', risk.broadcastIp ? $('<strong>', { 'class': 'proxycheck-banner-warning-text', text: 'At-risk' }) : document.createTextNode('No'));
-                addItem('Tor Node', risk.isTor ? $('<strong>', { 'class': 'proxycheck-banner-danger-text', text: torDesc }) : document.createTextNode('No'));
+                if (sharedEgress) addItem('Shared Egress', $('<strong>', { class: 'proxycheck-banner-warning-text', text: `${sharedEgress} (soft block recommended)` }));
+                if (isMobileOrCgnatPayload(bannerData)) addItem('Network', $('<strong>', { class: 'proxycheck-banner-warning-text', text: 'Mobile / CGNAT (/32 IPv4, /64 IPv6 lock)' }));
+                addItem('Broadcast IP', risk.broadcastIp ? $('<strong>', { class: 'proxycheck-banner-warning-text', text: 'At-risk' }) : document.createTextNode('No'));
+                addItem('Tor Node', risk.isTor ? $('<strong>', { class: 'proxycheck-banner-danger-text', text: torDesc }) : document.createTextNode('No'));
 
                 let renderedSpur = getSpurProxyText();
                 activeBannerDetailsPanel = buildResultDetailsPanel(bannerData, risk, resolvedIp);
-                const $detailsWrapper = $('<div>', { 'class': 'proxycheck-pageinfo-details', style: isStatsExpanded ? 'display: block;' : 'display: none;' }).append(activeBannerDetailsPanel);
-
+                const $detailsWrapper = $('<div>', { class: 'proxycheck-pageinfo-details', style: isStatsExpanded ? 'display: block;' : 'display: none;' }).append(activeBannerDetailsPanel);
                 refreshPageInfoSpur = () => {
                     const latestSpur = getSpurProxyText();
                     if (latestSpur === renderedSpur) return;
                     renderedSpur = latestSpur;
                     disposeDetailsPanel(activeBannerDetailsPanel);
-                    activeBannerDetailsPanel = buildResultDetailsPanel(bannerData, risk, resolvedIp);
-                    $detailsWrapper.empty().append(activeBannerDetailsPanel);
+                    $detailsWrapper.empty().append((activeBannerDetailsPanel = buildResultDetailsPanel(bannerData, risk, resolvedIp)));
                 };
 
                 const $statsToggle = $('<a>', {
-                    href: '#', role: 'button', 'class': 'proxycheck-stats-toggle',
-                    'aria-expanded': isStatsExpanded ? 'true' : 'false',
-                    text: isStatsExpanded ? 'Statistic ▾' : 'Statistic ▸'
+                    href: '#', role: 'button', class: 'proxycheck-stats-toggle',
+                    'aria-expanded': isStatsExpanded ? 'true' : 'false', text: isStatsExpanded ? 'Statistic ▾' : 'Statistic ▸'
                 }).on('click', (e) => {
                     e.preventDefault(); e.stopPropagation();
                     isStatsExpanded = !isStatsExpanded;
@@ -2978,50 +2233,23 @@
                     if (isStatsExpanded && isPartialLightResult(bannerData) && !fullUpgradeRequestedForKey[resolvedKey]) {
                         fullUpgradeRequestedForKey[resolvedKey] = true;
                         clearContributionsSchedule();
-                        const $notice = $('<p>', { 'class': 'proxycheck-light-upgrade-notice', style: 'margin-top: 8px; margin-bottom: 0; font-size: 12px;' }).text('Loading full commercial provider intelligence...');
-                        $detailsWrapper.append($notice);
-                        requestFullIpUpgrade(resolvedIp, false).then((fullData) => {
-                            if (!fullData) { $notice.text('Full commercial intelligence unavailable right now.'); return; }
-                            if (ensureBannerAttached() && currentCanonicalKey === resolvedKey) renderBannerData(fullData, false);
-                        });
+                        attachLightUpgrade($detailsWrapper, resolvedIp, () => ensureBannerAttached() && currentCanonicalKey === resolvedKey, (fullData) => renderBannerData(fullData, false));
                     }
                 });
 
-                const $bannerWarning = $('<div>', { 'class': 'proxycheck-refresh-warning', style: 'display: none;' });
-                const meta = getCacheMeta(bannerData);
-                const isStale = Boolean(!isJustUpdated && meta && meta.isStale === true);
-                const $bannerAgeSpan = $('<span>', { 'class': 'proxycheck-cache-age' + (isStale ? ' proxycheck-cache-age-stale' : ''), text: formatCacheStatusLabel(bannerData, Boolean(isJustUpdated)) });
-                const $bannerRefetchBtn = $('<button>', { type: 'button', 'class': 'proxycheck-refetch-btn', text: 'Refetch' });
-
-                const runBannerRefresh = (isAutoSwr) => {
-                    if (bannerRefreshInFlight || accessBlocked || !isValidIp(resolvedIp)) return;
-                    if (isAutoSwr && !tryConsumeAutoSwrBudget()) return;
-                    const seq = bannerLoadSeq;
-                    bannerRefreshInFlight = true;
-                    $bannerWarning.css('display', 'none').text('');
-                    $bannerRefetchBtn.prop('disabled', true).text('Updating...');
-                    executeIpRefresh(resolvedIp).then((outcome) => {
-                        if (seq !== bannerLoadSeq || currentCanonicalKey !== resolvedKey) return;
-                        bannerRefreshInFlight = false;
-                        if (!ensureBannerAttached()) return;
-                        if (!outcome || !outcome.ok || !outcome.data) {
-                            $bannerRefetchBtn.prop('disabled', false).text('Refetch');
-                            $bannerWarning.text(formatRefreshWarningText(outcome)).css('display', 'block');
-                            return;
-                        }
-                        renderBannerData(outcome.data, true);
-                    });
-                };
-
-                $bannerRefetchBtn.on('click', (e) => { e.preventDefault(); e.stopPropagation(); runBannerRefresh(false); });
+                const refreshCtrl = createRefreshControl({
+                    getIp: () => resolvedIp, isActive: ensureBannerAttached,
+                    getGuard: () => `${bannerLoadSeq}:${currentCanonicalKey}`, onSuccess: (freshData) => renderBannerData(freshData, true)
+                });
+                refreshCtrl.sync(bannerData, isJustUpdated);
                 $summary.append(
                     document.createTextNode(' \u00b7 '),
                     $('<a>', { href: TOOL_BASE_URL + '/?ip=' + encodeURIComponent(resolvedIp), target: '_blank', rel: 'noopener noreferrer', text: 'Full Report ↗' }),
                     document.createTextNode(' \u00b7 '), $statsToggle,
-                    document.createTextNode(' \u00b7 '), $('<span>', { 'class': 'proxycheck-cache-controls' }).append($bannerAgeSpan, $bannerRefetchBtn)
+                    document.createTextNode(' \u00b7 '), $('<span>', { class: 'proxycheck-cache-controls' }).append(refreshCtrl.$ageSpan, refreshCtrl.$btn)
                 );
-                $result.empty().append($summary, $bannerWarning, $detailsWrapper);
-                if (!isPartialLightResult(bannerData) && shouldAutoRefreshPayload(bannerData, resolvedKey)) runBannerRefresh(true);
+                $result.empty().append($summary, refreshCtrl.$warning, $detailsWrapper);
+                if (!isPartialLightResult(bannerData) && shouldAutoRefreshPayload(bannerData, resolvedKey)) refreshCtrl.run(true);
             };
 
             const scheduleFullUpgradeAfterDelay = (ipForUpgrade, keyForUpgrade) => {
@@ -3044,12 +2272,10 @@
 
             function switchInspectedBannerIp(nextIp, immediateFetch) {
                 if (!isValidIp(nextIp)) return Promise.resolve(null);
-                clearLoadingInterval(); clearContributionsSchedule();
-                bannerRefreshInFlight = false;
+                stopLoading(); clearContributionsSchedule();
                 currentTargetIp = nextIp;
                 currentCanonicalKey = canonicalizeIpKey(nextIp);
-                bannerLoadSeq += 1;
-                const activeSeq = bannerLoadSeq;
+                const activeSeq = ++bannerLoadSeq;
                 renderMultiIpSwitcher();
 
                 const cachedNow = peekCachedIpState(nextIp);
@@ -3079,21 +2305,18 @@
                 const frames = ['.\u00a0\u00a0', '\u00a0.\u00a0', '\u00a0\u00a0.'];
                 let frameIdx = 0;
                 $result.text(frames[0]);
-                activeLoadingInterval = window.setInterval(() => {
-                    $result.text(frames[frameIdx]);
-                    frameIdx = (frameIdx + 1) % frames.length;
-                }, 300);
+                activeLoadingInterval = window.setInterval(() => { $result.text(frames[(frameIdx = (frameIdx + 1) % frames.length)]); }, 300);
 
                 const runFullFetch = () => fetchIpIntelligence(nextIp, 'full').then((data) => {
                     if (activeSeq !== bannerLoadSeq) return null;
-                    clearLoadingInterval();
+                    stopLoading();
                     if (!ensureBannerAttached()) return null;
                     if (!data) { renderBannerFailure(nextIp); return null; }
                     renderBannerData(data, false);
                     return data;
                 }).catch((err) => {
                     if (activeSeq !== bannerLoadSeq) return null;
-                    clearLoadingInterval();
+                    stopLoading();
                     warn('Contributions banner data failed:', err);
                     if (ensureBannerAttached()) renderBannerFailure(nextIp);
                     return null;
@@ -3104,7 +2327,7 @@
                     ipContributionsDelayTimer = window.setTimeout(() => {
                         ipContributionsDelayTimer = null;
                         if (activeSeq !== bannerLoadSeq) return resolve(null);
-                        if (accessBlocked) { clearLoadingInterval(); return resolve(null); }
+                        if (accessBlocked) { stopLoading(); return resolve(null); }
                         if (!isDocumentVisible()) { removeUnpopulatedBanner(); registerResumeWhenVisible(); return resolve(null); }
                         runFullFetch().then(resolve);
                     }, CONTRIB_FULL_TRIGGER_DELAY_MS);
@@ -3128,11 +2351,7 @@
             };
             ipContributionsPending = false;
             return switchInspectedBannerIp(initialTargetIp, Boolean(isTempAccountTarget));
-        }).catch((err) => {
-            clearLoadingInterval();
-            ipContributionsPending = false;
-            warn('Contributions banner update failed:', err);
-        });
+        }).catch((err) => { stopLoading(); ipContributionsPending = false; warn('Contributions banner update failed:', err); });
     }
 
     $(() => {
@@ -3148,7 +2367,8 @@
                 if (!m.target || isProxycheckInternalNode(m.target)) continue;
                 const targetEl = m.target.nodeType === 3 ? m.target.parentNode : m.target;
                 if (!targetEl || targetEl.nodeType !== 1 || isProxycheckInternalNode(targetEl)) continue;
-                const matched = matchesSelector(targetEl, TARGET_SELECTOR) ? targetEl : closestElement(targetEl, TARGET_SELECTOR);
+                const matched = (targetEl.matches && targetEl.matches(TARGET_SELECTOR))
+                    ? targetEl : (targetEl.closest ? targetEl.closest(TARGET_SELECTOR) : null);
                 if (matched) { hasExternal = true; scheduleAnchor(matched); }
                 if (m.addedNodes) {
                     for (const added of m.addedNodes) {

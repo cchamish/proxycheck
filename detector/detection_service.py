@@ -1027,7 +1027,6 @@ async def _resolve_swr_refresh_flags(
     *,
     age_seconds: int,
     is_stale: bool,
-    is_batch_item: bool,
     force_should_auto_refresh: Optional[bool],
     force_refresh_in_progress: bool,
     degraded_refresh_fallback: bool,
@@ -1036,7 +1035,7 @@ async def _resolve_swr_refresh_flags(
     refresh_in_progress = bool(force_refresh_in_progress)
     if force_should_auto_refresh is not None:
         return bool(force_should_auto_refresh), refresh_in_progress
-    if is_batch_item or degraded_refresh_fallback or refresh_in_progress or not is_stale:
+    if degraded_refresh_fallback or refresh_in_progress or not is_stale:
         return False, refresh_in_progress
     if await is_ip_updating_locked(ip):
         return False, True
@@ -1054,7 +1053,7 @@ async def _rehydrate_snapshot_payload(
     layer: str,
     normalized_mode: str,
     force_rehydrate_offline: bool,
-    is_batch_item: bool = False,
+    allow_auto_refresh: bool = True,
     force_should_auto_refresh: Optional[bool] = None,
     force_refresh_in_progress: bool = False,
     degraded_refresh_fallback: bool = False,
@@ -1079,12 +1078,12 @@ async def _rehydrate_snapshot_payload(
         raw_fetched_at = snap_meta.get("fetchedAt") if isinstance(snap_meta, dict) else None
     preserved_fetched_at, age_seconds, _, is_stale = _compute_age_and_staleness(raw_fetched_at, now_dt)
 
+    effective_force_auto_refresh = False if not allow_auto_refresh else force_should_auto_refresh
     should_auto_refresh, refresh_in_progress = await _resolve_swr_refresh_flags(
         ip,
         age_seconds=age_seconds,
         is_stale=is_stale,
-        is_batch_item=is_batch_item,
-        force_should_auto_refresh=force_should_auto_refresh,
+        force_should_auto_refresh=effective_force_auto_refresh,
         force_refresh_in_progress=force_refresh_in_progress,
         degraded_refresh_fallback=degraded_refresh_fallback,
         now_dt=now_dt,
@@ -1144,8 +1143,6 @@ async def _rehydrate_snapshot_payload(
 async def _poll_for_concurrent_snapshot(
     ip: str,
     normalized_mode: str,
-    *,
-    is_batch_item: bool = False,
 ) -> Optional[Dict[str, Any]]:
     max_attempts = max(1, int(_LOCK_POLL_MAX_WAIT_SECONDS / _LOCK_POLL_INTERVAL_SECONDS))
     for _ in range(max_attempts):
@@ -1158,7 +1155,6 @@ async def _poll_for_concurrent_snapshot(
                 layer="L1",
                 normalized_mode=normalized_mode,
                 force_rehydrate_offline=False,
-                is_batch_item=is_batch_item,
             )
         if not await is_ip_updating_locked(ip):
             l1_after = await _try_read_l1_snapshot(ip, normalized_mode)
@@ -1169,7 +1165,6 @@ async def _poll_for_concurrent_snapshot(
                     layer="L1",
                     normalized_mode=normalized_mode,
                     force_rehydrate_offline=False,
-                    is_batch_item=is_batch_item,
                 )
             l2_after = await _safe_l2_aget_snapshot(ip, mode=normalized_mode)
             if l2_after is not None:
@@ -1179,7 +1174,6 @@ async def _poll_for_concurrent_snapshot(
                     layer="L2",
                     normalized_mode=normalized_mode,
                     force_rehydrate_offline=True,
-                    is_batch_item=is_batch_item,
                     backfill_l1=True,
                 )
             break
@@ -1205,7 +1199,6 @@ async def _execute_l1_l2_or_upstream(
     target_mode: str,
     *,
     skip_prefetched_snapshots: bool = False,
-    is_batch_item: bool = False,
 ) -> Dict[str, Any]:
     if not skip_prefetched_snapshots:
         l1_snap = await _try_read_l1_snapshot(target_ip, target_mode)
@@ -1216,7 +1209,6 @@ async def _execute_l1_l2_or_upstream(
                 layer="L1",
                 normalized_mode=target_mode,
                 force_rehydrate_offline=False,
-                is_batch_item=is_batch_item,
             )
 
         l2_snap = await _safe_l2_aget_snapshot(target_ip, mode=target_mode)
@@ -1227,7 +1219,6 @@ async def _execute_l1_l2_or_upstream(
                 layer="L2",
                 normalized_mode=target_mode,
                 force_rehydrate_offline=True,
-                is_batch_item=is_batch_item,
                 backfill_l1=True,
             )
 
@@ -1244,7 +1235,6 @@ async def _execute_l1_l2_or_upstream(
         polled = await _poll_for_concurrent_snapshot(
             target_ip,
             target_mode,
-            is_batch_item=is_batch_item,
         )
         if polled is not None:
             return polled
@@ -1271,16 +1261,6 @@ def _resolve_cache_layer_telemetry_event(cache_meta: Dict[str, Any]) -> Optional
     return None
 
 
-def _clone_payload_with_batch_override(base_payload: Dict[str, Any], *, is_batch_item: bool) -> Dict[str, Any]:
-    raw_meta = base_payload.get("cacheMeta")
-    if not isinstance(raw_meta, dict):
-        return dict(base_payload)
-    cloned_meta = dict(raw_meta)
-    if is_batch_item:
-        cloned_meta["shouldAutoRefresh"] = False
-    return {**base_payload, "cacheMeta": cloned_meta}
-
-
 async def detect_single_canonical_ip(
     ip: str,
     auth_mode: str,
@@ -1289,7 +1269,6 @@ async def detect_single_canonical_ip(
     compact: bool = False,
     query_mode: str = "full",
     skip_prefetched_snapshots: bool = False,
-    is_batch_item: bool = False,
 ) -> Dict[str, Any]:
     """Runs singleflight-coalesced dual-layer intelligence detection for one canonical IP address."""
     normalized_mode = normalize_query_mode(query_mode)
@@ -1328,7 +1307,6 @@ async def detect_single_canonical_ip(
                         target_ip,
                         target_mode,
                         skip_prefetched_snapshots=skip_prefetched_snapshots,
-                        is_batch_item=is_batch_item,
                     )
                 finally:
                     _release_inflight_task((target_ip, target_mode), own_task)
@@ -1352,10 +1330,9 @@ async def detect_single_canonical_ip(
             ip,
             normalized_mode,
             skip_prefetched_snapshots=skip_prefetched_snapshots,
-            is_batch_item=is_batch_item,
         )
 
-    base_payload = _clone_payload_with_batch_override(shared_payload, is_batch_item=is_batch_item)
+    base_payload = shared_payload
     cache_meta = base_payload.get("cacheMeta") or {}
     cache_status = cache_meta.get("status")
     if isinstance(cache_status, str) and cache_status in ("hit", "stale", "partial", "miss"):
@@ -1501,7 +1478,7 @@ async def refresh_single_canonical_ip(
         if in_progress_cached is not None:
             out_payload = strip_raw_json_from_payload(in_progress_cached) if compact else in_progress_cached
             return attach_request_diagnostics(out_payload, start_time), 200, {}
-        polled = await _poll_for_concurrent_snapshot(ip, normalized_mode, is_batch_item=False)
+        polled = await _poll_for_concurrent_snapshot(ip, normalized_mode)
         if polled is not None:
             out_payload = strip_raw_json_from_payload(polled) if compact else polled
             return attach_request_diagnostics(out_payload, start_time), 200, {}
@@ -1656,48 +1633,45 @@ async def detect_canonical_ip_batch(
                     layer="L1",
                     normalized_mode=normalized_mode,
                     force_rehydrate_offline=False,
-                    is_batch_item=True,
+                    allow_auto_refresh=False,
                 )
-                rehydrated["cacheMeta"]["shouldAutoRefresh"] = False
                 await quota_telemetry.record_global_request_telemetry(
                     str(rehydrated["cacheMeta"].get("status") or "hit"),
                     auth_mode,
                     cache_layer_event="l1_hit",
                 )
-                out = strip_raw_json_from_payload(rehydrated) if compact else rehydrated
-                return canonical_ip, attach_request_diagnostics(out, ip_start_time)
-
-            if canonical_ip in l2_hits:
+                payload = strip_raw_json_from_payload(rehydrated) if compact else rehydrated
+                payload = attach_request_diagnostics(payload, ip_start_time)
+            elif canonical_ip in l2_hits:
                 rehydrated = await _rehydrate_snapshot_payload(
                     canonical_ip,
                     l2_hits[canonical_ip],
                     layer="L2",
                     normalized_mode=normalized_mode,
                     force_rehydrate_offline=True,
-                    is_batch_item=True,
+                    allow_auto_refresh=False,
                     backfill_l1=True,
                 )
-                rehydrated["cacheMeta"]["shouldAutoRefresh"] = False
                 layer_event = "l2_hit_stale_swr" if rehydrated["cacheMeta"].get("isStale") else "l2_hit_fresh"
                 await quota_telemetry.record_global_request_telemetry(
                     str(rehydrated["cacheMeta"].get("status") or "hit"),
                     auth_mode,
                     cache_layer_event=layer_event,
                 )
-                out = strip_raw_json_from_payload(rehydrated) if compact else rehydrated
-                return canonical_ip, attach_request_diagnostics(out, ip_start_time)
+                payload = strip_raw_json_from_payload(rehydrated) if compact else rehydrated
+                payload = attach_request_diagnostics(payload, ip_start_time)
+            else:
+                payload = await detect_single_canonical_ip(
+                    canonical_ip,
+                    auth_mode,
+                    ip_start_time,
+                    compact=compact,
+                    query_mode=normalized_mode,
+                    skip_prefetched_snapshots=True,
+                )
 
-            payload = await detect_single_canonical_ip(
-                canonical_ip,
-                auth_mode,
-                ip_start_time,
-                compact=compact,
-                query_mode=normalized_mode,
-                skip_prefetched_snapshots=True,
-                is_batch_item=True,
-            )
             if isinstance(payload.get("cacheMeta"), dict):
-                payload["cacheMeta"]["shouldAutoRefresh"] = False
+                payload = {**payload, "cacheMeta": {**payload["cacheMeta"], "shouldAutoRefresh": False}}
             return canonical_ip, payload
 
     pairs = await asyncio.gather(*(_detect_bounded(ip) for ip in unique_canonical_ips))

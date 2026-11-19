@@ -1080,6 +1080,12 @@ body {
   border: 1px solid var(--cdx-color-destructive-border);
 }
 
+.flag-warning {
+  background-color: var(--cdx-color-warning-bg);
+  color: var(--cdx-color-warning);
+  border: 1px solid var(--cdx-color-warning-border);
+}
+
 .flag-safe {
   background-color: var(--cdx-color-success-bg);
   color: var(--cdx-color-success);

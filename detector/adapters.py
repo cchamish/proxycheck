@@ -1735,6 +1735,8 @@ def adapt_shodan_internetdb(raw_data: Optional[Dict[str, Any]], status_code: int
     if open_proxy_ports:
         port_list_text = ", ".join(str(p) for p in open_proxy_ports)
         flags.append({"label": f"Open Proxy Ports ({port_list_text})", "isHighRisk": True})
+    elif ports:
+        flags.append({"label": "Open Ports", "isHighRisk": False})
     for tag in tags:
         if tag.lower() in _SHODAN_HIGH_RISK_TAGS:
             flags.append({"label": f"Shodan Tag: {tag}", "isHighRisk": True})

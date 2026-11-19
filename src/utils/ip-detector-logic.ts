@@ -712,12 +712,25 @@ export function simplifySecurityFlags(
     return [{ label: 'No Flags', isHighRisk: false }];
   }
 
-  const highRisk = flags.filter((f) => f.isHighRisk);
-  if (highRisk.length > 0) {
-    return highRisk;
+  const visibleFlags = flags.filter((f) => f.isHighRisk || f.label === 'Open Ports');
+  if (visibleFlags.length > 0) {
+    return visibleFlags;
   }
 
   return [{ label: 'No Flags', isHighRisk: false }];
+}
+
+/**
+ * Resolves the CSS pill modifier class for a simplified security flag.
+ */
+export function getSecurityFlagClass(flag: { label: string; isHighRisk: boolean }): string {
+  if (flag.isHighRisk) {
+    return 'flag-high-risk';
+  }
+  if (flag.label === 'Open Ports') {
+    return 'flag-warning';
+  }
+  return 'flag-safe';
 }
 
 export type ProviderDisplayRow = Omit<Partial<ProviderRawResult>, 'port'> & {

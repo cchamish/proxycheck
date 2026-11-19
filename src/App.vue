@@ -491,7 +491,7 @@
                       v-for="flag in getSimplifiedFlags(row.securityFlags)"
                       :key="flag.label"
                       class="flag-pill"
-                      :class="flag.isHighRisk ? 'flag-high-risk' : 'flag-safe'"
+                      :class="getSecurityFlagClass(flag)"
                     >
                       {{ flag.label }}
                     </span>
@@ -599,6 +599,7 @@ import {
   filterComparisonResults,
   resolveRefetchButtonState,
   shouldRecommendFreshRecheck,
+  getSecurityFlagClass,
   simplifySecurityFlags,
   createDetectionCoordinator,
   resolveRepoBaseUrl,

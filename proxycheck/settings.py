@@ -12,7 +12,11 @@ from typing import Any, Mapping, Optional, Tuple
 from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
-from detector.provider_registry import DEFAULT_PROVIDER_L2_MAX_RETENTION_DAYS, PROVIDER_REGISTRY
+from detector.provider_registry import (
+    DEFAULT_PROVIDER_L2_MAX_RETENTION_DAYS,
+    PROVIDER_REGISTRY,
+    build_redis_namespace,
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -324,19 +328,30 @@ TOOLSDB_PASSWORD = os.environ.get("TOOLSDB_PASSWORD", "")
 TOOL_TOOLSDB_PASSWORD = os.environ.get("TOOL_TOOLSDB_PASSWORD", "")
 
 
-def _build_default_cache_config(redis_url: str, key_prefix: str, *, is_test_run: bool) -> dict:
+def _build_default_cache_config(
+    redis_url: str,
+    key_prefix: str,
+    *,
+    is_test_run: bool,
+    key_secret: str = "",
+) -> dict:
+    effective_secret = str(key_secret or "").strip() or str(SECRET_KEY or "")
+    isolated_prefix = build_redis_namespace(key_prefix, effective_secret)
     if is_test_run:
         return {
             "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
             "LOCATION": "proxycheck-test-cache",
             "TIMEOUT": 86400,
-            "KEY_PREFIX": key_prefix,
+            "KEY_PREFIX": isolated_prefix,
         }
     return {
         "BACKEND": "django.core.cache.backends.redis.RedisCache",
         "LOCATION": redis_url,
         "TIMEOUT": 86400,
-        "KEY_PREFIX": key_prefix,
+        "KEY_PREFIX": isolated_prefix,
+        "OPTIONS": {
+            "serializer": "detector.provider_registry.JsonRedisSerializer",
+        },
     }
 
 
@@ -345,6 +360,7 @@ CACHES = {
         REDIS_URL,
         REDIS_KEY_PREFIX,
         is_test_run=_IS_TEST_RUN,
+        key_secret=REDIS_KEY_SECRET or SECRET_KEY,
     )
 }
 
@@ -421,7 +437,7 @@ WIKIMEDIA_CLIENT_SECRET = os.environ.get("WIKIMEDIA_CLIENT_SECRET", "").strip()
 WIKIMEDIA_REDIRECT_URI = os.environ.get(
     "WIKIMEDIA_REDIRECT_URI", "https://proxycheck.toolforge.org/oauth/callback"
 ).strip()
-GADGET_TOKEN_TTL_SECONDS = _parse_positive_int_env("GADGET_TOKEN_TTL_SECONDS", 3600)
+GADGET_TOKEN_TTL_SECONDS = _parse_positive_int_env("GADGET_TOKEN_TTL_SECONDS", 900)
 ALLOWED_WIKI_USERS = os.environ.get("ALLOWED_WIKI_USERS", "")
 
 PROVIDER_STATIC_CACHE_TTL_SECONDS = _parse_positive_int_env("PROVIDER_STATIC_CACHE_TTL_SECONDS", 86400)
@@ -629,3 +645,20 @@ OFFLINE_DB_RULES_STALE_SECONDS = _parse_positive_int_env("OFFLINE_DB_RULES_STALE
 HOSTING_ASN_RULES_PATH = _resolve_optional_data_path("HOSTING_ASN_RULES_PATH", "hosting_asn_rules.json")
 HOSTING_ASNS = _parse_csv_env("HOSTING_ASNS")
 HOSTING_ORG_KEYWORDS = _parse_csv_env("HOSTING_ORG_KEYWORDS")
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+        },
+    },
+    "loggers": {
+        "detector.views": {
+            "handlers": ["console"],
+            "level": "INFO",
+            "propagate": False,
+        },
+    },
+}

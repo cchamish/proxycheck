@@ -10,6 +10,7 @@ from typing import Optional, Tuple
 
 from django.conf import settings
 from django.http import HttpResponse, HttpResponseNotFound
+from django.middleware.csrf import get_token
 from django.urls import include, path, re_path
 
 from detector import views as detector_views
@@ -46,8 +47,9 @@ def _read_asset_bytes(assets_root: Path, rel_path: str) -> Optional[Tuple[bytes,
     return target.read_bytes(), content_type or "application/octet-stream"
 
 
-async def spa_index(_request):
+async def spa_index(request):
     """Serves the compiled index page for client-side SPA routes outside API, OAuth, and static asset paths."""
+    get_token(request)
     index_path = Path(settings.BASE_DIR) / "dist" / "index.html"
     html_content = await asyncio.to_thread(_read_text_if_exists, index_path)
     if html_content is not None:

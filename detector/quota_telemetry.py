@@ -12,6 +12,8 @@ import json
 import logging
 import os
 import re
+import secrets
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
@@ -254,11 +256,55 @@ def _global_telemetry_key(now_dt: datetime) -> str:
     return f"{get_redis_namespace()}:telemetry:global:day:{now_dt.strftime('%Y%m%d')}"
 
 
-def hash_username_for_rate_limit(username: str) -> str:
+_DAILY_RL_SALT_CACHE: Dict[str, Tuple[Any, str]] = {}
+
+_ENDPOINT_RATE_LIMIT_SPECS: Dict[str, Tuple[int, int, Optional[str], str]] = {
+    "detect": (120, 600, "DETECT_USER_RPM_LIMIT", "DETECT_GLOBAL_RPM_LIMIT"),
+    "detect_batch": (20, 100, "DETECT_BATCH_USER_RPM_LIMIT", "DETECT_BATCH_GLOBAL_RPM_LIMIT"),
+    "gadget_token": (0, 60, None, "GADGET_TOKEN_GLOBAL_RPM_LIMIT"),
+}
+
+
+def hash_username_for_rate_limit(username: str, *, salt: Optional[str] = None) -> str:
     """Computes an anonymised HMAC-SHA256 digest for per-user rate-limit keys without storing usernames."""
-    secret = str(getattr(settings, "SECRET_KEY", "") or "proxycheck-default-secret")
+    secret = str(salt if salt is not None else getattr(settings, "SECRET_KEY", "") or "proxycheck-default-secret")
     normalized = " ".join(str(username or "").strip().replace("_", " ").split())
     return hmac.new(secret.encode("utf-8"), normalized.encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+
+
+async def _get_daily_rate_limit_salt(client: Any, current_dt: datetime) -> str:
+    """Fetches or lazily creates a volatile daily random salt in Redis without persisting usernames."""
+    salt_key = f"{get_redis_namespace()}:rl_salt:day:{current_dt.strftime('%Y%m%d')}"
+    cached = _DAILY_RL_SALT_CACHE.get(salt_key)
+    if cached is not None:
+        cached_ref, cached_salt = cached
+        if cached_ref is not None and cached_ref() is client:
+            return cached_salt
+
+    candidate = secrets.token_hex(16)
+    set_fn = getattr(client, "set", None)
+    if callable(set_fn):
+        put_call = set_fn(salt_key, candidate, ex=DAILY_QUOTA_TTL_SECONDS, nx=True)
+        if inspect.isawaitable(put_call):
+            await put_call
+
+    resolved = candidate
+    get_fn = getattr(client, "get", None)
+    if callable(get_fn):
+        raw_call = get_fn(salt_key)
+        raw_val = await raw_call if inspect.isawaitable(raw_call) else raw_call
+        decoded = _decode_redis_str(raw_val)
+        if isinstance(decoded, str) and decoded.strip():
+            resolved = decoded.strip()
+
+    try:
+        client_ref = weakref.ref(client)
+    except TypeError:
+        client_ref = None
+    if len(_DAILY_RL_SALT_CACHE) >= 8:
+        _DAILY_RL_SALT_CACHE.pop(next(iter(_DAILY_RL_SALT_CACHE)))
+    _DAILY_RL_SALT_CACHE[salt_key] = (client_ref, resolved)
+    return resolved
 
 
 def _refresh_user_minute_key(user_digest: str, now_dt: datetime) -> str:
@@ -931,6 +977,8 @@ async def _consume_single_refresh_window(
     retry_after_seconds: int,
     incremented_keys: List[Tuple[str, int]],
     current_dt: datetime,
+    *,
+    telemetry_event: Optional[str] = "refresh_rate_limited",
 ) -> Optional[RefreshRateLimitResult]:
     if limit <= 0:
         return None
@@ -942,7 +990,8 @@ async def _consume_single_refresh_window(
         return None
     for rk, rttl in incremented_keys:
         await _atomic_decr_clamped(client, rk, rttl)
-    await record_cache_telemetry_event("refresh_rate_limited", now_dt=current_dt)
+    if telemetry_event:
+        await record_cache_telemetry_event(telemetry_event, now_dt=current_dt)
     return RefreshRateLimitResult(
         allowed=False,
         reason=reason,
@@ -960,7 +1009,7 @@ async def check_and_consume_refresh_rate_limit(
 ) -> RefreshRateLimitResult:
     """
     Enforces anonymised per-user (6 per minute, 60 per hour) and global (30 per minute)
-    refresh rate limits, exempting allowlisted administrators from per-user caps.
+    refresh rate limits, exempting allowlisted admin sessions via the explicit is_admin flag.
     """
     client = _get_redis_client()
     if client is None:
@@ -969,39 +1018,44 @@ async def check_and_consume_refresh_rate_limit(
     current_dt = now_dt or datetime.now(timezone.utc)
     user_rpm_limit, user_rph_limit, global_rpm_limit = _resolve_refresh_limits()
     cleaned_user = str(username or "").strip()
-    exempt_user = bool(is_admin) or (
-        bool(cleaned_user) and not cleaned_user.startswith("~") and is_allowlisted_wiki_user(cleaned_user)
-    )
+    exempt_user = bool(is_admin)
     min_retry = max(1, 60 - current_dt.second)
     hr_retry = max(60, 3600 - (current_dt.minute * 60 + current_dt.second))
 
-    windows: List[Tuple[str, int, int, str, int]] = []
-    if not exempt_user and cleaned_user:
-        user_digest = hash_username_for_rate_limit(cleaned_user)
+    incremented_keys: List[Tuple[str, int]] = []
+    try:
+        windows: List[Tuple[str, int, int, str, int]] = []
+        if not exempt_user and cleaned_user:
+            daily_salt = await _get_daily_rate_limit_salt(client, current_dt)
+            user_digest = hash_username_for_rate_limit(cleaned_user, salt=daily_salt)
+            windows.append(
+                (
+                    _refresh_user_minute_key(user_digest, current_dt),
+                    MINUTE_QUOTA_TTL_SECONDS,
+                    user_rpm_limit,
+                    "user_rpm",
+                    min_retry,
+                )
+            )
+            windows.append(
+                (
+                    _refresh_user_hour_key(user_digest, current_dt),
+                    HOURLY_QUOTA_TTL_SECONDS,
+                    user_rph_limit,
+                    "user_rph",
+                    hr_retry,
+                )
+            )
         windows.append(
             (
-                _refresh_user_minute_key(user_digest, current_dt),
+                _refresh_global_minute_key(current_dt),
                 MINUTE_QUOTA_TTL_SECONDS,
-                user_rpm_limit,
-                "user_rpm",
+                global_rpm_limit,
+                "global_rpm",
                 min_retry,
             )
         )
-        windows.append(
-            (
-                _refresh_user_hour_key(user_digest, current_dt),
-                HOURLY_QUOTA_TTL_SECONDS,
-                user_rph_limit,
-                "user_rph",
-                hr_retry,
-            )
-        )
-    windows.append(
-        (_refresh_global_minute_key(current_dt), MINUTE_QUOTA_TTL_SECONDS, global_rpm_limit, "global_rpm", min_retry)
-    )
 
-    incremented_keys: List[Tuple[str, int]] = []
-    try:
         for key, ttl_s, limit, reason, retry_s in windows:
             blocked = await _consume_single_refresh_window(
                 client, key, ttl_s, limit, reason, retry_s, incremented_keys, current_dt
@@ -1011,6 +1065,84 @@ async def check_and_consume_refresh_rate_limit(
     except REDIS_TRANSPORT_ERRORS as exc:
         mark_redis_failure(exc)
         logger.warning(f"Refresh rate-limit check bypassed due to Redis error ({type(exc).__name__})")
+        return RefreshRateLimitResult(allowed=True)
+
+    return RefreshRateLimitResult(allowed=True)
+
+
+async def check_and_consume_endpoint_rate_limit(
+    endpoint: str,
+    username: Optional[str] = None,
+    *,
+    now_dt: Optional[datetime] = None,
+) -> RefreshRateLimitResult:
+    """Enforces short-lived volatile Redis per-minute limits for detect, batch, and gadget-token endpoints."""
+    spec = _ENDPOINT_RATE_LIMIT_SPECS.get(endpoint)
+    if spec is None:
+        return RefreshRateLimitResult(allowed=True)
+    client = _get_redis_client()
+    if client is None:
+        return RefreshRateLimitResult(allowed=True)
+
+    default_user_rpm, default_global_rpm, user_setting, global_setting = spec
+    user_rpm = default_user_rpm
+    if user_setting:
+        override_user = _parse_non_negative_int(getattr(settings, user_setting, None))
+        if override_user is not None:
+            user_rpm = override_user
+    global_rpm = default_global_rpm
+    override_global = _parse_non_negative_int(getattr(settings, global_setting, None))
+    if override_global is not None:
+        global_rpm = override_global
+
+    current_dt = now_dt or datetime.now(timezone.utc)
+    min_retry = max(1, 60 - current_dt.second)
+    minute_bucket = current_dt.strftime("%Y%m%d%H%M")
+    ns = get_redis_namespace()
+    cleaned_user = str(username or "").strip()
+
+    incremented_keys: List[Tuple[str, int]] = []
+    try:
+        windows: List[Tuple[str, int, int, str, int]] = []
+        if user_rpm > 0 and cleaned_user:
+            daily_salt = await _get_daily_rate_limit_salt(client, current_dt)
+            user_digest = hash_username_for_rate_limit(cleaned_user, salt=daily_salt)
+            windows.append(
+                (
+                    f"{ns}:rl:{endpoint}:user:{user_digest}:min:{minute_bucket}",
+                    MINUTE_QUOTA_TTL_SECONDS,
+                    user_rpm,
+                    f"{endpoint}_user_rpm",
+                    min_retry,
+                )
+            )
+        if global_rpm > 0:
+            windows.append(
+                (
+                    f"{ns}:rl:{endpoint}:global:min:{minute_bucket}",
+                    MINUTE_QUOTA_TTL_SECONDS,
+                    global_rpm,
+                    f"{endpoint}_global_rpm",
+                    min_retry,
+                )
+            )
+        for key, ttl_s, limit, reason, retry_s in windows:
+            blocked = await _consume_single_refresh_window(
+                client,
+                key,
+                ttl_s,
+                limit,
+                reason,
+                retry_s,
+                incremented_keys,
+                current_dt,
+                telemetry_event=None,
+            )
+            if blocked is not None:
+                return blocked
+    except REDIS_TRANSPORT_ERRORS as exc:
+        mark_redis_failure(exc)
+        logger.warning(f"Endpoint rate-limit check bypassed due to Redis error ({type(exc).__name__})")
         return RefreshRateLimitResult(allowed=True)
 
     return RefreshRateLimitResult(allowed=True)

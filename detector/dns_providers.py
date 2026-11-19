@@ -502,7 +502,7 @@ async def _query_dnsbl_zone(
         return {"status": "clean", "query": qname, "reversedIp": reversed_ip, "codes": []}, 200
     except (dns.exception.Timeout, dns.resolver.LifetimeTimeout, asyncio.TimeoutError, TimeoutError) as exc:
         safe_message = sanitize_error_message(str(exc) or "DNS timeout")
-        logger.warning(f"{provider_label} DNS query timed out for {qname}: {safe_message}")
+        logger.warning(f"{provider_label} DNS query timed out: {safe_message}")
         record_upstream_event(
             provider_key,
             trigger_cooldown=True,
@@ -514,7 +514,7 @@ async def _query_dnsbl_zone(
         return {"status": "timeout", "query": qname, "reversedIp": reversed_ip, "codes": [], "error": safe_message}, 504
     except (dns.resolver.NoNameservers, dns.exception.DNSException, OSError) as exc:
         safe_message = sanitize_error_message(str(exc) or "DNS resolution failed")
-        logger.warning(f"{provider_label} DNS query failed for {qname}: {safe_message}")
+        logger.warning(f"{provider_label} DNS query failed: {safe_message}")
         record_upstream_event(
             provider_key,
             trigger_cooldown=True,

@@ -1590,7 +1590,7 @@ export interface DetectionCoordinatorOptions {
   onDetectionSuccess?: (canonicalIp: string, data: any) => void;
 }
 
-function readCsrfTokenFromDocumentCookie(): string {
+export function readCsrfTokenFromDocumentCookie(): string {
   if (typeof document === 'undefined' || typeof document.cookie !== 'string' || !document.cookie) {
     return '';
   }

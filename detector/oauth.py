@@ -25,10 +25,17 @@ WIKIMEDIA_BETA_SUFFIXES = (
     r"wikisource|wikiversity|wikivoyage|wikidata|mediawiki|wikifunctions"
 )
 WIKIMEDIA_HOST_SUFFIXES = rf"{WIKIMEDIA_BETA_SUFFIXES}|wikimediafoundation"
-WIKIMEDIA_HOST_RE = re.compile(
-    rf"^(?:[a-z0-9-]+\.)*(?:{WIKIMEDIA_HOST_SUFFIXES})\.org$"
-    rf"|^(?:[a-z0-9-]+\.)*(?:{WIKIMEDIA_BETA_SUFFIXES})\.beta\.wm(?:cloud|flabs)\.org$"
-)
+WIKIMEDIA_HOST_RE = re.compile(rf"^(?:[a-z0-9-]+\.)*(?:{WIKIMEDIA_HOST_SUFFIXES})\.org$")
+WIKIMEDIA_BETA_HOST_RE = re.compile(rf"^(?:[a-z0-9-]+\.)*(?:{WIKIMEDIA_BETA_SUFFIXES})\.beta\.wm(?:cloud|flabs)\.org$")
+
+
+def is_wikimedia_beta_origins_allowed() -> bool:
+    """Returns True only when Wikimedia Beta Cluster origins and domains are explicitly enabled."""
+    configured = getattr(settings, "ALLOW_WIKIMEDIA_BETA_ORIGINS", None)
+    if isinstance(configured, bool):
+        return configured
+    return os.environ.get("ALLOW_WIKIMEDIA_BETA_ORIGINS", "").strip() == "1"
+
 
 REQUIRED_WIKIMEDIA_RIGHTS: Tuple[str, ...] = (
     "checkuser-temporary-account-no-preference",
@@ -68,7 +75,10 @@ def normalize_and_validate_wikimedia_domain(raw_domain: Any) -> Optional[str]:
     candidate = raw_domain.strip().lower()
     if not candidate or len(candidate) > 253:
         return None
-    if not WIKIMEDIA_HOST_RE.match(candidate):
+    if not (
+        WIKIMEDIA_HOST_RE.match(candidate)
+        or (is_wikimedia_beta_origins_allowed() and WIKIMEDIA_BETA_HOST_RE.match(candidate))
+    ):
         return None
     for label in candidate.split("."):
         if not label or len(label) > 63 or label.startswith("-") or label.endswith("-"):
@@ -363,8 +373,8 @@ async def fetch_user_rights_from_meta(
     Raises MetaWikiRightsFetchError when the upstream request fails or returns a non-200
     or malformed payload, distinguishing transient API failures from normal users without rights.
     """
-    validated_domain = normalize_and_validate_wikimedia_domain(wiki_domain)
-    api_url = f"https://{validated_domain}/w/api.php" if validated_domain else MEDIAWIKI_API_URL
+    # Always query canonical Meta-Wiki so caller-supplied domains cannot redirect global identity checks.
+    api_url = MEDIAWIKI_API_URL
     params = {
         "action": "query",
         "meta": "globaluserinfo",

@@ -1,18 +1,8 @@
-"""Shared test doubles, mock builders, and fixtures for the detector test suite."""
+"""Shared test doubles and provider mock helpers for the detector P0 test suite."""
 
 import contextlib
-import socket
-import threading
-import time
-from types import SimpleNamespace
 from typing import Any, Callable, Dict, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
-
-import dns.exception
-import dns.name
-import dns.resolver
-import dns.reversename
-import uvicorn
 
 from detector.adapters import (
     adapt_abuseipdb,
@@ -45,8 +35,6 @@ TEST_UPSTREAM_SECRETS = {
     "IPHUB_API_KEY": "iphub-key-81fa",
     "IPHUNTER_API_KEY": "iphunter-key-6e09",
 }
-
-EMPTY_UPSTREAM_SECRETS = {name: "" for name in TEST_UPSTREAM_SECRETS}
 
 MAXMIND_STUB = {
     "provider": "MaxMind",
@@ -81,33 +69,6 @@ ALL_ADAPTERS = (
 )
 
 
-HTTP_PROVIDERS = tuple(
-    name
-    for name, _ in ALL_ADAPTERS
-    if name not in ("MaxMind", "Tor Onionoo", "StopForumSpam", "IPsum / DROP", "X4BNet VPN")
-)
-
-
-def _mock_ptr_answer(*hostnames):
-    return [SimpleNamespace(target=dns.name.from_text(host)) for host in hostnames]
-
-
-def _mock_a_answer(*ipv4_codes):
-    return [SimpleNamespace(address=code) for code in ipv4_codes]
-
-
-def _ptr_or_clean_dns_side_effect(ptr_hostname=None, ptr_timeout=False):
-    async def _impl(_self_or_qname, rdtype="A", *_args, **_kwargs):
-        if str(rdtype).upper() == "PTR":
-            if ptr_timeout:
-                raise dns.exception.Timeout("DNS timed out")
-            if ptr_hostname:
-                return _mock_ptr_answer(ptr_hostname)
-        raise dns.resolver.NXDOMAIN()
-
-    return _impl
-
-
 def _mock_response(status_code=200, json_value=None, json_error=None, text=""):
     resp = MagicMock()
     resp.status_code = status_code
@@ -130,46 +91,6 @@ def _login_authorised(test_case):
         "globalGroups": [],
     }
     session.save()
-
-
-def _patch_async_client(mock_async_client_cls, get_side_effect):
-    mock_client = AsyncMock()
-    mock_client.get.side_effect = get_side_effect
-    mock_client.__aenter__.return_value = mock_client
-    mock_async_client_cls.return_value = mock_client
-    return mock_client
-
-
-@contextlib.contextmanager
-def _run_uvicorn_smoke_server(asgi_app):
-    """Starts an ephemeral local Uvicorn server and guarantees shutdown on exit."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    finally:
-        sock.close()
-
-    config = uvicorn.Config(
-        asgi_app,
-        host="127.0.0.1",
-        port=port,
-        log_level="error",
-        access_log=False,
-    )
-    server = uvicorn.Server(config)
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
-    try:
-        deadline = time.monotonic() + 5.0
-        while not server.started:
-            if not thread.is_alive() or time.monotonic() >= deadline:
-                raise RuntimeError("Uvicorn test server failed to become ready within timeout.")
-            time.sleep(0.02)
-        yield f"http://127.0.0.1:{port}"
-    finally:
-        server.should_exit = True
-        thread.join(timeout=5.0)
 
 
 class _FakeRedisPipeline:
@@ -217,9 +138,7 @@ class _FakeRedisPipeline:
         return self._queue("hgetall", *args, **kwargs)
 
     async def execute(self):
-        results = []
-        for name, args, kwargs in self._ops:
-            results.append(await getattr(self._store, name)(*args, **kwargs))
+        results = [await getattr(self._store, name)(*args, **kwargs) for name, args, kwargs in self._ops]
         self._ops.clear()
         return results
 
@@ -257,14 +176,12 @@ class FakeAsyncRedis:
         return self.ttls.get(key, -1)
 
     async def incr(self, key, amount=1):
-        current = int(self.strings.get(key, "0"))
-        updated = current + int(amount)
+        updated = int(self.strings.get(key, "0")) + int(amount)
         self.strings[key] = str(updated)
         return updated
 
     async def decr(self, key, amount=1):
-        current = int(self.strings.get(key, "0"))
-        updated = current - int(amount)
+        updated = int(self.strings.get(key, "0")) - int(amount)
         self.strings[key] = str(updated)
         return updated
 
@@ -282,10 +199,7 @@ class FakeAsyncRedis:
 
     async def hset(self, key, mapping=None, **kwargs):
         bucket = self.hashes.setdefault(key, {})
-        merged = {}
-        if mapping:
-            merged.update(mapping)
-        merged.update(kwargs)
+        merged = {**(mapping or {}), **kwargs}
         for field, val in merged.items():
             bucket[str(field)] = str(val)
         return len(merged)
@@ -298,7 +212,7 @@ class FakeAsyncRedis:
 
 
 class _BatchingFakeRedis(FakeAsyncRedis):
-    """In-memory Redis double that records single reads, batch reads and pipeline flushes."""
+    """In-memory Redis double that records single reads, batch reads, and pipeline flushes."""
 
     def __init__(self):
         super().__init__()
@@ -317,106 +231,6 @@ class _BatchingFakeRedis(FakeAsyncRedis):
     def pipeline(self, transaction=True):
         self.pipeline_calls.append(transaction)
         return super().pipeline(transaction=transaction)
-
-
-def build_provider_http_response(url, ip="8.8.8.8"):
-    static_payloads = (
-        (
-            "cloudflare.com",
-            {"success": True, "result": {"ip": {"asn": "15169", "asnName": "Google LLC", "asnLocation": "US"}}},
-            None,
-        ),
-        (
-            "abuseipdb.com",
-            {"data": {"isp": "Google LLC", "countryCode": "US", "usageType": "Data Center", "abuseConfidenceScore": 0}},
-            {"X-RateLimit-Remaining": "982", "X-RateLimit-Limit": "1000"},
-        ),
-        (
-            "ipdata.co",
-            {
-                "asn": {"asn": "AS15169", "name": "Google LLC"},
-                "country_name": "United States",
-                "country_code": "US",
-                "threat": {},
-                "count": "142",
-            },
-            None,
-        ),
-        (
-            "ipregistry.co",
-            {
-                "company": {"name": "Google LLC"},
-                "connection": {"asn": 15169, "type": "isp"},
-                "location": {"country": {"name": "United States", "code": "US"}},
-                "security": {},
-            },
-            {"RateLimit-Remaining": "4950"},
-        ),
-        (
-            "ip2location.io",
-            {
-                "asn": "15169",
-                "as": "Google LLC",
-                "country_name": "United States",
-                "country_code": "US",
-                "usage_type": "DCH",
-                "is_proxy": False,
-            },
-            None,
-        ),
-        ("getipintel.net", {"status": "success", "result": "0.02"}, None),
-        (
-            "proxycheck.io",
-            {
-                "status": "ok",
-                ip: {
-                    "asn": "AS15169",
-                    "provider": "Google LLC",
-                    "country": "United States",
-                    "isocode": "US",
-                    "proxy": "no",
-                },
-            },
-            None,
-        ),
-        (
-            "iphub.info",
-            {"asn": 15169, "isp": "Google LLC", "countryName": "United States", "countryCode": "US", "block": 0},
-            None,
-        ),
-        (
-            "iphunter.info",
-            {
-                "status": "success",
-                "data": {"isp": "Google LLC", "country_name": "United States", "country_code": "US", "block": 0},
-            },
-            None,
-        ),
-        ("onionoo.torproject.org", {"relays": []}, None),
-        ("stopforumspam.org", {"success": 1, "ip": {"appears": 0, "frequency": 0, "confidence": 0.0}}, None),
-        (
-            "sans.edu",
-            {"ip": {"count": 0, "attacks": 0, "as": "15169", "asname": "Google LLC", "ascountry": "US"}},
-            None,
-        ),
-        ("dshield", {"ip": {"count": 0, "attacks": 0, "as": "15169", "asname": "Google LLC", "ascountry": "US"}}, None),
-        ("internetdb.shodan.io", {"ip": ip, "ports": [], "tags": [], "hostnames": []}, None),
-    )
-    for fragment, payload, headers in static_payloads:
-        if fragment in url:
-            resp = _mock_response(status_code=200, json_value=payload)
-            if headers is not None:
-                resp.headers = headers
-            return resp
-    return _mock_response(status_code=404, json_value={})
-
-
-def clean_dns_side_effect(qname, rdtype):
-    if rdtype == "PTR":
-        answer = MagicMock()
-        answer.__str__ = lambda self: "dns.google."
-        return [answer]
-    raise dns.resolver.NXDOMAIN()
 
 
 _DNS_PROVIDER_KEYS = frozenset({"maxmind", "spamhaus_zen", "spamcop", "stopforumspam", "ipsum_drop", "x4bnet_vpn"})

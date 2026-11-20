@@ -33,11 +33,15 @@ from proxycheck.settings import (
     MAXMIND_COUNTRY_DB_FILENAME,
     expand_configured_path,
     find_mmdb_in_directory,
-    resolve_data_file,
     resolve_mmdb_file,
     resolve_tool_data_subdir,
     standard_data_directories,
 )
+
+try:
+    import maxminddb
+except ImportError:
+    maxminddb = None
 
 logger = logging.getLogger(__name__)
 
@@ -62,26 +66,97 @@ SFS_LISTED_1_FILENAMES = (
 )
 SFS_SQLITE_FILENAME = "stopforumspam.sqlite3"
 
-CLOUD_CIDRS_FILENAME = "cloud_cidrs.json"
-CLOUD_CIDR_FILENAMES = (CLOUD_CIDRS_FILENAME, "computehosts.json")
 HOSTING_RULES_FILENAME = "hosting_asn_rules.json"
 
+SHARED_CIDRS_BIN_FILENAME = "shared_cidrs.bin"
 PRIVACY_RELAYS_BIN_FILENAME = "privacy_relays.bin"
 IPSUM_DROP_BIN_FILENAME = "ipsum_drop.bin"
 TOR_ONIONOO_SUMMARY_FILENAME = "tor_onionoo_summary.json"
 BGP_TOOLS_BIN_FILENAME = "bgp_tools.bin"
 BGP_TAGS_JSON_FILENAME = "bgp_tags.json"
-X4BNET_VPN_BIN_FILENAME = "x4bnet_vpn.bin"
+OPENASN_MMDB_FILENAME = "openasn.mmdb"
 MOBILE_ASNS_JSON_FILENAME = "mobile_asns.json"
 HTTP_FEED_METADATA_FILENAME = "http_feed_metadata.json"
-
-X4BNET_MASK_VPN = 1
-X4BNET_MASK_DATACENTER = 2
-X4BNET_MASK_HOSTING = 4
 
 MOBILE_BGP_TAG_TOKENS: FrozenSet[str] = frozenset(
     {"mobile", "cellular", "cell", "lte", "5g", "wireless_mobile", "cgnat"}
 )
+
+REZMOSS_EXCLUDED_PROVIDERS: FrozenSet[str] = frozenset({"apple_private_relay", "tor"})
+
+REZMOSS_PROVIDER_CATALOG: Dict[str, Tuple[str, str]] = {
+    # cloud (24)
+    "aws": ("AWS", "cloud"),
+    "azure": ("Azure", "cloud"),
+    "googlecloud": ("Google Cloud", "cloud"),
+    "oracle": ("Oracle Cloud", "cloud"),
+    "digitalocean": ("DigitalOcean", "cloud"),
+    "linode": ("Linode", "cloud"),
+    "vultr": ("Vultr", "cloud"),
+    "alibaba": ("Alibaba Cloud", "cloud"),
+    "tencent": ("Tencent Cloud", "cloud"),
+    "huawei": ("Huawei Cloud", "cloud"),
+    "ibmcloud": ("IBM Cloud", "cloud"),
+    "hetzner": ("Hetzner", "cloud"),
+    "ovhcloud": ("OVHcloud", "cloud"),
+    "scaleway": ("Scaleway", "cloud"),
+    "leaseweb": ("Leaseweb", "cloud"),
+    "rackspace": ("Rackspace", "cloud"),
+    "contabo": ("Contabo", "cloud"),
+    "upcloud": ("UpCloud", "cloud"),
+    "play2go": ("Play2Go", "cloud"),
+    "nhncloud": ("NHN Cloud", "cloud"),
+    "hostway": ("Hostway", "cloud"),
+    "gabia": ("Gabia", "cloud"),
+    "wasabi": ("Wasabi", "cloud"),
+    "backblaze": ("Backblaze", "cloud"),
+    # vpn (1)
+    "mullvad": ("Mullvad", "vpn"),
+    # enterprise_gateway (1)
+    "zscaler": ("Zscaler", "enterprise_gateway"),
+    # cdn (11)
+    "cloudflare": ("Cloudflare", "cdn"),
+    "fastly": ("Fastly", "cdn"),
+    "akamai": ("Akamai", "cdn"),
+    "imperva": ("Imperva", "cdn"),
+    "gcore": ("G-Core", "cdn"),
+    "cachefly": ("CacheFly", "cdn"),
+    "gocache": ("GoCache", "cdn"),
+    "quiccloud": ("QUIC.cloud", "cdn"),
+    "bunny": ("Bunny CDN", "cdn"),
+    "sucuri": ("Sucuri", "cdn"),
+    "stormwall": ("StormWall", "cdn"),
+    # saas (19)
+    "github": ("GitHub", "saas"),
+    "googleservices": ("Google Services", "saas"),
+    "microsoft365": ("Microsoft 365", "saas"),
+    "zoom": ("Zoom", "saas"),
+    "atlassian": ("Atlassian", "saas"),
+    "salesforce": ("Salesforce", "saas"),
+    "zoho": ("Zoho", "saas"),
+    "meta": ("Meta", "saas"),
+    "yandex": ("Yandex", "saas"),
+    "baidu": ("Baidu", "saas"),
+    "telegram": ("Telegram", "saas"),
+    "discord": ("Discord", "saas"),
+    "circleci": ("CircleCI", "saas"),
+    "teamcity": ("TeamCity", "saas"),
+    "datadog": ("Datadog", "saas"),
+    "uptimerobot": ("UptimeRobot", "saas"),
+    "statuscake": ("StatusCake", "saas"),
+    "pingdom": ("Pingdom", "saas"),
+    "internetarchive": ("Internet Archive", "saas"),
+    # bot (9)
+    "googlebot": ("GoogleBot", "bot"),
+    "bingbot": ("BingBot", "bot"),
+    "gptbot": ("GPTBot", "bot"),
+    "claudebot": ("ClaudeBot", "bot"),
+    "applebot": ("AppleBot", "bot"),
+    "perplexitybot": ("PerplexityBot", "bot"),
+    "duckduckbot": ("DuckDuckBot", "bot"),
+    "amazonbot": ("Amazonbot", "bot"),
+    "commoncrawl": ("Common Crawl", "bot"),
+}
 
 MAXMIND_EDITION_SPECS: Tuple[Tuple[str, str], ...] = (
     ("GeoLite2-Country", MAXMIND_COUNTRY_DB_FILENAME),
@@ -97,7 +172,8 @@ DEFAULT_STALE_MAXMIND_SECONDS = 14 * 86400
 DEFAULT_STALE_SFS_TOXIC_SECONDS = 7 * 86400
 DEFAULT_STALE_SFS_90_SECONDS = 2 * 86400
 DEFAULT_STALE_SFS_1_SECONDS = 6 * 3600
-DEFAULT_STALE_CLOUD_CIDRS_SECONDS = 7 * 86400
+DEFAULT_STALE_SHARED_CIDRS_SECONDS = 7 * 86400
+DEFAULT_STALE_OPENASN_SECONDS = 14 * 86400
 DEFAULT_STALE_TOR_ONIONOO_SECONDS = 6 * 3600
 DEFAULT_STALE_DAILY_FEED_SECONDS = 7 * 86400
 DEFAULT_STALE_RULES_SECONDS = 90 * 86400
@@ -749,10 +825,10 @@ _sfs_thread_connections: Dict[Tuple[int, str], sqlite3.Connection] = {}
 _sfs_warm_lock = threading.Lock()
 _sfs_cache_warmed = False
 
+_shared_cidrs_index = _BinaryIndexCache(SHARED_CIDRS_BIN_FILENAME, "SHARED_CIDRS_BIN_PATH")
 _privacy_relays_index = _BinaryIndexCache(PRIVACY_RELAYS_BIN_FILENAME, "PRIVACY_RELAYS_BIN_PATH")
 _ipsum_drop_index = _BinaryIndexCache(IPSUM_DROP_BIN_FILENAME, "IPSUM_DROP_BIN_PATH")
 _bgp_tools_index = _BinaryIndexCache(BGP_TOOLS_BIN_FILENAME, "BGP_TOOLS_BIN_PATH")
-_x4bnet_vpn_index = _BinaryIndexCache(X4BNET_VPN_BIN_FILENAME, "X4BNET_VPN_BIN_PATH")
 
 _tor_onionoo_cache: FileStatCache[Tuple[str, int, int], Dict[str, List[Dict[str, Any]]]] = FileStatCache()
 _bgp_tags_cache: FileStatCache[Tuple[str, int, int], Tuple[Dict[int, Tuple[str, ...]], FrozenSet[int]]] = (
@@ -1163,16 +1239,53 @@ def clear_stopforumspam_caches() -> None:
     _toxic_cidr_cache.clear()
     _sfs_local_sqlite_cache = (None, None)
     _close_sfs_connections()
+    _shared_cidrs_index.clear()
     _privacy_relays_index.clear()
     _ipsum_drop_index.clear()
     _bgp_tools_index.clear()
-    _x4bnet_vpn_index.clear()
     _tor_onionoo_cache.clear()
     _bgp_tags_cache.clear()
     _mobile_asns_cache.clear()
     clear_stat_throttle_cache()
     with _sfs_warm_lock:
         _sfs_cache_warmed = False
+
+
+def classify_rezmoss_provider(slug: str) -> Optional[Tuple[str, str]]:
+    """Maps a Rezmoss provider slug to (display_label, category), or None when excluded."""
+    cleaned = slug.strip().lower() if isinstance(slug, str) else ""
+    if not cleaned or cleaned in REZMOSS_EXCLUDED_PROVIDERS:
+        return None
+    known = REZMOSS_PROVIDER_CATALOG.get(cleaned)
+    if known is not None:
+        return known
+    category = "bot" if cleaned.endswith("bot") else "cloud"
+    return cleaned.replace("_", " ").title(), category
+
+
+def lookup_shared_cidr_offline(ip: str) -> Optional[Dict[str, Any]]:
+    """Looks up an IP in the compiled Rezmoss shared-egress binary prefix index."""
+    reader, _updated = _shared_cidrs_index.get_reader_and_mtime()
+    if reader is None:
+        return None
+    hit = reader.lookup_with_prefix_len(ip)
+    if hit is None:
+        return None
+    matched_cidr, prefix_len, payload = hit
+    if not isinstance(payload, Mapping):
+        return None
+    provider = payload.get("p") or payload.get("provider")
+    category = payload.get("c") or payload.get("category")
+    if not isinstance(provider, str) or not provider.strip():
+        return None
+    if not isinstance(category, str) or not category.strip():
+        category = "cloud"
+    return {
+        "cidr": matched_cidr,
+        "prefixLength": prefix_len,
+        "provider": provider.strip(),
+        "category": category.strip().lower(),
+    }
 
 
 def lookup_privacy_relay_offline(ip: str) -> Optional[str]:
@@ -1422,84 +1535,152 @@ def lookup_bgp_tools_offline(ip: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def _empty_x4bnet_result(*, has_db: bool, updated_at: Optional[str]) -> Dict[str, Any]:
+def get_maxmind_reader(db_path: str, maxminddb_module: Any) -> Any:
+    """Opens or reuses a cached MMDB reader, importing the cache layer lazily to avoid an import cycle."""
+    from detector.cache_backends import get_maxmind_reader as _get_cached_reader
+
+    return _get_cached_reader(db_path, maxminddb_module)
+
+
+def evict_maxmind_reader(db_path: str) -> None:
+    """Drops and closes a cached MMDB reader for a specific file path."""
+    from detector.cache_backends import evict_maxmind_reader as _evict_reader
+
+    _evict_reader(db_path)
+
+
+def evict_missing_maxmind_readers(filename: str, resolved_path: str) -> None:
+    """Drops cached MMDB readers for a file that has disappeared from disk."""
+    from detector.cache_backends import evict_missing_maxmind_readers as _evict_missing
+
+    _evict_missing(filename, resolved_path)
+
+
+def resolve_openasn_mmdb_path(
+    *,
+    env_overrides: Optional[Mapping[str, str]] = None,
+    base_dir: Optional[Path] = None,
+    bypass_throttle: bool = False,
+) -> Optional[Path]:
+    """Resolves the local OpenASN MMDB across OPENASN_MMDB_PATH, TOOL_DATA_DIR, and standard data directories."""
+    return resolve_feed_data_path(
+        OPENASN_MMDB_FILENAME,
+        override_setting="OPENASN_MMDB_PATH",
+        env_overrides=env_overrides,
+        base_dir=base_dir,
+        bypass_throttle=bypass_throttle,
+    )
+
+
+def get_openasn_mtime_iso() -> Optional[str]:
+    """Returns the OpenASN MMDB modification time as an ISO timestamp, or None when it is absent."""
+    path = resolve_openasn_mmdb_path()
+    if path is None:
+        return None
+    sig = get_file_stat_signature(path)
+    if sig is None:
+        return None
+    return datetime.fromtimestamp(sig[0] / 1_000_000_000.0, tz=timezone.utc).isoformat()
+
+
+def _empty_openasn_result(*, has_db: bool, updated_at: Optional[str]) -> Dict[str, Any]:
     return {
         "hasDb": has_db,
         "has_db": has_db,
-        "isListed": False,
-        "isVpn": False,
-        "isDatacenter": False,
-        "isHosting": False,
-        "matchedCidr": None,
+        "lookupStatus": "unrouted",
+        "asn": None,
+        "asOrg": None,
         "category": None,
-        "sources": [],
+        "networkRole": None,
+        "badAsn": False,
+        "vpnProvider": False,
+        "mobileCarrier": False,
+        "enterpriseGw": False,
+        "cdn": False,
+        "hostingExtra": False,
+        "vpnRange": False,
+        "datacenterRange": False,
+        "coreVerdict": "unknown",
+        "coreSources": ["unrouted"],
         "offlineDbUpdatedAt": updated_at,
+        "rawRecord": {},
     }
 
 
-def _decode_x4bnet_mask(payload: Any) -> int:
-    if isinstance(payload, int) and not isinstance(payload, bool):
-        return payload
-    if isinstance(payload, str):
-        label_text = payload.strip().lower()
-        if label_text == "vpn":
-            return X4BNET_MASK_VPN
-        if label_text == "datacenter":
-            return X4BNET_MASK_DATACENTER
-        if label_text == "hosting":
-            return X4BNET_MASK_HOSTING
-    if isinstance(payload, dict):
-        mask = 0
-        if payload.get("isVpn") or payload.get("category") == "vpn":
-            mask |= X4BNET_MASK_VPN
-        if payload.get("isDatacenter") or payload.get("category") == "datacenter":
-            mask |= X4BNET_MASK_DATACENTER
-        if payload.get("isHosting") or payload.get("category") == "hosting":
-            mask |= X4BNET_MASK_HOSTING
-        return mask
-    return 0
+def _optional_text(value: Any) -> Optional[str]:
+    return value if isinstance(value, str) and value else None
 
 
-def query_x4bnet_vpn_offline(ip: str) -> Dict[str, Any]:
-    """Queries the compiled X4BNet VPN, datacenter, and hosting binary prefix index."""
-    reader, updated_at = _x4bnet_vpn_index.get_reader_and_mtime()
-    if reader is None:
-        return _empty_x4bnet_result(has_db=False, updated_at=None)
-
-    hit = reader.lookup(ip)
-    if hit is None:
-        return _empty_x4bnet_result(has_db=True, updated_at=updated_at)
-
-    matched_cidr, payload = hit
-    mask = _decode_x4bnet_mask(payload)
-    if mask <= 0:
-        return _empty_x4bnet_result(has_db=True, updated_at=updated_at)
-
-    is_vpn = bool(mask & X4BNET_MASK_VPN)
-    is_datacenter = bool(mask & X4BNET_MASK_DATACENTER)
-    is_hosting = bool(mask & (X4BNET_MASK_DATACENTER | X4BNET_MASK_HOSTING))
-    category = "vpn" if is_vpn else ("datacenter" if is_datacenter else "hosting")
-
-    sources: List[str] = []
-    if is_vpn:
-        sources.append("x4bnet_vpn")
-    if is_datacenter:
-        sources.append("x4bnet_datacenter")
-    if mask & X4BNET_MASK_HOSTING:
-        sources.append("ipapi_hosting")
-
+def _decode_openasn_record(raw: Mapping[str, Any], *, updated_at: Optional[str]) -> Dict[str, Any]:
+    raw_asn = raw.get("asn")
+    asn = raw_asn if isinstance(raw_asn, int) and not isinstance(raw_asn, bool) else None
+    verdict = raw.get("core_verdict")
+    raw_sources = raw.get("core_sources")
+    sources = [s for s in raw_sources if isinstance(s, str) and s] if isinstance(raw_sources, list) else []
     return {
         "hasDb": True,
         "has_db": True,
-        "isListed": True,
-        "isVpn": is_vpn,
-        "isDatacenter": is_datacenter,
-        "isHosting": is_hosting,
-        "matchedCidr": matched_cidr,
-        "category": category,
-        "sources": sources,
+        "lookupStatus": "matched",
+        "asn": asn,
+        "asOrg": _optional_text(raw.get("as_org")),
+        "category": _optional_text(raw.get("category")),
+        "networkRole": _optional_text(raw.get("network_role")),
+        "badAsn": bool(raw.get("bad_asn")),
+        "vpnProvider": bool(raw.get("vpn_provider")),
+        "mobileCarrier": bool(raw.get("mobile_carrier")),
+        "enterpriseGw": bool(raw.get("enterprise_gw")),
+        "cdn": bool(raw.get("cdn")),
+        "hostingExtra": bool(raw.get("hosting_extra")),
+        "vpnRange": bool(raw.get("vpn_range")),
+        "datacenterRange": bool(raw.get("datacenter_range")),
+        "coreVerdict": verdict if isinstance(verdict, str) and verdict else "unknown",
+        "coreSources": sources,
         "offlineDbUpdatedAt": updated_at,
+        "rawRecord": dict(raw),
     }
+
+
+def _openasn_lookup_address(ip: str) -> Optional[str]:
+    """Returns the address string to query, or None when the literal must not touch the IPv4 subtree."""
+    cleaned = ip.strip() if isinstance(ip, str) else ""
+    if "%" in cleaned and ":" in cleaned:
+        cleaned = cleaned.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(cleaned)
+    except ValueError:
+        return None
+    if addr.version == 6:
+        mapped = addr.ipv4_mapped
+        if mapped is not None:
+            return str(mapped)
+        if int(addr) >> 32 == 0:
+            return None
+    return str(addr)
+
+
+def query_openasn_offline(ip: str) -> Dict[str, Any]:
+    """Queries the local OpenASN MMDB without surfacing tree prefix lengths as block ranges."""
+    path = resolve_openasn_mmdb_path()
+    if path is None or maxminddb is None:
+        if path is None:
+            evict_missing_maxmind_readers(OPENASN_MMDB_FILENAME, "")
+        return _empty_openasn_result(has_db=False, updated_at=None)
+
+    updated_at = get_openasn_mtime_iso()
+    lookup_ip = _openasn_lookup_address(ip)
+    if lookup_ip is None:
+        return _empty_openasn_result(has_db=True, updated_at=updated_at)
+
+    try:
+        reader = get_maxmind_reader(str(path), maxminddb)
+        raw = reader.get(lookup_ip)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.warning("Failed to query OpenASN MMDB %s: %s", path, exc)
+        evict_maxmind_reader(str(path))
+        return _empty_openasn_result(has_db=False, updated_at=None)
+    if not isinstance(raw, Mapping):
+        return _empty_openasn_result(has_db=True, updated_at=updated_at)
+    return _decode_openasn_record(raw, updated_at=updated_at)
 
 
 def _parse_mobile_asns_payload(payload: Any) -> FrozenSet[int]:
@@ -1593,40 +1774,6 @@ def resolve_maxmind_paths(
         "city": Path(resolve_mmdb_file(configured_dir, MAXMIND_CITY_DB_FILENAME, resolved_base)),
         "asn": Path(resolve_mmdb_file(configured_dir, MAXMIND_ASN_DB_FILENAME, resolved_base)),
     }
-
-
-def resolve_cloud_cidr_path(
-    *,
-    env_overrides: Optional[Mapping[str, str]] = None,
-    base_dir: Optional[Path] = None,
-    bypass_throttle: bool = False,
-) -> Tuple[Optional[Path], str]:
-    """Resolves the local cloud provider CIDR file from TOOL_DATA_DIR or standard data directories."""
-    configured_dir = resolve_configured_data_dir(env_overrides=env_overrides)
-    if configured_dir:
-        base = Path(expand_configured_path(configured_dir))
-        for fname in CLOUD_CIDR_FILENAMES:
-            candidate = base / fname
-            if _is_regular_file(candidate, bypass_throttle=bypass_throttle):
-                return candidate, candidate.name
-        return None, CLOUD_CIDR_FILENAMES[0]
-
-    resolved_base = _effective_base_dir(base_dir)
-    if env_overrides is not None or not bypass_throttle:
-        for directory in _effective_standard_dirs(env_overrides=env_overrides, base_dir=resolved_base):
-            for fname in CLOUD_CIDR_FILENAMES:
-                candidate = directory / fname
-                if _is_regular_file(candidate, bypass_throttle=bypass_throttle):
-                    return candidate, candidate.name
-        return None, CLOUD_CIDR_FILENAMES[0]
-
-    for fname in CLOUD_CIDR_FILENAMES:
-        resolved = resolve_data_file("", fname, resolved_base, default_missing="")
-        if resolved:
-            candidate = Path(resolved)
-            if _is_regular_file(candidate, bypass_throttle=True):
-                return candidate, candidate.name
-    return None, CLOUD_CIDR_FILENAMES[0]
 
 
 def resolve_hosting_rules_path(
@@ -1724,8 +1871,6 @@ def build_offline_database_entries(
     *,
     maxmind_paths: Dict[str, Optional[Path]],
     sfs_paths: Dict[str, Optional[Path]],
-    cloud_cidr_path: Optional[Path],
-    cloud_cidr_name: str,
     hosting_rules_path: Optional[Path],
     hosting_rules_name: str,
     maxmind_stale: int,
@@ -1734,7 +1879,6 @@ def build_offline_database_entries(
     sfs_1_stale: int,
     rules_stale: int,
     now_ts: float,
-    cloud_cidrs_stale: Optional[int] = None,
     extra_feed_specs: Optional[Sequence[Tuple[str, str, str, Optional[Path], str, bool, int, Optional[str]]]] = None,
     include_resolved_path: bool = False,
 ) -> List[Dict[str, Any]]:
@@ -1811,16 +1955,6 @@ def build_offline_database_entries(
             None,
         ),
         (
-            "cloud_cidrs",
-            "Cloud CIDRs",
-            "Cloud Provider CIDRs",
-            cloud_cidr_path,
-            cloud_cidr_name,
-            True,
-            rules_stale if cloud_cidrs_stale is None else cloud_cidrs_stale,
-            "Built-in (Optional)",
-        ),
-        (
             "hosting_asn_rules",
             "Hosting Rules",
             "Hosting ASN Rules",
@@ -1876,8 +2010,11 @@ def collect_offline_databases_status(
     sfs_1_stale = get_positive_int_setting(
         "OFFLINE_DB_SFS_1_STALE_SECONDS", DEFAULT_STALE_SFS_1_SECONDS, env_overrides=env_overrides
     )
-    cloud_cidrs_stale = get_positive_int_setting(
-        "OFFLINE_DB_CLOUD_CIDRS_STALE_SECONDS", DEFAULT_STALE_CLOUD_CIDRS_SECONDS, env_overrides=env_overrides
+    shared_cidrs_stale = get_positive_int_setting(
+        "OFFLINE_DB_SHARED_CIDRS_STALE_SECONDS", DEFAULT_STALE_SHARED_CIDRS_SECONDS, env_overrides=env_overrides
+    )
+    openasn_stale = get_positive_int_setting(
+        "OFFLINE_DB_OPENASN_STALE_SECONDS", DEFAULT_STALE_OPENASN_SECONDS, env_overrides=env_overrides
     )
     rules_stale = get_positive_int_setting(
         "OFFLINE_DB_RULES_STALE_SECONDS", DEFAULT_STALE_RULES_SECONDS, env_overrides=env_overrides
@@ -1891,14 +2028,27 @@ def collect_offline_databases_status(
 
     maxmind_paths = resolve_maxmind_paths(env_overrides=env_overrides, base_dir=base_dir)
     sfs_paths = resolve_stopforumspam_paths(env_overrides=env_overrides, base_dir=base_dir, bypass_throttle=True)
-    cloud_cidr_path, cloud_cidr_name = resolve_cloud_cidr_path(
-        env_overrides=env_overrides, base_dir=base_dir, bypass_throttle=True
-    )
     hosting_rules_path, hosting_rules_name = resolve_hosting_rules_path(
         env_overrides=env_overrides, base_dir=base_dir, bypass_throttle=True
     )
 
     extra_specs = (
+        (
+            "shared_cidrs",
+            "Shared CIDRs",
+            "Rezmoss Shared Egress CIDRs",
+            resolve_feed_data_path(
+                SHARED_CIDRS_BIN_FILENAME,
+                override_setting="SHARED_CIDRS_BIN_PATH",
+                env_overrides=env_overrides,
+                base_dir=base_dir,
+                bypass_throttle=True,
+            ),
+            SHARED_CIDRS_BIN_FILENAME,
+            True,
+            shared_cidrs_stale,
+            None,
+        ),
         (
             "privacy_relays",
             "Privacy Relays",
@@ -1964,19 +2114,19 @@ def collect_offline_databases_status(
             None,
         ),
         (
-            "x4bnet_vpn",
-            "X4BNet VPN",
-            "X4BNet VPN and Hosting Index",
+            "openasn",
+            "OpenASN",
+            "OpenASN IP/ASN Classification",
             resolve_feed_data_path(
-                X4BNET_VPN_BIN_FILENAME,
-                override_setting="X4BNET_VPN_BIN_PATH",
+                OPENASN_MMDB_FILENAME,
+                override_setting="OPENASN_MMDB_PATH",
                 env_overrides=env_overrides,
                 base_dir=base_dir,
                 bypass_throttle=True,
             ),
-            X4BNET_VPN_BIN_FILENAME,
+            OPENASN_MMDB_FILENAME,
             True,
-            daily_feed_stale,
+            openasn_stale,
             None,
         ),
         (
@@ -2000,8 +2150,6 @@ def collect_offline_databases_status(
     return build_offline_database_entries(
         maxmind_paths=maxmind_paths,
         sfs_paths=sfs_paths,
-        cloud_cidr_path=cloud_cidr_path,
-        cloud_cidr_name=cloud_cidr_name,
         hosting_rules_path=hosting_rules_path,
         hosting_rules_name=hosting_rules_name,
         maxmind_stale=maxmind_stale,
@@ -2009,7 +2157,6 @@ def collect_offline_databases_status(
         sfs_90_stale=sfs_90_stale,
         sfs_1_stale=sfs_1_stale,
         rules_stale=rules_stale,
-        cloud_cidrs_stale=cloud_cidrs_stale,
         extra_feed_specs=extra_specs,
         now_ts=now_ts,
         include_resolved_path=include_resolved_path,

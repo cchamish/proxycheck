@@ -57,8 +57,8 @@
         'Tor Onionoo': ['#f1ecf8', '#c9bce3', '#4e3475', '#29203d', '#574480', '#cbb8f2'], DShield: ['#e7f3f3', '#a7cfd1', '#1f5357', '#172e2f', '#316163', '#8cd4d6'],
         StopForumSpam: ['#e6f8f5', '#9fdcd2', '#125c51', '#13332e', '#286b60', '#7ee0d1'], 'Spamhaus ZEN': ['#eaedf7', '#b5c0de', '#2e3f6e', '#1e243b', '#404d7d', '#a8b8eb'],
         SpamCop: ['#eaf4fb', '#add2ec', '#1c537d', '#172c3d', '#315c80', '#91c6f2'], 'IPsum / DROP': ['#f4ecfb', '#ceb3ea', '#512b78', '#2a1d3b', '#5d4180', '#d4b8f8'],
-        'X4BNet VPN': ['#e6f4f8', '#9fd0df', '#0e5266', '#132d36', '#285f70', '#82d2e8'], 'Shodan InternetDB': ['#fbeee8', '#e8bca8', '#783416', '#361f16', '#734330', '#f5bba3'],
-        'Privacy Relay': ['#eef0ff', '#b5bff7', '#2b3a94', '#1c2247', '#3f4d96', '#a8b5ff'], 'Cloud CIDR': ['#e8f6ff', '#a8d8f8', '#0e527d', '#152c3d', '#2c5c80', '#8ac7f5'],
+        'OpenASN': ['#e6f4f8', '#9fd0df', '#0e5266', '#132d36', '#285f70', '#82d2e8'], 'Shodan InternetDB': ['#fbeee8', '#e8bca8', '#783416', '#361f16', '#734330', '#f5bba3'],
+        'Privacy Relay': ['#eef0ff', '#b5bff7', '#2b3a94', '#1c2247', '#3f4d96', '#a8b5ff'], 'Shared CIDR': ['#e8f6ff', '#a8d8f8', '#0e527d', '#152c3d', '#2c5c80', '#8ac7f5'],
         'Multi-Source': ['#eef2f6', '#b9c6d4', '#3b4f66', '#222830', '#475466', '#b3c2d4'], 'Reverse DNS': ['#e8f7f7', '#a6dada', '#185b5e', '#153030', '#2c6666', '#87dbdb'],
         Spur: ['#e3f1f8', '#95cce6', '#0f4c6e', '#152b38', '#2c5973', '#8bc8eb']
     };
@@ -913,7 +913,8 @@
         let hasQuotaGuardedProvider = false, hasCooldownProvider = false;
         let validCommercialCount = 0, positiveCommercialVotes = 0, validTotalSourceCount = 0;
         let hasSpamhausNonPbl = false, hasSpamhausPolicy = false, hasDshieldSignal = false;
-        let hasSpamcopSignal = false, hasIpsumDropSignal = false, hasX4bnetSignal = false;
+        let hasSpamcopSignal = false, hasIpsumDropSignal = false;
+        let hasOpenAsnVpn = false, hasOpenAsnHosting = false, openAsnSharedProvider = '', openAsnSharedCategory = '';
         let hasMaxmindHosting = false, hasMaxmindRiskFlag = false, hasShodanOpenPortsSignal = false;
         let hasOtherNonCommercialRiskFlag = false, hasLightCommercialRiskFlag = false;
 
@@ -988,13 +989,26 @@
                 else if (r.isIpsumListed || r.isListed || ipsumScore >= 2) addLightLbl(ipsumScore > 0 ? `IPsum:${ipsumScore} lists` : 'IPsum:Listed');
                 if (r.inSpamhausDrop || r.isIpsumListed || r.isListed || ipsumScore >= 2 || hasHighRiskFlag) hasIpsumDropSignal = true;
                 if (!hasHighRiskFlag && !r.inSpamhausDrop && (r.isIpsumListed || ipsumScore === 2)) rowRiskItems.push([`IPsum Moderate (${ipsumScore || 2} lists)`, provider]);
-            } else if (r.provider === 'X4BNet VPN') {
-                if (r.isVpn || r.isHosting || r.isDatacenter || r.isListed) addLightLbl(r.isVpn ? 'X4BNet:VPN' : 'X4BNet:Hosting');
-                if (r.isVpn || r.isHosting || r.isDatacenter || r.isListed || hasHighRiskFlag) hasX4bnetSignal = true;
-                if (!hasHighRiskFlag && (r.isHosting || r.isDatacenter) && !r.isVpn) rowRiskItems.push(['Hosting / Datacentre', provider]);
+            } else if (r.provider === 'OpenASN') {
+                const verdict = typeof r.coreVerdict === 'string' ? r.coreVerdict.trim().toLowerCase() : '';
+                const isCdn = Boolean(r.isCdn), isDc = Boolean(r.isDatacenter);
+                const fallbackName = (fallback) => [r.sharedProvider, r.organisation, r.isp].map((v) => (typeof v === 'string' ? v.trim() : '')).find((v) => v && v !== '-') || fallback;
+                if (verdict === 'vpn') {
+                    hasOpenAsnVpn = true; addLightLbl('OpenASN:VPN');
+                    if (!hasHighRiskFlag) rowRiskItems.push(['VPN', provider]);
+                } else if (verdict === 'enterprise_gateway' || r.isEnterpriseGateway) {
+                    if (!openAsnSharedProvider) { openAsnSharedProvider = fallbackName('Enterprise Gateway'); openAsnSharedCategory = 'enterprise_gateway'; }
+                } else if (verdict === 'hosting' && isCdn && !isDc) {
+                    if (!openAsnSharedProvider) { openAsnSharedProvider = fallbackName('CDN'); openAsnSharedCategory = 'cdn'; }
+                } else if (verdict === 'hosting') {
+                    hasOpenAsnHosting = true; addLightLbl('OpenASN:Hosting');
+                    if (!hasHighRiskFlag) rowRiskItems.push(['Hosting / Datacentre', provider]);
+                }
+                if (hasHighRiskFlag && verdict !== 'vpn') hasOtherNonCommercialRiskFlag = true;
             } else if (r.provider === 'MaxMind') {
                 const usage = typeof r.usageType === 'string' ? r.usageType.trim().toLowerCase() : '';
-                const isHosting = Boolean((typeof r.hostingProvider === 'string' && r.hostingProvider.trim()) ||
+                const sharedHosting = Boolean(typeof r.sharedProvider === 'string' && r.sharedProvider.trim() && (r.sharedCategory === 'cloud' || r.sharedCategory === 'vpn'));
+                const isHosting = Boolean((typeof r.hostingProvider === 'string' && r.hostingProvider.trim()) || sharedHosting ||
                     (typeof r.cloudProvider === 'string' && r.cloudProvider.trim()) || usage === 'hosting' || usage === 'datacenter' || usage === 'data center');
                 if (isHosting) { hasMaxmindHosting = true; if (!hasHighRiskFlag) { rowRiskItems.push(['Hosting', provider]); addLightLbl('MaxMind:Hosting'); } }
                 if (hasHighRiskFlag) hasMaxmindRiskFlag = true;
@@ -1016,7 +1030,7 @@
             getipintelRow, stopforumspamRow, hasQuotaGuardedProvider, hasCooldownProvider,
             validCommercialCount, positiveCommercialVotes, validTotalSourceCount,
             hasSpamhausNonPbl, hasSpamhausPolicy, hasDshieldSignal, hasSpamcopSignal,
-            hasIpsumDropSignal, hasX4bnetSignal, hasMaxmindHosting, hasMaxmindRiskFlag,
+            hasIpsumDropSignal, hasOpenAsnVpn, hasOpenAsnHosting, openAsnSharedProvider, openAsnSharedCategory, hasMaxmindHosting, hasMaxmindRiskFlag,
             hasShodanOpenPortsSignal, hasOtherNonCommercialRiskFlag, hasLightCommercialRiskFlag
         };
         if (data && typeof data === 'object' && signalCache) signalCache.set(data, sig);
@@ -1033,7 +1047,7 @@
         const hasPrediction = data.getipintel_chance !== null && data.getipintel_chance !== undefined && !isNaN(Number(data.getipintel_chance));
         const broadcastIp = Boolean(data.is_broadcast_ip), isTor = Boolean(data.isTor), isMajorityProxyVpn = Boolean(data.isMajorityProxyVpn);
         const arbitrationTier = typeof data.arbitrationTier === 'string' ? data.arbitrationTier.trim().toLowerCase() : '';
-        const ptrIsHighRisk = Boolean(data.ptrIsHighRisk), hasCloudProvider = Boolean(typeof data.cloudProvider === 'string' && data.cloudProvider.trim());
+        const ptrIsHighRisk = Boolean(data.ptrIsHighRisk);
         const arbitrationVerdict = typeof data.arbitrationVerdict === 'string' ? data.arbitrationVerdict.trim() : '';
         const torLabel = typeof data.torLabel === 'string' && data.torLabel.trim() ? data.torLabel.trim() : (isTor ? 'Tor Node' : '');
         const torSummary = typeof data.torSummary === 'string' && data.torSummary.trim() ? data.torSummary.trim() : '';
@@ -1045,6 +1059,7 @@
             (Array.isArray(sfsRow.securityFlags) && sfsRow.securityFlags.some((f) => f && f.isHighRisk))));
         const suspectedResidentialProxy = Boolean(data.suspectedResidentialProxy), highlySuspectedResidentialProxy = Boolean(data.highlySuspectedResidentialProxy);
         const sharedPrivacyEgress = typeof data.sharedPrivacyEgress === 'string' && data.sharedPrivacyEgress.trim() ? data.sharedPrivacyEgress.trim().toLowerCase() : '';
+        const sharedProvider = resolveSharedProvider(data, sig), hasSharedProvider = Boolean(sharedProvider);
         const isPartialLight = Boolean(data.isPartialMode || String(data.queryMode || '').trim().toLowerCase() === 'light');
         const giiRow = sig.getipintelRow, isGetIpIntelDeferred = Boolean(giiRow && (giiRow.isDeferred || giiRow.status === 'Deferred (Light Mode)'));
         // Spamhaus PBL flags dynamic consumer ISP ranges, so only elevate it to yellow before commercial scoring runs.
@@ -1052,13 +1067,13 @@
         const hasActiveSpamhausSignal = sig.hasSpamhausNonPbl || (isLightScreeningMode && sig.hasSpamhausPolicy);
         const hasProviderRiskSignal = Boolean(
             hasActiveSpamhausSignal || sig.hasDshieldSignal || sig.hasSpamcopSignal || sig.hasIpsumDropSignal ||
-            sig.hasX4bnetSignal || sig.hasMaxmindHosting || sig.hasMaxmindRiskFlag || sig.hasShodanOpenPortsSignal ||
+            sig.hasOpenAsnVpn || sig.hasOpenAsnHosting || sig.hasMaxmindHosting || sig.hasMaxmindRiskFlag || sig.hasShodanOpenPortsSignal ||
             sig.shodanOpenPorts.length > 0 || sig.hasOtherNonCommercialRiskFlag || (isLightScreeningMode && sig.hasLightCommercialRiskFlag)
         );
         const hasHighOrMediumSignals = Boolean(
             isTor || isMajorityProxyVpn || highlySuspectedResidentialProxy || suspectedResidentialProxy ||
-            sig.openProxyPorts.length > 0 || sharedPrivacyEgress || arbitrationTier === 'destructive' ||
-            hasCloudProvider || ptrIsHighRisk || arbitrationTier === 'warning' || broadcastIp ||
+            sig.openProxyPorts.length > 0 || hasSharedProvider || arbitrationTier === 'destructive' ||
+            ptrIsHighRisk || arbitrationTier === 'warning' || broadcastIp ||
             isSfsBlacklisted || isSfsListed || hasProviderRiskSignal
         );
         const isLightDeferredClean = Boolean(!hasPrediction && !hasHighOrMediumSignals && !sig.hasQuotaGuardedProvider && !sig.hasCooldownProvider && (isPartialLight || isGetIpIntelDeferred));
@@ -1066,8 +1081,8 @@
             (sig.validCommercialCount > 0 || (!sig.hasQuotaGuardedProvider && !sig.hasCooldownProvider && (sig.validTotalSourceCount > 0 || arbitrationTier === 'success'))));
 
         const riskTier = isNonPublic ? 'nonpublic'
-            : ((hasPrediction && prediction > 80) || isTor || isMajorityProxyVpn || highlySuspectedResidentialProxy || arbitrationTier === 'destructive' || isSfsBlacklisted) ? 'high'
-            : ((hasPrediction && prediction >= 30) || broadcastIp || suspectedResidentialProxy || sig.openProxyPorts.length > 0 || sharedPrivacyEgress || arbitrationTier === 'warning' || ptrIsHighRisk || hasCloudProvider || isSfsListed || hasProviderRiskSignal) ? 'medium'
+            : ((hasPrediction && prediction > 80) || isTor || isMajorityProxyVpn || highlySuspectedResidentialProxy || arbitrationTier === 'destructive' || isSfsBlacklisted || hasSharedProvider || sig.hasOpenAsnVpn) ? 'high'
+            : ((hasPrediction && prediction >= 30) || broadcastIp || suspectedResidentialProxy || sig.openProxyPorts.length > 0 || arbitrationTier === 'warning' || ptrIsHighRisk || isSfsListed || hasProviderRiskSignal) ? 'medium'
             : 'low';
 
         const predictionText = hasPrediction ? String(Number(prediction.toFixed(2))) : '';
@@ -1086,8 +1101,8 @@
             [isMajorityProxyVpn || arbitrationTier === 'destructive', /datacenter|hosting/i.test(arbitrationVerdict) ? 'HOSTING' : 'PROXY'],
             [isSfsBlacklisted, 'BLACKLIST'],
             [sig.openProxyPorts.length > 0, 'PROXY-PORT'],
-            [sharedPrivacyEgress, 'RELAY'],
-            [hasCloudProvider, 'CLOUD'],
+            [hasSharedProvider, 'SHARED/' + sharedProvider],
+            [sig.hasOpenAsnVpn, 'OpenASN:VPN'],
             [ptrIsHighRisk, 'PTR-RISK'],
             [isSfsListed, 'SPAM'],
             [arbitrationTier === 'warning', 'REVIEW'],
@@ -1095,7 +1110,7 @@
             [sig.hasSpamcopSignal, 'SPAMCOP'],
             [hasActiveSpamhausSignal, 'SPAMHAUS'],
             [sig.hasIpsumDropSignal, 'IPSUM'],
-            [sig.hasMaxmindHosting || sig.hasX4bnetSignal, 'HOSTING'],
+            [sig.hasMaxmindHosting || sig.hasOpenAsnHosting, 'HOSTING'],
             [sig.hasShodanOpenPortsSignal || sig.shodanOpenPorts.length > 0, 'OPEN-PORTS'],
             [sig.hasMaxmindRiskFlag || sig.hasOtherNonCommercialRiskFlag || (isLightScreeningMode && sig.hasLightCommercialRiskFlag), 'FLAGGED'],
             [isLightDeferredClean, 'LIGHT'],
@@ -1111,7 +1126,7 @@
             prediction, hasPrediction, broadcastIp, isTor, isMajorityProxyVpn,
             suspectedResidentialProxy, highlySuspectedResidentialProxy, sharedPrivacyEgress,
             isMobileOrCgnat: isMobileOrCgnatPayload(data), openProxyPorts: sig.openProxyPorts, shodanOpenPorts: sig.shodanOpenPorts,
-            arbitrationTier, ptrIsHighRisk, hasCloudProvider, isSfsBlacklisted, isSfsListed,
+            arbitrationTier, ptrIsHighRisk, sharedProvider, hasSharedProvider, isSfsBlacklisted, isSfsListed,
             hasQuotaGuardedProvider: sig.hasQuotaGuardedProvider, hasCooldownProvider: sig.hasCooldownProvider,
             isLightScreeningMode, isLightDeferredClean, validCommercialCount: sig.validCommercialCount,
             positiveCommercialVotes: sig.positiveCommercialVotes, validTotalSourceCount: sig.validTotalSourceCount,
@@ -1126,10 +1141,11 @@
             : (risk.torSummary && risk.torSummary !== lbl ? `${lbl} (${risk.torSummary})` : lbl);
     }
 
-    function formatCloudDescription(data) {
-        if (!data || typeof data.cloudProvider !== 'string' || !data.cloudProvider.trim()) return '';
-        const p = data.cloudProvider.trim();
-        return typeof data.cloudCidr === 'string' && data.cloudCidr.trim() ? `${p} (${data.cloudCidr.trim()})` : p;
+    function formatSharedDescription(data, risk) {
+        const p = risk && risk.sharedProvider ? risk.sharedProvider : '';
+        if (!p) return '';
+        const cidr = [data && data.sharedCidr, data && data.cloudCidr].find((v) => typeof v === 'string' && v.trim());
+        return cidr ? `${p} (${cidr.trim()})` : p;
     }
 
     function getCacheMeta(data) { return data && typeof data === 'object' && data.cacheMeta && typeof data.cacheMeta === 'object' ? data.cacheMeta : null; }
@@ -1172,12 +1188,15 @@
         return val === 'icloud_private_relay' ? 'Apple iCloud Private Relay' : (val === 'cloudflare_warp' ? 'Cloudflare WARP' : (val ? data.sharedPrivacyEgress.trim() : ''));
     }
 
+    function resolveSharedProvider(data, sig) {
+        const text = (v) => (typeof v === 'string' ? v.trim() : '');
+        return text(data && data.sharedProvider) || getSharedPrivacyEgressLabel(data) || (sig && sig.openAsnSharedProvider) || text(data && data.cloudProvider);
+    }
+
     function shouldRecommendFreshResidentialRecheck(data) {
         const meta = getCacheMeta(data), age = getCacheAgeSeconds(data);
         return Boolean((meta && meta.recommendFreshRecheck === true) || (data && data.suspectedResidentialProxy && age !== null && age > RESIDENTIAL_RECHECK_THRESHOLD_SECONDS));
     }
-
-    function isSoftBlockAdvised(data) { return Boolean(getSharedPrivacyEgressLabel(data) || isMobileOrCgnatPayload(data)); }
 
     function resolveRangeBlockTarget(cidr) {
         const trimmed = typeof cidr === 'string' ? cidr.trim() : '';
@@ -1226,8 +1245,8 @@
         const verdict = sanitizeWikitextFragment((data && data.arbitrationVerdict) || 'IP Intelligence Summary');
         const signals = [];
         if (data && data.isTor) signals.push(sanitizeWikitextFragment(data.torLabel || (data.torIsExit ? 'Tor Exit' : 'Tor Node')));
-        const shared = getSharedPrivacyEgressLabel(data);
-        if (shared) signals.push(sanitizeWikitextFragment(shared));
+        const shared = resolveSharedProvider(data, sig);
+        if (shared) signals.push('Shared egress: ' + sanitizeWikitextFragment(shared));
         if (isMobileOrCgnatPayload(data)) signals.push('Mobile/CGNAT');
         const ports = sig.openProxyPorts;
         if (ports.length > 0) signals.push(`Open proxy ports: ${ports.join(', ')}`);
@@ -1337,10 +1356,10 @@
         if (risk.isTor) addEntry(risk.torLabel || (data.torIsExit ? 'Tor Exit' : 'Tor Node'), 'Tor Onionoo');
         sig.rowRiskItems.forEach(([lbl, provider]) => addEntry(lbl, provider));
         if (risk.isLightScreeningMode && sig.hasSpamhausPolicy) addEntry('Policy/Dynamic ISP Range (PBL)', 'Spamhaus ZEN');
-        const cloudProvider = typeof data.cloudProvider === 'string' ? data.cloudProvider.trim() : '';
-        if (cloudProvider) {
-            const matchRow = rows.find((r) => r && r.cloudProvider === cloudProvider && r.provider);
-            addEntry(`Cloud (${cloudProvider})`, matchRow ? matchRow.provider : 'Cloud CIDR');
+        if (risk.hasSharedProvider) {
+            const matchRow = rows.find((r) => r && r.provider && (r.sharedProvider || r.cloudProvider) === risk.sharedProvider);
+            const viaRelay = Boolean((typeof data.sharedCategory === 'string' && data.sharedCategory.trim().toLowerCase() === 'relay') || getSharedPrivacyEgressLabel(data) === risk.sharedProvider);
+            addEntry(`Shared (${risk.sharedProvider})`, matchRow ? matchRow.provider : (viaRelay ? 'Privacy Relay' : 'Shared CIDR'));
         }
         if (risk.broadcastIp) addEntry('Broadcast IP', 'Multi-Source');
         if (data.ptrIsHighRisk && typeof data.ptrLabel === 'string' && data.ptrLabel.trim()) addEntry(`PTR (${data.ptrLabel.trim()})`, 'Reverse DNS');
@@ -1349,8 +1368,6 @@
         if (sig.openProxyPorts.length > 0) addEntry(`Open Proxy Ports (${sig.openProxyPorts.join(', ')})`, 'Shodan InternetDB');
         else if (sig.shodanOpenPorts.length > 0) addEntry(`Open Ports (${sig.shodanOpenPorts.join(', ')})`, 'Shodan InternetDB');
         else if (sig.hasShodanOpenPortsSignal) addEntry('Open Ports', 'Shodan InternetDB');
-        const shared = getSharedPrivacyEgressLabel(data);
-        if (shared) addEntry(`Shared Privacy Egress (${shared})`, 'Privacy Relay');
         return entries;
     }
 
@@ -1371,7 +1388,6 @@
         if (risk.badgePrimaryLabel && !['LIGHT', 'CLEAN', 'N/A'].includes(risk.badgePrimaryLabel) &&
             !(providerRiskLabels.length > 0 && redundant.includes(risk.badgePrimaryLabel))) addLabelTo(riskLabels, risk.badgePrimaryLabel);
         if (risk.isTor) addLabelTo(riskLabels, formatTorDescription(risk) || 'Tor');
-        if (risk.hasCloudProvider) addLabelTo(riskLabels, formatCloudDescription(data) || 'Cloud');
         if (risk.ptrIsHighRisk) addLabelTo(riskLabels, 'PTR-Risk');
         if (risk.openProxyPorts && risk.openProxyPorts.length > 0) addLabelTo(riskLabels, `Shodan:${risk.openProxyPorts.join(',')}`);
         providerRiskLabels.forEach((lbl) => addLabelTo(riskLabels, lbl));
@@ -1520,11 +1536,11 @@
         ];
 
         const $panel = $('<div>', { class: 'proxycheck-details-panel' });
-        const sharedEgressLabel = getSharedPrivacyEgressLabel(data);
+        const sharedEgressLabel = risk.sharedProvider;
         const highlySuspectedResidentialProxy = Boolean(data && data.highlySuspectedResidentialProxy);
         const bannerPills = [];
-        if (sharedEgressLabel) bannerPills.push(['proxycheck-signal-privacy', `Shared Privacy Egress: ${sharedEgressLabel} \u2014 Soft / anon-only block recommended to avoid collateral impact on logged-in editors.`]);
-        if (isMobileOrCgnatPayload(data)) bannerPills.push(['proxycheck-signal-cgnat', 'Mobile / CGNAT Network: Collateral-damage warning \u2014 recommended block locked to /32 (IPv4) or /64 (IPv6); prefer soft / anon-only block.']);
+        if (sharedEgressLabel) bannerPills.push(['proxycheck-signal-privacy', `Shared Egress: ${sharedEgressLabel} \u2014 many unrelated users may share this address; check collateral damage before blocking.`]);
+        if (isMobileOrCgnatPayload(data)) bannerPills.push(['proxycheck-signal-cgnat', 'Mobile / CGNAT Network: Collateral-damage warning \u2014 recommended block locked to /32 (IPv4) or /64 (IPv6).']);
         if (data && data.suspectedResidentialProxy) bannerPills.push(['proxycheck-signal-danger', 'Suspected Residential Proxy / Compromised Host' + (shouldRecommendFreshResidentialRecheck(data) ? ' \u2014 Cached signal is older than 7 days; click Refetch to verify current DHCP assignment before issuing a long-term block.' : '')]);
         if (highlySuspectedResidentialProxy) bannerPills.push(['proxycheck-signal-danger', 'Highly Suspected Residential Proxy']);
         if (sig.openProxyPorts.length > 0) bannerPills.push(['proxycheck-signal-danger', `Shodan Open Proxy Ports: ${sig.openProxyPorts.join(', ')}`]);
@@ -1624,12 +1640,10 @@
         $panel.append($table, $('<div>', { style: 'margin-top: 8px; display: flex; align-items: center; flex-wrap: wrap; gap: 12px;' }).append($copyLink, $copyWikitextBtn));
 
         if (resolvedIp) {
-            const softBlock = isSoftBlockAdvised(data), rangeTarget = resolveRangeBlockTarget(recCidr);
+            const rangeTarget = resolveRangeBlockTarget(recCidr);
             const buildBlockParams = () => {
                 // Omit wpReason so Codex Special:Block does not prepend "other:" to wpReason-other.
-                const params = { wpExpiry: '3 months', 'wpReason-other': '{{blocked proxy}}' + buildAttributionComment(getSelectedCommentValues()) };
-                if (softBlock) { params.wpAnonOnly = '1'; params.wpHardBlock = '0'; params.wpDisableUTEdit = '0'; }
-                return params;
+                return { wpExpiry: '3 months', wpHardBlock: '1', 'wpReason-other': '{{blocked proxy}}' + buildAttributionComment(getSelectedCommentValues()) };
             };
             const mkLink = (cls, href, text) => $('<a>', { class: cls, href, target: '_blank', rel: 'noopener noreferrer', text });
             const $singleBlockLink = mkLink('proxycheck-link-block', buildWikiPageUrl('Special:Block/' + resolvedIp, buildBlockParams()), 'Special:Block ↗');
@@ -1688,7 +1702,7 @@
         if (risk.isNonPublic) {
             return `Address Type: ${risk.nonPublicReason} [${risk.nonPublicBadgeCode}]\nStatus: External threat lookups skipped (non-public or reserved IP)`;
         }
-        const sig = risk.sig, torDesc = formatTorDescription(risk), cloudDesc = formatCloudDescription(data);
+        const sig = risk.sig, torDesc = formatTorDescription(risk), sharedDesc = formatSharedDescription(data, risk);
         const lines = [];
         if (!risk.hasPrediction && isPartialLightResult(data)) {
             const lightInfo = collectLightBadgeInfo(data, risk);
@@ -1702,7 +1716,7 @@
         if (typeof data.arbitrationVerdict === 'string' && data.arbitrationVerdict.trim()) lines.push('Verdict: ' + data.arbitrationVerdict.trim());
         lines.push('Recommended CIDR: ' + (data.recommendedCidr || 'N/A'));
         lines.push('BGP CIDR: ' + (data.bgpPrefix || data.mmdbCidr || 'N/A'));
-        if (cloudDesc) lines.push('Cloud: ' + cloudDesc);
+        if (sharedDesc) lines.push('Shared egress: ' + sharedDesc);
         lines.push('Broadcast IP: ' + (risk.broadcastIp ? 'At-risk' : 'No'));
         lines.push('Tor Node: ' + (risk.isTor ? torDesc : 'No'));
         if (sig.sfsTitleLine) lines.push(sig.sfsTitleLine);
@@ -2305,7 +2319,7 @@
                     return;
                 }
 
-                const torDesc = formatTorDescription(risk), cloudDesc = formatCloudDescription(bannerData), sharedEgress = getSharedPrivacyEgressLabel(bannerData);
+                const torDesc = formatTorDescription(risk), sharedDesc = formatSharedDescription(bannerData, risk);
                 const verdictText = typeof bannerData.arbitrationVerdict === 'string' ? bannerData.arbitrationVerdict.trim() : '';
                 const ptrHost = typeof bannerData.ptrHostname === 'string' ? bannerData.ptrHostname.trim() : '';
                 const ptrLbl = typeof bannerData.ptrLabel === 'string' ? bannerData.ptrLabel.trim() : '';
@@ -2325,8 +2339,7 @@
                     } else $ptr.text(ptrLbl);
                     addItem('PTR', $ptr);
                 }
-                if (cloudDesc) addItem('Cloud', document.createTextNode(cloudDesc));
-                if (sharedEgress) addItem('Shared Egress', $('<strong>', { class: 'proxycheck-banner-warning-text', text: `${sharedEgress} (soft block recommended)` }));
+                if (sharedDesc) addItem('Shared Egress', $('<strong>', { class: 'proxycheck-banner-danger-text', text: sharedDesc }));
                 if (isMobileOrCgnatPayload(bannerData)) addItem('Network', $('<strong>', { class: 'proxycheck-banner-warning-text', text: 'Mobile / CGNAT (/32 IPv4, /64 IPv6 lock)' }));
                 addItem('Broadcast IP', risk.broadcastIp ? $('<strong>', { class: 'proxycheck-banner-warning-text', text: 'At-risk' }) : document.createTextNode('No'));
                 addItem('Tor Node', risk.isTor ? $('<strong>', { class: 'proxycheck-banner-danger-text', text: torDesc }) : document.createTextNode('No'));

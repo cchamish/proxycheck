@@ -14,13 +14,10 @@ from .cidr_attribution import (
     classify_rdns_hostname,
     clear_offline_intelligence_caches,
     compute_cidr_attribution,
-    match_cloud_cidr,
     match_hosting_asn_or_org,
-    parse_cloud_cidr_payload,
     warm_offline_intelligence_caches,
 )
-
-_parse_cloud_cidr_payload = parse_cloud_cidr_payload
+from .offline_dbs import lookup_shared_cidr_offline
 
 _ERROR_STATUS_LABELS: Dict[int, str] = {
     401: "401 Unauthorised",
@@ -545,9 +542,10 @@ def adapt_maxmind(
     loc_str, country_code, coords = _extract_maxmind_geo(raw_data)
 
     target_ip = ip if isinstance(ip, str) and ip.strip() else raw_data.get("_ip")
-    cloud_match = match_cloud_cidr(target_ip) if target_ip else None
+    shared_hit = lookup_shared_cidr_offline(target_ip) if target_ip else None
+    hosting_hint = shared_hit if (shared_hit is not None and shared_hit.get("category") in ("cloud", "vpn")) else None
     hosting_match = match_hosting_asn_or_org(asn_val, org_name)
-    usage_type, flags = _extract_maxmind_signals(raw_data, cloud_match=cloud_match, hosting_match=hosting_match)
+    usage_type, flags = _extract_maxmind_signals(raw_data, cloud_match=hosting_hint, hosting_match=hosting_match)
 
     raw_prefix_val = (
         raw_data.get("_mmdb_prefix_len") if raw_data.get("_mmdb_prefix_len") is not None else raw_data.get("prefix_len")
@@ -566,10 +564,11 @@ def adapt_maxmind(
     extra: Dict[str, Any] = {"countryCode": country_code, "coordinates": coords}
     if prefix_length is not None:
         extra["prefixLength"] = prefix_length
-    if cloud_match is not None:
-        extra["cloudProvider"] = cloud_match["provider"]
-        extra["cloudCidr"] = cloud_match["cidr"]
-        extra["cloudPrefixLength"] = cloud_match["prefixLength"]
+    if shared_hit is not None:
+        extra["sharedProvider"] = shared_hit["provider"]
+        extra["sharedCidr"] = shared_hit["cidr"]
+        extra["sharedCategory"] = shared_hit["category"]
+        extra["sharedPrefixLength"] = shared_hit["prefixLength"]
     if hosting_match is not None:
         extra["hostingProvider"] = hosting_match["provider"]
     offline_updated = raw_data.get("_offline_db_updated_at")
@@ -1572,28 +1571,48 @@ def adapt_ipsum_drop(
     )
 
 
-def adapt_x4bnet_vpn(
+def _openasn_flags(core_verdict: str, *, is_pure_cdn: bool, is_hosting: bool, is_mobile: bool) -> List[Dict[str, Any]]:
+    flags: List[Dict[str, Any]] = []
+    if core_verdict == "vpn":
+        flags.append({"label": "VPN", "isHighRisk": True})
+    if core_verdict == "enterprise_gateway":
+        flags.append({"label": "Enterprise Gateway", "isHighRisk": False})
+    if is_pure_cdn:
+        flags.append({"label": "CDN", "isHighRisk": False})
+    if is_hosting:
+        flags.append({"label": "Hosting / Datacentre", "isHighRisk": False})
+    if is_mobile:
+        flags.append({"label": "Mobile Carrier", "isHighRisk": False})
+    return flags or _default_no_flags()
+
+
+def adapt_openasn(
     raw_data: Optional[Dict[str, Any]],
     status_code: int = 200,
     *,
     has_db: bool = True,
 ) -> Dict[str, Any]:
-    """Normalises offline X4BNet VPN and hosting CIDR index lookups."""
+    """Normalises offline OpenASN MMDB classification lookups without treating bad_asn as malicious."""
     extra: Dict[str, Any] = {
-        "isListed": False,
-        "isVpn": False,
-        "isDatacenter": False,
-        "isHosting": False,
-        "matchedCidr": None,
+        "coreVerdict": "unknown",
+        "coreSources": [],
         "category": None,
-        "sources": [],
+        "networkRole": None,
+        "isVpn": False,
+        "isHosting": False,
+        "isDatacenter": False,
+        "isCdn": False,
+        "isMobile": False,
+        "isEnterpriseGateway": False,
+        "isBadAsn": False,
+        "lookupStatus": "unrouted",
     }
     if not has_db:
         return _build_error_row(
-            "X4BNet VPN",
+            "OpenASN",
             status="Offline DB Missing",
             usage_type="Offline DB Missing",
-            raw_data={"status": "unconfigured", "message": "X4BNet VPN offline index not found"},
+            raw_data={"status": "unconfigured", "message": "OpenASN offline database not found"},
             extra=extra,
         )
 
@@ -1601,49 +1620,48 @@ def adapt_x4bnet_vpn(
     if status_code != 200 or not raw_data or "error" in raw_data or raw_data.get("status") == "error":
         if status_code == 200:
             status_code = 502
-        return _build_error_row("X4BNet VPN", status_code, raw_data, extra=extra)
+        return _build_error_row("OpenASN", status_code, raw_data, extra=extra)
 
-    is_vpn = bool(raw_data.get("isVpn"))
-    is_datacenter = bool(raw_data.get("isDatacenter"))
-    is_hosting = bool(raw_data.get("isHosting")) or is_datacenter
-    is_listed = bool(raw_data.get("isListed")) or is_vpn or is_hosting
-    raw_matched = raw_data.get("matchedCidr")
-    matched_cidr = raw_matched.strip() if isinstance(raw_matched, str) and raw_matched.strip() else None
-    raw_sources = raw_data.get("sources")
-    sources = (
-        [str(src).strip() for src in raw_sources if isinstance(src, str) and str(src).strip()]
-        if isinstance(raw_sources, list)
-        else []
-    )
-    category = "vpn" if is_vpn else ("datacenter" if is_datacenter else ("hosting" if is_hosting else None))
+    verdict = raw_data.get("coreVerdict")
+    core_verdict = verdict if isinstance(verdict, str) and verdict else "unknown"
+    is_cdn = bool(raw_data.get("cdn"))
+    is_datacenter = bool(raw_data.get("datacenterRange"))
+    is_pure_cdn = core_verdict == "hosting" and is_cdn and not is_datacenter
+    is_hosting = core_verdict == "hosting" and not is_pure_cdn
+    is_mobile = core_verdict == "mobile"
+    raw_sources = raw_data.get("coreSources")
+    raw_asn = raw_data.get("asn")
+    as_org = raw_data.get("asOrg")
+    org_text = as_org if isinstance(as_org, str) and as_org else "-"
 
-    flags: List[Dict[str, Any]] = []
-    if is_vpn:
-        flags.append({"label": "High-Risk VPN", "isHighRisk": True})
-    if is_hosting:
-        flags.append({"label": "Hosting / Datacentre", "isHighRisk": False})
-
-    usage_type = (
-        "vpn" if is_vpn else ("datacenter" if is_datacenter else ("hosting" if is_hosting else "Clean (Not Listed)"))
-    )
     row_extra: Dict[str, Any] = {
-        "isListed": is_listed,
-        "isVpn": is_vpn,
-        "isDatacenter": is_datacenter,
+        "coreVerdict": core_verdict,
+        "coreSources": [s for s in raw_sources if isinstance(s, str) and s] if isinstance(raw_sources, list) else [],
+        "category": raw_data.get("category"),
+        "networkRole": raw_data.get("networkRole"),
+        "isVpn": core_verdict == "vpn",
         "isHosting": is_hosting,
-        "matchedCidr": matched_cidr,
-        "category": category,
-        "sources": sources,
+        "isDatacenter": is_datacenter,
+        "isCdn": is_cdn,
+        "isMobile": is_mobile,
+        "isEnterpriseGateway": core_verdict == "enterprise_gateway",
+        "isBadAsn": bool(raw_data.get("badAsn")),
+        "lookupStatus": raw_data.get("lookupStatus") or "unrouted",
     }
     offline_updated = raw_data.get("offlineDbUpdatedAt")
     if isinstance(offline_updated, str) and offline_updated.strip():
         row_extra["offlineDbUpdatedAt"] = offline_updated.strip()
 
+    asn_text = f"AS{raw_asn}" if isinstance(raw_asn, int) and not isinstance(raw_asn, bool) else "-"
     return _build_ok_row(
-        "X4BNet VPN",
+        "OpenASN",
         raw_data,
-        usage_type=usage_type,
-        security_flags=flags or _default_no_flags(),
+        asn=asn_text,
+        isp=org_text,
+        usage_type="cdn" if is_pure_cdn else core_verdict,
+        security_flags=_openasn_flags(
+            core_verdict, is_pure_cdn=is_pure_cdn, is_hosting=is_hosting, is_mobile=is_mobile
+        ),
         extra=row_extra,
     )
 
@@ -1783,7 +1801,7 @@ ADAPTER_DISPATCH_TABLE: Dict[str, Any] = {
     "stopforumspam": adapt_stopforumspam,
     "dshield": adapt_dshield,
     "ipsum_drop": adapt_ipsum_drop,
-    "x4bnet_vpn": adapt_x4bnet_vpn,
+    "openasn": adapt_openasn,
     "shodan_internetdb": adapt_shodan_internetdb,
 }
 
@@ -1791,7 +1809,6 @@ ADAPTER_DISPATCH_TABLE: Dict[str, Any] = {
 __all__ = [
     "ADAPTER_DISPATCH_TABLE",
     "SHODAN_HIGH_RISK_PROXY_PORTS",
-    "_parse_cloud_cidr_payload",
     "_safe_int",
     "adapt_abuseipdb",
     "adapt_cloudflare_radar",
@@ -1804,19 +1821,17 @@ __all__ = [
     "adapt_ipregistry",
     "adapt_ipsum_drop",
     "adapt_maxmind",
+    "adapt_openasn",
     "adapt_proxycheck",
     "adapt_shodan_internetdb",
     "adapt_spamcop",
     "adapt_spamhaus_zen",
     "adapt_stopforumspam",
     "adapt_tor_onionoo",
-    "adapt_x4bnet_vpn",
     "are_offline_intelligence_caches_warm",
     "classify_rdns_hostname",
     "clear_offline_intelligence_caches",
     "compute_cidr_attribution",
-    "match_cloud_cidr",
     "match_hosting_asn_or_org",
-    "parse_cloud_cidr_payload",
     "warm_offline_intelligence_caches",
 ]

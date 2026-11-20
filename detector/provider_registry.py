@@ -257,8 +257,8 @@ PROVIDER_REGISTRY: Tuple[ProviderMetadata, ...] = (
         has_quota_env_vars=False,
     ),
     ProviderMetadata(
-        key="x4bnet_vpn",
-        label="X4BNet VPN",
+        key="openasn",
+        label="OpenASN",
         uses_http=False,
         supports_cooldown=False,
         active_in_light_mode=True,
@@ -301,7 +301,10 @@ DNSBL_PROVIDER_KEYS: FrozenSet[str] = frozenset(meta.key for meta in PROVIDER_RE
 
 OFFLINE_PROVIDER_KEYS: FrozenSet[str] = frozenset(meta.key for meta in PROVIDER_REGISTRY if meta.is_offline)
 
-OFFLINE_REHYDRATE_PROVIDERS: FrozenSet[str] = frozenset({"maxmind", "stopforumspam", "ipsum_drop", "x4bnet_vpn"})
+OFFLINE_REHYDRATE_PROVIDERS: FrozenSet[str] = frozenset({"maxmind", "stopforumspam", "ipsum_drop", "openasn"})
+
+# Local mmap lookups cost microseconds, so these providers never touch Redis or the L1/L2 snapshots.
+NO_REDIS_CACHE_PROVIDER_KEYS: FrozenSet[str] = frozenset({"openasn"})
 
 L1_ONLY_PROVIDERS: FrozenSet[str] = frozenset({"iphub", "spamhaus_zen", "spamcop"})
 

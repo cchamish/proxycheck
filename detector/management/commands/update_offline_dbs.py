@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import contextlib
-import csv
 import gzip
 import hashlib
-import io
 import ipaddress
 import json
 import os
@@ -17,36 +15,36 @@ import tempfile
 import time
 import zipfile
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 import httpx
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
 from detector.binary_prefix_index import compile_binary_prefix_index, parse_cidr_to_int_prefix
-from detector.cidr_attribution import clear_offline_intelligence_caches, parse_cloud_cidr_payload
+from detector.cache_backends import clear_maxmind_readers
+from detector.cidr_attribution import clear_offline_intelligence_caches
 from detector.offline_dbs import (
     BGP_TAGS_JSON_FILENAME,
     BGP_TOOLS_BIN_FILENAME,
-    CLOUD_CIDRS_FILENAME,
     HTTP_FEED_METADATA_FILENAME,
     IPSUM_DROP_BIN_FILENAME,
     MAXMIND_EDITION_SPECS,
     MOBILE_ASNS_JSON_FILENAME,
     MOBILE_BGP_TAG_TOKENS,
+    OPENASN_MMDB_FILENAME,
     PRIVACY_RELAYS_BIN_FILENAME,
+    REZMOSS_EXCLUDED_PROVIDERS,
     SFS_LISTED_1_ZIP_NAME,
     SFS_LISTED_90_ZIP_NAME,
     SFS_SQLITE_FILENAME,
     SFS_TOXIC_CIDR_FILENAME,
+    SHARED_CIDRS_BIN_FILENAME,
     TOR_ONIONOO_SUMMARY_FILENAME,
-    X4BNET_MASK_DATACENTER,
-    X4BNET_MASK_HOSTING,
-    X4BNET_MASK_VPN,
-    X4BNET_VPN_BIN_FILENAME,
     PrefixCidrIndex,
     atomic_temp_path,
     build_stopforumspam_sqlite_index,
+    classify_rezmoss_provider,
     clear_stopforumspam_caches,
     replace_temp_file_atomically,
     resolve_configured_data_dir,
@@ -73,17 +71,19 @@ SFS_TOXIC_MIN_INTERVAL_SECONDS = 12 * 3600 - 300
 SFS_90_MIN_INTERVAL_SECONDS = 12 * 3600 - 300
 SFS_1_MIN_INTERVAL_SECONDS = 3600 - 120
 MAXMIND_MIN_INTERVAL_SECONDS = 24 * 3600 - 300
-CLOUD_CIDRS_MIN_INTERVAL_SECONDS = 24 * 3600 - 300
 TOR_ONIONOO_MIN_INTERVAL_SECONDS = 3600 - 120
 DAILY_FEED_MIN_INTERVAL_SECONDS = 24 * 3600 - 300
 
-AWS_IP_RANGES_URL = "https://ip-ranges.amazonaws.com/ip-ranges.json"
-GCP_IP_RANGES_URL = "https://www.gstatic.com/ipranges/cloud.json"
-OCI_IP_RANGES_URL = "https://docs.oracle.com/en-us/iaas/tools/public_ip_ranges.json"
-AZURE_DOWNLOAD_PAGE_URL = "https://www.microsoft.com/en-us/download/details.aspx?id=56519"
-_AZURE_SERVICETAGS_URL_RE = re.compile(
-    r"https://download\.microsoft\.com/download/[^\"'\s<>]+/ServiceTags_Public_\d+\.json"
-)
+REZMOSS_BASE_URL = "https://raw.githubusercontent.com/rezmoss/cloud-provider-ip-addresses/main"
+REZMOSS_SUMMARY_URL = f"{REZMOSS_BASE_URL}/summary.json"
+_SHARED_CATEGORY_PRIORITY: Dict[str, int] = {
+    "vpn": 6,
+    "enterprise_gateway": 5,
+    "bot": 4,
+    "saas": 3,
+    "cdn": 2,
+    "cloud": 1,
+}
 
 APPLE_PRIVATE_RELAY_URL = "https://mask-api.icloud.com/egress-ip-ranges.csv"
 CLOUDFLARE_LOCAL_GEOFEED_URL = "https://api.cloudflare.com/local-ip-ranges.csv"
@@ -102,11 +102,21 @@ BGP_TOOLS_TAGS_URL = "https://bgp.tools/tags.txt"
 BGP_TOOLS_MOBILE_TAG_CSV_URL = "https://bgp.tools/tags/mobile.csv"
 BGP_TOOLS_VPN_TAG_CSV_URL = "https://bgp.tools/tags/vpn.csv"
 
-X4BNET_VPN_IPV4_URL = "https://raw.githubusercontent.com/X4BNet/lists_vpn/main/output/vpn/ipv4.txt"
-X4BNET_VPN_IPV6_URL = "https://raw.githubusercontent.com/X4BNet/lists_vpn/main/output/vpn/ipv6.txt"
-X4BNET_DATACENTER_IPV4_URL = "https://raw.githubusercontent.com/X4BNet/lists_vpn/main/output/datacenter/ipv4.txt"
-X4BNET_DATACENTER_IPV6_URL = "https://raw.githubusercontent.com/X4BNet/lists_vpn/main/output/datacenter/ipv6.txt"
-IPAPI_IS_HOSTING_URL = "https://raw.githubusercontent.com/ipapi-is/ip_to_hosting/main/data/hosting_ranges.txt"
+# Always the tag-addressed "latest" release: the GitHub "Latest" badge can point at stale dated snapshots.
+OPENASN_MANIFEST_URL = "https://github.com/openasn/openasn/releases/download/latest/manifest.json"
+OPENASN_MMDB_URL = "https://github.com/openasn/openasn/releases/download/latest/openasn.mmdb"
+OPENASN_MANIFEST_MAX_BYTES = 2 * 1024 * 1024
+OPENASN_MAX_ATTEMPTS = 3
+OPENASN_RETRY_BACKOFF_SECONDS = (2, 5)
+OPENASN_DATABASE_TYPE = "OpenASN-Core-v1"
+_OPENASN_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_OPENASN_EXPORT_CONTRACT: Dict[str, Any] = {
+    "format": "mmdb",
+    "content_encoding": "identity",
+    "schema_version": 1,
+    "classification_profile": "core-v1",
+    "lookup_policy_version": 1,
+}
 
 PEERINGDB_NET_URL = "https://www.peeringdb.com/api/net"
 
@@ -114,9 +124,9 @@ _SOURCE_ALIASES: Dict[str, str] = {
     "stopforumspam": "stopforumspam",
     "sfs": "stopforumspam",
     "maxmind": "maxmind",
-    "cloud_cidrs": "cloud_cidrs",
-    "cloud-cidrs": "cloud_cidrs",
-    "cloud": "cloud_cidrs",
+    "shared_cidrs": "shared_cidrs",
+    "shared-cidrs": "shared_cidrs",
+    "rezmoss": "shared_cidrs",
     "privacy_relays": "privacy_relays",
     "privacy-relays": "privacy_relays",
     "ipsum_drop": "ipsum_drop",
@@ -125,20 +135,20 @@ _SOURCE_ALIASES: Dict[str, str] = {
     "tor-onionoo": "tor_onionoo",
     "bgp_tools": "bgp_tools",
     "bgp-tools": "bgp_tools",
-    "x4bnet_vpn": "x4bnet_vpn",
-    "x4bnet-vpn": "x4bnet_vpn",
+    "openasn": "openasn",
+    "open-asn": "openasn",
     "peeringdb_mobile": "peeringdb_mobile",
     "peeringdb-mobile": "peeringdb_mobile",
 }
 _ALL_CANONICAL_SOURCES: Tuple[str, ...] = (
     "stopforumspam",
     "maxmind",
-    "cloud_cidrs",
+    "shared_cidrs",
     "privacy_relays",
     "ipsum_drop",
     "tor_onionoo",
     "bgp_tools",
-    "x4bnet_vpn",
+    "openasn",
     "peeringdb_mobile",
 )
 
@@ -443,117 +453,40 @@ def _extract_mmdb_into_file(tar_path: Path, edition_name: str, destination_path:
             reader.close()
 
 
-def _normalize_cidr_list(raw_cidrs: Iterable[Any]) -> List[str]:
-    """Validates, normalises, and deduplicates raw CIDR strings in deterministic order."""
-    seen: set[str] = set()
-    for raw in raw_cidrs:
-        if not isinstance(raw, str) or not raw.strip():
-            continue
-        try:
-            seen.add(str(ipaddress.ip_network(raw.strip(), strict=False)))
-        except ValueError:
-            continue
-    return sorted(seen)
-
-
-def _parse_aws_cloud_cidrs(payload: Any) -> List[str]:
-    if not isinstance(payload, dict):
-        raise CommandError("AWS IP ranges payload was not a JSON object.")
-    raw: List[Any] = []
-    for key, field in (("prefixes", "ip_prefix"), ("ipv6_prefixes", "ipv6_prefix")):
-        items = payload.get(key)
-        if isinstance(items, list):
-            raw.extend(entry.get(field) for entry in items if isinstance(entry, dict))
-    return _normalize_cidr_list(raw)
-
-
-def _parse_gcp_cloud_cidrs(payload: Any) -> List[str]:
-    if not isinstance(payload, dict):
-        raise CommandError("GCP IP ranges payload was not a JSON object.")
-    prefixes = payload.get("prefixes")
-    if not isinstance(prefixes, list):
-        raise CommandError("GCP IP ranges payload missing prefixes list.")
-    raw: List[Any] = []
-    for entry in prefixes:
-        if isinstance(entry, dict):
-            raw.append(entry.get("ipv4Prefix"))
-            raw.append(entry.get("ipv6Prefix"))
-    return _normalize_cidr_list(raw)
-
-
-def _parse_oci_cloud_cidrs(payload: Any) -> List[str]:
-    if not isinstance(payload, dict):
-        raise CommandError("OCI IP ranges payload was not a JSON object.")
-    regions = payload.get("regions")
-    if not isinstance(regions, list):
-        raise CommandError("OCI IP ranges payload missing regions list.")
-    raw: List[Any] = []
-    for region in regions:
-        if isinstance(region, dict) and isinstance(region.get("cidrs"), list):
-            raw.extend(item.get("cidr") for item in region["cidrs"] if isinstance(item, dict))
-    return _normalize_cidr_list(raw)
-
-
-def _extract_azure_servicetags_url(html_text: str) -> str:
-    match = _AZURE_SERVICETAGS_URL_RE.search(html_text or "")
-    if match is None:
-        raise CommandError("Could not locate ServiceTags_Public JSON download URL on Microsoft download page.")
-    return match.group(0)
-
-
-def _parse_azure_cloud_cidrs(payload: Any) -> List[str]:
-    if not isinstance(payload, dict):
-        raise CommandError("Azure ServiceTags payload was not a JSON object.")
-    values = payload.get("values")
-    if not isinstance(values, list):
-        raise CommandError("Azure ServiceTags payload missing values list.")
-    raw: List[Any] = []
-    for entry in values:
-        if isinstance(entry, dict):
-            props = entry.get("properties")
-            if isinstance(props, dict) and isinstance(props.get("addressPrefixes"), list):
-                raw.extend(props["addressPrefixes"])
-    return _normalize_cidr_list(raw)
-
-
-def _fetch_json_payload(client: httpx.Client, url: str) -> Any:
-    resp = client.get(url)
-    resp.raise_for_status()
-    json_fn = getattr(resp, "json", None)
-    return json_fn() if callable(json_fn) else json.loads(resp.text)
-
-
-def _fetch_azure_cloud_cidrs(client: httpx.Client) -> List[str]:
-    page_resp = client.get(AZURE_DOWNLOAD_PAGE_URL)
-    page_resp.raise_for_status()
-    json_url = _extract_azure_servicetags_url(page_resp.text)
-    return _parse_azure_cloud_cidrs(_fetch_json_payload(client, json_url))
-
-
-_CLOUD_CIDR_SOURCES: Tuple[Tuple[str, Callable[[httpx.Client], List[str]]], ...] = (
-    ("Amazon AWS", lambda client: _parse_aws_cloud_cidrs(_fetch_json_payload(client, AWS_IP_RANGES_URL))),
-    ("Google Cloud", lambda client: _parse_gcp_cloud_cidrs(_fetch_json_payload(client, GCP_IP_RANGES_URL))),
-    ("Oracle Cloud", lambda client: _parse_oci_cloud_cidrs(_fetch_json_payload(client, OCI_IP_RANGES_URL))),
-    ("Microsoft Azure", _fetch_azure_cloud_cidrs),
-)
-
-
-def _load_existing_cloud_cidrs_by_provider(target_path: Path) -> Dict[str, List[str]]:
-    if not target_path.is_file():
-        return {}
-    try:
-        payload = json.loads(target_path.read_text(encoding="utf-8"))
-    except OSError, ValueError:
-        return {}
-    grouped: Dict[str, List[str]] = {}
-    for raw_cidr, provider_name in parse_cloud_cidr_payload(payload):
-        grouped.setdefault(provider_name, []).append(raw_cidr)
-    return {provider: _normalize_cidr_list(cidrs) for provider, cidrs in grouped.items()}
-
-
 def _write_json_atomically(payload: Any, target_path: Path) -> None:
     with atomic_temp_path(target_path) as tmp_path:
         tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _merge_shared_cidr_payloads(existing: Any, new: Any) -> Dict[str, str]:
+    existing_map = existing if isinstance(existing, Mapping) else {}
+    new_map = new if isinstance(new, Mapping) else {}
+    existing_cat = str(existing_map.get("c") or "cloud").lower()
+    new_cat = str(new_map.get("c") or "cloud").lower()
+    if _SHARED_CATEGORY_PRIORITY.get(new_cat, 0) > _SHARED_CATEGORY_PRIORITY.get(existing_cat, 0):
+        return {"p": str(new_map.get("p") or ""), "c": new_cat}
+    return {"p": str(existing_map.get("p") or ""), "c": existing_cat}
+
+
+def _parse_rezmoss_summary_slugs(raw_text: str) -> List[str]:
+    _reject_html_payload(raw_text, "Rezmoss summary.json")
+    try:
+        payload = json.loads(raw_text)
+    except ValueError as exc:
+        raise CommandError(f"Rezmoss summary.json was not valid JSON: {exc}") from exc
+    providers = payload.get("providers") if isinstance(payload, dict) else None
+    if not isinstance(providers, dict) or not providers:
+        raise CommandError("Rezmoss summary.json is missing a non-empty providers object.")
+    slugs = sorted(
+        str(raw_slug).strip().lower()
+        for raw_slug in providers
+        if isinstance(raw_slug, str)
+        and str(raw_slug).strip()
+        and str(raw_slug).strip().lower() not in REZMOSS_EXCLUDED_PROVIDERS
+    )
+    if not slugs:
+        raise CommandError("Rezmoss summary.json contained no eligible provider slugs.")
+    return slugs
 
 
 def _parse_geofeed_csv_cidrs(raw_text: str, label: str) -> List[str]:
@@ -822,42 +755,6 @@ def _ingest_bgp_tag_category_csv(raw_text: str, category_tag: str, asn_tags: Dic
                 bucket.append(tag_clean)
 
 
-def _parse_hosting_feed_cidrs(raw_text: str) -> List[str]:
-    _reject_html_payload(raw_text, "ip_to_hosting")
-    stripped_body = raw_text.strip()
-    if not stripped_body:
-        return []
-
-    if stripped_body.startswith(("{", "[")):
-        try:
-            parsed_json = json.loads(stripped_body)
-            return [cidr for cidr, _prov in parse_cloud_cidr_payload(parsed_json, default_provider="Hosting")]
-        except ValueError:
-            pass
-
-    cidrs: List[str] = []
-    for row in csv.reader(io.StringIO(stripped_body)):
-        if not row:
-            continue
-        first = row[0].strip()
-        if not first or first.startswith(("#", ";")) or first.lower() in ("startip", "start_ip", "cidr", "network"):
-            continue
-        if len(row) >= 2 and "/" not in first:
-            second = row[1].strip()
-            try:
-                start_ip = ipaddress.ip_address(first)
-                end_ip = ipaddress.ip_address(second)
-                if start_ip.version == end_ip.version and int(start_ip) <= int(end_ip):
-                    cidrs.extend(str(net) for net in ipaddress.summarize_address_range(start_ip, end_ip))
-                    continue
-            except ValueError:
-                pass
-        candidate = first.split()[0]
-        if parse_cidr_to_int_prefix(candidate) is not None:
-            cidrs.append(candidate)
-    return cidrs
-
-
 def _is_peeringdb_mobile_entry(entry: Mapping[str, Any]) -> bool:
     info_types = entry.get("info_types")
     if isinstance(info_types, list) and any(str(item).strip().lower() == "mobile" for item in info_types):
@@ -898,6 +795,60 @@ def _parse_peeringdb_mobile_payload(raw_text: str) -> Dict[str, Any]:
     }
 
 
+class _OpenAsnUnsupportedError(CommandError):
+    """Raised when the OpenASN manifest declares a contract this updater does not understand."""
+
+
+def _is_transient_openasn_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return status == 404 or status >= 500
+    return isinstance(exc, (httpx.TransportError, CommandError, OSError))
+
+
+def _select_openasn_manifest_entry(manifest: Any) -> Dict[str, Any]:
+    """Validates the manifest files entry for openasn.mmdb against the v1 export contract."""
+    files = manifest.get("files") if isinstance(manifest, dict) else None
+    entry = next(
+        (item for item in files or [] if isinstance(item, dict) and item.get("name") == OPENASN_MMDB_FILENAME),
+        None,
+    )
+    if entry is None:
+        raise CommandError("OpenASN manifest.json does not list openasn.mmdb.")
+
+    sha256 = entry.get("sha256")
+    size = entry.get("bytes")
+    if not isinstance(sha256, str) or not _OPENASN_SHA256_RE.fullmatch(sha256):
+        raise CommandError("OpenASN manifest entry has an invalid sha256.")
+    if not isinstance(size, int) or isinstance(size, bool) or not 0 < size <= MAX_ARCHIVE_BYTES:
+        raise CommandError("OpenASN manifest entry has an invalid byte length.")
+
+    export_meta = entry.get("export")
+    if not isinstance(export_meta, dict):
+        raise _OpenAsnUnsupportedError("OpenASN manifest entry is missing its export metadata.")
+    for key, expected in _OPENASN_EXPORT_CONTRACT.items():
+        if export_meta.get(key) != expected:
+            raise _OpenAsnUnsupportedError(
+                f"Unsupported OpenASN export {key}: {export_meta.get(key)!r} (expected {expected!r})."
+            )
+    return {"sha256": sha256, "bytes": size}
+
+
+def _verify_openasn_database_type(candidate: Path) -> None:
+    if maxminddb is None:
+        raise _OpenAsnUnsupportedError("maxminddb is not installed; cannot verify the OpenASN database.")
+    try:
+        reader = maxminddb.open_database(str(candidate))
+        try:
+            database_type = reader.metadata().database_type
+        finally:
+            reader.close()
+    except RuntimeError as exc:
+        raise _OpenAsnUnsupportedError(f"OpenASN database is invalid or unreadable: {exc}") from exc
+    if database_type != OPENASN_DATABASE_TYPE:
+        raise _OpenAsnUnsupportedError(f"Unexpected OpenASN database type: {database_type!r}.")
+
+
 class Command(BaseCommand):
     help = "Downloads and atomically replaces local offline threat intelligence databases and prefix indexes."
 
@@ -907,8 +858,8 @@ class Command(BaseCommand):
             nargs="+",
             default=["all"],
             help=(
-                "Sources to update: all, stopforumspam, maxmind, cloud_cidrs, privacy_relays, "
-                "ipsum_drop, tor_onionoo, bgp_tools, x4bnet_vpn, peeringdb_mobile (space or comma separated)."
+                "Sources to update: all, stopforumspam, maxmind, shared_cidrs, privacy_relays, "
+                "ipsum_drop, tor_onionoo, bgp_tools, openasn, peeringdb_mobile (space or comma separated)."
             ),
         )
         parser.add_argument(
@@ -1178,63 +1129,129 @@ class Command(BaseCommand):
 
         return errors
 
-    def _update_cloud_cidrs(
+    def _fetch_rezmoss_provider_cidrs(
+        self,
+        client: httpx.Client,
+        slug: str,
+        *,
+        data_dir: Path,
+        meta_map: Dict[str, Dict[str, str]],
+        target_exists: bool,
+    ) -> Tuple[List[str], bool]:
+        provider_url = f"{REZMOSS_BASE_URL}/{slug}/{slug}_ips_merged.txt"
+        modified = False
+        try:
+            body, modified = _fetch_conditional_text(
+                client,
+                provider_url,
+                data_dir=data_dir,
+                meta_map=meta_map,
+                target_exists=target_exists,
+                cache_raw=True,
+            )
+        except _DOWNLOAD_UPDATE_ERRORS as exc:
+            cache_file = _url_cache_path(data_dir, provider_url)
+            if not cache_file.is_file():
+                self.stderr.write(
+                    self.style.WARNING(_redact_update_error(f"Failed Rezmoss {slug} fetch ({exc}); skipping."))
+                )
+                return [], False
+            body = cache_file.read_text(encoding="utf-8")
+            self.stderr.write(
+                self.style.WARNING(_redact_update_error(f"Failed Rezmoss {slug} fetch ({exc}); using cached list."))
+            )
+
+        if body is None:
+            return [], modified
+        try:
+            return _parse_plaintext_cidrs(body, f"Rezmoss {slug}"), modified
+        except CommandError as exc:
+            self.stderr.write(self.style.WARNING(_redact_update_error(f"Invalid Rezmoss {slug} payload: {exc}")))
+            return [], modified
+
+    def _update_shared_cidrs(
         self,
         client: httpx.Client,
         *,
         data_dir: Path,
+        meta_map: Dict[str, Dict[str, str]],
         force: bool,
         dry_run: bool,
     ) -> int:
-        target_path = data_dir / CLOUD_CIDRS_FILENAME
-        wait_seconds = _check_mtime_cooldown(target_path, CLOUD_CIDRS_MIN_INTERVAL_SECONDS, force=force)
+        target_path = data_dir / SHARED_CIDRS_BIN_FILENAME
+        wait_seconds = _check_mtime_cooldown(target_path, DAILY_FEED_MIN_INTERVAL_SECONDS, force=force)
         if wait_seconds is not None:
-            self.stdout.write(
-                f"Skipped Cloud CIDRs ({target_path.name}): updated recently, next check allowed in {wait_seconds}s."
-            )
+            self.stdout.write(f"Skipped Shared CIDRs ({target_path.name}): wait {wait_seconds}s.")
             return 0
         if dry_run:
-            self.stdout.write(f"[dry-run] Would fetch AWS, GCP, OCI, and Azure IP ranges into {target_path}")
+            self.stdout.write(f"[dry-run] Would compile Rezmoss shared CIDRs index into {target_path}")
             return 0
 
-        existing_by_provider = _load_existing_cloud_cidrs_by_provider(target_path)
-        merged: Dict[str, List[str]] = {}
-        fetched_count = 0
-
-        for provider_name, fetcher in _CLOUD_CIDR_SOURCES:
-            try:
-                cidrs = fetcher(client)
-                if not cidrs:
-                    raise CommandError(f"{provider_name} returned no valid IP networks.")
-                merged[provider_name] = cidrs
-                fetched_count += 1
-            except (*_DOWNLOAD_UPDATE_ERRORS, KeyError, TypeError) as exc:
-                historical = existing_by_provider.get(provider_name, [])
-                if historical:
-                    merged[provider_name] = historical
-                    self.stderr.write(
-                        self.style.WARNING(
-                            f"Failed {provider_name} CIDR fetch ({exc}); retaining {len(historical)} historical CIDRs."
-                        )
-                    )
-                else:
-                    self.stderr.write(
-                        self.style.WARNING(f"Failed {provider_name} CIDR fetch ({exc}); no fallback data.")
-                    )
-
-        total_cidrs = sum(len(v) for v in merged.values())
-        if fetched_count == 0 and total_cidrs == 0:
-            self.stderr.write(self.style.ERROR("Failed Cloud CIDRs update: all providers failed with no fallback."))
+        target_exists = target_path.is_file()
+        try:
+            summary_body, summary_modified = _fetch_conditional_text(
+                client,
+                REZMOSS_SUMMARY_URL,
+                data_dir=data_dir,
+                meta_map=meta_map,
+                target_exists=target_exists,
+                cache_raw=True,
+            )
+            if not summary_modified and target_exists:
+                self.stdout.write(f"Skipped Shared CIDRs ({target_path.name}): summary.json returned 304 Not Modified.")
+                return 0
+            if summary_body is None:
+                raise CommandError("Rezmoss summary.json returned no content.")
+            slugs = _parse_rezmoss_summary_slugs(summary_body)
+        except _DOWNLOAD_UPDATE_ERRORS as exc:
+            self.stderr.write(self.style.ERROR(_redact_update_error(f"Failed Shared CIDRs summary fetch: {exc}")))
             return 1
 
-        _write_json_atomically(merged, target_path)
-        clear_offline_intelligence_caches()
-        self.stdout.write(
-            self.style.SUCCESS(
-                f"Updated Cloud CIDRs ({target_path.name}, {total_cidrs} CIDRs across {len(merged)} providers)."
+        entries: List[Tuple[str, Dict[str, str]]] = []
+        any_modified = summary_modified
+        provider_count = 0
+
+        for slug in slugs:
+            classified = classify_rezmoss_provider(slug)
+            if classified is None:
+                continue
+            display_label, category = classified
+            cidrs, modified = self._fetch_rezmoss_provider_cidrs(
+                client,
+                slug,
+                data_dir=data_dir,
+                meta_map=meta_map,
+                target_exists=target_exists,
             )
-        )
-        return 0
+            any_modified = any_modified or modified
+            if cidrs:
+                payload = {"p": display_label, "c": category}
+                provider_count += 1
+                entries.extend((cidr, payload) for cidr in cidrs)
+
+        if not any_modified and target_exists:
+            self.stdout.write(f"Skipped Shared CIDRs ({target_path.name}): upstream returned 304 Not Modified.")
+            return 0
+        if not entries:
+            self.stderr.write(self.style.ERROR("Failed Shared CIDRs update: no valid CIDR entries collected."))
+            return 1
+
+        try:
+            rule_count = compile_binary_prefix_index(
+                entries,
+                target_path,
+                merge_payloads=_merge_shared_cidr_payloads,
+            )
+            clear_offline_intelligence_caches()
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f"Updated Shared CIDRs ({target_path.name}, {rule_count} CIDRs across {provider_count} providers)."
+                )
+            )
+            return 0
+        except _DOWNLOAD_UPDATE_ERRORS as exc:
+            self.stderr.write(self.style.ERROR(_redact_update_error(f"Failed Shared CIDRs compilation: {exc}")))
+            return 1
 
     def _update_privacy_relays(
         self,
@@ -1522,7 +1539,55 @@ class Command(BaseCommand):
             self.stderr.write(self.style.ERROR(_redact_update_error(f"Failed BGP Tools update: {exc}")))
             return 1
 
-    def _update_x4bnet_vpn(
+    def _fetch_openasn_manifest_entry(self, client: httpx.Client) -> Dict[str, Any]:
+        resp = client.get(OPENASN_MANIFEST_URL)
+        resp.raise_for_status()
+        raw_bytes = resp.content
+        if not isinstance(raw_bytes, (bytes, bytearray)) or not raw_bytes:
+            raise CommandError("OpenASN manifest.json was empty.")
+        if len(raw_bytes) > OPENASN_MANIFEST_MAX_BYTES:
+            raise _OpenAsnUnsupportedError("OpenASN manifest.json exceeded the size limit.")
+        try:
+            manifest = json.loads(bytes(raw_bytes).decode("utf-8"))
+        except ValueError as exc:
+            raise CommandError(f"OpenASN manifest.json was not valid JSON: {exc}") from exc
+        return _select_openasn_manifest_entry(manifest)
+
+    def _install_openasn_once(
+        self,
+        client: httpx.Client,
+        *,
+        target_path: Path,
+        force: bool,
+    ) -> bool:
+        """Runs one verified OpenASN download attempt, returning False when the local file is already current."""
+        entry = self._fetch_openasn_manifest_entry(client)
+        expected_sha = entry["sha256"]
+        expected_bytes = entry["bytes"]
+
+        if not force and target_path.is_file():
+            with contextlib.suppress(OSError):
+                if _file_sha256_hex(target_path) == expected_sha:
+                    self.stdout.write(f"Skipped OpenASN ({target_path.name}): local file already matches manifest.")
+                    return False
+
+        tmp_path = _stream_download_to_temp(client, OPENASN_MMDB_URL, target_path.parent, f".{target_path.name}.tmp.")
+        try:
+            actual_bytes = tmp_path.stat().st_size
+            if actual_bytes != expected_bytes:
+                raise CommandError(f"OpenASN size mismatch: expected {expected_bytes} bytes, got {actual_bytes}.")
+            actual_sha = _file_sha256_hex(tmp_path)
+            if actual_sha != expected_sha:
+                raise CommandError(f"OpenASN SHA-256 mismatch: expected {expected_sha}, got {actual_sha}.")
+            _verify_openasn_database_type(tmp_path)
+            replace_temp_file_atomically(tmp_path, target_path)
+        finally:
+            if tmp_path.exists():
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink()
+        return True
+
+    def _update_openasn(
         self,
         client: httpx.Client,
         *,
@@ -1531,88 +1596,37 @@ class Command(BaseCommand):
         force: bool,
         dry_run: bool,
     ) -> int:
-        target_path = data_dir / X4BNET_VPN_BIN_FILENAME
+        target_path = data_dir / OPENASN_MMDB_FILENAME
         wait_seconds = _check_mtime_cooldown(target_path, DAILY_FEED_MIN_INTERVAL_SECONDS, force=force)
         if wait_seconds is not None:
-            self.stdout.write(f"Skipped X4BNet VPN ({target_path.name}): wait {wait_seconds}s.")
+            self.stdout.write(f"Skipped OpenASN ({target_path.name}): wait {wait_seconds}s.")
             return 0
         if dry_run:
-            self.stdout.write(f"[dry-run] Would compile X4BNet VPN and hosting index into {target_path}")
+            self.stdout.write(f"[dry-run] Would verify manifest and download OpenASN into {target_path}")
             return 0
 
-        target_exists = target_path.is_file()
-        hosting_url = str(getattr(settings, "IPAPI_IS_HOSTING_URL", IPAPI_IS_HOSTING_URL) or IPAPI_IS_HOSTING_URL)
-        sources = (
-            ("X4BNet VPN IPv4", X4BNET_VPN_IPV4_URL, X4BNET_MASK_VPN, _parse_plaintext_cidrs, False),
-            ("X4BNet VPN IPv6", X4BNET_VPN_IPV6_URL, X4BNET_MASK_VPN, _parse_plaintext_cidrs, True),
-            (
-                "X4BNet Datacenter IPv4",
-                X4BNET_DATACENTER_IPV4_URL,
-                X4BNET_MASK_DATACENTER,
-                _parse_plaintext_cidrs,
-                False,
-            ),
-            (
-                "X4BNet Datacenter IPv6",
-                X4BNET_DATACENTER_IPV6_URL,
-                X4BNET_MASK_DATACENTER,
-                _parse_plaintext_cidrs,
-                True,
-            ),
-            (
-                "ipapi-is Hosting",
-                hosting_url,
-                X4BNET_MASK_HOSTING,
-                lambda txt, _lbl: _parse_hosting_feed_cidrs(txt),
-                True,
-            ),
-        )
-
-        any_modified = False
-        any_304 = False
-        entries: List[Tuple[str, int]] = []
         last_error: Optional[Exception] = None
-
-        for label, url, bit_mask, parser_fn, optional_feed in sources:
+        for attempt in range(OPENASN_MAX_ATTEMPTS):
             try:
-                body, modified = _fetch_conditional_text(
-                    client,
-                    url,
-                    data_dir=data_dir,
-                    meta_map=meta_map,
-                    target_exists=target_exists,
-                    cache_raw=True,
-                )
-                any_modified = any_modified or modified
-                any_304 = any_304 or (not modified)
-                if body is not None:
-                    entries.extend((cidr, bit_mask) for cidr in parser_fn(body, label))
+                installed = self._install_openasn_once(client, target_path=target_path, force=force)
+            except _OpenAsnUnsupportedError as exc:
+                last_error = exc
+                break
             except _DOWNLOAD_UPDATE_ERRORS as exc:
                 last_error = exc
-                if not optional_feed:
-                    self.stderr.write(self.style.WARNING(_redact_update_error(f"Failed {label} fetch: {exc}")))
-
-        if not any_modified and any_304 and target_exists:
-            self.stdout.write(f"Skipped X4BNet VPN ({target_path.name}): upstream returned 304 Not Modified.")
+                if not _is_transient_openasn_error(exc):
+                    break
+                if attempt + 1 < OPENASN_MAX_ATTEMPTS:
+                    time.sleep(OPENASN_RETRY_BACKOFF_SECONDS[attempt])
+                continue
+            if installed:
+                clear_maxmind_readers()
+                clear_offline_intelligence_caches()
+                self.stdout.write(self.style.SUCCESS(f"Updated OpenASN ({target_path.name})."))
             return 0
 
-        if not entries:
-            detail = f": {last_error}" if last_error is not None else ""
-            self.stderr.write(self.style.ERROR(_redact_update_error(f"Failed X4BNet VPN update{detail}")))
-            return 1
-
-        try:
-            rule_count = compile_binary_prefix_index(
-                entries,
-                target_path,
-                merge_payloads=lambda a, b: int(a) | int(b),
-            )
-            clear_offline_intelligence_caches()
-            self.stdout.write(self.style.SUCCESS(f"Updated X4BNet VPN ({target_path.name}, {rule_count} CIDRs)."))
-            return 0
-        except _DOWNLOAD_UPDATE_ERRORS as exc:
-            self.stderr.write(self.style.ERROR(_redact_update_error(f"Failed X4BNet VPN compilation: {exc}")))
-            return 1
+        self.stderr.write(self.style.ERROR(_redact_update_error(f"Failed OpenASN update: {last_error}")))
+        return 1
 
     def _update_peeringdb_mobile(
         self,
@@ -1701,15 +1715,14 @@ class Command(BaseCommand):
             )
         if "maxmind" in selected:
             total_errors += self._update_maxmind(client, maxmind_dir=data_dir, force=force, dry_run=dry_run)
-        if "cloud_cidrs" in selected:
-            total_errors += self._update_cloud_cidrs(client, data_dir=data_dir, force=force, dry_run=dry_run)
 
         conditional_handlers = (
+            ("shared_cidrs", self._update_shared_cidrs),
             ("privacy_relays", self._update_privacy_relays),
             ("ipsum_drop", self._update_ipsum_drop),
             ("tor_onionoo", self._update_tor_onionoo),
             ("bgp_tools", self._update_bgp_tools),
-            ("x4bnet_vpn", self._update_x4bnet_vpn),
+            ("openasn", self._update_openasn),
             ("peeringdb_mobile", self._update_peeringdb_mobile),
         )
         for key, handler in conditional_handlers:

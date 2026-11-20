@@ -1301,7 +1301,7 @@ def _resolve_provider_dashboard_status(
     has_maxmind_db: bool,
     has_sfs_db: bool,
     has_ipsum_db: bool = True,
-    has_x4bnet_db: bool = True,
+    has_openasn_db: bool = True,
 ) -> Tuple[str, str]:
     if provider_key == "maxmind" and not has_maxmind_db:
         return "db_missing", "Database Missing"
@@ -1309,7 +1309,7 @@ def _resolve_provider_dashboard_status(
         return "db_missing", "Offline DB Missing"
     if provider_key == "ipsum_drop" and not has_ipsum_db:
         return "db_missing", "Offline DB Missing"
-    if provider_key == "x4bnet_vpn" and not has_x4bnet_db:
+    if provider_key == "openasn" and not has_openasn_db:
         return "db_missing", "Offline DB Missing"
     if not configured:
         return "no_api_key", "No API Key"
@@ -1329,7 +1329,7 @@ def _build_provider_dashboard_entry(
     has_maxmind_db: bool,
     has_sfs_db: bool,
     has_ipsum_db: bool = True,
-    has_x4bnet_db: bool = True,
+    has_openasn_db: bool = True,
 ) -> Dict[str, Any]:
     configured = is_provider_configured(meta.key)
     rpm_limit, daily_limit = get_provider_quota_limits(meta.key)
@@ -1345,7 +1345,7 @@ def _build_provider_dashboard_entry(
         has_maxmind_db=has_maxmind_db,
         has_sfs_db=has_sfs_db,
         has_ipsum_db=has_ipsum_db,
-        has_x4bnet_db=has_x4bnet_db,
+        has_openasn_db=has_openasn_db,
     )
     return {
         "key": meta.key,
@@ -1493,7 +1493,7 @@ async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict
         entry.get("key", "").startswith("stopforumspam_") and entry.get("exists") for entry in offline_databases
     )
     has_ipsum_db = any(entry.get("key") == "ipsum_drop" and entry.get("exists") for entry in offline_databases)
-    has_x4bnet_db = any(entry.get("key") == "x4bnet_vpn" and entry.get("exists") for entry in offline_databases)
+    has_openasn_db = any(entry.get("key") == "openasn" and entry.get("exists") for entry in offline_databases)
 
     providers_out = [
         _build_provider_dashboard_entry(
@@ -1502,7 +1502,7 @@ async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict
             has_maxmind_db=has_maxmind_db,
             has_sfs_db=has_sfs_db,
             has_ipsum_db=has_ipsum_db,
-            has_x4bnet_db=has_x4bnet_db,
+            has_openasn_db=has_openasn_db,
         )
         for meta in PROVIDER_REGISTRY
     ]

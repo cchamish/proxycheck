@@ -24,12 +24,13 @@ from django.utils.crypto import get_random_string
 from dotenv import dotenv_values, set_key
 
 from detector.offline_dbs import (
-    DEFAULT_STALE_CLOUD_CIDRS_SECONDS,
     DEFAULT_STALE_MAXMIND_SECONDS,
+    DEFAULT_STALE_OPENASN_SECONDS,
     DEFAULT_STALE_RULES_SECONDS,
     DEFAULT_STALE_SFS_1_SECONDS,
     DEFAULT_STALE_SFS_90_SECONDS,
     DEFAULT_STALE_SFS_TOXIC_SECONDS,
+    DEFAULT_STALE_SHARED_CIDRS_SECONDS,
     collect_offline_databases_status,
 )
 from detector.provider_registry import PROVIDER_REGISTRY
@@ -319,6 +320,8 @@ def _build_runtime_and_path_env_specs() -> Tuple[EnvVarSpec, ...]:
         ),
         ("STOPFORUMSPAM_LISTED_1_PATH", "(auto)", "Override path for StopForumSpam 1-day listed IP archive", False),
         ("STOPFORUMSPAM_SQLITE_PATH", "(auto)", "Override path for stopforumspam.sqlite3 index", False),
+        ("OPENASN_MMDB_PATH", "(auto)", "Override path for openasn.mmdb", False),
+        ("SHARED_CIDRS_BIN_PATH", "(auto)", "Override path for shared_cidrs.bin", False),
         ("HOSTING_ASN_RULES_PATH", "(auto)", "Override path for hosting_asn_rules.json", False),
         ("HOSTING_ASNS", "(built-in)", "Extra comma-separated hosting ASNs", False),
         ("HOSTING_ORG_KEYWORDS", "(built-in)", "Extra comma-separated hosting organisation keywords", False),
@@ -375,9 +378,14 @@ def _build_tuning_and_quota_env_specs() -> Tuple[EnvVarSpec, ...]:
             "StopForumSpam 1-day dump staleness threshold",
         ),
         (
-            "OFFLINE_DB_CLOUD_CIDRS_STALE_SECONDS",
-            str(DEFAULT_STALE_CLOUD_CIDRS_SECONDS),
-            "Cloud provider CIDRs staleness threshold",
+            "OFFLINE_DB_OPENASN_STALE_SECONDS",
+            str(DEFAULT_STALE_OPENASN_SECONDS),
+            "OpenASN MMDB staleness threshold",
+        ),
+        (
+            "OFFLINE_DB_SHARED_CIDRS_STALE_SECONDS",
+            str(DEFAULT_STALE_SHARED_CIDRS_SECONDS),
+            "Rezmoss shared egress CIDRs staleness threshold",
         ),
         ("OFFLINE_DB_RULES_STALE_SECONDS", str(DEFAULT_STALE_RULES_SECONDS), "Hosting ASN rules staleness threshold"),
     )
@@ -444,10 +452,17 @@ DEFAULT_JOB_SPECS: Tuple[JobSpec, ...] = (
         mount="all",
     ),
     JobSpec(
-        name="update-cloud-cidrs-db",
-        command="python manage.py update_offline_dbs --sources cloud_cidrs",
+        name="update-shared-cidrs-db",
+        command="python manage.py update_offline_dbs --sources shared_cidrs privacy_relays",
         image="tool-proxycheck/tool-proxycheck:latest",
-        schedule="0 3 * * *",
+        schedule="@daily",
+        mount="all",
+    ),
+    JobSpec(
+        name="update-openasn-db",
+        command="python manage.py update_offline_dbs --sources openasn",
+        image="tool-proxycheck/tool-proxycheck:latest",
+        schedule="@daily",
         mount="all",
     ),
 )
@@ -1236,12 +1251,12 @@ def _extract_update_offline_sources(command: str) -> set[str]:
         return {
             "stopforumspam",
             "maxmind",
-            "cloud_cidrs",
+            "shared_cidrs",
             "privacy_relays",
             "ipsum_drop",
             "tor_onionoo",
             "bgp_tools",
-            "x4bnet_vpn",
+            "openasn",
             "peeringdb_mobile",
         }
 
@@ -1249,15 +1264,21 @@ def _extract_update_offline_sources(command: str) -> set[str]:
         "stopforumspam": "stopforumspam",
         "sfs": "stopforumspam",
         "maxmind": "maxmind",
-        "cloud_cidrs": "cloud_cidrs",
-        "cloud-cidrs": "cloud_cidrs",
-        "cloud": "cloud_cidrs",
+        "shared_cidrs": "shared_cidrs",
+        "shared-cidrs": "shared_cidrs",
+        "rezmoss": "shared_cidrs",
         "privacy_relays": "privacy_relays",
+        "privacy-relays": "privacy_relays",
         "ipsum_drop": "ipsum_drop",
+        "ipsum-drop": "ipsum_drop",
         "tor_onionoo": "tor_onionoo",
+        "tor-onionoo": "tor_onionoo",
         "bgp_tools": "bgp_tools",
-        "x4bnet_vpn": "x4bnet_vpn",
+        "bgp-tools": "bgp_tools",
+        "openasn": "openasn",
+        "open-asn": "openasn",
         "peeringdb_mobile": "peeringdb_mobile",
+        "peeringdb-mobile": "peeringdb_mobile",
     }
     return {alias_map[tok] for tok in source_tokens if tok in alias_map}
 
@@ -2107,7 +2128,7 @@ class Command(BaseCommand):
                 self.stdout.write(
                     style_fn(f"  - {tag} {name} ({filename}): {status.upper()} ({meta}) -> {resolved_path}")
                 )
-            elif entry["optional"] and entry["key"] in ("cloud_cidrs", "hosting_asn_rules"):
+            elif entry["optional"] and entry["key"] == "hosting_asn_rules":
                 self.stdout.write(f"  - {tag} {name} ({filename}): BUILT-IN FALLBACK (no override file found)")
             elif entry["optional"]:
                 self.stdout.write(f"  - {tag} {name} ({filename}): MISSING (optional)")

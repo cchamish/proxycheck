@@ -24,7 +24,7 @@ export const PROVIDER_NAMES = [
   'StopForumSpam',
   'DShield',
   'IPsum / DROP',
-  'X4BNet VPN',
+  'OpenASN',
   'Shodan InternetDB',
 ] as const;
 
@@ -69,6 +69,17 @@ export interface ProviderRawResult {
   totalReports?: number | null;
   numDistinctUsers?: number | null;
   isMobile?: boolean;
+  sharedProvider?: string | null;
+  sharedCidr?: string | null;
+  sharedCategory?: SharedCategory | null;
+  sharedPrefixLength?: number | null;
+  coreVerdict?: string | null;
+  coreSources?: string[];
+  networkRole?: string | null;
+  isCdn?: boolean;
+  isEnterpriseGateway?: boolean;
+  isBadAsn?: boolean;
+  /** Legacy cache fields, read-only. */
   cloudProvider?: string | null;
   cloudCidr?: string | null;
   cloudPrefixLength?: number | null;
@@ -139,6 +150,8 @@ export type PtrCategory =
 
 export type SharedPrivacyEgress = 'icloud_private_relay' | 'cloudflare_warp';
 
+export type SharedCategory = 'cloud' | 'vpn' | 'relay' | 'enterprise_gateway' | 'cdn' | 'saas' | 'bot';
+
 export type CacheStatus = 'hit' | 'stale' | 'partial' | 'miss' | 'bypassed';
 
 export type CacheLayer = 'L1' | 'L2' | 'upstream' | 'bypassed';
@@ -203,6 +216,10 @@ export interface DetectionResponse {
   recommendedCidr?: string | null;
   defaultCidr?: string | null;
   mmdbCidr?: string | null;
+  sharedProvider?: string | null;
+  sharedCidr?: string | null;
+  sharedCategory?: SharedCategory | null;
+  /** Legacy cache fields, read-only. */
   cloudCidr?: string | null;
   cloudProvider?: string | null;
   cidrNote?: string | null;
@@ -815,8 +832,22 @@ export function getProviderMetaItems(
   if (row.mobileBrand) {
     items.push(`Mobile brand: ${row.mobileBrand}`);
   }
-  if (row.cloudProvider) {
-    items.push(`Cloud: ${row.cloudProvider}`);
+  if (row.coreVerdict) {
+    items.push(`Core verdict: ${row.coreVerdict}`);
+  }
+  if (Array.isArray(row.coreSources) && row.coreSources.length > 0) {
+    items.push(`Core sources: ${row.coreSources.join(', ')}`);
+  }
+  if (row.networkRole) {
+    items.push(`Network role: ${row.networkRole}`);
+  }
+  const rowSharedProvider = row.sharedProvider || row.cloudProvider;
+  if (rowSharedProvider) {
+    items.push(
+      row.sharedCategory
+        ? `Shared egress: ${rowSharedProvider} (${row.sharedCategory})`
+        : `Shared egress: ${rowSharedProvider}`
+    );
   }
   if (row.provider === 'AbuseIPDB' || row.totalReports !== undefined || row.numDistinctUsers !== undefined) {
     if (row.totalReports !== undefined && row.totalReports !== null) {
@@ -920,25 +951,23 @@ export interface SharedPrivacyEgressInfo {
 }
 
 /**
- * Resolves human-readable badge copy and soft-block guidance for shared client privacy relays.
+ * Resolves human-readable badge copy and guidance for shared client privacy relays.
  */
 export function getSharedPrivacyEgressInfo(egress?: string | null): SharedPrivacyEgressInfo | null {
   if (egress === 'icloud_private_relay') {
     return {
       kind: 'icloud_private_relay',
       label: 'Apple iCloud Private Relay',
-      pillText: 'Apple iCloud Private Relay · Soft block (anon-only)',
-      guidance:
-        'Shared Apple iCloud Private Relay client egress. Prefer an anon-only soft block (anononly) rather than a hard block to avoid collateral impact on logged-in editors.',
+      pillText: 'Apple iCloud Private Relay · Shared egress',
+      guidance: 'Shared Apple iCloud Private Relay client egress. Many unrelated users may share this address.',
     };
   }
   if (egress === 'cloudflare_warp') {
     return {
       kind: 'cloudflare_warp',
       label: 'Cloudflare WARP',
-      pillText: 'Cloudflare WARP Egress · Soft block (anon-only)',
-      guidance:
-        'Shared Cloudflare WARP client egress. Prefer an anon-only soft block (anononly) rather than a hard block to avoid collateral impact on logged-in editors.',
+      pillText: 'Cloudflare WARP Egress · Shared egress',
+      guidance: 'Shared Cloudflare WARP client egress. Many unrelated users may share this address.',
     };
   }
   return null;
@@ -1015,13 +1044,18 @@ export function shouldRecommendFreshRecheck(data?: Partial<DetectionResponse> | 
 }
 
 /**
- * Determines whether Special:Block links should pre-fill anon-only soft-block query parameters.
+ * Returns the `SHARED/<provider>` badge text, falling back to the legacy cached cloud provider.
  */
-export function shouldUseSoftBlockDefaults(data?: Partial<DetectionResponse> | null): boolean {
+export function formatSharedProviderBadge(data?: Partial<DetectionResponse> | null): string | null {
   if (!data) {
-    return false;
+    return null;
   }
-  return Boolean(getSharedPrivacyEgressInfo(data.sharedPrivacyEgress)) || isMobileOrCgnatDetection(data);
+  for (const candidate of [data.sharedProvider, data.cloudProvider]) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return `SHARED/${candidate.trim()}`;
+    }
+  }
+  return null;
 }
 
 function normaliseSafeIpWithoutZone(rawIp?: string | null): string | null {
@@ -1078,29 +1112,16 @@ function normaliseWikiBaseUrl(wikiBaseUrl?: string | null): string {
   return 'https://meta.wikimedia.org';
 }
 
-function buildSpecialBlockTargetUrl(
-  target: string,
-  base: string,
-  useSoftBlock: boolean
-): string {
+function buildSpecialBlockTargetUrl(target: string, base: string): string {
   const encodedPathTarget = target
     .split('/')
     .map((segment) => encodeURIComponent(segment).replaceAll('%3A', ':'))
     .join('/');
-  const blockBase = `${base}/wiki/Special:Block/${encodedPathTarget}`;
-  if (!useSoftBlock) {
-    return blockBase;
-  }
-  const params = new URLSearchParams({
-    wpHardBlock: '0',
-    wpDisableUTEdit: '0',
-  });
-  return `${blockBase}?${params.toString()}`;
+  return `${base}/wiki/Special:Block/${encodedPathTarget}?wpHardBlock=1`;
 }
 
 /**
- * Builds a MediaWiki Special:Block URL for the recommended CIDR, defaulting to soft-block parameters
- * when shared privacy egress or mobile CGNAT sharing is detected.
+ * Builds a MediaWiki Special:Block URL for the recommended CIDR, always pre-filling a hard block.
  */
 export function buildSpecialBlockUrl(
   data?: Partial<DetectionResponse> | null,
@@ -1113,7 +1134,7 @@ export function buildSpecialBlockUrl(
   if (!target) {
     return null;
   }
-  return buildSpecialBlockTargetUrl(target, normaliseWikiBaseUrl(wikiBaseUrl), shouldUseSoftBlockDefaults(data));
+  return buildSpecialBlockTargetUrl(target, normaliseWikiBaseUrl(wikiBaseUrl));
 }
 
 export interface VerificationLinks {
@@ -1123,7 +1144,6 @@ export interface VerificationLinks {
   specialBlockUrl: string;
   singleIpBlockUrl: string;
   rangeBlockUrl: string | null;
-  isSoftBlockRecommended: boolean;
 }
 
 /**
@@ -1140,10 +1160,9 @@ export function buildVerificationLinks(
   const base = normaliseWikiBaseUrl(wikiBaseUrl);
   const pathSafeIp = encodeURIComponent(safeIp).replaceAll('%3A', ':');
   const querySafeIp = encodeURIComponent(safeIp);
-  const isSoftBlockRecommended = shouldUseSoftBlockDefaults(data);
-  const singleIpBlockUrl = buildSpecialBlockTargetUrl(safeIp, base, isSoftBlockRecommended);
+  const singleIpBlockUrl = buildSpecialBlockTargetUrl(safeIp, base);
   const rangeCidr = normaliseSafeRangeCidr(data.recommendedCidr);
-  const rangeBlockUrl = rangeCidr ? buildSpecialBlockTargetUrl(rangeCidr, base, isSoftBlockRecommended) : null;
+  const rangeBlockUrl = rangeCidr ? buildSpecialBlockTargetUrl(rangeCidr, base) : null;
   const specialBlockUrl = buildSpecialBlockUrl(data, base) ?? singleIpBlockUrl;
 
   return {
@@ -1153,7 +1172,6 @@ export function buildVerificationLinks(
     specialBlockUrl,
     singleIpBlockUrl,
     rangeBlockUrl,
-    isSoftBlockRecommended,
   };
 }
 
@@ -1178,8 +1196,10 @@ function resolvePrimaryIspLabel(data: Partial<DetectionResponse>): string {
       }
     }
   }
-  if (typeof data.cloudProvider === 'string' && data.cloudProvider.trim()) {
-    return data.cloudProvider.trim();
+  for (const candidate of [data.sharedProvider, data.cloudProvider]) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
   }
   return 'Unknown ISP';
 }
@@ -1230,7 +1250,15 @@ export function buildWikitextSummary(
   }
   const privacyInfo = getSharedPrivacyEgressInfo(data.sharedPrivacyEgress);
   if (privacyInfo) {
-    publicClassifications.push(`${privacyInfo.label} (anon-only soft block recommended)`);
+    publicClassifications.push(privacyInfo.label);
+  }
+  const sharedProviderName = formatSharedProviderBadge(data)?.slice('SHARED/'.length);
+  if (sharedProviderName) {
+    publicClassifications.push(
+      data.sharedCategory
+        ? `Shared egress: ${sharedProviderName} (${data.sharedCategory})`
+        : `Shared egress: ${sharedProviderName}`
+    );
   }
   if (isMobileOrCgnatDetection(data)) {
     publicClassifications.push('Mobile cellular or CGNAT shared gateway');

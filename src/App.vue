@@ -259,6 +259,13 @@
                             {{ detectionData.torSummary }}
                           </span>
                           <span
+                            v-if="sharedProviderBadge"
+                            class="cdx-badge badge-destructive shared-egress-badge"
+                            :title="detectionData.sharedCidr || detectionData.cloudCidr || sharedProviderBadge"
+                          >
+                            {{ sharedProviderBadge }}
+                          </span>
+                          <span
                             v-if="sharedPrivacyInfo"
                             class="privacy-egress-badge"
                             :title="sharedPrivacyInfo.guidance"
@@ -359,7 +366,7 @@
                           </div>
                           <div v-if="isMobileOrCgnat" class="cgnat-collateral-warning" role="status">
                             <strong>Mobile Cellular / CGNAT Shared Gateway:</strong>
-                            Locked to single-host <code>/32</code> IPv4 or <code>/64</code> IPv6 — avoid broad <code>/24</code> or <code>/48</code> range blocks and prefer anon-only soft blocks (<code>anononly</code>) to prevent collateral damage.
+                            Locked to single-host <code>/32</code> IPv4 or <code>/64</code> IPv6 — avoid broad <code>/24</code> or <code>/48</code> range blocks to prevent collateral damage.
                           </div>
                           <div
                             v-if="detectionData.highlySuspectedResidentialProxy"
@@ -599,6 +606,7 @@ import {
   extractShodanTags,
   formatCacheAgeBadgeLabel,
   formatExactUtcTimestamp,
+  formatSharedProviderBadge,
   getSharedPrivacyEgressInfo,
   isAuthorisedAdminUser,
   isCacheStale,
@@ -791,6 +799,8 @@ const cacheExactUtcTooltip = computed(() => {
 const sharedPrivacyInfo = computed(() =>
   getSharedPrivacyEgressInfo(detectionData.value?.sharedPrivacyEgress)
 );
+
+const sharedProviderBadge = computed(() => formatSharedProviderBadge(detectionData.value));
 
 const isMobileOrCgnat = computed(() => isMobileOrCgnatDetection(detectionData.value));
 

@@ -22,10 +22,10 @@ from . import cache_backends, cidr_attribution
 from .adapters import (
     adapt_ipsum_drop,
     adapt_maxmind,
+    adapt_openasn,
     adapt_spamcop,
     adapt_spamhaus_zen,
     adapt_stopforumspam,
-    adapt_x4bnet_vpn,
 )
 from .cache_backends import (
     MAXMIND_DB_SPECS,
@@ -39,8 +39,8 @@ from .offline_dbs import (
     get_maxmind_newest_mtime_iso,
     lookup_bgp_tools_offline,
     query_ipsum_drop_offline,
+    query_openasn_offline,
     query_stopforumspam_offline,
-    query_x4bnet_vpn_offline,
 )
 from .sanitization import sanitize_error_message
 
@@ -282,22 +282,22 @@ async def query_ipsum_drop(ip_or_client: Any, ip: Optional[str] = None) -> Dict[
     return await asyncio.to_thread(_read_ipsum_drop_sync, target_ip)
 
 
-def _read_x4bnet_vpn_sync(ip: str) -> Dict[str, Any]:
+def _read_openasn_sync(ip: str) -> Dict[str, Any]:
     try:
-        lookup = query_x4bnet_vpn_offline(ip)
+        lookup = query_openasn_offline(ip)
     except (OSError, ValueError, RuntimeError) as exc:
         safe_message = sanitize_error_message(str(exc))
-        logger.error("Error querying X4BNet VPN offline index: %s", safe_message)
-        return adapt_x4bnet_vpn({"status": "error", "error": safe_message}, status_code=500, has_db=True)
+        logger.error("Error querying OpenASN offline database: %s", safe_message)
+        return adapt_openasn({"status": "error", "error": safe_message}, status_code=500, has_db=True)
 
     if not lookup.get("has_db"):
-        return adapt_x4bnet_vpn(None, has_db=False)
-    return adapt_x4bnet_vpn(lookup, status_code=200, has_db=True)
+        return adapt_openasn(None, has_db=False)
+    return adapt_openasn(lookup, status_code=200, has_db=True)
 
 
-async def query_x4bnet_vpn(ip_or_client: Any, ip: Optional[str] = None) -> Dict[str, Any]:
+async def query_openasn(ip_or_client: Any, ip: Optional[str] = None) -> Dict[str, Any]:
     target_ip = ip if isinstance(ip, str) and ip.strip() else str(ip_or_client)
-    return await asyncio.to_thread(_read_x4bnet_vpn_sync, target_ip)
+    return await asyncio.to_thread(_read_openasn_sync, target_ip)
 
 
 def _get_positive_float_setting(name: str, default: float) -> float:

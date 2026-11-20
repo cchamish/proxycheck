@@ -253,8 +253,9 @@ def build_non_public_response_payload(
         "recommendedCidr": None,
         "defaultCidr": None,
         "mmdbCidr": None,
-        "cloudCidr": None,
-        "cloudProvider": None,
+        "sharedCidr": None,
+        "sharedProvider": None,
+        "sharedCategory": None,
         "cidrNote": f"External lookups skipped for {reason.lower()}",
         "bgpPrefix": None,
         "escalationCidr": None,
@@ -487,10 +488,10 @@ def _classify_osint_arbitration_signals(row: Dict[str, Any], acc: _ArbitrationAc
     p_name = row.get("provider")
     if p_name in ("Spamhaus ZEN", "IPsum / DROP"):
         _classify_spamhaus_or_ipsum_row(str(p_name), row, acc)
-    elif p_name == "X4BNet VPN":
+    elif p_name == "OpenASN":
         if bool(row.get("isVpn")):
             _add_affirmative_osint_vote(acc)
-        elif bool(row.get("isHosting") or row.get("isDatacenter")):
+        elif bool(row.get("isHosting")):
             acc.has_datacenter_or_hosting = True
     elif p_name == "Shodan InternetDB":
         raw_proxy_ports = row.get("openProxyPorts")
@@ -635,7 +636,7 @@ def _resolve_arbitration_verdict(
         and not _has_malicious_abuse_records(acc)
     ):
         return (
-            "Shared Privacy Egress (iCloud Relay / WARP — Soft Block Recommended)",
+            "Shared Privacy Egress (iCloud Relay / WARP)",
             "warning",
             False,
         )
@@ -680,10 +681,11 @@ def _resolve_arbitration_verdict(
 
 def _extract_maxmind_cidr_hints(
     comparison_results: List[Dict[str, Any]],
-) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
     mmdb_prefix_len: Optional[int] = None
-    cloud_cidr: Optional[str] = None
-    cloud_provider: Optional[str] = None
+    shared_cidr: Optional[str] = None
+    shared_provider: Optional[str] = None
+    shared_category: Optional[str] = None
     for row in comparison_results:
         if row.get("provider") != "MaxMind" or row.get("status") != "200 OK":
             continue
@@ -692,11 +694,16 @@ def _extract_maxmind_cidr_hints(
             candidate_len = row["rawJson"].get("prefix_len")
         if not isinstance(candidate_len, bool) and isinstance(candidate_len, int):
             mmdb_prefix_len = candidate_len
-        if isinstance(row.get("cloudCidr"), str) and row.get("cloudCidr"):
-            cloud_cidr = row["cloudCidr"]
-        if isinstance(row.get("cloudProvider"), str) and row.get("cloudProvider"):
-            cloud_provider = row["cloudProvider"]
-    return mmdb_prefix_len, cloud_cidr, cloud_provider
+        raw_shared_cidr = row.get("sharedCidr") or row.get("cloudCidr")
+        if isinstance(raw_shared_cidr, str) and raw_shared_cidr:
+            shared_cidr = raw_shared_cidr
+        raw_shared_provider = row.get("sharedProvider") or row.get("cloudProvider")
+        if isinstance(raw_shared_provider, str) and raw_shared_provider:
+            shared_provider = raw_shared_provider
+        raw_shared_category = row.get("sharedCategory") or ("cloud" if row.get("cloudProvider") else None)
+        if isinstance(raw_shared_category, str) and raw_shared_category:
+            shared_category = raw_shared_category
+    return mmdb_prefix_len, shared_cidr, shared_provider, shared_category
 
 
 def aggregate_intelligence_metrics(
@@ -737,15 +744,16 @@ def aggregate_intelligence_metrics(
 
     prediction_score, prediction_label, prediction_tier = _compute_getipintel_prediction(acc.getipintel_chance)
     highly_suspected_residential_proxy = acc.residential_proxy is not None and acc.residential_proxy >= 0.95
-    mmdb_prefix_len, cloud_cidr, cloud_provider = _extract_maxmind_cidr_hints(comparison_results)
+    mmdb_prefix_len, shared_cidr, shared_provider, shared_category = _extract_maxmind_cidr_hints(comparison_results)
     rdns_info = classify_rdns_hostname(ptr_hostname)
     primary_asn = acc.valid_asns[0] if acc.valid_asns else "-"
     primary_org = acc.valid_orgs[0] if acc.valid_orgs else None
     cidr_info = compute_cidr_attribution(
         ip,
         mmdb_prefix_len,
-        cloud_cidr=cloud_cidr,
-        cloud_provider=cloud_provider,
+        shared_cidr=shared_cidr,
+        shared_provider=shared_provider,
+        shared_category=shared_category,
         bgp_prefix=bgp_prefix,
         asn=primary_asn if primary_asn != "-" else None,
         org_name=primary_org,
@@ -802,8 +810,9 @@ def aggregate_intelligence_metrics(
         "recommendedCidr": cidr_info["recommendedCidr"],
         "defaultCidr": cidr_info["defaultCidr"],
         "mmdbCidr": cidr_info["mmdbCidr"],
-        "cloudCidr": cidr_info["cloudCidr"],
-        "cloudProvider": cidr_info["cloudProvider"],
+        "sharedCidr": cidr_info["sharedCidr"],
+        "sharedProvider": cidr_info["sharedProvider"],
+        "sharedCategory": cidr_info["sharedCategory"],
         "cidrNote": cidr_info["cidrNote"],
         "bgpPrefix": cidr_info["bgpPrefix"],
         "escalationCidr": cidr_info["escalationCidr"],

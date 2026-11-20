@@ -16,11 +16,11 @@ from detector.adapters import (
     adapt_ipregistry,
     adapt_ipsum_drop,
     adapt_maxmind,
+    adapt_openasn,
     adapt_proxycheck,
     adapt_shodan_internetdb,
     adapt_stopforumspam,
     adapt_tor_onionoo,
-    adapt_x4bnet_vpn,
 )
 from detector.provider_registry import PROVIDER_REGISTRY
 
@@ -64,7 +64,7 @@ ALL_ADAPTERS = (
     ("StopForumSpam", lambda raw, code: adapt_stopforumspam(raw, code)),
     ("DShield", lambda raw, code: adapt_dshield(raw, code)),
     ("IPsum / DROP", lambda raw, code: adapt_ipsum_drop(raw, code)),
-    ("X4BNet VPN", lambda raw, code: adapt_x4bnet_vpn(raw, code)),
+    ("OpenASN", lambda raw, code: adapt_openasn(raw, code)),
     ("Shodan InternetDB", lambda raw, code: adapt_shodan_internetdb(raw, code)),
 )
 
@@ -233,7 +233,7 @@ class _BatchingFakeRedis(FakeAsyncRedis):
         return super().pipeline(transaction=transaction)
 
 
-_DNS_PROVIDER_KEYS = frozenset({"maxmind", "spamhaus_zen", "spamcop", "stopforumspam", "ipsum_drop", "x4bnet_vpn"})
+_DNS_PROVIDER_KEYS = frozenset({"maxmind", "spamhaus_zen", "spamcop", "stopforumspam", "ipsum_drop", "openasn"})
 
 CANONICAL_PROVIDER_PATCH_TARGETS: Dict[str, str] = {
     meta.key: (

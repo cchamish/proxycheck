@@ -65,6 +65,7 @@ from .intelligence import (
 )
 from .offline_dbs import (
     get_maxmind_newest_mtime_iso,
+    get_openasn_mtime_iso,
     get_positive_int_setting,
     get_stopforumspam_db_version,
     has_any_local_stopforumspam_db,
@@ -73,6 +74,7 @@ from .offline_dbs import (
 from .provider_registry import (
     DNSBL_PROVIDER_KEYS,
     LIGHT_MODE_ACTIVE_PROVIDER_KEYS,
+    NO_REDIS_CACHE_PROVIDER_KEYS,
     OFFLINE_PROVIDER_KEYS,
     OFFLINE_REHYDRATE_PROVIDERS,
 )
@@ -188,8 +190,8 @@ def _current_offline_provider_signature(provider_key: str) -> str:
         return f"v:{get_stopforumspam_db_version()}"
     if provider_key == "ipsum_drop":
         return offline_dbs._ipsum_drop_index.get_reader_and_mtime()[1] or "none"
-    if provider_key == "x4bnet_vpn":
-        return offline_dbs._x4bnet_vpn_index.get_reader_and_mtime()[1] or "none"
+    if provider_key == "openasn":
+        return get_openasn_mtime_iso() or "none"
     return "none"
 
 
@@ -199,6 +201,8 @@ def _stamp_offline_signatures(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]
         if not isinstance(row, dict):
             continue
         pkey = l2_cache.resolve_provider_key(row)
+        if pkey in NO_REDIS_CACHE_PROVIDER_KEYS:
+            continue
         if pkey in OFFLINE_REHYDRATE_PROVIDERS:
             stamped.append({**row, "_rehydrate_sig": _current_offline_provider_signature(pkey)})
         else:
@@ -230,6 +234,8 @@ def resolve_query_mode(request: Any, body: Optional[Dict[str, Any]] = None, *, d
 
 def _is_provider_cache_expected(provider_key: str, is_ipv4: bool) -> bool:
     """Returns False for sources that never write a cache entry for this address family or configuration."""
+    if provider_key in NO_REDIS_CACHE_PROVIDER_KEYS:
+        return False
     if not is_ipv4 and (provider_key in DNSBL_PROVIDER_KEYS or provider_key in {"shodan_internetdb", "iphunter"}):
         return False
     if not is_provider_configured(provider_key):
@@ -239,9 +245,7 @@ def _is_provider_cache_expected(provider_key: str, is_ipv4: bool) -> bool:
         return False
     if provider_key == "stopforumspam" and not has_any_local_stopforumspam_db():
         return False
-    if provider_key == "ipsum_drop" and offline_dbs._ipsum_drop_index.get_reader_and_mtime()[0] is None:
-        return False
-    return not (provider_key == "x4bnet_vpn" and offline_dbs._x4bnet_vpn_index.get_reader_and_mtime()[0] is None)
+    return not (provider_key == "ipsum_drop" and offline_dbs._ipsum_drop_index.get_reader_and_mtime()[0] is None)
 
 
 async def _ensure_offline_caches_warm() -> None:
@@ -254,11 +258,12 @@ async def _read_provider_caches(
 ) -> Tuple[Dict[str, Tuple[Dict[str, Any], Optional[str]]], Optional[Tuple[Optional[str], Optional[str]]]]:
     if get_redis_client() is None:
         return {}, None
-    keys = [provider_cache_key(spec.key, ip) for spec in PROVIDER_SPECS]
+    read_specs = [spec for spec in PROVIDER_SPECS if spec.key not in NO_REDIS_CACHE_PROVIDER_KEYS]
+    keys = [provider_cache_key(spec.key, ip) for spec in read_specs]
     keys.append(provider_cache_key("ptr", ip))
     raw_values = await safe_redis_mget(keys)
     cached_providers: Dict[str, Tuple[Dict[str, Any], Optional[str]]] = {}
-    for idx, spec in enumerate(PROVIDER_SPECS):
+    for idx, spec in enumerate(read_specs):
         decoded = decode_cached_provider_entry(raw_values[idx])
         if decoded is not None:
             if spec.key == "maxmind" and should_refresh_cached_maxmind_entry(raw_values[idx], decoded[0]):
@@ -307,7 +312,7 @@ def _extract_hit_and_missed_providers(
         if not isinstance(row, dict) or is_unconfigured_provider_row(row) or row.get("isDeferred"):
             continue
         pkey = l2_cache.resolve_provider_key(row)
-        if not pkey:
+        if not pkey or pkey in NO_REDIS_CACHE_PROVIDER_KEYS:
             continue
         if all_from_snapshot or row.get("isCached"):
             hit_providers.append(pkey)
@@ -561,6 +566,8 @@ def _build_cache_or_cooldown_write(
     now_iso: str,
     default_cooldown: int,
 ) -> Optional[Tuple[str, str, int]]:
+    if spec.key in NO_REDIS_CACHE_PROVIDER_KEYS:
+        return None
     if is_provider_result_cacheable(row):
         entry_payload: Dict[str, Any] = {"row": row, "cachedAt": now_iso, "sanitized": True}
         if spec.key == "maxmind":
@@ -675,7 +682,7 @@ def _collect_detection_outcomes(
         raw_res = executed_provider_results.get(provider_key)
         row, miss_triggered_exception = _normalize_executed_row(provider_name, raw_res)
         clean_results.append(row)
-        if not is_unconfigured_provider_row(row):
+        if not is_unconfigured_provider_row(row) and provider_key not in NO_REDIS_CACHE_PROVIDER_KEYS:
             miss_count += 1
 
         if active_redis is None:
@@ -1006,6 +1013,7 @@ async def _build_rehydrated_rows(
         if offline_key in spec_by_key
         and (
             force_rehydrate_offline
+            or offline_key in NO_REDIS_CACHE_PROVIDER_KEYS
             or rows_by_key.get(offline_key) is None
             or rows_by_key[offline_key].get("_rehydrate_sig") != _current_offline_provider_signature(offline_key)
         )
@@ -1019,7 +1027,11 @@ async def _build_rehydrated_rows(
                     "_rehydrate_sig": _current_offline_provider_signature(pkey),
                 }
 
-    return [{**rows_by_key[spec.key], "isCached": True} for spec in PROVIDER_SPECS if spec.key in rows_by_key]
+    return [
+        {**rows_by_key[spec.key], "isCached": spec.key not in NO_REDIS_CACHE_PROVIDER_KEYS}
+        for spec in PROVIDER_SPECS
+        if spec.key in rows_by_key
+    ]
 
 
 async def _resolve_swr_refresh_flags(

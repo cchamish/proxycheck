@@ -1,44 +1,50 @@
 <!doctype html>
 <html lang="en-GB" data-theme="dark">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#101418" />
-    <title>Proxy Detector</title>
-    <script>
-      try {
-        if (localStorage.getItem('proxy_detector_theme') === 'light') {
-          document.documentElement.dataset.theme = 'light';
-          document.documentElement.style.colorScheme = 'light';
-          var themeMeta = document.querySelector('meta[name="theme-color"]');
-          if (themeMeta) {
-            themeMeta.setAttribute('content', '#f6f7f8');
-          }
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#101418" />
+  <title>Proxycheck</title>
+  <script>
+    try {
+      if (localStorage.getItem('proxy_detector_theme') === 'light') {
+        document.documentElement.dataset.theme = 'light';
+        document.documentElement.style.colorScheme = 'light';
+        var themeMeta = document.querySelector('meta[name="theme-color"]');
+        if (themeMeta) {
+          themeMeta.setAttribute('content', '#f6f7f8');
         }
-      } catch {
-        // Ignore storage errors when restoring the saved theme before mount.
       }
-    </script>
-    <style>
-      html {
-        background-color: #101418;
-        color: #eaecf0;
-      }
-      html[data-theme='light'] {
-        background-color: #f6f7f8;
-        color: #202122;
-      }
-    </style>
-    <link rel="icon" type="image/svg+xml" href="/src/assets/Proxycheck.svg" />
-    <link rel="alternate icon" href="/src/assets/Proxycheck.svg" />
-    <meta name="description" content="Multi-source IP intelligence and proxy detection web application for Wikimedia Toolforge." />
-    <meta property="og:title" content="Proxy Detector" />
-    <meta property="og:description" content="Multi-source IP intelligence and proxy detection web application for Wikimedia Toolforge." />
-    <meta property="og:type" content="website" />
-    <meta name="twitter:card" content="summary_large_image" />
-  </head>
-  <body>
-    <div id="app"></div>
-    <script type="module" src="/src/main.ts"></script>
-  </body>
+    } catch {
+      // Ignore storage errors when restoring the saved theme before mount.
+    }
+  </script>
+  <style>
+    html {
+      background-color: #101418;
+      color: #eaecf0;
+    }
+
+    html[data-theme='light'] {
+      background-color: #f6f7f8;
+      color: #202122;
+    }
+  </style>
+  <link rel="icon" type="image/svg+xml" href="/src/assets/Proxycheck.svg" />
+  <link rel="alternate icon" href="/src/assets/Proxycheck.svg" />
+  <meta name="description"
+    content="Multi-source IP intelligence and proxy detection web application for Wikimedia Toolforge." />
+  <meta property="og:title" content="Proxycheck" />
+  <meta property="og:description"
+    content="Multi-source IP intelligence and proxy detection web application for Wikimedia Toolforge." />
+  <meta property="og:type" content="website" />
+  <meta name="twitter:card" content="summary_large_image" />
+</head>
+
+<body>
+  <div id="app"></div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+
 </html>

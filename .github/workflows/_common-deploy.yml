@@ -1,0 +1,228 @@
+name: Common Toolforge Deploy
+
+on:
+  workflow_call:
+    inputs:
+      target_branch:
+        description: Branch to build and deploy
+        required: true
+        type: string
+      toolforge_tool:
+        description: Target Toolforge tool account name
+        required: true
+        type: string
+      environment_name:
+        description: GitHub Environment name
+        required: true
+        type: string
+      environment_url:
+        description: GitHub Environment URL
+        required: true
+        type: string
+      verified_sha:
+        description: Commit SHA verified by CI or manual dispatch
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  deploy:
+    concurrency:
+      group: toolforge-deploy-${{ inputs.toolforge_tool }}
+      cancel-in-progress: false
+    environment:
+      name: ${{ inputs.environment_name }}
+      url: ${{ inputs.environment_url }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Verify target branch tip matches verified commit
+        env:
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          VERIFIED_SHA: ${{ inputs.verified_sha }}
+        run: |
+          # Toolforge build start rejects raw commit hashes (phab:T429227),
+          # so confirm the branch ref still points to the verified commit before building.
+          remote_sha="$(git ls-remote "$REPO_URL" "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          if [ "$remote_sha" != "$VERIFIED_SHA" ]; then
+            echo "Remote refs/heads/$TARGET_BRANCH ($remote_sha) does not match verified commit $VERIFIED_SHA."
+            exit 1
+          fi
+
+      - name: Check out verified commit
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.verified_sha }}
+          fetch-depth: 1
+
+      - name: Configure SSH credentials
+        env:
+          TOOLFORGE_HOST: ${{ secrets.TOOLFORGE_HOST }}
+          TOOLFORGE_SSH_KEY: ${{ secrets.TOOLFORGE_SSH_KEY }}
+          TOOLFORGE_KNOWN_HOSTS: ${{ secrets.TOOLFORGE_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$TOOLFORGE_SSH_KEY" | tr -d '\r' > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          if [ -n "${TOOLFORGE_KNOWN_HOSTS:-}" ]; then
+            printf '%s\n' "$TOOLFORGE_KNOWN_HOSTS" | tr -d '\r' > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -H "$TOOLFORGE_HOST" >> ~/.ssh/known_hosts
+          fi
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Trigger remote Build Service deployment on Toolforge
+        env:
+          TOOLFORGE_USER: ${{ secrets.TOOLFORGE_USER }}
+          TOOLFORGE_HOST: ${{ secrets.TOOLFORGE_HOST }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          TOOLFORGE_TOOL: ${{ inputs.toolforge_tool }}
+          VERIFIED_SHA: ${{ inputs.verified_sha }}
+          VITE_GITHUB_REPO: ${{ github.repository }}
+          REPO_GIT_URL: ${{ github.server_url }}/${{ github.repository }}.git
+        run: |
+          VITE_COMMIT_HASH="$(git rev-parse --short HEAD)"
+          VITE_COMMIT_TIMESTAMP="$(TZ=UTC0 LC_ALL=C git log -1 --format=%cd --date='format-local:%H:%M %d %b %Y (UTC)')"
+          {
+            printf 'target_branch=%q\n' "$TARGET_BRANCH"
+            printf 'toolforge_tool=%q\n' "$TOOLFORGE_TOOL"
+            printf 'verified_sha=%q\n' "$VERIFIED_SHA"
+            printf 'vite_github_repo=%q\n' "$VITE_GITHUB_REPO"
+            printf 'vite_commit_hash=%q\n' "$VITE_COMMIT_HASH"
+            printf 'vite_commit_timestamp=%q\n' "$VITE_COMMIT_TIMESTAMP"
+            printf 'repo_git_url=%q\n' "$REPO_GIT_URL"
+            cat << 'EOF'
+              set -euo pipefail
+
+              repo_dir="$HOME/proxycheck"
+              if [[ -e "$repo_dir" && ! -d "$repo_dir/.git" ]]; then
+                echo "$repo_dir exists but is not a Git checkout."
+                exit 1
+              fi
+              if [[ ! -d "$repo_dir/.git" ]]; then
+                echo "Cloning $target_branch into $repo_dir"
+                git clone --branch "$target_branch" --single-branch "$repo_git_url" "$repo_dir"
+              else
+                echo "Synchronising $target_branch in $repo_dir"
+                git -C "$repo_dir" remote set-url origin "$repo_git_url"
+                git -C "$repo_dir" fetch --prune origin "$target_branch"
+                git -C "$repo_dir" checkout --force "$target_branch" 2>/dev/null ||
+                  git -C "$repo_dir" checkout --force -b "$target_branch" "origin/$target_branch"
+                git -C "$repo_dir" reset --hard "origin/$target_branch"
+                git -C "$repo_dir" clean -fd
+              fi
+              synced_sha="$(git -C "$repo_dir" rev-parse HEAD)"
+              if [[ "$synced_sha" != "$verified_sha" ]]; then
+                echo "Synced checkout $synced_sha does not match verified CI commit $verified_sha."
+                exit 1
+              fi
+
+              for _ in {1..30}; do
+                current_status="$(toolforge build show 2>/dev/null | awk -F': ' '/^[[:space:]]*Status:/ {print tolower($2)}' || true)"
+                if [[ "$current_status" == "running" || "$current_status" == "pending" ]]; then
+                  echo "Previous build is still $current_status, waiting 10s..."
+                  sleep 10
+                else
+                  break
+                fi
+              done
+
+              echo "Building ASGI container image via Toolforge Build Service"
+              build_output="$(mktemp)"
+              if toolforge build start \
+                  --ref "$target_branch" \
+                  --envvar "VITE_GITHUB_REPO=$vite_github_repo" \
+                  --envvar "VITE_COMMIT_HASH=$vite_commit_hash" \
+                  --envvar "VITE_COMMIT_TIMESTAMP=$vite_commit_timestamp" \
+                  "$repo_git_url" 2>&1 | tee "$build_output"; then
+                rm -f "$build_output"
+              else
+                if ! grep -Eiq 'BuildClientError: Error getting the logs|container .* is not available' "$build_output"; then
+                  echo "Toolforge build failed before a recoverable log-read error."
+                  rm -f "$build_output"
+                  exit 1
+                fi
+                rm -f "$build_output"
+
+                echo "Build log stream disconnected early; polling 'toolforge build show' until completion..."
+                build_recovered=false
+                for attempt in {1..30}; do
+                  sleep 10
+                  if ! build_status="$(toolforge build show 2>&1)"; then
+                    echo "[$attempt/30] Unable to query build status yet, retrying..."
+                    continue
+                  fi
+
+                  if ! grep -Fq "VITE_COMMIT_HASH=$vite_commit_hash" <<< "$build_status"; then
+                    echo "[$attempt/30] Waiting for build of commit $vite_commit_hash to register..."
+                    continue
+                  fi
+
+                  status_val="$(awk -F': ' '/^[[:space:]]*Status:/ {print tolower($2); exit}' <<< "$build_status")"
+                  echo "[$attempt/30] Current build status: ${status_val:-unknown}"
+
+                  case "$status_val" in
+                    ok|succeeded|success)
+                      echo "$build_status"
+                      build_recovered=true
+                      break
+                      ;;
+                    failed|error|cancelled|aborted)
+                      echo "$build_status"
+                      break
+                      ;;
+                  esac
+                done
+
+                if [[ "$build_recovered" != true ]]; then
+                  echo "Toolforge build did not reach a successful state."
+                  exit 1
+                fi
+              fi
+
+              build_image="tool-${toolforge_tool}/tool-${toolforge_tool}:latest"
+
+              echo "Running database schema migrations before restarting web service"
+              toolforge jobs delete migrate-db 2>/dev/null || true
+              if ! toolforge jobs run migrate-db \
+                  --command "python manage.py migrate --noinput" \
+                  --image "$build_image" \
+                  --mount=all \
+                  --wait; then
+                echo "Database migration job failed; inspecting job status before aborting deployment."
+                toolforge jobs show migrate-db 2>&1 || true
+                exit 1
+              fi
+              toolforge jobs delete migrate-db 2>/dev/null || true
+
+              echo "Restarting Build Service web service and verifying status"
+              if ! toolforge webservice buildservice restart --mount=all; then
+                toolforge webservice stop 2>/dev/null || true
+                toolforge webservice buildservice start --mount=all
+              fi
+              sleep 6
+              toolforge webservice status
+
+              if [[ -f "$repo_dir/jobs.yaml" ]]; then
+                echo "Synchronising Toolforge scheduled jobs from jobs.yaml"
+                rendered_jobs="$(mktemp)"
+                sed "s|tool-proxycheck/tool-proxycheck:latest|$build_image|g" "$repo_dir/jobs.yaml" > "$rendered_jobs"
+                if ! toolforge jobs load "$rendered_jobs"; then
+                  rm -f "$rendered_jobs"
+                  exit 1
+                fi
+                rm -f "$rendered_jobs"
+              fi
+
+          EOF
+          } | ssh -i ~/.ssh/id_deploy -o BatchMode=yes -o StrictHostKeyChecking=yes "${TOOLFORGE_USER}@${TOOLFORGE_HOST}" "become $TOOLFORGE_TOOL bash -s"
+
+      - name: Clean up SSH credentials
+        if: always()
+        run: rm -f ~/.ssh/id_deploy

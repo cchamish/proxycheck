@@ -16,9 +16,10 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.db import Error as DjangoDbError
-from django.db import close_old_connections
+from django.db import close_old_connections, connection
 
 from . import sanitization
+from .cache_backends import scrub_legacy_coordinates_from_row
 from .intelligence import MAX_BATCH_IPS, canonicalize_ip, normalize_query_mode
 from .models import IpIntelligenceCache
 from .provider_registry import (
@@ -81,6 +82,7 @@ _SHODAN_ALLOWED_ROW_KEYS = frozenset(
 _FORBIDDEN_TOP_LEVEL_SNAPSHOT_KEYS = frozenset(
     {
         "rawJson",
+        "primaryCoordinates",
         "durationSeconds",
         "memoryMb",
         "username",
@@ -90,6 +92,8 @@ _FORBIDDEN_TOP_LEVEL_SNAPSHOT_KEYS = frozenset(
         "temporaryAccount",
         "revId",
         "logId",
+        "rangeblock",
+        "pendingProviders",
     }
 )
 
@@ -293,8 +297,8 @@ def sanitize_provider_row_for_l2(
     if not is_provider_allowed_in_l2(resolved_key):
         return None
     if resolved_key == "shodan_internetdb":
-        return _sanitize_shodan_row(row)
-    stripped = {key: val for key, val in row.items() if key != "rawJson"}
+        return scrub_legacy_coordinates_from_row(_sanitize_shodan_row(row))
+    stripped = scrub_legacy_coordinates_from_row({key: val for key, val in row.items() if key != "rawJson"})
     return sanitization.sanitize_payload(stripped)
 
 
@@ -977,6 +981,7 @@ def purge_expired_provider_fields(
             "failed": False,
         }
     except DjangoDbError as db_err:
+        connection.close()
         safe_err = sanitization.sanitize_error_message(str(db_err))
         logger.warning(f"ToolsDB L2 retention purge bypassed due to database error: {safe_err}")
         return {"scanned": 0, "updated": 0, "purged_providers": 0, "dry_run": bool(dry_run), "failed": True}

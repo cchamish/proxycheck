@@ -1,4 +1,4 @@
-"""Proxy Detector project configuration package."""
+"""Proxycheck project configuration package."""
 
 try:
     import pymysql

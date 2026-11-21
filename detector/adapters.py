@@ -140,37 +140,10 @@ def _format_asn_str(asn_val: Any, *, strict_numeric: bool = False) -> str:
     return "-"
 
 
-def _format_coordinates(lat: Any, lon: Any, *, reject_blank: bool = False) -> Optional[str]:
-    if lat is None or lon is None:
-        return None
-    if reject_blank:
-        if isinstance(lat, bool) or isinstance(lon, bool):
-            return None
-        if str(lat).strip() == "" or str(lon).strip() == "":
-            return None
-    return f"{lat}, {lon}"
-
-
-def _format_location_with_coords(
-    parts: Iterable[Any],
-    lat: Any = None,
-    lon: Any = None,
-    *,
-    reject_blank_coords: bool = False,
-    empty_with_coords_prefix: str = "",
-) -> Tuple[str, Optional[str]]:
-    """Joins non-empty geographic parts and appends parenthesised coordinates when present."""
+def _format_location(parts: Iterable[Any]) -> str:
+    """Joins non-empty geographic parts into a display string, falling back to a hyphen."""
     clean_parts = [str(part) for part in parts if part]
-    coords = _format_coordinates(lat, lon, reject_blank=reject_blank_coords)
-    loc_str = ", ".join(clean_parts)
-    if coords:
-        if loc_str:
-            loc_str = f"{loc_str} ({coords})"
-        elif empty_with_coords_prefix:
-            loc_str = f"{empty_with_coords_prefix} ({coords})"
-        else:
-            loc_str = f" ({coords})"
-    return (loc_str if loc_str else "-"), coords
+    return ", ".join(clean_parts) if clean_parts else "-"
 
 
 def _extract_carrier_name(carrier_val: Any) -> Optional[str]:
@@ -247,7 +220,7 @@ def adapt_abuseipdb(raw_data: Optional[Dict[str, Any]], has_api_key: bool, statu
         ("Tor Exit Node", data.get("isTor")),
         ("Datacenter / Hosting", is_datacenter),
     )
-    location, _ = _format_location_with_coords((data.get("countryName"), data.get("countryCode")))
+    location = _format_location((data.get("countryName"), data.get("countryCode")))
 
     raw_abuse_score = _safe_int(data.get("abuseConfidenceScore"), default=None)
     raw_total_reports = _safe_int(data.get("totalReports"), default=None)
@@ -297,11 +270,7 @@ def adapt_ipdata(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_c
         asn_str = _format_asn_str(asn_val)
         org_fallback = None
 
-    location, coords = _format_location_with_coords(
-        (raw_data.get("city"), raw_data.get("region"), raw_data.get("country_name")),
-        raw_data.get("latitude"),
-        raw_data.get("longitude"),
-    )
+    location = _format_location((raw_data.get("city"), raw_data.get("region"), raw_data.get("country_name")))
     carrier_name = _extract_carrier_name(raw_data.get("carrier"))
     company_type = company.get("type")
     normalized_company_type = company_type.strip() if isinstance(company_type, str) and company_type.strip() else None
@@ -317,7 +286,6 @@ def adapt_ipdata(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_c
         extra={
             "carrier": carrier_name,
             "countryCode": raw_data.get("country_code"),
-            "coordinates": coords,
         },
     )
 
@@ -350,11 +318,7 @@ def adapt_ipregistry(raw_data: Optional[Dict[str, Any]], has_api_key: bool, stat
 
     region_obj = loc.get("region") if isinstance(loc.get("region"), dict) else {}
     country_obj = loc.get("country") if isinstance(loc.get("country"), dict) else {}
-    location, coords = _format_location_with_coords(
-        (loc.get("city"), region_obj.get("name"), country_obj.get("name")),
-        loc.get("latitude"),
-        loc.get("longitude"),
-    )
+    location = _format_location((loc.get("city"), region_obj.get("name"), country_obj.get("name")))
 
     return _build_ok_row(
         "IPRegistry",
@@ -367,7 +331,6 @@ def adapt_ipregistry(raw_data: Optional[Dict[str, Any]], has_api_key: bool, stat
         extra={
             "isMobile": conn_type_lower == "mobile",
             "countryCode": country_obj.get("code"),
-            "coordinates": coords,
         },
     )
 
@@ -397,11 +360,7 @@ def adapt_ip2location(raw_data: Optional[Dict[str, Any]], has_api_key: bool, sta
         ("Threat Detected", proxy_obj.get("is_spammer") or proxy_obj.get("is_scanner") or proxy_obj.get("is_botnet")),
     )
 
-    location, coords = _format_location_with_coords(
-        (raw_data.get("city_name"), raw_data.get("region_name"), raw_data.get("country_name")),
-        raw_data.get("latitude"),
-        raw_data.get("longitude"),
-    )
+    location = _format_location((raw_data.get("city_name"), raw_data.get("region_name"), raw_data.get("country_name")))
     raw_mobile_brand = raw_data.get("mobile_brand")
     mobile_brand = (
         raw_mobile_brand.strip()
@@ -423,7 +382,6 @@ def adapt_ip2location(raw_data: Optional[Dict[str, Any]], has_api_key: bool, sta
         extra={
             "mobileBrand": mobile_brand,
             "countryCode": raw_data.get("country_code"),
-            "coordinates": coords,
         },
     )
 
@@ -464,8 +422,8 @@ def _extract_maxmind_subdivision(raw_subdivisions: Any) -> str:
     return ""
 
 
-def _extract_maxmind_geo(raw_data: Dict[str, Any]) -> Tuple[str, Optional[str], Optional[str]]:
-    """Extracts country code, formatted location string, and coordinates from MMDB data."""
+def _extract_maxmind_geo(raw_data: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+    """Extracts country code and formatted location string from MMDB data."""
     country_obj = raw_data.get("country") or {}
     country_name = _extract_maxmind_name(country_obj)
     country_code = ""
@@ -484,15 +442,8 @@ def _extract_maxmind_geo(raw_data: Dict[str, Any]) -> Tuple[str, Optional[str], 
             loc_parts.append(part)
             seen_parts.add(part.lower())
 
-    loc_obj = raw_data.get("location") if isinstance(raw_data.get("location"), dict) else {}
-    loc_str, coords = _format_location_with_coords(
-        loc_parts,
-        loc_obj.get("latitude"),
-        loc_obj.get("longitude"),
-        reject_blank_coords=True,
-        empty_with_coords_prefix="Unknown",
-    )
-    return loc_str, country_code or None, coords
+    loc_str = _format_location(loc_parts)
+    return loc_str, country_code or None
 
 
 def _extract_maxmind_signals(
@@ -539,7 +490,7 @@ def adapt_maxmind(
 
     asn_val = raw_data.get("autonomous_system_number") or raw_data.get("asn")
     org_name = raw_data.get("autonomous_system_organization") or raw_data.get("as") or raw_data.get("isp") or "-"
-    loc_str, country_code, coords = _extract_maxmind_geo(raw_data)
+    loc_str, country_code = _extract_maxmind_geo(raw_data)
 
     target_ip = ip if isinstance(ip, str) and ip.strip() else raw_data.get("_ip")
     shared_hit = lookup_shared_cidr_offline(target_ip) if target_ip else None
@@ -561,7 +512,7 @@ def adapt_maxmind(
         else raw_data
     )
 
-    extra: Dict[str, Any] = {"countryCode": country_code, "coordinates": coords}
+    extra: Dict[str, Any] = {"countryCode": country_code}
     if prefix_length is not None:
         extra["prefixLength"] = prefix_length
     if shared_hit is not None:
@@ -712,20 +663,15 @@ def _extract_proxycheck_flags(
     return usage_type, flags
 
 
-def _extract_proxycheck_location(ip_obj: Dict[str, Any]) -> Tuple[str, Optional[str], Optional[str]]:
+def _extract_proxycheck_location(ip_obj: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     loc_obj = ip_obj.get("location") if isinstance(ip_obj.get("location"), dict) else {}
     country_name = ip_obj.get("country") or loc_obj.get("country_name") or ""
     country_code = ip_obj.get("isocode") or ip_obj.get("country_code") or loc_obj.get("country_code") or ""
     city_name = ip_obj.get("city") or loc_obj.get("city") or ""
-    coords = _format_coordinates(
-        ip_obj.get("latitude") or loc_obj.get("latitude"),
-        ip_obj.get("longitude") or loc_obj.get("longitude"),
-    )
-    loc_parts = [p for p in (city_name, country_name) if p]
-    loc_str = ", ".join(loc_parts) if loc_parts else (country_code or "-")
-    if coords and loc_str != "-":
-        loc_str = f"{loc_str} ({coords})"
-    return loc_str, (str(country_code).upper() if country_code else None), coords
+    loc_str = _format_location((city_name, country_name))
+    if loc_str == "-" and country_code:
+        loc_str = str(country_code)
+    return loc_str, (str(country_code).upper() if country_code else None)
 
 
 def _first_parsed(candidates: Iterable[Any], parser: Any) -> Any:
@@ -752,7 +698,7 @@ def adapt_proxycheck(
     detections = ip_obj.get("detections") if isinstance(ip_obj.get("detections"), dict) else {}
     network = ip_obj.get("network") if isinstance(ip_obj.get("network"), dict) else {}
     usage_type, flags = _extract_proxycheck_flags(detections, ip_obj, network)
-    loc_str, country_code, coords = _extract_proxycheck_location(ip_obj)
+    loc_str, country_code = _extract_proxycheck_location(ip_obj)
 
     org_val = (
         ip_obj.get("organisation")
@@ -796,7 +742,6 @@ def adapt_proxycheck(
             ),
             "lastSeen": normalized_last_seen,
             "countryCode": country_code,
-            "coordinates": coords,
         },
     )
 
@@ -876,7 +821,7 @@ def adapt_iphunter(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status
         ("Suspicious (Block 2)", block_val == 2),
     )
     country_code = data.get("country_code") or ""
-    location, _ = _format_location_with_coords((data.get("city"), data.get("country_name"), country_code))
+    location = _format_location((data.get("city"), data.get("country_name"), country_code))
 
     return _build_ok_row(
         "IPHunter",

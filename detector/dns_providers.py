@@ -188,7 +188,7 @@ def _read_maxmind_sync(ip: str) -> Dict[str, Any]:
     city_path = db_paths["city"]
     if record_city_db_presence(city_path, is_present="city" in available_paths):
         logger.warning(
-            "GeoLite2-City.mmdb was not found at %s; MaxMind lookups will omit city and coordinates",
+            "GeoLite2-City.mmdb was not found at %s; MaxMind lookups will omit city",
             city_path,
         )
 

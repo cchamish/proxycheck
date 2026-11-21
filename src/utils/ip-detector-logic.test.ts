@@ -20,7 +20,6 @@ function makeDetectionPayload(ip: string): DetectionResponse {
     arbitrationVerdict: 'Clean',
     isMajorityProxyVpn: false,
     primaryCountry: 'United States',
-    primaryCoordinates: '-',
     primaryAsn: 'AS15169',
     results: [
       {

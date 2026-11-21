@@ -5,12 +5,13 @@ and staged cache-backed intelligence gathering.
 
 import asyncio
 import concurrent.futures
+import contextlib
 import json
 import logging
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Set, Tuple
 
 import httpx
 
@@ -23,6 +24,7 @@ from . import (
     l2_cache,
     offline_dbs,
     quota_telemetry,
+    rangeblock_service,
     sanitization,
 )
 from .cache_backends import (
@@ -1281,14 +1283,19 @@ async def detect_single_canonical_ip(
     compact: bool = False,
     query_mode: str = "full",
     skip_prefetched_snapshots: bool = False,
+    wiki: Optional[str] = None,
+    skip_rangeblock: bool = False,
 ) -> Dict[str, Any]:
     """Runs singleflight-coalesced dual-layer intelligence detection for one canonical IP address."""
     normalized_mode = normalize_query_mode(query_mode)
     non_public = classify_non_public_ip(ip)
     if non_public is not None:
-        return build_non_public_response_payload(
+        payload = build_non_public_response_payload(
             ip, non_public[0], non_public[1], start_time, query_mode=normalized_mode
         )
+        if not skip_rangeblock:
+            payload["rangeblock"] = rangeblock_service.build_empty_rangeblock_summary(ip)
+        return payload
 
     current_loop = asyncio.get_running_loop()
     inflight_key = (ip, normalized_mode)
@@ -1334,6 +1341,9 @@ async def detect_single_canonical_ip(
             _ip_detect_inflight[inflight_key] = created_task
             inflight_task = created_task
 
+    rb_task = (
+        None if skip_rangeblock else asyncio.create_task(rangeblock_service.query_rangeblocks_for_ip(ip, wiki=wiki))
+    )
     try:
         shared_payload = await _await_inflight_task(inflight_task, current_loop)
     except _StaleInflightLoopError:
@@ -1343,6 +1353,8 @@ async def detect_single_canonical_ip(
             normalized_mode,
             skip_prefetched_snapshots=skip_prefetched_snapshots,
         )
+
+    rb_summary = await rb_task if rb_task is not None else None
 
     base_payload = shared_payload
     cache_meta = base_payload.get("cacheMeta") or {}
@@ -1354,7 +1366,9 @@ async def detect_single_canonical_ip(
             cache_layer_event=_resolve_cache_layer_telemetry_event(cache_meta),
         )
 
-    response_payload = strip_raw_json_from_payload(base_payload) if compact else base_payload
+    response_payload = strip_raw_json_from_payload(base_payload) if compact else dict(base_payload)
+    if rb_summary is not None:
+        response_payload["rangeblock"] = rb_summary
     return attach_request_diagnostics(response_payload, start_time)
 
 
@@ -1437,6 +1451,7 @@ async def refresh_single_canonical_ip(
     is_admin: bool = False,
     compact: bool = False,
     query_mode: str = "full",
+    wiki: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], int, Dict[str, str]]:
     """
     Executes an authenticated manual or stale-while-revalidate refresh with per-IP cooldown,
@@ -1445,11 +1460,11 @@ async def refresh_single_canonical_ip(
     normalized_mode = normalize_query_mode(query_mode, default="full")
     non_public = classify_non_public_ip(ip)
     if non_public is not None:
-        return (
-            build_non_public_response_payload(ip, non_public[0], non_public[1], start_time, query_mode=normalized_mode),
-            200,
-            {},
+        non_public_payload = build_non_public_response_payload(
+            ip, non_public[0], non_public[1], start_time, query_mode=normalized_mode
         )
+        non_public_payload["rangeblock"] = rangeblock_service.build_empty_rangeblock_summary(ip)
+        return non_public_payload, 200, {}
 
     if await is_refresh_on_cooldown(ip):
         cooldown_cached = await _try_serve_existing_snapshot_for_refresh(
@@ -1592,7 +1607,8 @@ async def refresh_single_canonical_ip(
                 now_dt=now_dt,
             ),
         )
-        out_payload = strip_raw_json_from_payload(final_payload) if compact else final_payload
+        out_payload = strip_raw_json_from_payload(final_payload) if compact else dict(final_payload)
+        out_payload["rangeblock"] = await rangeblock_service.query_rangeblocks_for_ip(ip, wiki=wiki)
         return attach_request_diagnostics(out_payload, start_time), 200, {}
     finally:
         if lock_token is not None:
@@ -1621,6 +1637,7 @@ async def detect_canonical_ip_batch(
     auth_mode: str,
     compact: bool = False,
     query_mode: str = "light",
+    wiki: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Executes bounded-concurrency intelligence detection across up to 25 unique canonical IPs
@@ -1629,7 +1646,10 @@ async def detect_canonical_ip_batch(
     normalized_mode = normalize_query_mode(query_mode, default="light")
     public_ips = [ip for ip in unique_canonical_ips if classify_non_public_ip(ip) is None]
 
-    l1_hits = await _prefetch_batch_l1_snapshots(public_ips, normalized_mode)
+    l1_hits, rangeblock_by_ip = await asyncio.gather(
+        _prefetch_batch_l1_snapshots(public_ips, normalized_mode),
+        rangeblock_service.query_rangeblocks_for_ips(public_ips, wiki=wiki),
+    )
     l1_miss_ips = [ip for ip in public_ips if ip not in l1_hits]
     l2_hits = await _safe_l2_aget_snapshots_bulk(l1_miss_ips, mode=normalized_mode) if l1_miss_ips else {}
 
@@ -1680,11 +1700,639 @@ async def detect_canonical_ip_batch(
                     compact=compact,
                     query_mode=normalized_mode,
                     skip_prefetched_snapshots=True,
+                    wiki=wiki,
+                    skip_rangeblock=True,
                 )
 
+            rb_summary = rangeblock_by_ip.get(canonical_ip) or rangeblock_service.build_empty_rangeblock_summary(
+                canonical_ip
+            )
+            payload = {**payload, "rangeblock": rb_summary}
             if isinstance(payload.get("cacheMeta"), dict):
                 payload = {**payload, "cacheMeta": {**payload["cacheMeta"], "shouldAutoRefresh": False}}
             return canonical_ip, payload
 
     pairs = await asyncio.gather(*(_detect_bounded(ip) for ip in unique_canonical_ips))
     return dict(pairs)
+
+
+def _format_sse_event(event_name: str, payload: Dict[str, Any]) -> bytes:
+    encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    return f"event: {event_name}\ndata: {encoded}\n\n".encode("utf-8")
+
+
+def _extract_overview_fields(assembled: Dict[str, Any]) -> Dict[str, Any]:
+    overview_keys = (
+        "ip",
+        "is_broadcast_ip",
+        "isTor",
+        "torIsExit",
+        "torRunning",
+        "torFlags",
+        "torLabel",
+        "torSummary",
+        "prediction_score",
+        "predictionLabel",
+        "predictionTier",
+        "getipintel_chance",
+        "residentialProxy",
+        "highlySuspectedResidentialProxy",
+        "arbitrationVerdict",
+        "arbitrationTier",
+        "isMajorityProxyVpn",
+        "suspectedResidentialProxy",
+        "primaryCountry",
+        "primaryAsn",
+        "ptrHostname",
+        "ptrCategory",
+        "ptrLabel",
+        "ptrIsHighRisk",
+        "recommendedCidr",
+        "defaultCidr",
+        "mmdbCidr",
+        "sharedCidr",
+        "sharedProvider",
+        "sharedCategory",
+        "cidrNote",
+        "bgpPrefix",
+        "escalationCidr",
+        "cidrRationale",
+        "isMobileOrCgnat",
+        "sharedPrivacyEgress",
+        "openProxyPorts",
+    )
+    return {k: assembled[k] for k in overview_keys if k in assembled}
+
+
+def _order_provider_rows(rows_by_key: Mapping[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [rows_by_key[spec.key] for spec in PROVIDER_SPECS if spec.key in rows_by_key]
+
+
+async def _run_isolated_stream_task(
+    task_kind: str,
+    spec: Optional[ProviderSpec],
+    client: Optional[httpx.AsyncClient],
+    ip: str,
+) -> Tuple[str, Optional[ProviderSpec], Any, Dict[str, Dict[str, Any]], Dict[str, str]]:
+    """Executes one stream upstream query with isolated ContextVars for events and rDNS state."""
+    upstream_events: Dict[str, Dict[str, Any]] = {}
+    events_token = provider_upstream_events.set(upstream_events)
+    rdns_state: Dict[str, str] = {"status": "ok"}
+    rdns_token = rdns_context_state.set(rdns_state)
+    try:
+        if task_kind == "provider" and spec is not None:
+            result = await spec.invoke(client, ip)
+            return task_kind, spec, result, upstream_events, rdns_state
+        if task_kind == "ptr":
+            result = await dns_providers.query_rdns_ptr(ip)
+            return task_kind, None, result, upstream_events, rdns_state
+        result = await dns_providers.query_cymru_bgp_prefix(ip)
+        return task_kind, None, result, upstream_events, rdns_state
+    except Exception as exc:  # noqa: BLE001
+        return task_kind, spec, exc, upstream_events, rdns_state
+    finally:
+        rdns_context_state.reset(rdns_token)
+        provider_upstream_events.reset(events_token)
+
+
+async def _persist_stream_provider_outcome(
+    spec: ProviderSpec,
+    ip: str,
+    row: Dict[str, Any],
+    event: Optional[Dict[str, Any]],
+    miss_triggered_exception: bool,
+    raw_res: Any,
+    quota_consumed_keys: Set[str],
+    active_redis: Any,
+    now_dt: datetime,
+    now_iso: str,
+    default_cooldown: int,
+) -> None:
+    if active_redis is None:
+        return
+    ops = []
+    write_entry = _build_cache_or_cooldown_write(
+        spec, ip, row, event, miss_triggered_exception, now_dt, now_iso, default_cooldown
+    )
+    if write_entry is not None:
+        ops.append(safe_redis_set_many([write_entry]))
+    tel_entry = _build_telemetry_entry(spec.key, row, event, miss_triggered_exception, raw_res, quota_consumed_keys)
+    if tel_entry is not None:
+        ops.append(quota_telemetry.record_provider_outcomes_batch([tel_entry], now_dt=now_dt))
+    if ops:
+        await asyncio.gather(*ops)
+
+
+async def _run_immediate_offline_sources(
+    ip: str,
+    cached_providers: Dict[str, Tuple[Dict[str, Any], Optional[str]]],
+    deferred_keys: FrozenSet[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Executes uncached offline databases and offline Tor Onionoo immediately for the first SSE frame."""
+    await _ensure_offline_caches_warm()
+    spec_by_key = _get_spec_by_key()
+    offline_keys = [
+        spec.key
+        for spec in PROVIDER_SPECS
+        if spec.key in OFFLINE_PROVIDER_KEYS and spec.key not in cached_providers and spec.key not in deferred_keys
+    ]
+    coros = [spec_by_key[k].invoke(None, ip) for k in offline_keys]
+    out: Dict[str, Dict[str, Any]] = {}
+    if coros:
+        results = await asyncio.gather(*coros, return_exceptions=True)
+        for pkey, raw_res in zip(offline_keys, results, strict=True):
+            row, _ = _normalize_executed_row(spec_by_key[pkey].label, raw_res)
+            out[pkey] = row
+
+    if "tor_onionoo" not in cached_providers and "tor_onionoo" not in deferred_keys:
+        offline_tor = offline_dbs.lookup_tor_onionoo_offline(ip)
+        if isinstance(offline_tor, dict):
+            from .adapters import adapt_tor_onionoo
+
+            out["tor_onionoo"] = adapt_tor_onionoo(offline_tor, status_code=200, ip=ip)
+    return out
+
+
+async def _emit_cached_or_non_public_sse(
+    ip: str,
+    auth_mode: str,
+    start_time: float,
+    *,
+    compact: bool,
+    normalized_mode: str,
+    wiki: Optional[str],
+):
+    non_public = classify_non_public_ip(ip)
+    if non_public is not None:
+        payload = build_non_public_response_payload(
+            ip, non_public[0], non_public[1], start_time, query_mode=normalized_mode
+        )
+        payload["rangeblock"] = rangeblock_service.build_empty_rangeblock_summary(ip)
+        payload["pendingProviders"] = []
+        yield _format_sse_event("snapshot", payload)
+        yield _format_sse_event(
+            "done",
+            attach_request_diagnostics(
+                {
+                    "ip": ip,
+                    "isCached": False,
+                    "fetchedAt": payload.get("fetchedAt"),
+                    "cacheMeta": payload.get("cacheMeta"),
+                },
+                start_time,
+            ),
+        )
+        return
+
+    l1_task = asyncio.create_task(_try_read_l1_snapshot(ip, normalized_mode))
+    rb_task = asyncio.create_task(rangeblock_service.query_rangeblocks_for_ip(ip, wiki=wiki))
+    l1_snap = await l1_task
+    snapshot = l1_snap
+    layer = "L1"
+    force_offline = False
+    backfill_l1 = False
+    if snapshot is None:
+        snapshot = await _safe_l2_aget_snapshot(ip, mode=normalized_mode)
+        layer = "L2"
+        force_offline = True
+        backfill_l1 = True
+
+    if snapshot is None:
+        rb_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await rb_task
+        return
+
+    rehydrated, rb_summary = await asyncio.gather(
+        _rehydrate_snapshot_payload(
+            ip,
+            snapshot,
+            layer=layer,
+            normalized_mode=normalized_mode,
+            force_rehydrate_offline=force_offline,
+            backfill_l1=backfill_l1,
+        ),
+        rb_task,
+    )
+    cache_meta = rehydrated.get("cacheMeta") or {}
+    cache_status = cache_meta.get("status")
+    if isinstance(cache_status, str) and cache_status in ("hit", "stale", "partial", "miss"):
+        await quota_telemetry.record_global_request_telemetry(
+            cache_status,
+            auth_mode,
+            cache_layer_event=_resolve_cache_layer_telemetry_event(cache_meta),
+        )
+
+    out_payload = strip_raw_json_from_payload(rehydrated) if compact else dict(rehydrated)
+    out_payload["rangeblock"] = rb_summary
+    out_payload["pendingProviders"] = []
+    out_payload = attach_request_diagnostics(out_payload, start_time)
+    yield _format_sse_event("snapshot", out_payload)
+    yield _format_sse_event(
+        "done",
+        attach_request_diagnostics(
+            {
+                "ip": ip,
+                "isCached": out_payload.get("isCached", False),
+                "fetchedAt": out_payload.get("fetchedAt"),
+                "cacheMeta": out_payload.get("cacheMeta"),
+            },
+            start_time,
+        ),
+    )
+
+
+def _build_initial_stream_state(
+    ip: str,
+    *,
+    cached_providers: Dict[str, Tuple[Dict[str, Any], Optional[str]]],
+    deferred_provider_keys: FrozenSet[str],
+    cooldown_entries: Dict[str, Dict[str, Any]],
+    quota_blocked_entries: Dict[str, Dict[str, Any]],
+    immediate_offline: Dict[str, Dict[str, Any]],
+    active_redis: Any,
+    now_dt: datetime,
+    now_iso: str,
+) -> Tuple[Dict[str, Dict[str, Any]], List[str], int, int, int, List[Tuple[str, str, int]]]:
+    rows_by_key: Dict[str, Dict[str, Any]] = {}
+    cached_at_timestamps: List[str] = []
+    hit_count = cooldown_count = miss_count = 0
+    default_cooldown, _, _ = get_cooldown_bounds()
+    offline_writes: List[Tuple[str, str, int]] = []
+
+    for spec in PROVIDER_SPECS:
+        key = spec.key
+        if key in cached_providers:
+            row, cached_at = cached_providers[key]
+            row_copy = {**row, "isCached": True}
+            if cached_at:
+                row_copy["cachedAt"] = cached_at
+                cached_at_timestamps.append(cached_at)
+            rows_by_key[key] = row_copy
+            if not is_unconfigured_provider_row(row_copy):
+                hit_count += 1
+        elif key in deferred_provider_keys:
+            rows_by_key[key] = build_deferred_provider_row(spec.label)
+        elif key in cooldown_entries or key in quota_blocked_entries:
+            cd_info = cooldown_entries.get(key) or quota_blocked_entries[key]
+            rows_by_key[key] = build_cooldown_provider_row(spec.label, cd_info)
+            cooldown_count += 1
+        elif key in immediate_offline:
+            row = immediate_offline[key]
+            rows_by_key[key] = row
+            if not is_unconfigured_provider_row(row) and key not in NO_REDIS_CACHE_PROVIDER_KEYS:
+                miss_count += 1
+            if active_redis is not None:
+                w = _build_cache_or_cooldown_write(spec, ip, row, None, False, now_dt, now_iso, default_cooldown)
+                if w is not None:
+                    offline_writes.append(w)
+
+    return rows_by_key, cached_at_timestamps, hit_count, miss_count, cooldown_count, offline_writes
+
+
+async def _finalise_stream_detection(
+    ip: str,
+    auth_mode: str,
+    start_time: float,
+    *,
+    rows_by_key: Dict[str, Dict[str, Any]],
+    ptr_hostname: Optional[str],
+    hit_count: int,
+    miss_count: int,
+    cooldown_count: int,
+    cached_at_timestamps: List[str],
+    normalized_mode: str,
+    deferred_provider_keys: FrozenSet[str],
+    cymru_bgp_prefix: Optional[str],
+    cached_ptr: Optional[Tuple[Optional[str], Optional[str]]],
+    rdns_state: Dict[str, str],
+    now_dt: datetime,
+    now_iso: str,
+) -> bytes:
+    final_rows = _order_provider_rows(rows_by_key)
+    all_cached_l1 = miss_count == 0 and cooldown_count == 0 and hit_count > 0
+    final_payload = _assemble_detection_payload(
+        ip,
+        final_rows,
+        ptr_hostname,
+        hit_count=hit_count,
+        miss_count=miss_count,
+        cooldown_count=cooldown_count,
+        cached_at_timestamps=cached_at_timestamps,
+        query_mode=normalized_mode,
+        is_partial_mode=bool(deferred_provider_keys),
+        bgp_prefix=cymru_bgp_prefix,
+        layer="L1" if all_cached_l1 else "upstream",
+        now_dt=now_dt,
+    )
+    has_transient = _has_transient_upstream_failures(
+        final_rows,
+        cooldown_count=cooldown_count,
+        cached_ptr=cached_ptr,
+        rdns_state=rdns_state,
+    )
+    if not all_cached_l1 and not deferred_provider_keys and not has_transient:
+        snapshot_doc = {
+            **final_payload,
+            "fetchedAt": now_iso,
+            "results": _stamp_offline_signatures(final_rows),
+            "_ptrResolved": True,
+        }
+        await asyncio.gather(
+            set_cached_ip_snapshot(ip, snapshot_doc, mode="full"),
+            _safe_l2_amerge_snapshot(
+                ip,
+                {**final_payload, "fetchedAt": now_iso, "results": final_rows},
+                query_mode="full",
+                now_dt=now_dt,
+            ),
+        )
+
+    cache_meta = final_payload.get("cacheMeta") or {}
+    cache_status = cache_meta.get("status")
+    if isinstance(cache_status, str) and cache_status in ("hit", "stale", "partial", "miss"):
+        await quota_telemetry.record_global_request_telemetry(
+            cache_status,
+            auth_mode,
+            cache_layer_event=_resolve_cache_layer_telemetry_event(cache_meta),
+        )
+
+    done_body = attach_request_diagnostics(
+        {
+            "ip": ip,
+            "isCached": final_payload.get("isCached", False),
+            "fetchedAt": final_payload.get("fetchedAt"),
+            "cacheMeta": final_payload.get("cacheMeta"),
+            "pendingProviders": [],
+            **_extract_overview_fields(final_payload),
+        },
+        start_time,
+    )
+    return _format_sse_event("done", done_body)
+
+
+def _create_stream_tasks(
+    ip: str,
+    specs_to_execute: List[ProviderSpec],
+    client: Optional[httpx.AsyncClient],
+    cached_ptr: Optional[Tuple[Optional[str], Optional[str]]],
+    cymru_bgp_prefix: Optional[str],
+) -> List[asyncio.Task[Any]]:
+    tasks = [asyncio.create_task(_run_isolated_stream_task("provider", spec, client, ip)) for spec in specs_to_execute]
+    if cached_ptr is None:
+        tasks.append(asyncio.create_task(_run_isolated_stream_task("ptr", None, None, ip)))
+        if cymru_bgp_prefix is None:
+            tasks.append(asyncio.create_task(_run_isolated_stream_task("bgp", None, None, ip)))
+    return tasks
+
+
+async def _consume_stream_tasks(
+    ip: str,
+    *,
+    tasks: List[asyncio.Task[Any]],
+    pending_set: List[str],
+    rows_by_key: Dict[str, Dict[str, Any]],
+    stream_ctx: Dict[str, Any],
+    hit_count: int,
+    cooldown_count: int,
+    cached_at_timestamps: List[str],
+    normalized_mode: str,
+    deferred_provider_keys: FrozenSet[str],
+    quota_consumed_keys: Set[str],
+    active_redis: Any,
+    now_dt: datetime,
+    now_iso: str,
+    default_cooldown: int,
+    compact: bool,
+):
+    for completed in asyncio.as_completed(tasks):
+        task_kind, spec, raw_res, task_events, task_rdns = await completed
+        if task_kind == "ptr":
+            ptr_hostname, _, ptr_miss, _, ptr_write = _resolve_ptr_outcome(
+                ip, None, raw_res, task_rdns, active_redis, now_iso
+            )
+            stream_ctx["ptr_hostname"] = ptr_hostname
+            stream_ctx["rdns_state"] = task_rdns
+            stream_ctx["miss_count"] += ptr_miss
+            if ptr_write is not None:
+                await safe_redis_set_many([ptr_write])
+            continue
+        if task_kind == "bgp":
+            if isinstance(raw_res, dict) and isinstance(raw_res.get("bgpPrefix"), str):
+                cleaned_bgp = raw_res["bgpPrefix"].strip()
+                if cleaned_bgp:
+                    stream_ctx["cymru_bgp_prefix"] = cleaned_bgp
+            continue
+        if spec is None:
+            continue
+
+        row, miss_exc = _normalize_executed_row(spec.label, raw_res)
+        rows_by_key[spec.key] = row
+        if not is_unconfigured_provider_row(row) and spec.key not in NO_REDIS_CACHE_PROVIDER_KEYS:
+            stream_ctx["miss_count"] += 1
+        if spec.label in pending_set:
+            pending_set.remove(spec.label)
+
+        await _persist_stream_provider_outcome(
+            spec,
+            ip,
+            row,
+            task_events.get(spec.key),
+            miss_exc,
+            raw_res,
+            quota_consumed_keys,
+            active_redis,
+            now_dt,
+            now_iso,
+            default_cooldown,
+        )
+        updated_payload = _assemble_detection_payload(
+            ip,
+            _order_provider_rows(rows_by_key),
+            stream_ctx["ptr_hostname"],
+            hit_count=hit_count,
+            miss_count=stream_ctx["miss_count"],
+            cooldown_count=cooldown_count,
+            cached_at_timestamps=cached_at_timestamps,
+            query_mode=normalized_mode,
+            is_partial_mode=bool(deferred_provider_keys),
+            bgp_prefix=stream_ctx["cymru_bgp_prefix"],
+            layer="upstream",
+            now_dt=now_dt,
+        )
+        out_row = {k: v for k, v in row.items() if k != "rawJson"} if compact else row
+        yield _format_sse_event(
+            "provider",
+            {
+                "provider": spec.label,
+                "providerKey": spec.key,
+                "row": out_row,
+                "pendingProviders": list(pending_set),
+                **_extract_overview_fields(updated_payload),
+            },
+        )
+
+
+async def stream_single_canonical_ip_sse(
+    ip: str,
+    auth_mode: str,
+    start_time: float,
+    *,
+    compact: bool = False,
+    query_mode: str = "full",
+    wiki: Optional[str] = None,
+):
+    """Streams snapshot, per-provider incremental updates, and done SSE frames for one IP."""
+    normalized_mode = normalize_query_mode(query_mode)
+    emitted_fast = False
+    async for chunk in _emit_cached_or_non_public_sse(
+        ip,
+        auth_mode,
+        start_time,
+        compact=compact,
+        normalized_mode=normalized_mode,
+        wiki=wiki,
+    ):
+        emitted_fast = True
+        yield chunk
+    if emitted_fast:
+        return
+
+    is_ipv4 = reverse_ipv4_octets(ip) is not None
+    (cached_providers, cached_ptr), rb_summary = await asyncio.gather(
+        _read_provider_caches(ip),
+        rangeblock_service.query_rangeblocks_for_ip(ip, wiki=wiki),
+    )
+
+    cache_expected_keys, deferred_provider_keys, missed_cooldown_keys = _plan_provider_execution(
+        cached_providers, normalized_mode, is_ipv4
+    )
+    active_redis = get_redis_client()
+    cooldown_entries, immediate_offline = await asyncio.gather(
+        _fetch_provider_cooldowns(active_redis, missed_cooldown_keys),
+        _run_immediate_offline_sources(ip, cached_providers, deferred_provider_keys),
+    )
+
+    candidate_specs = [
+        spec
+        for spec in PROVIDER_SPECS
+        if spec.key not in cached_providers
+        and spec.key not in deferred_provider_keys
+        and spec.key not in cooldown_entries
+        and spec.key not in immediate_offline
+    ]
+    quota_blocked_entries, quota_consumed_keys = await _evaluate_quota_candidates(
+        active_redis, candidate_specs, is_ipv4
+    )
+    specs_to_execute = [spec for spec in candidate_specs if spec.key not in quota_blocked_entries]
+
+    now_dt = datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat()
+    default_cooldown, _, _ = get_cooldown_bounds()
+    rows_by_key, cached_at_timestamps, hit_count, miss_count, cooldown_count, offline_writes = (
+        _build_initial_stream_state(
+            ip,
+            cached_providers=cached_providers,
+            deferred_provider_keys=deferred_provider_keys,
+            cooldown_entries=cooldown_entries,
+            quota_blocked_entries=quota_blocked_entries,
+            immediate_offline=immediate_offline,
+            active_redis=active_redis,
+            now_dt=now_dt,
+            now_iso=now_iso,
+        )
+    )
+    if offline_writes:
+        await safe_redis_set_many(offline_writes)
+
+    ptr_hostname: Optional[str] = cached_ptr[0] if cached_ptr is not None else None
+    if cached_ptr is not None:
+        hit_count += 1
+        if cached_ptr[1]:
+            cached_at_timestamps.append(cached_ptr[1])
+    cymru_bgp_prefix: Optional[str] = lookup_bgp_tools_offline(ip)
+    rdns_state: Dict[str, str] = {"status": "ok"}
+
+    pending_labels = [spec.label for spec in specs_to_execute]
+    initial_payload = _assemble_detection_payload(
+        ip,
+        _order_provider_rows(rows_by_key),
+        ptr_hostname,
+        hit_count=hit_count,
+        miss_count=miss_count,
+        cooldown_count=cooldown_count,
+        cached_at_timestamps=cached_at_timestamps,
+        query_mode=normalized_mode,
+        is_partial_mode=bool(deferred_provider_keys),
+        bgp_prefix=cymru_bgp_prefix,
+        layer="L1"
+        if (not specs_to_execute and miss_count == 0 and cooldown_count == 0 and hit_count > 0)
+        else "upstream",
+        now_dt=now_dt,
+    )
+    initial_payload = strip_raw_json_from_payload(initial_payload) if compact else initial_payload
+    initial_payload["rangeblock"] = rb_summary
+    initial_payload["pendingProviders"] = pending_labels
+    yield _format_sse_event("snapshot", attach_request_diagnostics(initial_payload, start_time))
+
+    lock_token = await acquire_ip_updating_lock(ip) if specs_to_execute else None
+    tasks: List[asyncio.Task[Any]] = []
+    try:
+        needs_http = any(spec.uses_http_client and spec.key in cache_expected_keys for spec in specs_to_execute)
+        client = await http_client.get_shared_http_client() if needs_http else None
+        tasks = _create_stream_tasks(ip, specs_to_execute, client, cached_ptr, cymru_bgp_prefix)
+
+        stream_ctx: Dict[str, Any] = {
+            "ptr_hostname": ptr_hostname,
+            "cymru_bgp_prefix": cymru_bgp_prefix,
+            "rdns_state": rdns_state,
+            "miss_count": miss_count,
+        }
+        async for chunk in _consume_stream_tasks(
+            ip,
+            tasks=tasks,
+            pending_set=list(pending_labels),
+            rows_by_key=rows_by_key,
+            stream_ctx=stream_ctx,
+            hit_count=hit_count,
+            cooldown_count=cooldown_count,
+            cached_at_timestamps=cached_at_timestamps,
+            normalized_mode=normalized_mode,
+            deferred_provider_keys=deferred_provider_keys,
+            quota_consumed_keys=quota_consumed_keys,
+            active_redis=active_redis,
+            now_dt=now_dt,
+            now_iso=now_iso,
+            default_cooldown=default_cooldown,
+            compact=compact,
+        ):
+            yield chunk
+
+        yield await _finalise_stream_detection(
+            ip,
+            auth_mode,
+            start_time,
+            rows_by_key=rows_by_key,
+            ptr_hostname=stream_ctx["ptr_hostname"],
+            hit_count=hit_count,
+            miss_count=stream_ctx["miss_count"],
+            cooldown_count=cooldown_count,
+            cached_at_timestamps=cached_at_timestamps,
+            normalized_mode=normalized_mode,
+            deferred_provider_keys=deferred_provider_keys,
+            cymru_bgp_prefix=stream_ctx["cymru_bgp_prefix"],
+            cached_ptr=cached_ptr,
+            rdns_state=stream_ctx["rdns_state"],
+            now_dt=now_dt,
+            now_iso=now_iso,
+        )
+    except asyncio.CancelledError:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    finally:
+        if lock_token is not None:
+            await release_ip_updating_lock(ip, lock_token)

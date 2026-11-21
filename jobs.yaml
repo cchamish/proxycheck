@@ -39,3 +39,8 @@
   image: tool-proxycheck/tool-proxycheck:latest
   schedule: "@daily"
   mount: all
+- name: sync-world-block
+  command: python manage.py sync_world_block
+  image: tool-proxycheck/tool-proxycheck:latest
+  schedule: "@hourly"
+  mount: all

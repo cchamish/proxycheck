@@ -244,7 +244,6 @@ def build_non_public_response_payload(
         "arbitrationTier": "neutral",
         "isMajorityProxyVpn": False,
         "primaryCountry": reason,
-        "primaryCoordinates": "N/A",
         "primaryAsn": "-",
         "ptrHostname": None,
         "ptrCategory": "none",
@@ -316,7 +315,6 @@ class _ArbitrationAccumulator:
     valid_asns: List[str] = field(default_factory=list)
     valid_orgs: List[str] = field(default_factory=list)
     valid_locations: List[str] = field(default_factory=list)
-    valid_coords: List[str] = field(default_factory=list)
     getipintel_chance: Optional[float] = None
     residential_proxy: Optional[float] = None
     positive_proxy_vpn_votes: float = 0.0
@@ -403,10 +401,6 @@ def _record_row_network_metadata(row: Dict[str, Any], acc: _ArbitrationAccumulat
     loc_val = row.get("location")
     if loc_val and loc_val != "-":
         acc.valid_locations.append(loc_val)
-
-    coords_val = row.get("coordinates")
-    if coords_val:
-        acc.valid_coords.append(coords_val)
 
     if row.get("provider") == "GetIPIntel":
         chance_val = row.get("chance")
@@ -801,7 +795,6 @@ def aggregate_intelligence_metrics(
         "isMajorityProxyVpn": is_majority_proxy_vpn,
         "suspectedResidentialProxy": suspected_residential_proxy,
         "primaryCountry": acc.valid_locations[0].split("(")[0].strip() if acc.valid_locations else "-",
-        "primaryCoordinates": acc.valid_coords[0] if acc.valid_coords else "Unknown",
         "primaryAsn": primary_asn,
         "ptrHostname": rdns_info["ptrHostname"],
         "ptrCategory": rdns_info["ptrCategory"],

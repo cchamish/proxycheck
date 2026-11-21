@@ -1,1 +1,1 @@
-web: sh -c 'exec gunicorn proxycheck.asgi:application -k uvicorn_worker.UvicornWorker --workers "${WEB_CONCURRENCY:-2}" --bind "0.0.0.0:${PORT:-8000}" --forwarded-allow-ips="*" --error-logfile -'
+web: sh -c 'exec env PYTHONUNBUFFERED=1 gunicorn proxycheck.asgi:application -k uvicorn_worker.UvicornWorker --workers "${WEB_CONCURRENCY:-1}" --bind "0.0.0.0:${PORT:-8000}" --forwarded-allow-ips="*" --access-logfile - --access-logformat "%(m)s %(U)s %(s)s %(b)sB %(L)ss" --error-logfile - --capture-output --log-level "${LOG_LEVEL:-info}"'

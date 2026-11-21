@@ -1,4 +1,4 @@
-# Proxy Detector
+# Proxycheck
 
 A tool that uses external APIs for proxy status of an IP
 

@@ -1,4 +1,4 @@
-"""Interactive environment diagnostic and initialisation command for Proxy Detector."""
+"""Interactive environment diagnostic and initialisation command for Proxycheck."""
 
 from __future__ import annotations
 
@@ -73,7 +73,7 @@ _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 @dataclass(frozen=True)
 class EnvVarSpec:
-    """Metadata describing an environment variable used by Proxy Detector."""
+    """Metadata describing an environment variable used by Proxycheck."""
 
     name: str
     tier: str
@@ -1721,7 +1721,7 @@ def check_toolsdb_status(
 
 
 class Command(BaseCommand):
-    help = "Audits and interactively initialises Proxy Detector environment configuration."
+    help = "Audits and interactively initialises Proxycheck environment configuration."
     requires_system_checks = []
     requires_migrations_checks = False
 
@@ -2418,7 +2418,7 @@ class Command(BaseCommand):
             if mode == "bastion" and tool_account
             else ("Toolforge Bastion (account undetected)" if mode == "bastion" else "Local / Buildpack Container")
         )
-        self.stdout.write(f"Proxy Detector Environment Check ({mode_desc})")
+        self.stdout.write(f"Proxycheck Environment Check ({mode_desc})")
         if mode == "bastion" and not tool_account:
             self.stdout.write(
                 self.style.WARNING(

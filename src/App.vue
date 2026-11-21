@@ -1,49 +1,32 @@
 <template>
-  <div class="proxy-detector-layout">
-    <header class="cdx-header">
-      <div class="header-left">
+  <div class="app-layout">
+    <header class="app-header">
+      <div class="app-header__brand">
         <img
           :src="proxycheckLogo"
           alt=""
           class="app-logo"
           aria-hidden="true"
         />
-        <h1 class="app-title">Proxy Detector</h1>
+        <h1 class="app-title">Proxycheck</h1>
       </div>
-      <div class="header-right">
+      <div class="app-header__actions">
         <template v-if="user.isLoggedIn">
-          <cdx-button
-            v-if="isAdminUser"
-            action="default"
-            weight="quiet"
-            size="medium"
-            class="admin-dashboard-btn"
-            @click="isDashboardOpen = true"
-          >
+          <cdx-button v-if="isAdminUser" weight="quiet" @click="isDashboardOpen = true">
             Status
           </cdx-button>
-          <span class="user-pill">
-            {{ user.username }}
-          </span>
-          <cdx-button
-            action="default"
-            weight="quiet"
-            size="medium"
-            @click="handleLogout"
-          >
+          <span class="app-username">{{ user.username }}</span>
+          <cdx-button weight="quiet" @click="handleLogout">
             Log out
           </cdx-button>
         </template>
         <cdx-button
-          action="default"
           weight="quiet"
-          size="medium"
-          class="theme-toggle-btn"
           :aria-label="themeToggleAriaLabel"
           :title="themeToggleAriaLabel"
           @click="handleToggleTheme"
         >
-          <cdx-icon :icon="themeToggleIcon" size="medium" />
+          <cdx-icon :icon="themeToggleIcon" />
         </cdx-button>
       </div>
     </header>
@@ -54,13 +37,13 @@
       @unauthorised="handleDashboardUnauthorised"
     />
 
-    <main class="cdx-main-container">
-      <div v-if="!user.isLoggedIn" class="barrier-wrapper">
+    <main class="app-main">
+      <div v-if="!user.isLoggedIn" class="barrier">
         <cdx-message
           v-if="sessionExpiredMessage"
           type="warning"
           :inline="false"
-          class="unauthorised-message"
+          class="barrier__message"
         >
           {{ sessionExpiredMessage }}
         </cdx-message>
@@ -68,502 +51,436 @@
           action="progressive"
           weight="primary"
           size="large"
-          class="login-btn"
           @click="handleLogin"
         >
           Log in with Wikimedia
         </cdx-button>
-        <p class="login-groups-note">
+        <p class="barrier__note">
           This tool is designed for users with the
           <code>{{ REQUIRED_USER_RIGHTS[0] }}(-no-preference)</code>
           right on any Wikimedia project.
         </p>
       </div>
 
-      <div v-else-if="!user.hasAccess" class="barrier-wrapper">
-        <cdx-message
-          type="error"
-          :inline="false"
-          class="unauthorised-message"
-        >
+      <div v-else-if="!user.hasAccess" class="barrier">
+        <cdx-message type="error" :inline="false" class="barrier__message">
           Access Denied: You must hold either the <code>{{ REQUIRED_USER_RIGHTS[0] }}</code> or <code>{{ REQUIRED_USER_RIGHTS[1] }}</code> user right on any Wikimedia project to use this tool.
         </cdx-message>
       </div>
 
       <div v-else class="tool-content">
-        <div class="search-section">
-          <form @submit.prevent="handleSearch" class="search-form">
-            <div class="search-input-group">
-              <cdx-text-input
-                v-model="inputIp"
-                placeholder="Enter IPv4 or IPv6 address..."
-                size="large"
-                class="ip-input"
-                :disabled="isLoading"
-                aria-label="IP Address Input"
-              />
-              <cdx-button
-                type="submit"
-                action="progressive"
-                weight="primary"
-                size="large"
-                :disabled="isLoading || !inputIp.trim()"
-              >
-                {{ isLoading ? 'Analysing...' : 'Detect' }}
-              </cdx-button>
-            </div>
+        <section class="search-section">
+          <form class="search-form" @submit.prevent="handleSearch">
+            <cdx-text-input
+              v-model="inputIp"
+              placeholder="Enter IPv4 or IPv6 address..."
+              size="large"
+              class="search-form__input"
+              :disabled="isActiveSearchBusy"
+              aria-label="IP Address Input"
+            />
+            <cdx-button
+              type="submit"
+              action="progressive"
+              weight="primary"
+              size="large"
+              :disabled="isActiveSearchBusy || !inputIp.trim()"
+            >
+              {{ isActiveSearchBusy ? 'Analysing...' : (activeTab === 'rb' ? 'Lookup' : 'Detect') }}
+            </cdx-button>
           </form>
 
-          <cdx-message
-            v-if="validationError"
-            type="error"
-            :inline="true"
-            class="validation-alert"
-          >
+          <cdx-message v-if="validationError" type="error" :inline="true">
             {{ validationError }}
           </cdx-message>
 
-          <div v-if="ipHistory.length > 0" class="history-section">
-            <span class="history-label">Recent queries:</span>
-            <div class="history-pills">
-              <button
-                v-for="historyIp in ipHistory"
-                :key="historyIp"
-                type="button"
-                class="cdx-pill-tag"
-                @click="queryFromHistory(historyIp)"
-              >
-                {{ historyIp }}
-              </button>
-            </div>
-          </div>
-        </div>
-
-        <cdx-card v-if="detectionData" class="executive-overview-card">
-          <template #title>
-            <div class="overview-header-bar">
-              <h2 class="overview-card-title">Executive Overview</h2>
-              <div v-if="refetchButtonState.visible" class="overview-cache-controls">
-                <span
-                  v-if="cacheAgeBadgeLabel"
-                  class="cdx-badge cache-age-badge"
-                  :class="isCurrentCacheStale ? 'badge-warning cache-age-badge--stale' : 'badge-neutral'"
-                  :title="cacheExactUtcTooltip || undefined"
-                >
-                  {{ cacheAgeBadgeLabel }}
-                </span>
-                <cdx-button
-                  type="button"
-                  action="progressive"
-                  weight="normal"
-                  size="small"
-                  class="overview-refetch-btn"
-                  :disabled="refetchButtonState.disabled"
-                  @click="handleRefetch"
-                >
-                  {{ refetchButtonState.label }}
-                </cdx-button>
-              </div>
-            </div>
-          </template>
-          <template #description>
-            <cdx-message
-              v-if="refreshWarningMessage"
-              type="warning"
-              :inline="false"
-              class="overview-warning-banner"
+          <div v-if="ipHistory.length > 0" class="history">
+            <span class="text-subtle">Recent queries:</span>
+            <cdx-button
+              v-for="historyIp in ipHistory"
+              :key="historyIp"
+              weight="quiet"
+              size="small"
+              @click="queryFromHistory(historyIp)"
             >
-              {{ refreshWarningMessage }}
-            </cdx-message>
-            <cdx-message
-              v-if="showFreshRecheckPrompt"
-              type="warning"
-              :inline="false"
-              class="overview-recheck-banner"
-            >
-              Cached residential proxy evidence is older than 7 days. Click
-              <button
-                type="button"
-                class="inline-refetch-trigger"
-                :disabled="refetchButtonState.disabled"
-                @click="handleRefetch"
-              >
-                Refetch
-              </button>
-              to verify the current dynamic DHCP assignment before applying a long-term block.
-            </cdx-message>
-            <div class="overview-body">
-              <div class="score-gauge-container prediction-gauge-container">
-                <span class="gauge-title">Prediction</span>
-                <div
-                  class="gauge-circle"
-                  :class="getPredictionScoreTierClass(detectionData)"
-                >
-                  <span
-                    class="gauge-score-value"
-                    :class="{ 'gauge-score-value--sm': String(formatChance(detectionData.prediction_score)).length > 3 }"
-                  >
-                    {{ formatChance(detectionData.prediction_score) }}
-                  </span>
-                  <span class="gauge-score-max">%</span>
-                </div>
-                <div class="prediction-badge-wrapper">
-                  <span
-                    v-if="detectionData.predictionTier === 'destructive'"
-                    class="prediction-badge prediction-badge--destructive"
-                  >
-                    <span aria-hidden="true">✘</span>
-                    {{ detectionData.predictionLabel || 'Proxy / VPN' }}
-                  </span>
-                  <span
-                    v-else-if="detectionData.predictionTier === 'success'"
-                    class="prediction-badge prediction-badge--success"
-                  >
-                    <span aria-hidden="true">✔</span>
-                    {{ detectionData.predictionLabel || 'Safe Residential' }}
-                  </span>
-                  <span
-                    v-else
-                    class="prediction-badge prediction-badge--neutral"
-                  >
-                    {{ detectionData.predictionLabel || 'Needs Human Review' }}
-                    <template v-if="detectionData.getipintel_chance !== null && detectionData.getipintel_chance !== undefined">
-                      ({{ formatChance(detectionData.prediction_score) }}%)
-                    </template>
-                  </span>
-                </div>
-              </div>
-
-              <div class="basic-info-container">
-                <table class="basic-info-table">
-                  <tbody>
-                    <tr>
-                      <th scope="row">IP ADDRESS</th>
-                      <td>
-                        <div class="ip-value-wrapper">
-                          <span class="ip-text-bold">{{ detectionData.ip }}</span>
-                          <span v-if="detectionData.is_broadcast_ip" class="broadcast-ip-badge">
-                            Broadcast IP?
-                          </span>
-                          <span
-                            v-if="detectionData.isTor"
-                            class="badge-destructive tor-ip-badge"
-                            :title="detectionData.torSummary || detectionData.torLabel || 'Tor Relay'"
-                          >
-                            {{ detectionData.torLabel || (detectionData.torIsExit ? 'Tor Exit' : 'Tor Node') }}
-                          </span>
-                          <span
-                            v-if="detectionData.isTor && detectionData.torSummary"
-                            class="tor-summary-text"
-                          >
-                            {{ detectionData.torSummary }}
-                          </span>
-                          <span
-                            v-if="sharedProviderBadge"
-                            class="cdx-badge badge-destructive shared-egress-badge"
-                            :title="detectionData.sharedCidr || detectionData.cloudCidr || sharedProviderBadge"
-                          >
-                            {{ sharedProviderBadge }}
-                          </span>
-                          <span
-                            v-if="sharedPrivacyInfo"
-                            class="privacy-egress-badge"
-                            :title="sharedPrivacyInfo.guidance"
-                          >
-                            {{ sharedPrivacyInfo.pillText }}
-                          </span>
-                          <span
-                            v-if="detectionData.suspectedResidentialProxy"
-                            class="cdx-badge badge-warning residential-paradox-badge"
-                          >
-                            Suspected Residential Proxy / Compromised Host
-                          </span>
-                          <span
-                            v-if="detectionData.highlySuspectedResidentialProxy"
-                            class="cdx-badge badge-destructive residential-proxy-high-risk-badge"
-                            :title="detectionData.residentialProxy != null ? `GetIPIntel ResidentialProxy: ${formatChance(detectionData.residentialProxy * 100)}%` : 'GetIPIntel ResidentialProxy'"
-                          >
-                            Highly Suspected Residential Proxy
-                          </span>
-                          <span
-                            v-for="proxyPort in openProxyPorts"
-                            :key="`proxy-port-${proxyPort}`"
-                            class="cdx-badge badge-destructive shodan-port-badge"
-                            title="Open proxy port detected via Shodan InternetDB"
-                          >
-                            Open Proxy Port: {{ proxyPort }}
-                          </span>
-                          <span
-                            v-for="shodanTag in shodanTags"
-                            :key="`shodan-tag-${shodanTag}`"
-                            class="cdx-badge badge-warning"
-                          >
-                            Shodan: {{ shodanTag }}
-                          </span>
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <th scope="row">ARBITRATION</th>
-                      <td>
-                        <div class="arbitration-cell-content">
-                          <span
-                            class="arbitration-pill"
-                            :class="getArbitrationBadgeClass(detectionData)"
-                          >
-                            {{ detectionData.arbitrationVerdict || 'Direct Connection (No Commercial Threats)' }}
-                          </span>
-                          <span v-if="sharedPrivacyInfo" class="privacy-egress-guidance">
-                            {{ sharedPrivacyInfo.guidance }}
-                          </span>
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <th scope="row">PRIMARY COUNTRY</th>
-                      <td>{{ detectionData.primaryCountry || '-' }}</td>
-                    </tr>
-                    <tr>
-                      <th scope="row">COORDINATES</th>
-                      <td>{{ detectionData.primaryCoordinates || 'Unknown' }}</td>
-                    </tr>
-                    <tr>
-                      <th scope="row">PRIMARY ASN</th>
-                      <td>
-                        <code class="asn-tag">{{ detectionData.primaryAsn || '-' }}</code>
-                      </td>
-                    </tr>
-                    <tr>
-                      <th scope="row">REVERSE DNS (PTR)</th>
-                      <td>
-                        <div class="ip-value-wrapper">
-                          <code class="asn-tag">{{ detectionData.ptrHostname || 'No PTR Record' }}</code>
-                          <span
-                            v-if="detectionData.ptrLabel && detectionData.ptrCategory && detectionData.ptrCategory !== 'none'"
-                            class="cdx-badge"
-                            :class="getPtrBadgeClass(detectionData)"
-                          >
-                            {{ detectionData.ptrLabel }}
-                          </span>
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <th scope="row">RECOMMENDED CIDR</th>
-                      <td>
-                        <div class="cidr-cell-stack">
-                          <div class="ip-value-wrapper">
-                            <code class="asn-tag">{{ detectionData.recommendedCidr || '-' }}</code>
-                            <span
-                              v-if="!detectionData.highlySuspectedResidentialProxy && (detectionData.bgpPrefix || (detectionData.mmdbCidr && detectionData.mmdbCidr !== detectionData.recommendedCidr))"
-                              class="text-muted"
-                            >
-                              (BGP: {{ detectionData.bgpPrefix || detectionData.mmdbCidr }})
-                            </span>
-                            <span v-if="!detectionData.highlySuspectedResidentialProxy && detectionData.escalationCidr" class="escalation-cidr-pill">
-                              Escalation CIDR: <code class="asn-tag">{{ detectionData.escalationCidr }}</code>
-                            </span>
-                          </div>
-                          <div v-if="isMobileOrCgnat" class="cgnat-collateral-warning" role="status">
-                            <strong>Mobile Cellular / CGNAT Shared Gateway:</strong>
-                            Locked to single-host <code>/32</code> IPv4 or <code>/64</code> IPv6 — avoid broad <code>/24</code> or <code>/48</code> range blocks to prevent collateral damage.
-                          </div>
-                          <div
-                            v-if="detectionData.highlySuspectedResidentialProxy"
-                            class="residential-proxy-cidr-warning"
-                            role="status"
-                          >
-                            <strong>Highly Suspected Residential Proxy:</strong>
-                            This IP is highly likely to use residential proxy infrastructure. CIDR blocking should be restricted to this single IP; proceed with discretion on CIDR.
-                          </div>
-                          <div v-if="!detectionData.highlySuspectedResidentialProxy && detectionData.cidrRationale" class="cidr-rationale-note">
-                            {{ detectionData.cidrRationale }}
-                          </div>
-                          <div v-if="verificationLinks" class="cidr-quick-actions">
-                            <a
-                              :href="verificationLinks.globalContributionsUrl"
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              class="quick-verify-link"
-                            >
-                              Special:GlobalContributions
-                            </a>
-                            <a
-                              :href="verificationLinks.rangeblockFinderUrl"
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              class="quick-verify-link"
-                            >
-                              Rangeblock Finder
-                            </a>
-                            <a
-                              :href="verificationLinks.whoisGatewayUrl"
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              class="quick-verify-link"
-                            >
-                              WHOIS Gateway
-                            </a>
-                            <a
-                              :href="verificationLinks.singleIpBlockUrl"
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              class="quick-verify-link quick-verify-link--block"
-                            >
-                              Special:Block
-                            </a>
-                            <a
-                              v-if="verificationLinks.rangeBlockUrl"
-                              :href="verificationLinks.rangeBlockUrl"
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              class="quick-verify-link quick-verify-link--block"
-                            >
-                              Special:Block (range)
-                            </a>
-                            <cdx-button
-                              type="button"
-                              action="default"
-                              weight="normal"
-                              size="small"
-                              class="copy-wikitext-btn"
-                              @click="handleCopyWikitext"
-                            >
-                              {{ wikitextCopied ? 'Copied Wikitext!' : 'Copy Wikitext Summary' }}
-                            </cdx-button>
-                          </div>
-                        </div>
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </template>
-        </cdx-card>
-
-        <div v-if="detectionData" class="results-section">
-          <div class="results-header">
-            <h2 class="results-title">Multi-Source Ground Truth Comparison</h2>
+              <code>{{ historyIp }}</code>
+            </cdx-button>
           </div>
-          <table class="ground-truth-table">
-            <thead>
-              <tr>
-                <th scope="col">PROVIDER</th>
-                <th scope="col" style="width: 120px;">ASN</th>
-                <th scope="col">ISP / ORGANISATION</th>
-                <th scope="col">LOCATION</th>
-                <th scope="col">USAGE TYPE</th>
-                <th scope="col">SECURITY FLAGS</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="row in filteredResults" :key="row.provider">
-                <td class="col-provider">
-                  <div class="provider-cell">
+        </section>
+
+        <cdx-tabs v-model:active="activeTab">
+          <cdx-tab name="detector" label="Detector">
+            <div v-if="detectionData" class="tab-panel">
+              <section class="overview-section" aria-label="Detection overview">
+                <div class="overview-header">
+                  <div class="overview-header__main">
+                    <div
+                      class="prediction__ring"
+                      :class="getPredictionScoreTierClass(detectionData)"
+                      :aria-label="`Prediction ${formatChance(detectionData.prediction_score)}%`"
+                    >
+                      <span
+                        class="prediction__score"
+                        :class="{ 'prediction__score--small': String(formatChance(detectionData.prediction_score)).length > 3 }"
+                      >
+                        {{ formatChance(detectionData.prediction_score) }}
+                      </span>
+                      <span class="prediction__unit text-subtle">%</span>
+                    </div>
+
+                    <div class="overview-header__summary">
+                      <div class="inline-group">
+                        <code class="ip-text">{{ detectionData.ip }}</code>
+                        <cdx-info-chip :status="predictionChipStatus">
+                          {{ predictionChipLabel }}
+                        </cdx-info-chip>
+                        <cdx-info-chip :status="getArbitrationChipStatus(detectionData)">
+                          {{ detectionData.arbitrationVerdict || 'Direct Connection (No Commercial Threats)' }}
+                        </cdx-info-chip>
+                      </div>
+
+                      <div
+                        v-if="
+                          detectionData.is_broadcast_ip ||
+                          detectionData.isTor ||
+                          sharedProviderBadge ||
+                          sharedPrivacyInfo ||
+                          detectionData.suspectedResidentialProxy ||
+                          detectionData.highlySuspectedResidentialProxy ||
+                          openProxyPorts.length > 0 ||
+                          shodanTags.length > 0
+                        "
+                        class="inline-group"
+                      >
+                        <cdx-info-chip v-if="detectionData.is_broadcast_ip" status="warning">
+                          Broadcast IP?
+                        </cdx-info-chip>
+                        <cdx-info-chip
+                          v-if="detectionData.isTor"
+                          status="error"
+                          :title="detectionData.torSummary || detectionData.torLabel || 'Tor Relay'"
+                        >
+                          {{ detectionData.torLabel || (detectionData.torIsExit ? 'Tor Exit' : 'Tor Node') }}
+                        </cdx-info-chip>
+                        <span v-if="detectionData.isTor && detectionData.torSummary" class="text-destructive">
+                          {{ detectionData.torSummary }}
+                        </span>
+                        <cdx-info-chip
+                          v-if="sharedProviderBadge"
+                          status="error"
+                          :title="detectionData.sharedCidr || detectionData.cloudCidr || sharedProviderBadge"
+                        >
+                          {{ sharedProviderBadge }}
+                        </cdx-info-chip>
+                        <cdx-info-chip
+                          v-if="sharedPrivacyInfo"
+                          status="notice"
+                          :title="sharedPrivacyInfo.guidance"
+                        >
+                          {{ sharedPrivacyInfo.pillText }}
+                        </cdx-info-chip>
+                        <cdx-info-chip v-if="detectionData.suspectedResidentialProxy" status="warning">
+                          Suspected Residential Proxy / Compromised Host
+                        </cdx-info-chip>
+                        <cdx-info-chip
+                          v-if="detectionData.highlySuspectedResidentialProxy"
+                          status="error"
+                          :title="detectionData.residentialProxy != null ? `GetIPIntel ResidentialProxy: ${formatChance(detectionData.residentialProxy * 100)}%` : 'GetIPIntel ResidentialProxy'"
+                        >
+                          Highly Suspected Residential Proxy
+                        </cdx-info-chip>
+                        <cdx-info-chip
+                          v-for="proxyPort in openProxyPorts"
+                          :key="`proxy-port-${proxyPort}`"
+                          status="error"
+                          title="Open proxy port detected via Shodan InternetDB"
+                        >
+                          Open Proxy Port: {{ proxyPort }}
+                        </cdx-info-chip>
+                        <cdx-info-chip
+                          v-for="shodanTag in shodanTags"
+                          :key="`shodan-tag-${shodanTag}`"
+                          status="warning"
+                        >
+                          Shodan: {{ shodanTag }}
+                        </cdx-info-chip>
+                      </div>
+
+                      <span v-if="sharedPrivacyInfo" class="text-subtle">
+                        {{ sharedPrivacyInfo.guidance }}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div v-if="refetchButtonState.visible" class="overview-header__controls">
+                    <cdx-info-chip
+                      v-if="cacheAgeBadgeLabel"
+                      :status="isCurrentCacheStale ? 'warning' : 'notice'"
+                      :title="cacheExactUtcTooltip || undefined"
+                    >
+                      {{ cacheAgeBadgeLabel }}
+                    </cdx-info-chip>
+                    <cdx-button
+                      type="button"
+                      action="progressive"
+                      size="small"
+                      :disabled="refetchButtonState.disabled"
+                      @click="handleRefetch"
+                    >
+                      {{ refetchButtonState.label }}
+                    </cdx-button>
+                  </div>
+                </div>
+
+                <cdx-message v-if="refreshWarningMessage" type="warning" :inline="false">
+                  {{ refreshWarningMessage }}
+                </cdx-message>
+                <cdx-message v-if="showFreshRecheckPrompt" type="warning" :inline="false">
+                  Cached residential proxy evidence is older than 7 days. Click
+                  <cdx-button
+                    type="button"
+                    action="progressive"
+                    weight="quiet"
+                    size="small"
+                    :disabled="refetchButtonState.disabled"
+                    @click="handleRefetch"
+                  >
+                    Refetch
+                  </cdx-button>
+                  to verify the current dynamic DHCP assignment before applying a long-term block.
+                </cdx-message>
+
+                <dl class="overview-grid">
+                  <div class="overview-grid__item">
+                    <dt class="overview-grid__label">Country</dt>
+                    <dd class="overview-grid__value">{{ detectionData.primaryCountry || '-' }}</dd>
+                  </div>
+
+                  <div class="overview-grid__item">
+                    <dt class="overview-grid__label">ASN</dt>
+                    <dd class="overview-grid__value"><code>{{ detectionData.primaryAsn || '-' }}</code></dd>
+                  </div>
+
+                  <div class="overview-grid__item">
+                    <dt class="overview-grid__label">Reverse DNS (PTR)</dt>
+                    <dd class="overview-grid__value">
+                      <div class="inline-group">
+                        <code>{{ detectionData.ptrHostname || 'No PTR Record' }}</code>
+                        <cdx-info-chip
+                          v-if="detectionData.ptrLabel && detectionData.ptrCategory && detectionData.ptrCategory !== 'none'"
+                          :status="getPtrChipStatus(detectionData)"
+                        >
+                          {{ detectionData.ptrLabel }}
+                        </cdx-info-chip>
+                      </div>
+                    </dd>
+                  </div>
+
+                  <div class="overview-grid__item">
+                    <dt class="overview-grid__label">Recommended CIDR</dt>
+                    <dd class="overview-grid__value">
+                      <div class="stack">
+                        <div class="inline-group">
+                          <code>{{ detectionData.recommendedCidr || '-' }}</code>
+                          <span
+                            v-if="!detectionData.highlySuspectedResidentialProxy && (detectionData.bgpPrefix || (detectionData.mmdbCidr && detectionData.mmdbCidr !== detectionData.recommendedCidr))"
+                            class="text-subtle"
+                          >
+                            (BGP: {{ detectionData.bgpPrefix || detectionData.mmdbCidr }})
+                          </span>
+                          <span v-if="!detectionData.highlySuspectedResidentialProxy && detectionData.escalationCidr" class="text-subtle">
+                            Escalation CIDR: <code>{{ detectionData.escalationCidr }}</code>
+                          </span>
+                        </div>
+                        <cdx-message v-if="isMobileOrCgnat" type="warning" :inline="true">
+                          <strong>Mobile Cellular / CGNAT Shared Gateway:</strong>
+                          Locked to single-host <code>/32</code> IPv4 or <code>/64</code> IPv6 鈥?avoid broad <code>/24</code> or <code>/48</code> range blocks to prevent collateral damage.
+                        </cdx-message>
+                        <cdx-message v-if="detectionData.highlySuspectedResidentialProxy" type="error" :inline="true">
+                          <strong>Highly Suspected Residential Proxy:</strong>
+                          This IP is highly likely to use residential proxy infrastructure. CIDR blocking should be restricted to this single IP; proceed with discretion on CIDR.
+                        </cdx-message>
+                        <span
+                          v-if="!detectionData.highlySuspectedResidentialProxy && detectionData.cidrRationale"
+                          class="text-subtle"
+                        >
+                          {{ detectionData.cidrRationale }}
+                        </span>
+                      </div>
+                    </dd>
+                  </div>
+
+                  <div v-if="detectionData.rangeblock" class="overview-grid__item">
+                    <dt class="overview-grid__label">Rangeblock</dt>
+                    <dd class="overview-grid__value">
+                      <span v-if="detectionData.rangeblock.wikis.length === 0" class="text-subtle">
+                        No hits (0/0)
+                      </span>
+                      <span v-else>
+                        <template v-for="(item, idx) in detectionData.rangeblock.wikis" :key="item.wiki">
+                          <span v-if="Number(idx) > 0">, </span>
+                          <span>{{ item.count }} on </span>
+                          <a
+                            :href="buildRangeblockWikiHref(detectionData.ip, item.wiki)"
+                            @click.prevent="openRangeblockTab(item.wiki)"
+                          >{{ item.wiki }}</a>
+                          <span v-if="item.hasActive" class="text-destructive"> (active)</span>
+                        </template>
+                      </span>
+                    </dd>
+                  </div>
+                </dl>
+
+                <div v-if="verificationLinks" class="overview-actions">
+                  <a
+                    :href="verificationLinks.globalContributionsUrl"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Special:GlobalContributions
+                  </a>
+                  <a
+                    :href="verificationLinks.rangeblockFinderUrl"
+                    @click.prevent="openRangeblockTab(null)"
+                  >
+                    Rangeblock Finder
+                  </a>
+                  <a
+                    :href="verificationLinks.whoisGatewayUrl"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    WHOIS Gateway
+                  </a>
+                  <a
+                    :href="verificationLinks.singleIpBlockUrl"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Special:Block
+                  </a>
+                  <a
+                    v-if="verificationLinks.rangeBlockUrl"
+                    :href="verificationLinks.rangeBlockUrl"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Special:Block (range)
+                  </a>
+                  <cdx-button type="button" size="small" @click="handleCopyWikitext">
+                    {{ wikitextCopied ? 'Copied Wikitext!' : 'Copy Wikitext Summary' }}
+                  </cdx-button>
+                </div>
+              </section>
+
+              <cdx-table
+                caption="Sources"
+                :columns="groundTruthColumns"
+                :data="filteredResults"
+              >
+                <template #item-provider="{ row }">
+                  <div class="stack stack--tight">
                     <span
-                      v-if="getProviderUpdatedLabel(row)"
-                      class="provider-updated-time"
+                      v-if="getProviderUpdatedLabel(row as ProviderDisplayRow)"
+                      class="text-subtle"
                       :title="row.cachedAt || detectionData?.cacheMeta?.cachedAt || undefined"
                     >
-                      {{ getProviderUpdatedLabel(row) }}
+                      {{ getProviderUpdatedLabel(row as ProviderDisplayRow) }}
                     </span>
-                    <span class="provider-name">{{ row.provider }}</span>
-                    <span
-                      class="cdx-badge"
-                      :class="getStatusBadgeClass(row.status)"
+                    <strong>{{ row.provider }}</strong>
+                    <cdx-info-chip
+                      :status="getStatusChipStatus(row.status)"
+                      :class="{ 'is-pending': row.status === 'Querying...' }"
                       :title="row.status === 'Offline DB Missing' ? 'Local offline database file not yet downloaded' : undefined"
                     >
                       {{ row.status }}
-                    </span>
+                    </cdx-info-chip>
                   </div>
-                </td>
-
-                <td class="col-asn">
-                  <code class="asn-tag">{{ row.asn || '-' }}</code>
-                </td>
-
-                <td class="col-isp">{{ row.isp || row.organisation || '-' }}</td>
-
-                <td class="col-location">{{ row.location }}</td>
-
-                <td class="col-usage">
-                  <span class="usage-text">{{ row.usageType }}</span>
-                  <div v-if="getProviderMetaItems(row).length > 0" class="provider-meta-list">
+                </template>
+                <template #item-asn="{ row }">
+                  <code>{{ row.asn || '-' }}</code>
+                </template>
+                <template #item-isp="{ row }">
+                  {{ row.isp || row.organisation || '-' }}
+                </template>
+                <template #item-location="{ row }">
+                  {{ row.location }}
+                </template>
+                <template #item-usageType="{ row }">
+                  <div class="stack stack--tight">
+                    <span>{{ row.usageType }}</span>
                     <span
-                      v-for="meta in getProviderMetaItems(row)"
+                      v-for="meta in getProviderMetaItems(row as ProviderDisplayRow)"
                       :key="meta"
-                      class="provider-meta-item"
+                      class="text-subtle"
                     >
                       {{ meta }}
                     </span>
                   </div>
-                </td>
-
-                <td class="col-flags">
-                  <div class="flags-container">
-                    <span
+                </template>
+                <template #item-securityFlags="{ row }">
+                  <div class="inline-group">
+                    <cdx-info-chip
                       v-for="flag in getSimplifiedFlags(row.securityFlags)"
                       :key="flag.label"
-                      class="flag-pill"
-                      :class="getSecurityFlagClass(flag)"
+                      :status="getSecurityFlagChipStatus(flag)"
                     >
                       {{ flag.label }}
-                    </span>
+                    </cdx-info-chip>
                   </div>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
+                </template>
+              </cdx-table>
+            </div>
+          </cdx-tab>
+
+          <cdx-tab name="rb" label="RB Finder">
+            <rangeblock-finder-view
+              v-if="activeTab === 'rb'"
+              :rangeblock="activeRangeblockData"
+              :selected-wiki="selectedRbWiki"
+              :is-loading="rbLoading"
+              :error-message="rbError"
+              @select-wiki="handleSelectRbWiki"
+            />
+          </cdx-tab>
+        </cdx-tabs>
       </div>
     </main>
 
-    <footer class="cdx-footer">
-      <div class="footer-left">
-        <span class="diagnostic-text">
-          &copy; 2026 &middot;
-          <button
-            type="button"
-            class="footer-about-link"
-            @click="isAboutOpen = true"
-          >
-            About
-          </button>
-          &middot;
-          <a
-            v-if="repoBaseUrl"
-            :href="`${repoBaseUrl}/tree/${commitHash}`"
-            target="_blank"
-            rel="noopener noreferrer"
-            class="commit-link"
-          >
-            {{ commitVersionLabel }}
-          </a>
-          <span v-else class="commit-link">{{ commitVersionLabel }}</span>
-          &middot; {{ formatDiagnosticSummary(footerDiagnostic) }}
-          <span v-if="footerDiagnostic.isCached" class="cached-pill">Cached</span>
-        </span>
-      </div>
-      <div class="footer-right">
-        <div class="footer-banner">
-          <a
-            href="https://wikitech.wikimedia.org/wiki/Portal:Toolforge"
-            target="_blank"
-            rel="noopener noreferrer"
-            title="Hosted on Wikimedia Toolforge"
-          >
-            <img :src="toolforgeLogo" alt="Toolforge" class="footer-logo footer-logo--toolforge">
-          </a>
-          <a
-            href="https://wikitech.wikimedia.org/wiki/Help:Cloud_Services_introduction"
-            target="_blank"
-            rel="noopener noreferrer"
-            title="Powered by Wikimedia Cloud Services"
-          >
-            <img :src="activeWmcsLogo" alt="Powered by Wikimedia Cloud Services" class="footer-logo">
-          </a>
-        </div>
+    <footer class="app-footer">
+      <span class="app-footer__meta">
+        &copy; 2026 &middot;
+        <a href="#" @click.prevent="isAboutOpen = true">About</a>
+        &middot;
+        <a
+          v-if="repoBaseUrl"
+          :href="`${repoBaseUrl}/tree/${commitHash}`"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          {{ commitVersionLabel }}
+        </a>
+        <span v-else>{{ commitVersionLabel }}</span>
+        &middot; {{ formatDiagnosticSummary(footerDiagnostic) }}
+        <cdx-info-chip v-if="footerDiagnostic.isCached">Cached</cdx-info-chip>
+      </span>
+      <div class="app-footer__logos">
+        <a
+          href="https://wikitech.wikimedia.org/wiki/Portal:Toolforge"
+          target="_blank"
+          rel="noopener noreferrer"
+          title="Hosted on Wikimedia Toolforge"
+        >
+          <img :src="toolforgeLogo" alt="Toolforge" class="footer-logo" />
+        </a>
+        <a
+          href="https://wikitech.wikimedia.org/wiki/Help:Cloud_Services_introduction"
+          target="_blank"
+          rel="noopener noreferrer"
+          title="Powered by Wikimedia Cloud Services"
+        >
+          <img :src="activeWmcsLogo" alt="Powered by Wikimedia Cloud Services" class="footer-logo" />
+        </a>
       </div>
     </footer>
 
@@ -580,12 +497,17 @@ import wmcsDarkLogo from './assets/WMCS-dark.svg';
 import {
   CdxTextInput,
   CdxButton,
-  CdxCard,
   CdxIcon,
+  CdxInfoChip,
   CdxMessage,
+  CdxTab,
+  CdxTable,
+  CdxTabs,
+  type TableColumn,
 } from '@wikimedia/codex';
 import AboutNoteModal from './components/AboutNoteModal.vue';
 import ProviderDashboardModal from './components/ProviderDashboardModal.vue';
+import RangeblockFinderView from './components/RangeblockFinderView.vue';
 import {
   applyThemeToDocument,
   getNextTheme,
@@ -598,9 +520,10 @@ import {
 import {
   REQUIRED_USER_RIGHTS,
   buildOAuthLoginUrl,
-  buildPageUrlWithIp,
+  buildPageUrlWithState,
   buildVerificationLinks,
   buildWikitextSummary,
+  canonicalizeIpAddress,
   createLoggedOutUserState,
   extractOpenProxyPorts,
   extractShodanTags,
@@ -612,10 +535,11 @@ import {
   isCacheStale,
   isMobileOrCgnatDetection,
   isValidIpAddress,
-  filterComparisonResults,
+  buildComparisonRowsWithPending,
+  parseInitialRouteParams,
   resolveRefetchButtonState,
   shouldRecommendFreshRecheck,
-  getSecurityFlagClass,
+  getSecurityFlagChipStatus,
   simplifySecurityFlags,
   createDetectionCoordinator,
   resolveRepoBaseUrl,
@@ -623,20 +547,22 @@ import {
   resolveProviderUpdatedLabel,
   formatOfflineDbTimestamp,
   getProviderMetaItems as buildProviderMetaItems,
-  getStatusBadgeClass,
+  getStatusChipStatus,
   getPredictionScoreTierClass,
-  getArbitrationBadgeClass,
-  getPtrBadgeClass,
+  getArbitrationChipStatus,
+  getPtrChipStatus,
   formatChance,
   buildDiagnosticMetrics,
   formatDiagnosticSummary,
   measureInitialLoadDurationSeconds,
   measureElapsedSeconds,
   readCsrfTokenFromDocumentCookie,
+  type AppTab,
   type DiagnosticMetrics,
   type DetectionCoordinatorState,
   type ProviderDisplayRow,
   type ProviderRawResult,
+  type RangeblockSummary,
 } from './utils/ip-detector-logic';
 
 const BRIGHT_ICON = {
@@ -702,6 +628,7 @@ function saveStoredHistory(history: string[]): void {
 
 const uiState = reactive<DetectionCoordinatorState>({
   isLoading: false,
+  isStreaming: false,
   isRefreshing: false,
   validationError: '',
   sessionExpiredMessage: '',
@@ -712,6 +639,14 @@ const uiState = reactive<DetectionCoordinatorState>({
   user: createLoggedOutUserState(),
   ipHistory: loadStoredHistory(),
 });
+
+const activeTab = ref<AppTab>('detector');
+const selectedRbWiki = ref<string | null>(null);
+const rbData = ref<RangeblockSummary | null>(null);
+const rbLoading = ref(false);
+const rbError = ref('');
+let rbAbortController: AbortController | null = null;
+let rbRequestSeq = 0;
 
 const isDashboardOpen = ref(false);
 const isAboutOpen = ref(false);
@@ -747,11 +682,11 @@ const footerDiagnostic = computed<DiagnosticMetrics>(
   () => diagnostic.value ?? initialDiagnostic.value
 );
 
-function syncBrowserUrlIp(ip: string | null): void {
+function syncBrowserUrlState(ip: string | null, tab: AppTab = activeTab.value, wiki: string | null = selectedRbWiki.value): void {
   if (typeof window === 'undefined' || !window.history || typeof window.history.replaceState !== 'function') {
     return;
   }
-  const nextUrl = buildPageUrlWithIp(window.location.pathname, window.location.search, ip);
+  const nextUrl = buildPageUrlWithState(window.location.pathname, window.location.search, { ip, tab, wiki });
   const currentRelativeUrl = `${window.location.pathname}${window.location.search}`;
   if (nextUrl !== currentRelativeUrl) {
     window.history.replaceState(window.history.state, '', nextUrl);
@@ -764,7 +699,7 @@ const coordinator = createDetectionCoordinator(
   {
     state: uiState,
     onHistoryUpdated: saveStoredHistory,
-    onDetectionSuccess: (resolvedIp) => syncBrowserUrlIp(resolvedIp),
+    onDetectionSuccess: (resolvedIp) => syncBrowserUrlState(resolvedIp, activeTab.value, selectedRbWiki.value),
   }
 );
 
@@ -818,10 +753,155 @@ const filteredResults = computed(() => {
   if (!detectionData.value || !Array.isArray(detectionData.value.results)) {
     return [];
   }
-  return filterComparisonResults(detectionData.value.results);
+  return buildComparisonRowsWithPending(
+    detectionData.value.results,
+    detectionData.value.pendingProviders
+  );
 });
 
+const activeRangeblockData = computed<RangeblockSummary | null>(() => {
+  const currentInputCanonical = canonicalizeIpAddress(inputIp.value);
+  if (rbData.value && (!currentInputCanonical || rbData.value.ip === currentInputCanonical)) {
+    return rbData.value;
+  }
+  const detectRb = detectionData.value?.rangeblock ?? null;
+  if (detectRb && (!currentInputCanonical || detectRb.ip === currentInputCanonical)) {
+    return detectRb;
+  }
+  return rbData.value ?? detectRb;
+});
+
+const groundTruthColumns: TableColumn[] = [
+  { id: 'provider', label: 'Provider' },
+  { id: 'asn', label: 'ASN', width: '120px' },
+  { id: 'isp', label: 'ISP / Organisation' },
+  { id: 'location', label: 'Location' },
+  { id: 'usageType', label: 'Usage type' },
+  { id: 'securityFlags', label: 'Security flags' },
+];
+
+const predictionChipStatus = computed(() => {
+  const tier = detectionData.value?.predictionTier;
+  if (tier === 'destructive') return 'error';
+  if (tier === 'success') return 'success';
+  return 'notice';
+});
+
+const predictionChipLabel = computed(() => {
+  const data = detectionData.value;
+  if (!data) return '';
+  if (data.predictionTier === 'destructive') return data.predictionLabel || 'Proxy / VPN';
+  if (data.predictionTier === 'success') return data.predictionLabel || 'Safe Residential';
+  const label = data.predictionLabel || 'Needs Human Review';
+  return data.getipintel_chance !== null && data.getipintel_chance !== undefined
+    ? `${label} (${formatChance(data.prediction_score)}%)`
+    : label;
+});
+
+const isActiveSearchBusy = computed(() => (activeTab.value === 'rb' ? rbLoading.value : isLoading.value));
+
+function cancelPendingRangeblock(): void {
+  rbRequestSeq += 1;
+  if (rbAbortController) {
+    rbAbortController.abort();
+    rbAbortController = null;
+  }
+  rbLoading.value = false;
+}
+
+function buildRangeblockWikiHref(ip: string, wiki: string): string {
+  return buildPageUrlWithState('/', '', { ip, tab: 'rb', wiki });
+}
+
+async function executeRangeblockLookup(ipToQuery: string, wikiOverride?: string | null): Promise<void> {
+  validationError.value = '';
+  rbError.value = '';
+  const trimmed = ipToQuery.trim();
+  const canonical = canonicalizeIpAddress(trimmed);
+  if (!canonical) {
+    validationError.value = 'Please provide a valid IPv4 or IPv6 address.';
+    return;
+  }
+
+  cancelPendingRangeblock();
+  const seq = ++rbRequestSeq;
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  rbAbortController = controller;
+  rbLoading.value = true;
+  if (wikiOverride !== undefined) {
+    selectedRbWiki.value = wikiOverride;
+  }
+
+  try {
+    const params = new URLSearchParams({ ip: canonical });
+    if (selectedRbWiki.value) {
+      params.set('wiki', selectedRbWiki.value);
+    }
+    const res = await fetch(
+      `/api/v1/rangeblock?${params.toString()}`,
+      controller ? { signal: controller.signal } : undefined
+    );
+    if (seq !== rbRequestSeq) {
+      return;
+    }
+    if (res.status === 401) {
+      user.value = createLoggedOutUserState();
+      sessionExpiredMessage.value = 'Your session has expired. Please log in again with Wikimedia.';
+      return;
+    }
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(payload?.message || payload?.error || `Server returned HTTP ${res.status}`);
+    }
+    rbData.value = payload as RangeblockSummary;
+    diagnostic.value = buildDiagnosticMetrics(payload);
+    syncBrowserUrlState(payload.ip || canonical, 'rb', selectedRbWiki.value);
+  } catch (err: any) {
+    if (seq !== rbRequestSeq || (err && err.name === 'AbortError')) {
+      return;
+    }
+    rbError.value = err?.message || 'Unable to query rangeblock records at this time.';
+  } finally {
+    if (seq === rbRequestSeq) {
+      rbLoading.value = false;
+      rbAbortController = null;
+    }
+  }
+}
+
+watch(activeTab, (nextTab) => {
+  const currentIp = canonicalizeIpAddress(inputIp.value) ?? detectionData.value?.ip ?? rbData.value?.ip ?? null;
+  syncBrowserUrlState(currentIp, nextTab, selectedRbWiki.value);
+  if (
+    nextTab === 'rb' &&
+    currentIp &&
+    user.value.isLoggedIn &&
+    user.value.hasAccess &&
+    !activeRangeblockData.value
+  ) {
+    void executeRangeblockLookup(currentIp);
+  }
+});
+
+function openRangeblockTab(wiki: string | null): void {
+  selectedRbWiki.value = wiki;
+  const currentIp = canonicalizeIpAddress(inputIp.value) ?? detectionData.value?.ip ?? rbData.value?.ip ?? null;
+  if (detectionData.value?.rangeblock && (!currentIp || detectionData.value.rangeblock.ip === currentIp)) {
+    rbData.value = detectionData.value.rangeblock;
+    rbError.value = '';
+  }
+  activeTab.value = 'rb';
+}
+
+function handleSelectRbWiki(wiki: string | null): void {
+  selectedRbWiki.value = wiki;
+  const currentIp = canonicalizeIpAddress(inputIp.value) ?? rbData.value?.ip ?? detectionData.value?.ip ?? null;
+  syncBrowserUrlState(currentIp, 'rb', wiki);
+}
+
 async function executeDetection(ipToQuery: string): Promise<void> {
+  rbData.value = null;
+  rbError.value = '';
   await coordinator.executeDetection(ipToQuery);
 }
 
@@ -878,14 +958,23 @@ async function handleCopyWikitext(): Promise<void> {
 }
 
 function handleSearch(): void {
-  if (inputIp.value) {
-    executeDetection(inputIp.value);
+  if (!inputIp.value) {
+    return;
+  }
+  if (activeTab.value === 'rb') {
+    void executeRangeblockLookup(inputIp.value);
+  } else {
+    void executeDetection(inputIp.value);
   }
 }
 
 function queryFromHistory(ip: string): void {
   inputIp.value = ip;
-  executeDetection(ip);
+  if (activeTab.value === 'rb') {
+    void executeRangeblockLookup(ip);
+  } else {
+    void executeDetection(ip);
+  }
 }
 
 watch(detectionData, () => {
@@ -967,14 +1056,19 @@ async function handleLogout() {
     }
     const data = await res.json().catch(() => null);
     coordinator.cancelPending();
+    cancelPendingRangeblock();
     clearWikitextCopyTimer();
     wikitextCopied.value = false;
     user.value = createLoggedOutUserState();
     isDashboardOpen.value = false;
     inputIp.value = '';
     detectionData.value = null;
+    rbData.value = null;
+    rbError.value = '';
+    selectedRbWiki.value = null;
+    activeTab.value = 'detector';
     diagnostic.value = null;
-    syncBrowserUrlIp(null);
+    syncBrowserUrlState(null, 'detector', null);
     initialDiagnostic.value = buildDiagnosticMetrics(
       data
         ? {
@@ -995,15 +1089,6 @@ function handleDashboardUnauthorised(): void {
   fetchUserStatus();
 }
 
-function getInitialIpParam(): string {
-  try {
-    const params = new URLSearchParams(window.location.search);
-    return (params.get('ip') || '').trim();
-  } catch {
-    return '';
-  }
-}
-
 let relativeTimeTimer: ReturnType<typeof setInterval> | null = null;
 
 onMounted(async () => {
@@ -1011,19 +1096,26 @@ onMounted(async () => {
   relativeTimeTimer = setInterval(() => {
     nowTimestampMs.value = Date.now();
   }, 30_000);
-  const initialIp = getInitialIpParam();
-  if (initialIp) {
-    inputIp.value = initialIp;
+  const initialRoute = parseInitialRouteParams(window.location.search);
+  activeTab.value = initialRoute.tab;
+  selectedRbWiki.value = initialRoute.wiki;
+  if (initialRoute.ip) {
+    inputIp.value = initialRoute.ip;
   }
   await fetchUserStatus();
-  if (initialIp && user.value.isLoggedIn && user.value.hasAccess) {
-    executeDetection(initialIp);
+  if (initialRoute.ip && user.value.isLoggedIn && user.value.hasAccess) {
+    if (initialRoute.tab === 'rb') {
+      void executeRangeblockLookup(initialRoute.ip, initialRoute.wiki);
+    } else {
+      void executeDetection(initialRoute.ip);
+    }
   }
 });
 
 onUnmounted(() => {
   window.removeEventListener('storage', handleThemeStorageSync);
   coordinator.cancelPending();
+  cancelPendingRangeblock();
   clearWikitextCopyTimer();
   if (relativeTimeTimer !== null) {
     clearInterval(relativeTimeTimer);

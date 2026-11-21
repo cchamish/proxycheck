@@ -40,7 +40,7 @@ def _is_stateless_api_request(request) -> bool:
         return True
     if path in _GADGET_TOKEN_PATHS:
         return True
-    if path.startswith("/api/v1/detect"):
+    if path.startswith(("/api/v1/detect", "/api/v1/rangeblock")):
         headers = getattr(request, "headers", None)
         auth_header = ""
         if hasattr(headers, "get"):

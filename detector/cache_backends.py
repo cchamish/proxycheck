@@ -8,12 +8,13 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 import uuid
 import weakref
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, TypeVar
 
 from django.conf import settings
 from django.core.signals import setting_changed
@@ -759,6 +760,30 @@ class _DecodedProviderRow(dict):
         self._source_raw_value = source_raw_value
 
 
+_TRAILING_COORDS_RE = re.compile(r"\s*\(\s*[+-]?\d+(?:\.\d+)?\s*,\s*[+-]?\d+(?:\.\d+)?\s*\)\s*$")
+
+
+def scrub_legacy_coordinates_from_row(row: Mapping[str, Any]) -> Dict[str, Any]:
+    """Returns a shallow copy of a provider row without legacy coordinate fields or suffixes."""
+    cleaned_row = {key: val for key, val in row.items() if key != "coordinates"}
+    loc = cleaned_row.get("location")
+    if isinstance(loc, str) and _TRAILING_COORDS_RE.search(loc):
+        stripped_loc = _TRAILING_COORDS_RE.sub("", loc).strip()
+        cleaned_row["location"] = "-" if stripped_loc in ("", "Unknown") else stripped_loc
+    return cleaned_row
+
+
+def _scrub_legacy_coordinates_from_snapshot(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
+    """Returns a shallow copy of a cached snapshot without legacy top-level or row coordinates."""
+    cleaned_snapshot = {key: val for key, val in snapshot.items() if key != "primaryCoordinates"}
+    raw_results = cleaned_snapshot.get("results")
+    if isinstance(raw_results, list):
+        cleaned_snapshot["results"] = [
+            scrub_legacy_coordinates_from_row(item) if isinstance(item, Mapping) else item for item in raw_results
+        ]
+    return cleaned_snapshot
+
+
 def decode_cached_provider_entry(raw_value: Optional[str]) -> Optional[Tuple[Dict[str, Any], Optional[str]]]:
     if not raw_value:
         return None
@@ -777,7 +802,7 @@ def decode_cached_provider_entry(raw_value: Optional[str]) -> Optional[Tuple[Dic
     )
     sanitize_fn = sanitization.sanitize_payload
     if "row" in parsed and isinstance(parsed["row"], dict):
-        row = parsed["row"]
+        row = scrub_legacy_coordinates_from_row(parsed["row"])
         if not parsed.get("sanitized") and isinstance(row.get("rawJson"), (dict, list)):
             row = {**row, "rawJson": sanitize_fn(row["rawJson"])}
         cached_at = parsed.get("cachedAt")
@@ -793,11 +818,12 @@ def decode_cached_provider_entry(raw_value: Optional[str]) -> Optional[Tuple[Dic
             cached_at_str,
         )
     if "status" in parsed and "provider" in parsed:
-        if not parsed.get("sanitized") and isinstance(parsed.get("rawJson"), (dict, list)):
-            parsed = {**parsed, "rawJson": sanitize_fn(parsed["rawJson"])}
+        cleaned_row = scrub_legacy_coordinates_from_row(parsed)
+        if not parsed.get("sanitized") and isinstance(cleaned_row.get("rawJson"), (dict, list)):
+            cleaned_row = {**cleaned_row, "rawJson": sanitize_fn(cleaned_row["rawJson"])}
         return (
             _DecodedProviderRow(
-                parsed,
+                cleaned_row,
                 city_db_loaded=city_db_loaded,
                 db_updated_at=db_updated_at,
                 db_version=db_version,
@@ -848,8 +874,6 @@ def should_refresh_cached_maxmind_entry(raw_value: Optional[str], row: Dict[str,
             return True
     if not has_local_maxmind_city_db():
         return False
-    if row.get("coordinates") is not None:
-        return False
     city_db_loaded = getattr(row, "_city_db_loaded", None)
     if isinstance(city_db_loaded, bool) and (not raw_value or getattr(row, "_source_raw_value", None) == raw_value):
         return not city_db_loaded
@@ -878,10 +902,11 @@ def _sanitize_snapshot_rows(results: Any) -> Any:
     sanitize_fn = sanitization.sanitize_payload
     sanitized_rows: List[Any] = []
     for item in results:
-        if isinstance(item, dict) and isinstance(item.get("rawJson"), (dict, list)):
-            sanitized_rows.append({**item, "rawJson": sanitize_fn(item["rawJson"])})
-        elif isinstance(item, dict):
-            sanitized_rows.append(dict(item))
+        if isinstance(item, Mapping):
+            cleaned = scrub_legacy_coordinates_from_row(item)
+            if isinstance(cleaned.get("rawJson"), (dict, list)):
+                cleaned["rawJson"] = sanitize_fn(cleaned["rawJson"])
+            sanitized_rows.append(cleaned)
         else:
             sanitized_rows.append(item)
     return sanitized_rows
@@ -900,7 +925,7 @@ def _decode_cached_snapshot_entry(raw_value: Optional[str]) -> Optional[Dict[str
     is_sanitized = parsed.get("sanitized") is True
     envelope_fetched_at = parsed.get("fetchedAt")
     if isinstance(parsed.get("snapshot"), dict):
-        snapshot = dict(parsed["snapshot"])
+        snapshot = _scrub_legacy_coordinates_from_snapshot(parsed["snapshot"])
         existing_fetched = snapshot.get("fetchedAt")
         if (
             not (isinstance(existing_fetched, str) and existing_fetched.strip())
@@ -913,7 +938,7 @@ def _decode_cached_snapshot_entry(raw_value: Optional[str]) -> Optional[Dict[str
         return snapshot
 
     if "ip" in parsed or "results" in parsed:
-        snapshot = dict(parsed)
+        snapshot = _scrub_legacy_coordinates_from_snapshot(parsed)
         if not is_sanitized and "results" in snapshot:
             snapshot["results"] = _sanitize_snapshot_rows(snapshot["results"])
         return snapshot

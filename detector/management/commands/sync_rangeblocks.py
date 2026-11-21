@@ -9,11 +9,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pymysql
 from django.core.management.base import BaseCommand, CommandError
-from django.db import close_old_connections, transaction
+from django.db import close_old_connections, connection, transaction
 
 from detector.models import RangeblockAggregate, RangeblockSyncState
 from detector.rangeblock_service import (
-    compute_effective_block_count,
     normalize_block_target,
     parse_mw_expiry,
     parse_mw_timestamp,
@@ -24,6 +23,9 @@ from proxycheck.settings import discover_wiki_replica_credentials
 logger = logging.getLogger("detector.views")
 
 _DEFAULT_BATCH_SIZE = 50000
+_UPSERT_SQL_BATCH_SIZE = 500
+_DEACTIVATE_BATCH_SIZE = 1000
+_PROGRESS_WIKIS = frozenset({"enwiki", "metawiki", "global", "commonswiki", "wikidatawiki", "zhwiki"})
 
 
 def _decode_str(raw_val: Any) -> str:
@@ -139,15 +141,198 @@ def _aggregate_active_rows(rows: Iterable[Tuple[Any, Any]]) -> Dict[str, Dict[st
     return active_map
 
 
-def _collect_incremental_logs(
+def _prep_db_datetime(dt: Optional[datetime]) -> Optional[str]:
+    if dt is None:
+        return None
+    utc_naive = dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo is not None else dt
+    return connection.ops.adapt_datetimefield_value(utc_naive)
+
+
+def _normalise_utc_datetime(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
+def _iter_batches(items: List[Any], size: int) -> Iterable[List[Any]]:
+    for idx in range(0, len(items), size):
+        yield items[idx : idx + size]
+
+
+def _advance_sync_state(
+    storage_wiki: str,
+    *,
+    wiki_domain: str,
+    now_dt: datetime,
+    last_log_id: Optional[int] = None,
+    last_log_timestamp: str = "",
+) -> None:
+    state_obj, _ = RangeblockSyncState.objects.get_or_create(wiki_dbname=storage_wiki)
+    if wiki_domain:
+        state_obj.wiki_domain = wiki_domain
+    if last_log_id is not None and last_log_id > state_obj.last_log_id:
+        state_obj.last_log_id = last_log_id
+    if last_log_timestamp and last_log_timestamp > state_obj.last_log_timestamp:
+        state_obj.last_log_timestamp = last_log_timestamp
+    state_obj.synced_at = now_dt
+    state_obj.save()
+
+
+def _upsert_log_chunk(
+    storage_wiki: str,
+    chunk_deltas: Dict[str, Dict[str, Any]],
+    *,
+    now_dt: datetime,
+) -> int:
+    if not chunk_deltas:
+        return 0
+
+    now_db = _prep_db_datetime(now_dt)
+    rows: List[Tuple[Any, ...]] = [
+        (
+            storage_wiki,
+            target_cidr,
+            info["ip_version"],
+            info["cidr_prefix"],
+            info["range_start_bin"],
+            info["range_end_bin"],
+            info["delta"],
+            0,
+            None,
+            0,
+            _prep_db_datetime(info["last_blocked_at"]),
+            now_db,
+        )
+        for target_cidr, info in chunk_deltas.items()
+    ]
+
+    is_sqlite = connection.vendor == "sqlite"
+    row_placeholder = "(" + ", ".join(["%s"] * 12) + ")"
+    with connection.cursor() as db_cursor:
+        for batch in _iter_batches(rows, _UPSERT_SQL_BATCH_SIZE):
+            values_sql = ", ".join([row_placeholder] * len(batch))
+            params = [val for row in batch for val in row]
+            if is_sqlite:
+                sql = (
+                    "INSERT INTO detector_rangeblock_agg ("  # noqa: S608
+                    "wiki_dbname, target_cidr, ip_version, cidr_prefix, "
+                    "range_start_bin, range_end_bin, block_count, "
+                    "has_active, active_expiry, active_indefinite, "
+                    "last_blocked_at, updated_at"
+                    f") VALUES {values_sql} "
+                    "ON CONFLICT(wiki_dbname, target_cidr) DO UPDATE SET "
+                    "block_count = detector_rangeblock_agg.block_count + excluded.block_count, "
+                    "last_blocked_at = CASE "
+                    "WHEN detector_rangeblock_agg.last_blocked_at IS NULL THEN excluded.last_blocked_at "
+                    "WHEN excluded.last_blocked_at IS NULL THEN detector_rangeblock_agg.last_blocked_at "
+                    "WHEN excluded.last_blocked_at > detector_rangeblock_agg.last_blocked_at "
+                    "THEN excluded.last_blocked_at "
+                    "ELSE detector_rangeblock_agg.last_blocked_at END, "
+                    "updated_at = excluded.updated_at"
+                )
+            else:
+                sql = (
+                    "INSERT INTO detector_rangeblock_agg ("  # noqa: S608
+                    "wiki_dbname, target_cidr, ip_version, cidr_prefix, "
+                    "range_start_bin, range_end_bin, block_count, "
+                    "has_active, active_expiry, active_indefinite, "
+                    "last_blocked_at, updated_at"
+                    f") VALUES {values_sql} "
+                    "ON DUPLICATE KEY UPDATE "
+                    "block_count = block_count + VALUES(block_count), "
+                    "last_blocked_at = CASE "
+                    "WHEN last_blocked_at IS NULL THEN VALUES(last_blocked_at) "
+                    "WHEN VALUES(last_blocked_at) IS NULL THEN last_blocked_at "
+                    "WHEN VALUES(last_blocked_at) > last_blocked_at THEN VALUES(last_blocked_at) "
+                    "ELSE last_blocked_at END, "
+                    "updated_at = VALUES(updated_at)"
+                )
+            db_cursor.execute(sql, params)
+    return len(rows)
+
+
+def _upsert_active_blocks(
+    storage_wiki: str,
+    active_entries: Dict[str, Dict[str, Any]],
+    *,
+    now_dt: datetime,
+) -> int:
+    if not active_entries:
+        return 0
+
+    now_db = _prep_db_datetime(now_dt)
+    rows: List[Tuple[Any, ...]] = [
+        (
+            storage_wiki,
+            target_cidr,
+            info["ip_version"],
+            info["cidr_prefix"],
+            info["range_start_bin"],
+            info["range_end_bin"],
+            1,
+            1,
+            _prep_db_datetime(info["active_expiry"]),
+            1 if info["active_indefinite"] else 0,
+            None,
+            now_db,
+        )
+        for target_cidr, info in active_entries.items()
+    ]
+
+    is_sqlite = connection.vendor == "sqlite"
+    row_placeholder = "(" + ", ".join(["%s"] * 12) + ")"
+    with connection.cursor() as db_cursor:
+        for batch in _iter_batches(rows, _UPSERT_SQL_BATCH_SIZE):
+            values_sql = ", ".join([row_placeholder] * len(batch))
+            params = [val for row in batch for val in row]
+            if is_sqlite:
+                sql = (
+                    "INSERT INTO detector_rangeblock_agg ("  # noqa: S608
+                    "wiki_dbname, target_cidr, ip_version, cidr_prefix, "
+                    "range_start_bin, range_end_bin, block_count, "
+                    "has_active, active_expiry, active_indefinite, "
+                    "last_blocked_at, updated_at"
+                    f") VALUES {values_sql} "
+                    "ON CONFLICT(wiki_dbname, target_cidr) DO UPDATE SET "
+                    "block_count = MAX(detector_rangeblock_agg.block_count, 1), "
+                    "has_active = excluded.has_active, "
+                    "active_expiry = excluded.active_expiry, "
+                    "active_indefinite = excluded.active_indefinite, "
+                    "updated_at = excluded.updated_at"
+                )
+            else:
+                sql = (
+                    "INSERT INTO detector_rangeblock_agg ("  # noqa: S608
+                    "wiki_dbname, target_cidr, ip_version, cidr_prefix, "
+                    "range_start_bin, range_end_bin, block_count, "
+                    "has_active, active_expiry, active_indefinite, "
+                    "last_blocked_at, updated_at"
+                    f") VALUES {values_sql} "
+                    "ON DUPLICATE KEY UPDATE "
+                    "block_count = GREATEST(block_count, 1), "
+                    "has_active = VALUES(has_active), "
+                    "active_expiry = VALUES(active_expiry), "
+                    "active_indefinite = VALUES(active_indefinite), "
+                    "updated_at = VALUES(updated_at)"
+                )
+            db_cursor.execute(sql, params)
+    return len(rows)
+
+
+def _stream_incremental_logs(
     cursor: Any,
     wiki_db: str,
     *,
+    storage_wiki: str,
+    wiki_domain: str,
     log_type: str,
     log_actions: Tuple[str, ...],
     last_log_id: int,
     batch_size: int,
-) -> Tuple[Dict[str, Dict[str, Any]], int, str]:
+    now_dt: datetime,
+    dry_run: bool,
+) -> int:
+    """Streams incremental block log chunks from Wiki Replicas and commits each chunk with its watermark."""
     action_placeholders = ", ".join(["%s"] * len(log_actions))
     cursor.execute(
         f"SELECT COALESCE(MAX(log_id), 0) FROM `{wiki_db}`.`logging_logindex` "  # noqa: S608
@@ -157,11 +342,10 @@ def _collect_incremental_logs(
     max_row = cursor.fetchone()
     target_max_id = int(max_row[0] or 0) if max_row else 0
     if target_max_id <= last_log_id:
-        return {}, last_log_id, ""
+        return 0
 
-    deltas: Dict[str, Dict[str, Any]] = {}
+    total_targets = 0
     cursor_id = last_log_id
-    latest_ts = ""
 
     while cursor_id < target_max_id:
         upper_id = min(target_max_id, cursor_id + batch_size)
@@ -172,143 +356,96 @@ def _collect_incremental_logs(
             "GROUP BY log_title"
         )
         cursor.execute(sql, [cursor_id, upper_id, log_type, *log_actions])
+        chunk_deltas: Dict[str, Dict[str, Any]] = {}
+        chunk_latest_ts = ""
         for raw_title, raw_count, raw_ts in cursor.fetchall():
             normalised = normalize_block_target(_decode_str(raw_title))
             if normalised is None:
                 continue
             target_cidr, ip_version, cidr_prefix, start_bin, end_bin = normalised
             ts_str = _decode_str(raw_ts).strip()
-            if ts_str and ts_str > latest_ts:
-                latest_ts = ts_str
+            if ts_str and ts_str > chunk_latest_ts:
+                chunk_latest_ts = ts_str
             last_dt = parse_mw_timestamp(ts_str)
-            entry = deltas.get(target_cidr)
+            delta_val = max(0, int(raw_count or 0))
+            entry = chunk_deltas.get(target_cidr)
             if entry is None:
-                deltas[target_cidr] = {
+                chunk_deltas[target_cidr] = {
                     "ip_version": ip_version,
                     "cidr_prefix": cidr_prefix,
                     "range_start_bin": start_bin,
                     "range_end_bin": end_bin,
-                    "delta": max(0, int(raw_count or 0)),
+                    "delta": delta_val,
                     "last_blocked_at": last_dt,
                 }
             else:
-                entry["delta"] += max(0, int(raw_count or 0))
+                entry["delta"] += delta_val
                 if last_dt is not None and (entry["last_blocked_at"] is None or last_dt > entry["last_blocked_at"]):
                     entry["last_blocked_at"] = last_dt
+
+        total_targets += len(chunk_deltas)
+        if not dry_run:
+            close_old_connections()
+            with transaction.atomic():
+                if chunk_deltas:
+                    _upsert_log_chunk(storage_wiki, chunk_deltas, now_dt=now_dt)
+                _advance_sync_state(
+                    storage_wiki,
+                    wiki_domain=wiki_domain,
+                    now_dt=now_dt,
+                    last_log_id=upper_id,
+                    last_log_timestamp=chunk_latest_ts,
+                )
         cursor_id = upper_id
 
-    return deltas, target_max_id, latest_ts
+    return total_targets
 
 
-def _apply_wiki_sync_to_toolsdb(
+def _sync_active_blocks_to_toolsdb(
     storage_wiki: str,
     wiki_domain: str,
     active_map: Dict[str, Dict[str, Any]],
-    log_deltas: Dict[str, Dict[str, Any]],
-    new_last_log_id: int,
-    new_last_ts: str,
     *,
     now_dt: datetime,
 ) -> Tuple[int, int]:
-    """Persists active rangeblock flags and incremental log counts into ToolsDB atomically."""
+    """Reconciles only the active block subset in ToolsDB without loading historical rows."""
     close_old_connections()
     with transaction.atomic():
-        existing_rows = {row.target_cidr: row for row in RangeblockAggregate.objects.filter(wiki_dbname=storage_wiki)}
+        local_active_rows = list(
+            RangeblockAggregate.objects.filter(wiki_dbname=storage_wiki, has_active=True).values_list(
+                "id", "target_cidr", "active_expiry", "active_indefinite"
+            )
+        )
+        local_active_meta: Dict[str, Tuple[Optional[datetime], bool]] = {}
+        deactivated_ids: List[int] = []
+        for row_id, target_cidr, local_expiry, local_indef in local_active_rows:
+            if target_cidr not in active_map:
+                deactivated_ids.append(row_id)
+            else:
+                local_active_meta[target_cidr] = (_normalise_utc_datetime(local_expiry), bool(local_indef))
 
-        deactivated_ids = [
-            row.id for target, row in existing_rows.items() if row.has_active and target not in active_map
-        ]
-        if deactivated_ids:
-            RangeblockAggregate.objects.filter(id__in=deactivated_ids).update(
+        active_to_upsert: Dict[str, Dict[str, Any]] = {}
+        for target_cidr, info in active_map.items():
+            existing_meta = local_active_meta.get(target_cidr)
+            desired_meta = (info["active_expiry"], bool(info["active_indefinite"]))
+            if existing_meta is None or existing_meta != desired_meta:
+                active_to_upsert[target_cidr] = info
+
+        for id_batch in _iter_batches(deactivated_ids, _DEACTIVATE_BATCH_SIZE):
+            RangeblockAggregate.objects.filter(id__in=id_batch).update(
                 has_active=False,
                 active_expiry=None,
                 active_indefinite=False,
                 updated_at=now_dt,
             )
 
-        all_targets = set(active_map.keys()) | set(log_deltas.keys())
-        to_create: List[RangeblockAggregate] = []
-        to_update: List[RangeblockAggregate] = []
+        upserted_count = 0
+        if active_to_upsert:
+            upserted_count = _upsert_active_blocks(storage_wiki, active_to_upsert, now_dt=now_dt)
 
-        for target in all_targets:
-            active_info = active_map.get(target)
-            delta_info = log_deltas.get(target)
-            has_active = active_info is not None
-            delta_count = int(delta_info["delta"]) if delta_info else 0
-            existing = existing_rows.get(target)
+        _advance_sync_state(storage_wiki, wiki_domain=wiki_domain, now_dt=now_dt)
 
-            if existing is None:
-                meta = active_info or delta_info
-                if meta is None:
-                    continue
-                to_create.append(
-                    RangeblockAggregate(
-                        wiki_dbname=storage_wiki,
-                        target_cidr=target,
-                        ip_version=meta["ip_version"],
-                        cidr_prefix=meta["cidr_prefix"],
-                        range_start_bin=meta["range_start_bin"],
-                        range_end_bin=meta["range_end_bin"],
-                        block_count=compute_effective_block_count(delta_count, has_active),
-                        has_active=has_active,
-                        active_expiry=active_info["active_expiry"] if active_info else None,
-                        active_indefinite=active_info["active_indefinite"] if active_info else False,
-                        last_blocked_at=delta_info["last_blocked_at"] if delta_info else None,
-                    )
-                )
-                continue
-
-            # When a previously unlogged active block (synthetic count 1) gains its first log, replace 1 with delta.
-            if (
-                existing.last_blocked_at is None
-                and existing.has_active
-                and existing.block_count == 1
-                and delta_count > 0
-            ):
-                new_count = delta_count
-            else:
-                new_count = compute_effective_block_count(existing.block_count + delta_count, has_active)
-
-            existing.block_count = new_count
-            existing.has_active = has_active
-            existing.active_expiry = active_info["active_expiry"] if active_info else None
-            existing.active_indefinite = active_info["active_indefinite"] if active_info else False
-            if (
-                delta_info
-                and delta_info["last_blocked_at"] is not None
-                and (existing.last_blocked_at is None or delta_info["last_blocked_at"] > existing.last_blocked_at)
-            ):
-                existing.last_blocked_at = delta_info["last_blocked_at"]
-            existing.updated_at = now_dt
-            to_update.append(existing)
-
-        if to_create:
-            RangeblockAggregate.objects.bulk_create(to_create, batch_size=1000)
-        if to_update:
-            RangeblockAggregate.objects.bulk_update(
-                to_update,
-                [
-                    "block_count",
-                    "has_active",
-                    "active_expiry",
-                    "active_indefinite",
-                    "last_blocked_at",
-                    "updated_at",
-                ],
-                batch_size=1000,
-            )
-
-        state_obj, _ = RangeblockSyncState.objects.get_or_create(wiki_dbname=storage_wiki)
-        if wiki_domain:
-            state_obj.wiki_domain = wiki_domain
-        if new_last_log_id > state_obj.last_log_id:
-            state_obj.last_log_id = new_last_log_id
-        if new_last_ts and new_last_ts > state_obj.last_log_timestamp:
-            state_obj.last_log_timestamp = new_last_ts
-        state_obj.synced_at = now_dt
-        state_obj.save()
-
-    return len(to_create), len(to_update)
+    return upserted_count, len(deactivated_ids)
 
 
 class Command(BaseCommand):
@@ -323,6 +460,12 @@ class Command(BaseCommand):
         )
         parser.add_argument("--batch-size", type=int, default=_DEFAULT_BATCH_SIZE, help="Log ID chunk size per query.")
         parser.add_argument("--dry-run", action="store_true", help="Inspect counts without modifying ToolsDB.")
+
+    def _write_progress(self, message: str) -> None:
+        self.stdout.write(message, ending="\n")
+        flush = getattr(self.stdout, "flush", None)
+        if callable(flush):
+            flush()
 
     def _sync_wiki_target(
         self,
@@ -342,30 +485,32 @@ class Command(BaseCommand):
     ) -> Tuple[int, int]:
         state = RangeblockSyncState.objects.filter(wiki_dbname=storage_wiki).first()
         last_log_id = int(state.last_log_id) if state is not None else 0
+        log_targets = _stream_incremental_logs(
+            cursor,
+            replica_db,
+            storage_wiki=storage_wiki,
+            wiki_domain=wiki_domain,
+            log_type=log_type,
+            log_actions=log_actions,
+            last_log_id=last_log_id,
+            batch_size=batch_size,
+            now_dt=now_dt,
+            dry_run=dry_run,
+        )
         active_map = (
             _collect_active_global_blocks(creds, now_mw)
             if is_global
             else _collect_active_local_blocks(cursor, replica_db, now_mw)
         )
-        deltas, max_log_id, latest_ts = _collect_incremental_logs(
-            cursor,
-            replica_db,
-            log_type=log_type,
-            log_actions=log_actions,
-            last_log_id=last_log_id,
-            batch_size=batch_size,
-        )
         if dry_run:
-            return len(active_map), len(deltas)
-        return _apply_wiki_sync_to_toolsdb(
+            return len(active_map), log_targets
+        active_upserted, active_deactivated = _sync_active_blocks_to_toolsdb(
             storage_wiki,
             wiki_domain,
             active_map,
-            deltas,
-            max_log_id,
-            latest_ts,
             now_dt=now_dt,
         )
+        return active_upserted + active_deactivated, log_targets
 
     def handle(self, *args: Any, **options: Any) -> None:
         creds = discover_wiki_replica_credentials()
@@ -392,6 +537,8 @@ class Command(BaseCommand):
         for section, entries in sorted(by_section.items()):
             host = f"{section}.analytics.db.svc.wikimedia.cloud"
             first_db = f"{entries[0][0]}_p"
+            section_synced = 0
+            section_failed = 0
             try:
                 conn = _connect_replica(host, first_db, creds)
             except pymysql.MySQLError as exc:
@@ -399,6 +546,9 @@ class Command(BaseCommand):
                     "Skipping section %s due to connection error: %s", section, sanitize_error_message(str(exc))
                 )
                 failed_wikis.extend(db for db, _ in entries)
+                self._write_progress(
+                    f"[section {section}] skipped due to connection error ({len(entries)} wikis failed)."
+                )
                 continue
 
             try:
@@ -406,7 +556,7 @@ class Command(BaseCommand):
                     for dbname, domain in entries:
                         replica_db = f"{dbname}_p"
                         try:
-                            self._sync_wiki_target(
+                            active_changes, log_targets = self._sync_wiki_target(
                                 cursor,
                                 replica_db=replica_db,
                                 creds=creds,
@@ -421,8 +571,13 @@ class Command(BaseCommand):
                                 dry_run=dry_run,
                             )
                             synced_count += 1
+                            section_synced += 1
+                            if dbname in _PROGRESS_WIKIS:
+                                self._write_progress(
+                                    f"[{dbname}] completed (log_targets={log_targets}, active_updates={active_changes})."
+                                )
                             if dbname == "metawiki":
-                                self._sync_wiki_target(
+                                global_active, global_logs = self._sync_wiki_target(
                                     cursor,
                                     replica_db=replica_db,
                                     creds=creds,
@@ -437,8 +592,13 @@ class Command(BaseCommand):
                                     dry_run=dry_run,
                                 )
                                 synced_count += 1
+                                section_synced += 1
+                                self._write_progress(
+                                    f"[global] completed (log_targets={global_logs}, active_updates={global_active})."
+                                )
                         except pymysql.MySQLError as exc:
                             failed_wikis.append(dbname)
+                            section_failed += 1
                             logger.warning(
                                 "Rangeblock sync failed for %s: %s",
                                 dbname,
@@ -447,9 +607,11 @@ class Command(BaseCommand):
             finally:
                 conn.close()
 
+            self._write_progress(f"[section {section}] completed (synced={section_synced}, failed={section_failed}).")
+
         summary = (
             f"Synchronised {synced_count} rangeblock wiki targets (dry_run={dry_run}, failed={len(failed_wikis)})."
         )
         if synced_count == 0 and failed_wikis:
             raise CommandError(f"Rangeblock sync failed for all targets: {summary}")
-        self.stdout.write(self.style.SUCCESS(summary))
+        self._write_progress(self.style.SUCCESS(summary))

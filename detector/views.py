@@ -13,17 +13,18 @@ from typing import Any, Awaitable, Callable, Dict
 from urllib.parse import urlencode
 
 from django.conf import settings
-from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
+from django.http import HttpResponse, HttpResponseRedirect, JsonResponse, StreamingHttpResponse
 from django.middleware.csrf import get_token
 from django.views.decorators.csrf import csrf_exempt
 
-from . import http_client, oauth
+from . import http_client, oauth, rangeblock_service
 from .detection_service import (
     detect_canonical_ip_batch,
     detect_single_canonical_ip,
     is_compact_request,
     refresh_single_canonical_ip,
     resolve_query_mode,
+    stream_single_canonical_ip_sse,
 )
 from .intelligence import (
     MAX_BATCH_IPS,
@@ -77,12 +78,14 @@ __all__ = [
     "canonicalize_ip",
     "detect_ip",
     "detect_ip_batch",
+    "detect_ip_stream",
     "exchange_gadget_token",
     "get_current_user",
     "issue_gadget_token",
     "oauth_callback",
     "oauth_login",
     "oauth_logout",
+    "rangeblock_lookup",
     "refresh_ip_detection",
     "switch_test_role",
     "system_status",
@@ -281,8 +284,104 @@ async def _detect_ip_get(request):
         start_time,
         compact=is_compact_request(request),
         query_mode=resolve_query_mode(request),
+        wiki=rangeblock_service.normalize_wiki_dbname(request.GET.get("wiki")),
     )
     response = JsonResponse(payload)
+    response["Cache-Control"] = "private, no-cache"
+    return response
+
+
+async def detect_ip_stream(request):
+    """Streams progressive IP detection results over Server-Sent Events."""
+    return await _dispatch_cors_endpoint(request, "GET", _detect_ip_stream_get)
+
+
+async def _detect_ip_stream_get(request):
+    start_time = time.perf_counter()
+
+    auth_mode, auth_error_response = await authenticate_detect_request(request)
+    if auth_error_response is not None or auth_mode is None:
+        return auth_error_response
+
+    username, _ = await _resolve_authenticated_identity(request, auth_mode)
+    rl_res = await check_and_consume_endpoint_rate_limit("detect", username)
+    if not rl_res.allowed:
+        return _build_rate_limit_response(rl_res, "Detection rate limit exceeded. Please wait before retrying.")
+
+    raw_ip = request.GET.get("ip")
+    if raw_ip is None or not str(raw_ip).strip():
+        return JsonResponse(
+            {
+                "error": "invalid_ip",
+                "message": "Missing required ip query parameter. Please provide a valid IPv4 or IPv6 address.",
+            },
+            status=400,
+        )
+
+    ip = canonicalize_ip(str(raw_ip))
+    if not ip:
+        return JsonResponse(
+            {
+                "error": "invalid_ip",
+                "message": "Invalid IP address format. Please provide a valid IPv4 or IPv6 address.",
+            },
+            status=400,
+        )
+
+    stream_iter = stream_single_canonical_ip_sse(
+        ip,
+        auth_mode,
+        start_time,
+        compact=is_compact_request(request),
+        query_mode=resolve_query_mode(request),
+        wiki=rangeblock_service.normalize_wiki_dbname(request.GET.get("wiki")),
+    )
+    response = StreamingHttpResponse(stream_iter, content_type="text/event-stream; charset=utf-8")
+    response["Cache-Control"] = "private, no-cache"
+    response["X-Accel-Buffering"] = "no"
+    return response
+
+
+async def rangeblock_lookup(request):
+    """Queries cross-wiki rangeblock aggregates and real-time Wiki Replicas status for an IP."""
+    return await _dispatch_cors_endpoint(request, "GET", _rangeblock_lookup_get)
+
+
+async def _rangeblock_lookup_get(request):
+    start_time = time.perf_counter()
+
+    auth_mode, auth_error_response = await authenticate_detect_request(request)
+    if auth_error_response is not None or auth_mode is None:
+        return auth_error_response
+
+    username, _ = await _resolve_authenticated_identity(request, auth_mode)
+    rl_res = await check_and_consume_endpoint_rate_limit("rangeblock", username)
+    if not rl_res.allowed:
+        return _build_rate_limit_response(rl_res, "Rangeblock lookup rate limit exceeded. Please wait before retrying.")
+
+    raw_ip = request.GET.get("ip")
+    if raw_ip is None or not str(raw_ip).strip():
+        return JsonResponse(
+            {
+                "error": "invalid_ip",
+                "message": "Missing required ip query parameter. Please provide a valid IPv4 or IPv6 address.",
+            },
+            status=400,
+        )
+
+    ip = canonicalize_ip(str(raw_ip))
+    if not ip:
+        return JsonResponse(
+            {
+                "error": "invalid_ip",
+                "message": "Invalid IP address format. Please provide a valid IPv4 or IPv6 address.",
+            },
+            status=400,
+        )
+
+    wiki = rangeblock_service.normalize_wiki_dbname(request.GET.get("wiki"))
+    payload = await rangeblock_service.query_rangeblocks_for_ip(ip, wiki=wiki)
+    response = JsonResponse(attach_request_diagnostics(payload, start_time))
     response["Cache-Control"] = "private, no-cache"
     return response
 
@@ -351,6 +450,7 @@ async def _refresh_ip_detection_post(request):
         )
 
     username, admin_flag = await _resolve_authenticated_identity(request, auth_mode)
+    wiki = rangeblock_service.normalize_wiki_dbname(body.get("wiki") or request.GET.get("wiki"))
     payload, status_code, extra_headers = await refresh_single_canonical_ip(
         ip,
         auth_mode,
@@ -359,6 +459,7 @@ async def _refresh_ip_detection_post(request):
         is_admin=admin_flag,
         compact=is_compact_request(request, body),
         query_mode=resolve_query_mode(request, body, default="full"),
+        wiki=wiki,
     )
     response = JsonResponse(payload, status=status_code)
     response["Cache-Control"] = "private, no-cache"
@@ -406,11 +507,13 @@ async def _detect_ip_batch_post(request):
     unique_canonical_ips, input_map = parsed_batch
 
     query_mode = resolve_query_mode(request, body, default="light")
+    wiki = rangeblock_service.normalize_wiki_dbname(body.get("wiki") or request.GET.get("wiki"))
     results_by_ip = await detect_canonical_ip_batch(
         unique_canonical_ips,
         auth_mode=auth_mode,
         compact=is_compact_request(request, body),
         query_mode=query_mode,
+        wiki=wiki,
     )
 
     response = JsonResponse(

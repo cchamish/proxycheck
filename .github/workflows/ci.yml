@@ -10,10 +10,11 @@ on:
 
 permissions:
   contents: read
+  deployments: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/dev' }}
 
 jobs:
   lint-meta:
@@ -143,3 +144,29 @@ jobs:
           test -f dist/index.html && test -d dist/assets
           uv run python manage.py collectstatic --noinput --clear
           test -d staticfiles && test -n "$(ls -A staticfiles)"
+
+  deploy-dev:
+    name: Deploy to Toolforge Dev
+    needs: [lint-meta, backend, frontend, static-assets]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    uses: ./.github/workflows/_common-deploy.yml
+    secrets: inherit
+    with:
+      target_branch: dev
+      toolforge_tool: proxycheck-dev
+      environment_name: Toolforge Dev
+      environment_url: https://proxycheck-dev.toolforge.org/
+      verified_sha: ${{ github.sha }}
+
+  deploy-prod:
+    name: Deploy to Toolforge
+    needs: [lint-meta, backend, frontend, static-assets]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/_common-deploy.yml
+    secrets: inherit
+    with:
+      target_branch: main
+      toolforge_tool: proxycheck
+      environment_name: Toolforge
+      environment_url: https://proxycheck.toolforge.org/
+      verified_sha: ${{ github.sha }}

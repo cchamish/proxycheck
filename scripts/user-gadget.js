@@ -18,7 +18,7 @@
     const TARGET_SELECTOR = `${REVEAL_ANCHOR_SELECTOR}, ${REVEAL_CONTAINER_SELECTOR}`;
     const BADGE_CLASS = 'proxycheck-ip-badge';
     const STYLE_ELEMENT_ID = 'proxycheck-userscript-styles';
-    const INTERNAL_NODE_SELECTOR = '#proxycheck-pageinfo, #proxycheck_result, #proxycheck-userscript-styles, .proxycheck-ip-badge, .proxycheck-details-panel, .proxycheck-light-upgrade-notice, .proxycheck-dialog-cache-bar, .proxycheck-cache-controls, .proxycheck-refetch-btn, .proxycheck-refresh-warning, .proxycheck-temp-ip-switcher, .proxycheck-quick-links';
+    const INTERNAL_NODE_SELECTOR = '#proxycheck-pageinfo, #proxycheck_result, #proxycheck-userscript-styles, .proxycheck-ip-badge, .proxycheck-rb-badge, .proxycheck-details-panel, .proxycheck-light-upgrade-notice, .proxycheck-dialog-cache-bar, .proxycheck-cache-controls, .proxycheck-refetch-btn, .proxycheck-refresh-warning, .proxycheck-temp-ip-switcher, .proxycheck-quick-links';
     const IPINFO_PANEL_SELECTOR = '.ext-ipinfo-panel-layout';
     const OBSERVER_THROTTLE_MS = 100;
     const IPINFO_FALLBACK_DELAY_MS = 400;
@@ -635,17 +635,27 @@
         });
     }
 
+    function getCurrentWikiDbname() {
+        const raw = mw && mw.config && typeof mw.config.get === 'function' ? mw.config.get('wgDBname') : '';
+        return typeof raw === 'string' && raw.trim() ? raw.trim().toLowerCase() : '';
+    }
+
     function fetchDetectWithToken(ip, token, hasRetried, mode) {
         if (!isValidIp(ip)) return Promise.resolve(null);
-        return apiFetchWithAuth(`/api/v1/detect?ip=${encodeURIComponent(ip)}&compact=1&mode=${encodeURIComponent(normalizeQueryMode(mode))}`,
+        const wikiDb = getCurrentWikiDbname();
+        const wikiParam = wikiDb ? `&wiki=${encodeURIComponent(wikiDb)}` : '';
+        return apiFetchWithAuth(`/api/v1/detect?ip=${encodeURIComponent(ip)}&compact=1&mode=${encodeURIComponent(normalizeQueryMode(mode))}${wikiParam}`,
             { method: 'GET' }, token, hasRetried).then((res) => (!res ? null : (!res.ok ? (warn(`Detection API HTTP ${res.status} for ${ip}`), null) : res.json())));
     }
 
     function fetchRefreshDetectWithToken(ip, token, hasRetried, mode) {
         if (!isValidIp(ip)) return Promise.resolve({ ok: false, status: 0, rateLimited: false, data: null });
+        const wikiDb = getCurrentWikiDbname();
+        const bodyPayload = { ip, mode: normalizeQueryMode(mode || 'full'), compact: true };
+        if (wikiDb) bodyPayload.wiki = wikiDb;
         return apiFetchWithAuth('/api/v1/detect/refresh', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ip, mode: normalizeQueryMode(mode || 'full'), compact: true })
+            body: JSON.stringify(bodyPayload)
         }, token, hasRetried).then((res) => {
             if (!res) return { ok: false, status: 401, rateLimited: false, data: null };
             if (res.status === 429) return res.json().catch(() => ({})).then((b) => ({
@@ -695,9 +705,12 @@
     function fetchBatchDetectWithToken(ips, token, hasRetried) {
         const validIps = Array.isArray(ips) ? ips.filter(isValidIp) : [];
         if (validIps.length === 0) return Promise.resolve(null);
+        const wikiDb = getCurrentWikiDbname();
+        const bodyPayload = { ips: validIps, mode: 'light' };
+        if (wikiDb) bodyPayload.wiki = wikiDb;
         return apiFetchWithAuth('/api/v1/detect/batch?compact=1', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ips: validIps, mode: 'light' })
+            body: JSON.stringify(bodyPayload)
         }, token, hasRetried).then((res) => {
             if (!res) return null;
             if (res.status === 404 || res.status === 405) { batchEndpointSupported = false; return { fallbackSingle: true }; }
@@ -1437,6 +1450,10 @@
             'a.proxycheck-ip-badge.proxycheck-ip-badge-error, a.proxycheck-ip-badge.proxycheck-ip-badge-error:visited { background-color: var(--proxycheck-low-bg); color: var(--proxycheck-muted-color) !important; border: 1px dashed var(--proxycheck-error-border); }',
             'a.proxycheck-ip-badge.proxycheck-ip-badge-consent, a.proxycheck-ip-badge.proxycheck-ip-badge-consent:visited { background-color: var(--proxycheck-low-bg); color: var(--proxycheck-low-color) !important; border: 1px solid var(--proxycheck-low-border); }',
             'a.proxycheck-ip-badge.proxycheck-badge-stale, a.proxycheck-ip-badge.proxycheck-badge-stale:visited { border-style: dashed; }',
+            'a.proxycheck-rb-badge, a.proxycheck-rb-badge:visited { margin-left: 4px; font-size: 0.85em; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; padding: 1px 5px; border-radius: 3px; text-decoration: none; white-space: nowrap; }',
+            'a.proxycheck-rb-badge.proxycheck-rb-badge-active, a.proxycheck-rb-badge.proxycheck-rb-badge-active:visited { background-color: var(--proxycheck-high-bg); color: var(--proxycheck-high-color) !important; border: 1px solid var(--proxycheck-high-border); font-weight: bold; }',
+            'a.proxycheck-rb-badge.proxycheck-rb-badge-neutral, a.proxycheck-rb-badge.proxycheck-rb-badge-neutral:visited { background-color: var(--proxycheck-low-bg); color: var(--proxycheck-low-color) !important; border: 1px solid var(--proxycheck-low-border); font-weight: normal; }',
+            '.proxycheck-rb-active-label { color: var(--proxycheck-high-color); font-weight: bold; }',
             '#proxycheck-pageinfo { font-size: 92%; line-height: 1.5em; padding: 8px 12px; margin-bottom: 12px; background-color: var(--proxycheck-surface-bg); color: var(--proxycheck-surface-color); border: 1px solid var(--proxycheck-divider-color); border-left: 4px solid var(--proxycheck-border-color); border-radius: 2px; }',
             ...allTiers.map((t) => `#proxycheck-pageinfo.proxycheck-banner-tier-${t} { border-left-color: var(--proxycheck-banner-${t}-accent); background-color: var(--proxycheck-banner-${t}-bg); }`),
             '#proxycheck-pageinfo code { background-color: var(--proxycheck-code-bg); color: inherit; border-color: var(--proxycheck-border-color); }',
@@ -1609,6 +1626,33 @@
         }
         appendRow('CIDR', $cidrCell);
 
+        const rb = data && data.rangeblock && typeof data.rangeblock === 'object' ? data.rangeblock : null;
+        if (rb && resolvedIp) {
+            const rbWikis = Array.isArray(rb.wikis) ? rb.wikis : [];
+            const $rbCell = $('<div>', { class: 'proxycheck-rb-distribution' });
+            if (rbWikis.length === 0) {
+                $rbCell.append($('<span>', { class: 'proxycheck-details-empty', text: 'No hits (0/0)' }));
+            } else {
+                rbWikis.forEach((entry, idx) => {
+                    if (!entry || !entry.wiki) return;
+                    if (idx > 0) $rbCell.append(document.createTextNode(', '));
+                    $rbCell.append(document.createTextNode(`${Number(entry.count) || 0} on `));
+                    $rbCell.append($('<a>', {
+                        class: 'proxycheck-rb-wiki-link',
+                        href: `${TOOL_BASE_URL}/?ip=${encodeURIComponent(resolvedIp)}&tab=rb&wiki=${encodeURIComponent(entry.wiki)}`,
+                        target: '_blank',
+                        rel: 'noopener noreferrer',
+                        text: entry.wiki
+                    }));
+                    if (entry.hasActive) {
+                        $rbCell.append(document.createTextNode(' '));
+                        $rbCell.append($('<span>', { class: 'proxycheck-rb-active-label', text: '(active)' }));
+                    }
+                });
+            }
+            appendRow('Rangeblock', $rbCell);
+        }
+
         const $copyLink = $('<a>', { href: '#', role: 'button', class: 'proxycheck-copy-result', text: 'Copy result' });
         const $copyWikitextBtn = $('<a>', { href: '#', role: 'button', class: 'proxycheck-copy-wikitext', text: 'Copy Wikitext' });
         let panelDisposed = false;
@@ -1662,7 +1706,7 @@
 
             const $quickLinks = $('<div>', { class: 'proxycheck-quick-links' }).append(
                 mkLink('proxycheck-link-globalcontribs', buildWikiPageUrl('Special:GlobalContributions/' + resolvedIp, null), 'GlobalContributions ↗'),
-                mkLink('proxycheck-link-rangeblock', 'https://rangeblockfinder.toolforge.org/?ip=' + encodeURIComponent(resolvedIp), 'Rangeblock Finder ↗'),
+                mkLink('proxycheck-link-rangeblock', TOOL_BASE_URL + '/?ip=' + encodeURIComponent(resolvedIp) + '&tab=rb', 'Rangeblock Finder ↗'),
                 mkLink('proxycheck-link-whois', 'https://whois.toolforge.org/gateway.py?lookup=true&ip=' + encodeURIComponent(resolvedIp), 'WHOIS ↗'),
                 $singleBlockLink
             );
@@ -1766,6 +1810,28 @@
         if (isStale) stateClass += ' proxycheck-badge-stale';
         badge.className = `${BADGE_CLASS} proxycheck-tier-${risk.riskTier}${stateClass}`;
         badge.title = buildBadgeTitleText(data, risk);
+
+        const rb = !risk.isNonPublic && data && data.rangeblock && typeof data.rangeblock === 'object' ? data.rangeblock : null;
+        const localTotal = rb ? Math.max(0, Number(rb.localTotal) || 0) : 0;
+        const globalTotal = rb ? Math.max(0, Number(rb.globalTotal) || 0) : 0;
+        const existingRbBadge = badge.nextElementSibling && badge.nextElementSibling.classList &&
+            badge.nextElementSibling.classList.contains('proxycheck-rb-badge')
+            ? badge.nextElementSibling : null;
+
+        if (localTotal > 0 || globalTotal > 0) {
+            const rbBadge = existingRbBadge || createEl('a', 'proxycheck-rb-badge', '');
+            rbBadge.textContent = `rangeblock: ${localTotal}/${globalTotal}`;
+            rbBadge.className = `proxycheck-rb-badge ${rb.hasActive ? 'proxycheck-rb-badge-active' : 'proxycheck-rb-badge-neutral'}`;
+            rbBadge.href = `${TOOL_BASE_URL}/?ip=${encodeURIComponent(resolvedIp)}&tab=rb`;
+            rbBadge.target = '_blank';
+            rbBadge.rel = 'noopener noreferrer';
+            rbBadge.title = rb.hasActive ? 'Cross-wiki rangeblock (active)' : 'Cross-wiki rangeblock (historical)';
+            if (!existingRbBadge && badge.parentNode) {
+                badge.parentNode.insertBefore(rbBadge, badge.nextSibling);
+            }
+        } else if (existingRbBadge && existingRbBadge.parentNode) {
+            existingRbBadge.parentNode.removeChild(existingRbBadge);
+        }
     }
 
     function isBadgeDetached(badge) {

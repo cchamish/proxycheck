@@ -261,6 +261,7 @@ _DAILY_RL_SALT_CACHE: Dict[str, Tuple[Any, str]] = {}
 _ENDPOINT_RATE_LIMIT_SPECS: Dict[str, Tuple[int, int, Optional[str], str]] = {
     "detect": (120, 600, "DETECT_USER_RPM_LIMIT", "DETECT_GLOBAL_RPM_LIMIT"),
     "detect_batch": (20, 100, "DETECT_BATCH_USER_RPM_LIMIT", "DETECT_BATCH_GLOBAL_RPM_LIMIT"),
+    "rangeblock": (120, 600, "RANGEBLOCK_USER_RPM_LIMIT", "RANGEBLOCK_GLOBAL_RPM_LIMIT"),
     "gadget_token": (15, 240, "GADGET_TOKEN_USER_RPM_LIMIT", "GADGET_TOKEN_GLOBAL_RPM_LIMIT"),
 }
 

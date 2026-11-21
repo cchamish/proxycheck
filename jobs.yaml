@@ -39,3 +39,8 @@
   image: tool-proxycheck/tool-proxycheck:latest
   schedule: "@daily"
   mount: all
+- name: sync-rangeblocks
+  command: python manage.py sync_rangeblocks
+  image: tool-proxycheck/tool-proxycheck:latest
+  schedule: "@hourly"
+  mount: all

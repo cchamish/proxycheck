@@ -90,6 +90,8 @@ _FORBIDDEN_TOP_LEVEL_SNAPSHOT_KEYS = frozenset(
         "temporaryAccount",
         "revId",
         "logId",
+        "rangeblock",
+        "pendingProviders",
     }
 )
 

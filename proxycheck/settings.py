@@ -269,6 +269,26 @@ def _discover_toolsdb_credentials(
     return None
 
 
+def discover_wiki_replica_credentials(
+    env: Optional[Mapping[str, str]] = None,
+    *,
+    home_dir: Optional[Path | str] = None,
+) -> Optional[Tuple[str, str]]:
+    """Discovers Wiki Replicas client credentials from environment variables or replica.my.cnf."""
+    active_env = os.environ if env is None else env
+    explicit_user = str(active_env.get("TOOL_REPLICA_USER") or "").strip()
+    explicit_pass = str(active_env.get("TOOL_REPLICA_PASSWORD") or "").strip()
+    if explicit_user and explicit_pass:
+        return explicit_user, explicit_pass
+
+    for cnf_path in _replica_cnf_candidates(active_env, home_dir=home_dir):
+        parsed_cnf = _read_replica_my_cnf(cnf_path)
+        if parsed_cnf is not None:
+            cnf_user, cnf_pass, _, _, _ = parsed_cnf
+            return cnf_user, cnf_pass
+    return None
+
+
 def build_databases_config(
     env: Optional[Mapping[str, str]] = None,
     base_dir: Path | str = BASE_DIR,
@@ -326,6 +346,8 @@ REDIS_KEY_PREFIX = os.environ.get("REDIS_KEY_PREFIX", "proxycheck_dev_")
 REDIS_KEY_SECRET = os.environ.get("REDIS_KEY_SECRET", "").strip()
 TOOLSDB_PASSWORD = os.environ.get("TOOLSDB_PASSWORD", "")
 TOOL_TOOLSDB_PASSWORD = os.environ.get("TOOL_TOOLSDB_PASSWORD", "")
+TOOL_REPLICA_PASSWORD = os.environ.get("TOOL_REPLICA_PASSWORD", "")
+RANGEBLOCK_REALTIME_WIKIS = os.environ.get("RANGEBLOCK_REALTIME_WIKIS", "enwiki")
 
 
 def _build_default_cache_config(
@@ -442,6 +464,8 @@ DETECT_USER_RPM_LIMIT = _parse_non_negative_int_env("DETECT_USER_RPM_LIMIT", 120
 DETECT_GLOBAL_RPM_LIMIT = _parse_non_negative_int_env("DETECT_GLOBAL_RPM_LIMIT", 600)
 DETECT_BATCH_USER_RPM_LIMIT = _parse_non_negative_int_env("DETECT_BATCH_USER_RPM_LIMIT", 20)
 DETECT_BATCH_GLOBAL_RPM_LIMIT = _parse_non_negative_int_env("DETECT_BATCH_GLOBAL_RPM_LIMIT", 100)
+RANGEBLOCK_USER_RPM_LIMIT = _parse_non_negative_int_env("RANGEBLOCK_USER_RPM_LIMIT", 120)
+RANGEBLOCK_GLOBAL_RPM_LIMIT = _parse_non_negative_int_env("RANGEBLOCK_GLOBAL_RPM_LIMIT", 600)
 GADGET_TOKEN_USER_RPM_LIMIT = _parse_non_negative_int_env("GADGET_TOKEN_USER_RPM_LIMIT", 15)
 GADGET_TOKEN_GLOBAL_RPM_LIMIT = _parse_non_negative_int_env("GADGET_TOKEN_GLOBAL_RPM_LIMIT", 240)
 REFRESH_USER_RPM_LIMIT = _parse_non_negative_int_env("REFRESH_USER_RPM_LIMIT", 6)
@@ -667,8 +691,12 @@ LOGGING = {
             "class": "logging.StreamHandler",
         },
     },
+    "root": {
+        "handlers": ["console"],
+        "level": "INFO",
+    },
     "loggers": {
-        "detector.views": {
+        "detector": {
             "handlers": ["console"],
             "level": "INFO",
             "propagate": False,

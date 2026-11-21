@@ -123,8 +123,43 @@ export interface ProviderRawResult {
   isCached?: boolean;
   cachedAt?: string | null;
   isHistoricalFallback?: boolean;
+  isPending?: boolean;
   rawJson: Record<string, unknown>;
 }
+
+export interface RangeblockHitRow {
+  target: string;
+  cidr: number | null;
+  upperBound: string;
+  count: number;
+  isActive: boolean;
+  expiry: string | null;
+  indefinite: boolean;
+  lastBlockedAt?: string | null;
+  logUrl: string;
+  blockListUrl: string;
+}
+
+export interface RangeblockWikiSummary {
+  wiki: string;
+  isGlobal: boolean;
+  count: number;
+  hasActive: boolean;
+  domain: string;
+  rows: RangeblockHitRow[];
+}
+
+export interface RangeblockSummary {
+  ip: string;
+  ipVersion: 4 | 6;
+  localTotal: number;
+  globalTotal: number;
+  hasActive: boolean;
+  realtimeDegraded?: boolean;
+  wikis: RangeblockWikiSummary[];
+}
+
+export type AppTab = 'detector' | 'rb';
 
 export interface OfflineDatabaseEntry {
   key: string;
@@ -229,6 +264,8 @@ export interface DetectionResponse {
   isMobileOrCgnat?: boolean;
   sharedPrivacyEgress?: SharedPrivacyEgress | null;
   openProxyPorts?: number[];
+  rangeblock?: RangeblockSummary | null;
+  pendingProviders?: string[];
   results: ProviderRawResult[];
 }
 
@@ -382,6 +419,58 @@ export function buildPageUrlWithIp(pathname: string, search: string, ip: string 
     params.set('ip', canonical);
   } else {
     params.delete('ip');
+  }
+  const queryString = params.toString();
+  return queryString ? `${basePath}?${queryString}` : basePath;
+}
+
+/**
+ * Parses initial ip, tab, and wiki query parameters from window.location.search.
+ */
+export function parseInitialRouteParams(search?: string | null): {
+  ip: string;
+  tab: AppTab;
+  wiki: string | null;
+} {
+  try {
+    const params = new URLSearchParams(search || '');
+    const rawIp = (params.get('ip') || '').trim();
+    const rawTab = (params.get('tab') || '').trim().toLowerCase();
+    const rawWiki = (params.get('wiki') || '').trim().toLowerCase();
+    const tab: AppTab = rawTab === 'rb' || rawTab === 'rangeblock' ? 'rb' : 'detector';
+    const wiki = /^[a-z0-9_]{2,64}$/.test(rawWiki) ? rawWiki : null;
+    return { ip: rawIp, tab, wiki };
+  } catch {
+    return { ip: '', tab: 'detector', wiki: null };
+  }
+}
+
+/**
+ * Updates the relative page URL with ip, tab, and optional wiki query parameters.
+ */
+export function buildPageUrlWithState(
+  pathname: string,
+  search: string,
+  routeState: { ip?: string | null; tab?: AppTab; wiki?: string | null }
+): string {
+  const basePath = pathname && pathname.startsWith('/') ? pathname : '/';
+  const params = new URLSearchParams(search || '');
+  const canonical = routeState.ip ? canonicalizeIpAddress(routeState.ip) : null;
+  if (canonical) {
+    params.set('ip', canonical);
+  } else {
+    params.delete('ip');
+  }
+  if (routeState.tab === 'rb') {
+    params.set('tab', 'rb');
+    if (routeState.wiki && /^[a-z0-9_]{2,64}$/.test(routeState.wiki)) {
+      params.set('wiki', routeState.wiki);
+    } else {
+      params.delete('wiki');
+    }
+  } else {
+    params.delete('tab');
+    params.delete('wiki');
   }
   const queryString = params.toString();
   return queryString ? `${basePath}?${queryString}` : basePath;
@@ -722,6 +811,51 @@ export function filterComparisonResults(results: ProviderRawResult[] | undefined
   return results.filter((row) => row.provider !== 'GetIPIntel' && row.provider !== 'Tor Onionoo');
 }
 
+/**
+ * Merges resolved provider rows with pending SSE placeholder rows in canonical provider order.
+ */
+export function buildComparisonRowsWithPending(
+  results: ProviderRawResult[] | undefined | null,
+  pendingProviders: string[] | undefined | null
+): ProviderRawResult[] {
+  const resolvedByName = new Map<string, ProviderRawResult>();
+  for (const row of filterComparisonResults(results)) {
+    resolvedByName.set(row.provider, row);
+  }
+  const pendingSet = new Set(
+    (Array.isArray(pendingProviders) ? pendingProviders : []).filter(
+      (name) => name !== 'GetIPIntel' && name !== 'Tor Onionoo'
+    )
+  );
+  const ordered: ProviderRawResult[] = [];
+  for (const providerName of PROVIDER_NAMES) {
+    if (providerName === 'GetIPIntel' || providerName === 'Tor Onionoo') {
+      continue;
+    }
+    const existing = resolvedByName.get(providerName);
+    if (existing) {
+      ordered.push(existing);
+      continue;
+    }
+    if (pendingSet.has(providerName)) {
+      ordered.push({
+        provider: providerName,
+        status: 'Querying...',
+        statusCode: null,
+        asn: '-',
+        isp: '-',
+        organisation: '-',
+        location: '-',
+        usageType: '-',
+        securityFlags: [],
+        isPending: true,
+        rawJson: {},
+      });
+    }
+  }
+  return ordered;
+}
+
 export function simplifySecurityFlags(
   flags: { label: string; isHighRisk: boolean }[] | undefined
 ): { label: string; isHighRisk: boolean }[] {
@@ -737,17 +871,19 @@ export function simplifySecurityFlags(
   return [{ label: 'No Flags', isHighRisk: false }];
 }
 
+export type ChipStatus = 'notice' | 'warning' | 'error' | 'success';
+
 /**
- * Resolves the CSS pill modifier class for a simplified security flag.
+ * Resolves the Codex info chip status for a simplified security flag.
  */
-export function getSecurityFlagClass(flag: { label: string; isHighRisk: boolean }): string {
+export function getSecurityFlagChipStatus(flag: { label: string; isHighRisk: boolean }): ChipStatus {
   if (flag.isHighRisk) {
-    return 'flag-high-risk';
+    return 'error';
   }
   if (flag.label === 'Open Ports') {
-    return 'flag-warning';
+    return 'warning';
   }
-  return 'flag-safe';
+  return 'success';
 }
 
 export type ProviderDisplayRow = Omit<Partial<ProviderRawResult>, 'port'> & {
@@ -871,24 +1007,25 @@ export function getProviderMetaItems(
 }
 
 /**
- * Maps a provider HTTP or circuit-breaker status string to a Codex badge severity class.
+ * Maps a provider HTTP or circuit-breaker status string to a Codex info chip status.
  */
-export function getStatusBadgeClass(status?: string | null): string {
-  if (!status) return 'badge-neutral';
-  if (status === '200 OK') return 'badge-success';
+export function getStatusChipStatus(status?: string | null): ChipStatus {
+  if (!status) return 'notice';
+  if (status === '200 OK') return 'success';
   if (
+    status === 'Querying...' ||
     status === 'No API Key' ||
     status === 'Database Missing' ||
     status === 'Offline DB Missing' ||
     status === 'Skipped (IPv6)' ||
     status === 'Deferred (Light Mode)'
   ) {
-    return 'badge-neutral';
+    return 'notice';
   }
   if (status.includes('429') || status.includes('Cooldown') || status.includes('Quota Guard')) {
-    return 'badge-warning';
+    return 'warning';
   }
-  return 'badge-destructive';
+  return 'error';
 }
 
 /**
@@ -908,39 +1045,39 @@ export function getPredictionScoreTierClass(
 }
 
 /**
- * Resolves the multi-source arbitration badge class from consensus tier or verdict text.
+ * Resolves the multi-source arbitration info chip status from consensus tier or verdict text.
  */
-export function getArbitrationBadgeClass(
+export function getArbitrationChipStatus(
   data: Partial<DetectionResponse> | null | undefined
-): string {
-  if (!data) return 'badge-neutral';
+): ChipStatus {
+  if (!data) return 'notice';
   if (data.arbitrationTier === 'destructive' || data.isMajorityProxyVpn) {
-    return 'badge-destructive';
+    return 'error';
   }
   if (data.arbitrationTier === 'warning' || String(data.arbitrationVerdict || '').startsWith('Disputed')) {
-    return 'badge-warning';
+    return 'warning';
   }
   if (data.arbitrationTier === 'neutral') {
-    return 'badge-neutral';
+    return 'notice';
   }
-  return 'badge-success';
+  return 'success';
 }
 
 /**
- * Resolves the reverse DNS classification badge class.
+ * Resolves the reverse DNS classification info chip status.
  */
-export function getPtrBadgeClass(data: Partial<DetectionResponse> | null | undefined): string {
-  if (!data || !data.ptrCategory) return 'badge-neutral';
+export function getPtrChipStatus(data: Partial<DetectionResponse> | null | undefined): ChipStatus {
+  if (!data || !data.ptrCategory) return 'notice';
   if (data.ptrCategory === 'hosting_or_gateway' || data.ptrIsHighRisk) {
-    return 'badge-destructive';
+    return 'error';
   }
   if (data.ptrCategory === 'mobile_or_cgnat') {
-    return 'badge-warning';
+    return 'warning';
   }
   if (data.ptrCategory === 'dynamic_residential') {
-    return 'badge-success';
+    return 'success';
   }
-  return 'badge-neutral';
+  return 'notice';
 }
 
 export interface SharedPrivacyEgressInfo {
@@ -1167,12 +1304,128 @@ export function buildVerificationLinks(
 
   return {
     globalContributionsUrl: `${base}/wiki/Special:GlobalContributions/${pathSafeIp}`,
-    rangeblockFinderUrl: `https://rangeblockfinder.toolforge.org/?ip=${querySafeIp}`,
+    rangeblockFinderUrl: `/?ip=${querySafeIp}&tab=rb`,
     whoisGatewayUrl: `https://whois.toolforge.org/gateway.py?lookup=true&ip=${querySafeIp}`,
     specialBlockUrl,
     singleIpBlockUrl,
     rangeBlockUrl,
   };
+}
+
+function ipv4ToBigInt(ip: string): bigint {
+  const parts = ip.split('.').map((part) => BigInt(Number(part)));
+  return (parts[0]! << 24n) | (parts[1]! << 16n) | (parts[2]! << 8n) | parts[3]!;
+}
+
+function bigIntToIpv4(val: bigint): string {
+  return [
+    Number((val >> 24n) & 0xffn),
+    Number((val >> 16n) & 0xffn),
+    Number((val >> 8n) & 0xffn),
+    Number(val & 0xffn),
+  ].join('.');
+}
+
+function ipv6ToBigInt(canonicalIp: string): bigint {
+  const halves = canonicalIp.split('::');
+  const left = halves[0] ? halves[0].split(':') : [];
+  const right = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const missing = 8 - (left.length + right.length);
+  const groups = [
+    ...left,
+    ...Array.from({ length: Math.max(0, missing) }, () => '0'),
+    ...right,
+  ];
+  let acc = 0n;
+  for (const g of groups) {
+    acc = (acc << 16n) | BigInt(parseInt(g || '0', 16));
+  }
+  return acc;
+}
+
+function bigIntToIpv6(val: bigint): string {
+  const groups: string[] = [];
+  for (let i = 7; i >= 0; i -= 1) {
+    const shift = BigInt(i * 16);
+    groups.push(((val >> shift) & 0xffffn).toString(16));
+  }
+  return canonicalizeIpAddress(groups.join(':')) ?? groups.join(':');
+}
+
+function buildRangeblockLinkPair(
+  wikiDbname: string,
+  domain: string,
+  target: string
+): { logUrl: string; blockListUrl: string } {
+  const encoded = encodeURIComponent(target).replaceAll('%2F', '/').replaceAll('%3A', ':');
+  if (wikiDbname === 'global') {
+    return {
+      logUrl: `https://meta.wikimedia.org/wiki/Special:Log?type=gblblock&page=User:${encoded}`,
+      blockListUrl: `https://meta.wikimedia.org/wiki/Special:GlobalBlockList?ip=${encoded}`,
+    };
+  }
+  return {
+    logUrl: `https://${domain}/wiki/Special:Log?type=block&page=User:${encoded}`,
+    blockListUrl: `https://${domain}/wiki/Special:BlockList?wpTarget=${encoded}`,
+  };
+}
+
+/**
+ * Expands the full IPv4 (single IP plus /32 to /16) or IPv6 (single IP plus /64 to /19)
+ * rangeblock ladder for a selected wiki, merging in any hit counts and active flags.
+ */
+export function buildFullCidrLadder(
+  rawIp: string,
+  wikiSummary: RangeblockWikiSummary
+): RangeblockHitRow[] {
+  const canonical = canonicalizeIpAddress(rawIp)?.split('%')[0] ?? '';
+  if (!canonical) {
+    return wikiSummary.rows;
+  }
+  const hitByTarget = new Map<string, RangeblockHitRow>();
+  for (const row of wikiSummary.rows) {
+    hitByTarget.set(row.target, row);
+  }
+
+  const isV6 = canonical.includes(':');
+  const maxBits = isV6 ? 128n : 32n;
+  const addrInt = isV6 ? ipv6ToBigInt(canonical) : ipv4ToBigInt(canonical);
+  const allMask = (1n << maxBits) - 1n;
+  const prefixes = isV6
+    ? Array.from({ length: 46 }, (_, i) => 64 - i)
+    : Array.from({ length: 17 }, (_, i) => 32 - i);
+
+  const makeRow = (target: string, cidr: number | null, upperBound: string): RangeblockHitRow => {
+    const hit = hitByTarget.get(target);
+    if (hit) {
+      return hit;
+    }
+    const links = buildRangeblockLinkPair(wikiSummary.wiki, wikiSummary.domain, target);
+    return {
+      target,
+      cidr,
+      upperBound,
+      count: 0,
+      isActive: false,
+      expiry: null,
+      indefinite: false,
+      lastBlockedAt: null,
+      logUrl: links.logUrl,
+      blockListUrl: links.blockListUrl,
+    };
+  };
+
+  const rows: RangeblockHitRow[] = [makeRow(canonical, null, canonical)];
+  for (const prefix of prefixes) {
+    const hostBits = maxBits - BigInt(prefix);
+    const netMask = (allMask << hostBits) & allMask;
+    const netStart = addrInt & netMask;
+    const netEnd = netStart | ((1n << hostBits) - 1n);
+    const startStr = isV6 ? bigIntToIpv6(netStart) : bigIntToIpv4(netStart);
+    const endStr = isV6 ? bigIntToIpv6(netEnd) : bigIntToIpv4(netEnd);
+    rows.push(makeRow(`${startStr}/${prefix}`, prefix, endStr));
+  }
+  return rows;
 }
 
 function resolvePrimaryIspLabel(data: Partial<DetectionResponse>): string {
@@ -1601,6 +1854,7 @@ export function formatUpstreamQuotaLabel(row: Pick<ProviderDashboardRow, 'upstre
 
 export interface DetectionCoordinatorState {
   isLoading: boolean;
+  isStreaming?: boolean;
   isRefreshing?: boolean;
   validationError: string;
   sessionExpiredMessage: string;
@@ -1654,6 +1908,8 @@ export function createDetectionCoordinator(
   fetchImpl: (url: string, init?: RequestInit) => Promise<{
     ok: boolean;
     status: number;
+    headers?: { get?: (name: string) => string | null } | null;
+    body?: ReadableStream<Uint8Array> | null;
     json: () => Promise<any>;
   }>,
   initialUser: UserSessionState = {
@@ -1666,6 +1922,7 @@ export function createDetectionCoordinator(
 ) {
   const state: DetectionCoordinatorState = options?.state ?? {
     isLoading: false,
+    isStreaming: false,
     isRefreshing: false,
     validationError: '',
     sessionExpiredMessage: '',
@@ -1676,6 +1933,10 @@ export function createDetectionCoordinator(
     user: { ...initialUser },
     ipHistory: [],
   };
+
+  if (state.isStreaming === undefined) {
+    state.isStreaming = false;
+  }
 
   if (state.isRefreshing === undefined) {
     state.isRefreshing = false;
@@ -1711,6 +1972,7 @@ export function createDetectionCoordinator(
     }
     abortActiveRefresh();
     state.isLoading = false;
+    state.isStreaming = false;
     state.refreshWarningMessage = '';
   }
 
@@ -1899,6 +2161,138 @@ export function createDetectionCoordinator(
     await startRefreshForCanonicalIp(canonicalIp, latestRequestId);
   }
 
+  function applyCompleteDetectionPayload(data: any, targetIp: string, requestId: number): void {
+    if (requestId !== latestRequestId) {
+      return;
+    }
+    state.sessionExpiredMessage = '';
+    state.detectionData = data;
+    state.diagnostic = buildDiagnosticMetrics(data);
+    const resolvedIp = canonicalizeIpAddress(data?.ip || targetIp) ?? (data?.ip || targetIp);
+    state.ipHistory = updateIpHistory(state.ipHistory, resolvedIp);
+    options?.onHistoryUpdated?.(state.ipHistory);
+    options?.onDetectionSuccess?.(resolvedIp, data);
+
+    if (
+      data?.cacheMeta?.shouldAutoRefresh === true &&
+      !data?.cacheMeta?.refreshInProgress &&
+      !data?.isNonPublic
+    ) {
+      const canonicalForRefresh = canonicalizeIpAddress(resolvedIp);
+      if (canonicalForRefresh) {
+        void startRefreshForCanonicalIp(canonicalForRefresh, requestId);
+      }
+    }
+  }
+
+  function applyStreamEvent(eventName: string, payload: any, targetIp: string, requestId: number): void {
+    if (requestId !== latestRequestId || !payload || typeof payload !== 'object') {
+      return;
+    }
+    if (eventName === 'snapshot') {
+      state.sessionExpiredMessage = '';
+      state.detectionData = payload;
+      state.diagnostic = buildDiagnosticMetrics(payload);
+      state.isLoading = false;
+      const pending = Array.isArray(payload.pendingProviders) ? payload.pendingProviders : [];
+      state.isStreaming = pending.length > 0;
+      const resolvedIp = canonicalizeIpAddress(payload?.ip || targetIp) ?? (payload?.ip || targetIp);
+      state.ipHistory = updateIpHistory(state.ipHistory, resolvedIp);
+      options?.onHistoryUpdated?.(state.ipHistory);
+      options?.onDetectionSuccess?.(resolvedIp, payload);
+      return;
+    }
+    if (eventName === 'provider' && state.detectionData) {
+      const existingResults: ProviderRawResult[] = Array.isArray(state.detectionData.results)
+        ? [...state.detectionData.results]
+        : [];
+      const row = payload.row as ProviderRawResult | undefined;
+      if (row && row.provider) {
+        const idx = existingResults.findIndex((r) => r.provider === row.provider);
+        if (idx >= 0) {
+          existingResults[idx] = row;
+        } else {
+          existingResults.push(row);
+        }
+      }
+      const { provider: _p, providerKey: _pk, row: _r, ...overviewPatch } = payload;
+      state.detectionData = {
+        ...state.detectionData,
+        ...overviewPatch,
+        results: existingResults,
+      };
+      return;
+    }
+    if (eventName === 'done') {
+      state.isStreaming = false;
+      if (state.detectionData) {
+        const merged = {
+          ...state.detectionData,
+          ...payload,
+          pendingProviders: [],
+        };
+        state.detectionData = merged;
+        state.diagnostic = buildDiagnosticMetrics(merged);
+        if (
+          merged?.cacheMeta?.shouldAutoRefresh === true &&
+          !merged?.cacheMeta?.refreshInProgress &&
+          !merged?.isNonPublic
+        ) {
+          const resolvedIp = canonicalizeIpAddress(merged?.ip || targetIp) ?? (merged?.ip || targetIp);
+          if (resolvedIp) {
+            void startRefreshForCanonicalIp(resolvedIp, requestId);
+          }
+        }
+      }
+    }
+  }
+
+  async function consumeSseResponse(
+    body: ReadableStream<Uint8Array>,
+    targetIp: string,
+    requestId: number
+  ): Promise<boolean> {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let sawDone = false;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done || requestId !== latestRequestId) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      let separatorIdx = buffer.indexOf('\n\n');
+      while (separatorIdx !== -1) {
+        const block = buffer.slice(0, separatorIdx);
+        buffer = buffer.slice(separatorIdx + 2);
+        let eventName = 'message';
+        const dataLines: string[] = [];
+        for (const rawLine of block.split(/\r?\n/)) {
+          if (rawLine.startsWith('event:')) {
+            eventName = rawLine.slice('event:'.length).trim();
+          } else if (rawLine.startsWith('data:')) {
+            dataLines.push(rawLine.slice('data:'.length).trim());
+          }
+        }
+        if (dataLines.length > 0) {
+          try {
+            const parsed = JSON.parse(dataLines.join('\n'));
+            applyStreamEvent(eventName, parsed, targetIp, requestId);
+            if (eventName === 'done') {
+              sawDone = true;
+            }
+          } catch {
+            // Ignore malformed SSE event payload.
+          }
+        }
+        separatorIdx = buffer.indexOf('\n\n');
+      }
+    }
+    return sawDone;
+  }
+
   async function executeDetection(ipToQuery: string): Promise<void> {
     state.validationError = '';
     const targetIp = ipToQuery.trim();
@@ -1915,16 +2309,20 @@ export function createDetectionCoordinator(
     abortActiveRefresh();
     state.refreshWarningMessage = '';
     state.lastRefreshedAt = null;
+    state.isStreaming = false;
 
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     activeAbortController = controller;
 
     state.isLoading = true;
     try {
-      const fetchOptions = controller ? { signal: controller.signal } : undefined;
+      const streamHeaders = { Accept: 'text/event-stream' };
+      const streamOptions: RequestInit = controller
+        ? { signal: controller.signal, headers: streamHeaders }
+        : { headers: streamHeaders };
       const response = await fetchImpl(
-        `/api/v1/detect?ip=${encodeURIComponent(targetIp)}`,
-        fetchOptions
+        `/api/v1/detect/stream?ip=${encodeURIComponent(targetIp)}`,
+        streamOptions
       );
       if (requestId !== latestRequestId) {
         return;
@@ -1935,37 +2333,45 @@ export function createDetectionCoordinator(
         return;
       }
 
-      if (!response.ok) {
-        const errData = await response.json().catch(() => ({}));
+      const contentType = response.headers?.get?.('content-type') || '';
+      if (response.ok && contentType.includes('text/event-stream') && response.body?.getReader) {
+        const sawDone = await consumeSseResponse(response.body, targetIp, requestId);
         if (requestId !== latestRequestId) {
           return;
         }
-        throw new Error(errData.message || errData.error || `Server returned HTTP ${response.status}`);
-      }
-
-      const data = await response.json();
-      if (requestId !== latestRequestId) {
+        if (sawDone) {
+          return;
+        }
+      } else if (response.ok && !contentType.includes('text/event-stream')) {
+        const data = await response.json();
+        applyCompleteDetectionPayload(data, targetIp, requestId);
         return;
       }
 
-      state.sessionExpiredMessage = '';
-      state.detectionData = data;
-      state.diagnostic = buildDiagnosticMetrics(data);
-      const resolvedIp = canonicalizeIpAddress(data?.ip || targetIp) ?? (data?.ip || targetIp);
-      state.ipHistory = updateIpHistory(state.ipHistory, resolvedIp);
-      options?.onHistoryUpdated?.(state.ipHistory);
-      options?.onDetectionSuccess?.(resolvedIp, data);
-
-      if (
-        data?.cacheMeta?.shouldAutoRefresh === true &&
-        !data?.cacheMeta?.refreshInProgress &&
-        !data?.isNonPublic
-      ) {
-        const canonicalForRefresh = canonicalizeIpAddress(resolvedIp);
-        if (canonicalForRefresh) {
-          void startRefreshForCanonicalIp(canonicalForRefresh, requestId);
-        }
+      const fallbackOptions = controller ? { signal: controller.signal } : undefined;
+      const fallbackResponse = await fetchImpl(
+        `/api/v1/detect?ip=${encodeURIComponent(targetIp)}`,
+        fallbackOptions
+      );
+      if (requestId !== latestRequestId) {
+        return;
       }
+      if (fallbackResponse.status === 401) {
+        handleSessionExpired();
+        return;
+      }
+      if (!fallbackResponse.ok) {
+        const errData = await fallbackResponse.json().catch(() => ({}));
+        if (requestId !== latestRequestId) {
+          return;
+        }
+        throw new Error(
+          errData.message || errData.error || `Server returned HTTP ${fallbackResponse.status}`
+        );
+      }
+
+      const fallbackData = await fallbackResponse.json();
+      applyCompleteDetectionPayload(fallbackData, targetIp, requestId);
     } catch (err: any) {
       if (requestId !== latestRequestId || (err && err.name === 'AbortError')) {
         return;
@@ -1975,6 +2381,7 @@ export function createDetectionCoordinator(
     } finally {
       if (requestId === latestRequestId) {
         state.isLoading = false;
+        state.isStreaming = false;
       }
     }
   }

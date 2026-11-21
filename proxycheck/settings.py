@@ -7,7 +7,7 @@ import math
 import os
 import sys
 from pathlib import Path
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, Mapping, Optional, Sequence, Tuple
 
 from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
@@ -164,6 +164,44 @@ ASGI_APPLICATION = "proxycheck.asgi.application"
 
 DEFAULT_TOOLSDB_HOST = "tools.db.svc.wikimedia.cloud"
 DEFAULT_TOOLSDB_PORT = 3306
+_MANAGEMENT_COMMAND_DB_TIMEOUT_COMMANDS = frozenset(
+    {
+        "sync_rangeblocks",
+        "purge_l2_cache",
+        "migrate",
+        "makemigrations",
+        "sqlmigrate",
+        "showmigrations",
+        "dbshell",
+        "flush",
+        "loaddata",
+        "dumpdata",
+        "check_setup",
+    }
+)
+
+
+def _is_management_command_argv(argv: Optional[Sequence[str]] = None) -> bool:
+    """Returns True when invoked as a non-server Django management command."""
+    args = sys.argv if argv is None else argv
+    if len(args) < 2:
+        return False
+    subcommand = str(args[1]).strip().lower()
+    if subcommand in _MANAGEMENT_COMMAND_DB_TIMEOUT_COMMANDS:
+        return True
+    script_name = Path(str(args[0])).name.lower()
+    return script_name == "manage.py" and subcommand not in {"runserver", "test"}
+
+
+def _parse_positive_int_from_mapping(mapping: Mapping[str, str], name: str, default: int) -> int:
+    raw_value = str(mapping.get(name) or "").strip()
+    if not raw_value:
+        return default
+    try:
+        parsed = int(raw_value)
+        return parsed if parsed > 0 else default
+    except ValueError:
+        return default
 
 
 def _strip_cnf_quotes(raw_value: str) -> str:
@@ -295,6 +333,7 @@ def build_databases_config(
     *,
     is_test_run: bool = False,
     home_dir: Optional[Path | str] = None,
+    is_management_command: Optional[bool] = None,
 ) -> dict[str, dict[str, Any]]:
     """Builds the Django DATABASES dictionary using ToolsDB credential discovery or SQLite fallback."""
     resolved_base = Path(base_dir)
@@ -312,6 +351,12 @@ def build_databases_config(
     if discovered is not None:
         db_user, db_password, db_host, db_port, db_name = discovered
         if db_name:
+            use_management_timeouts = (
+                _is_management_command_argv() if is_management_command is None else bool(is_management_command)
+            )
+            default_connect_timeout = 10 if use_management_timeouts else 3
+            default_read_timeout = 120 if use_management_timeouts else 5
+            default_write_timeout = 30 if use_management_timeouts else 5
             return {
                 "default": {
                     "ENGINE": "django.db.backends.mysql",
@@ -322,9 +367,15 @@ def build_databases_config(
                     "PORT": db_port,
                     "CONN_MAX_AGE": 0,
                     "OPTIONS": {
-                        "connect_timeout": 3,
-                        "read_timeout": 5,
-                        "write_timeout": 5,
+                        "connect_timeout": _parse_positive_int_from_mapping(
+                            active_env, "TOOLSDB_CONNECT_TIMEOUT", default_connect_timeout
+                        ),
+                        "read_timeout": _parse_positive_int_from_mapping(
+                            active_env, "TOOLSDB_READ_TIMEOUT", default_read_timeout
+                        ),
+                        "write_timeout": _parse_positive_int_from_mapping(
+                            active_env, "TOOLSDB_WRITE_TIMEOUT", default_write_timeout
+                        ),
                         "charset": "utf8mb4",
                     },
                 }

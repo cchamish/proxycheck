@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import pymysql
 from django.core.management.base import BaseCommand, CommandError
-from django.db import close_old_connections, connection, transaction
+from django.db import DatabaseError, OperationalError, close_old_connections, connection, transaction
 
 from detector.models import RangeblockAggregate, RangeblockSyncState
 from detector.rangeblock_service import (
@@ -23,9 +24,59 @@ from proxycheck.settings import discover_wiki_replica_credentials
 logger = logging.getLogger("detector.views")
 
 _DEFAULT_BATCH_SIZE = 50000
-_UPSERT_SQL_BATCH_SIZE = 500
-_DEACTIVATE_BATCH_SIZE = 1000
+_UPSERT_SQL_BATCH_SIZE = 200
+_DEACTIVATE_BATCH_SIZE = 500
 _PROGRESS_WIKIS = frozenset({"enwiki", "metawiki", "global", "commonswiki", "wikidatawiki", "zhwiki"})
+_TRANSIENT_TOOLSDB_ERROR_CODES = frozenset({2006, 2013, 1205, 1213})
+_TOOLSDB_MAX_RETRIES = 3
+_TOOLSDB_RETRY_BASE_DELAY_SECONDS = 1.0
+
+_T = TypeVar("_T")
+
+
+def _extract_mysql_error_code(exc: BaseException) -> Optional[int]:
+    if exc.args:
+        first = exc.args[0]
+        if isinstance(first, int) and not isinstance(first, bool):
+            return first
+    cause = getattr(exc, "__cause__", None)
+    cause_args = getattr(cause, "args", None) if cause is not None else None
+    if cause_args:
+        first = cause_args[0]
+        if isinstance(first, int) and not isinstance(first, bool):
+            return first
+    return None
+
+
+def _run_toolsdb_with_retry(
+    operation: Callable[[], _T],
+    *,
+    context: str,
+    max_retries: int = _TOOLSDB_MAX_RETRIES,
+    base_delay: float = _TOOLSDB_RETRY_BASE_DELAY_SECONDS,
+) -> _T:
+    """Runs an idempotent ToolsDB operation, reconnecting and backing off on transient MySQL errors."""
+    for attempt in range(max_retries + 1):
+        try:
+            close_old_connections()
+            return operation()
+        except OperationalError as exc:
+            error_code = _extract_mysql_error_code(exc)
+            connection.close()
+            if error_code not in _TRANSIENT_TOOLSDB_ERROR_CODES or attempt >= max_retries:
+                raise
+            delay = base_delay * (2**attempt)
+            logger.warning(
+                "Transient ToolsDB error (code=%s) during %s; retrying (%d/%d) in %.1fs: %s",
+                error_code,
+                context,
+                attempt + 1,
+                max_retries,
+                delay,
+                sanitize_error_message(str(exc)),
+            )
+            time.sleep(delay)
+    raise AssertionError("Unreachable retry loop exit")
 
 
 def _decode_str(raw_val: Any) -> str:
@@ -385,17 +436,27 @@ def _stream_incremental_logs(
 
         total_targets += len(chunk_deltas)
         if not dry_run:
-            close_old_connections()
-            with transaction.atomic():
-                if chunk_deltas:
-                    _upsert_log_chunk(storage_wiki, chunk_deltas, now_dt=now_dt)
-                _advance_sync_state(
-                    storage_wiki,
-                    wiki_domain=wiki_domain,
-                    now_dt=now_dt,
-                    last_log_id=upper_id,
-                    last_log_timestamp=chunk_latest_ts,
-                )
+
+            def _commit_log_chunk(
+                deltas: Dict[str, Dict[str, Any]] = chunk_deltas,
+                log_id: int = upper_id,
+                latest_ts: str = chunk_latest_ts,
+            ) -> None:
+                with transaction.atomic():
+                    if deltas:
+                        _upsert_log_chunk(storage_wiki, deltas, now_dt=now_dt)
+                    _advance_sync_state(
+                        storage_wiki,
+                        wiki_domain=wiki_domain,
+                        now_dt=now_dt,
+                        last_log_id=log_id,
+                        last_log_timestamp=latest_ts,
+                    )
+
+            _run_toolsdb_with_retry(
+                _commit_log_chunk,
+                context=f"log chunk upsert for {storage_wiki} (up to log_id={upper_id})",
+            )
         cursor_id = upper_id
 
     return total_targets
@@ -409,43 +470,49 @@ def _sync_active_blocks_to_toolsdb(
     now_dt: datetime,
 ) -> Tuple[int, int]:
     """Reconciles only the active block subset in ToolsDB without loading historical rows."""
-    close_old_connections()
-    with transaction.atomic():
-        local_active_rows = list(
-            RangeblockAggregate.objects.filter(wiki_dbname=storage_wiki, has_active=True).values_list(
-                "id", "target_cidr", "active_expiry", "active_indefinite"
+
+    def _reconcile_active_blocks() -> Tuple[int, int]:
+        with transaction.atomic():
+            local_active_rows = list(
+                RangeblockAggregate.objects.filter(wiki_dbname=storage_wiki, has_active=True).values_list(
+                    "id", "target_cidr", "active_expiry", "active_indefinite"
+                )
             )
-        )
-        local_active_meta: Dict[str, Tuple[Optional[datetime], bool]] = {}
-        deactivated_ids: List[int] = []
-        for row_id, target_cidr, local_expiry, local_indef in local_active_rows:
-            if target_cidr not in active_map:
-                deactivated_ids.append(row_id)
-            else:
-                local_active_meta[target_cidr] = (_normalise_utc_datetime(local_expiry), bool(local_indef))
+            local_active_meta: Dict[str, Tuple[Optional[datetime], bool]] = {}
+            deactivated_ids: List[int] = []
+            for row_id, target_cidr, local_expiry, local_indef in local_active_rows:
+                if target_cidr not in active_map:
+                    deactivated_ids.append(row_id)
+                else:
+                    local_active_meta[target_cidr] = (_normalise_utc_datetime(local_expiry), bool(local_indef))
 
-        active_to_upsert: Dict[str, Dict[str, Any]] = {}
-        for target_cidr, info in active_map.items():
-            existing_meta = local_active_meta.get(target_cidr)
-            desired_meta = (info["active_expiry"], bool(info["active_indefinite"]))
-            if existing_meta is None or existing_meta != desired_meta:
-                active_to_upsert[target_cidr] = info
+            active_to_upsert: Dict[str, Dict[str, Any]] = {}
+            for target_cidr, info in active_map.items():
+                existing_meta = local_active_meta.get(target_cidr)
+                desired_meta = (info["active_expiry"], bool(info["active_indefinite"]))
+                if existing_meta is None or existing_meta != desired_meta:
+                    active_to_upsert[target_cidr] = info
 
-        for id_batch in _iter_batches(deactivated_ids, _DEACTIVATE_BATCH_SIZE):
-            RangeblockAggregate.objects.filter(id__in=id_batch).update(
-                has_active=False,
-                active_expiry=None,
-                active_indefinite=False,
-                updated_at=now_dt,
-            )
+            for id_batch in _iter_batches(deactivated_ids, _DEACTIVATE_BATCH_SIZE):
+                RangeblockAggregate.objects.filter(id__in=id_batch).update(
+                    has_active=False,
+                    active_expiry=None,
+                    active_indefinite=False,
+                    updated_at=now_dt,
+                )
 
-        upserted_count = 0
-        if active_to_upsert:
-            upserted_count = _upsert_active_blocks(storage_wiki, active_to_upsert, now_dt=now_dt)
+            upserted_count = 0
+            if active_to_upsert:
+                upserted_count = _upsert_active_blocks(storage_wiki, active_to_upsert, now_dt=now_dt)
 
-        _advance_sync_state(storage_wiki, wiki_domain=wiki_domain, now_dt=now_dt)
+            _advance_sync_state(storage_wiki, wiki_domain=wiki_domain, now_dt=now_dt)
 
-    return upserted_count, len(deactivated_ids)
+        return upserted_count, len(deactivated_ids)
+
+    return _run_toolsdb_with_retry(
+        _reconcile_active_blocks,
+        context=f"active block reconciliation for {storage_wiki}",
+    )
 
 
 class Command(BaseCommand):
@@ -483,7 +550,10 @@ class Command(BaseCommand):
         batch_size: int,
         dry_run: bool,
     ) -> Tuple[int, int]:
-        state = RangeblockSyncState.objects.filter(wiki_dbname=storage_wiki).first()
+        state = _run_toolsdb_with_retry(
+            lambda: RangeblockSyncState.objects.filter(wiki_dbname=storage_wiki).first(),
+            context=f"sync state lookup for {storage_wiki}",
+        )
         last_log_id = int(state.last_log_id) if state is not None else 0
         log_targets = _stream_incremental_logs(
             cursor,
@@ -596,7 +666,8 @@ class Command(BaseCommand):
                                 self._write_progress(
                                     f"[global] completed (log_targets={global_logs}, active_updates={global_active})."
                                 )
-                        except pymysql.MySQLError as exc:
+                        except (pymysql.MySQLError, DatabaseError) as exc:
+                            connection.close()
                             failed_wikis.append(dbname)
                             section_failed += 1
                             logger.warning(

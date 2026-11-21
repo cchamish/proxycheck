@@ -53,6 +53,7 @@ class RangeblockAggregate(models.Model):
         ]
         indexes = [
             models.Index(fields=["ip_version", "target_cidr"], name="idx_rb_agg_ver_target"),
+            models.Index(fields=["wiki_dbname", "has_active"], name="idx_rb_agg_wiki_active"),
         ]
 
     def __str__(self) -> str:

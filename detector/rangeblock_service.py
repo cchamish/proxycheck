@@ -517,10 +517,12 @@ def _row_from_record(
     candidate: RangeblockCandidate,
     rec: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    has_active = bool(rec.get("has_active"))
-    count = compute_effective_block_count(int(rec.get("block_count") or 0), has_active)
     expiry_dt = rec.get("active_expiry")
     is_indef = bool(rec.get("active_indefinite"))
+    has_active = bool(rec.get("has_active")) and (
+        is_indef or not isinstance(expiry_dt, datetime) or expiry_dt > datetime.now(timezone.utc)
+    )
+    count = compute_effective_block_count(int(rec.get("block_count") or 0), has_active)
     last_dt = rec.get("last_blocked_at")
     log_url, block_list_url = build_rangeblock_links(wiki_dbname, domain, candidate.target)
     return {

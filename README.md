@@ -2,6 +2,10 @@
 
 A tool that uses external APIs for proxy status of an IP
 
+## Architecture
+
+See [docs/architecture.md](./docs/architecture.md) for diagrams of the backend, caching, providers, frontend, gadget, rangeblock lookup and scheduled jobs.
+
 ## Credits
 
 * [ipcheck](https://github.com/SQL-enwiki/ipcheck)
@@ -55,7 +59,7 @@ toolforge jobs run update-offline-dbs-init \
   --mount=all --wait \
   --command "python manage.py update_offline_dbs"
 
-# 3. Register the scheduled database update jobs (@hourly StopForumSpam + @daily MaxMind + @daily Cloud CIDRs; see jobs.yaml)
+# 3. Register the scheduled jobs (offline database updates, L2 cache purge and rangeblock sync; see jobs.yaml)
 toolforge jobs load jobs.yaml
 
 # 4. Start or restart the ASGI webservice with NFS mounts enabled

@@ -22,6 +22,7 @@ from detector.cache_backends import get_redis_namespace
 from detector.models import RangeblockAggregate, RangeblockSyncState
 from detector.provider_registry import REDIS_TRANSPORT_ERRORS
 from detector.rangeblock_service import (
+    expand_db_lookup_targets,
     get_configured_realtime_wikis,
     normalize_block_target,
     parse_mw_expiry,
@@ -644,17 +645,6 @@ def _safe_close_cursor(cursor: Any) -> None:
         cursor.close()
 
 
-def _expand_db_lookup_targets(targets: Sequence[str]) -> List[str]:
-    expanded: List[str] = []
-    seen: Set[str] = set()
-    for target in targets:
-        for variant in (target, target.upper()):
-            if variant not in seen:
-                seen.add(variant)
-                expanded.append(variant)
-    return expanded
-
-
 def _merge_active_rows(active_map: Dict[str, Dict[str, Any]], rows: Iterable[Tuple[Any, Any]]) -> None:
     for raw_target, raw_expiry in rows:
         normalised = normalize_block_target(_decode_str(raw_target))
@@ -802,7 +792,7 @@ def _fetch_targeted_active_from_conn(
     targets: Sequence[str],
     now_mw: str,
 ) -> Dict[str, Dict[str, Any]]:
-    expanded = _expand_db_lookup_targets(targets)
+    expanded = expand_db_lookup_targets(targets)
     active_map: Dict[str, Dict[str, Any]] = {}
     with conn.cursor() as cursor:
         for batch in _iter_batches(expanded, _TARGETED_ACTIVE_BATCH_SIZE):

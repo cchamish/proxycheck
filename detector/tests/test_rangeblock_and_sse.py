@@ -1,6 +1,7 @@
 """Core P0 tests for rangeblock invariants, real-time overrides, auth guards, and SSE streaming."""
 
 import json
+import sqlite3
 from unittest.mock import AsyncMock, patch
 
 import dns.resolver
@@ -125,3 +126,77 @@ class RangeblockAndSseTests(TestCase):
         self.assertIn("rangeblock", events[0][1])
         self.assertIn("provider", [name for name, _ in events[1:-1]])
         self.assertEqual(events[-1][0], "done")
+
+
+class _ReplicaCursor:
+    """Runs the live replica SQL against SQLite tables seeded with MediaWiki's stored target spellings."""
+
+    def __init__(self, conn):
+        self._cursor = conn.cursor()
+
+    def execute(self, sql, params):
+        self._cursor.execute(sql.replace("%s", "?"), list(params))
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+
+def _seed_replica(stored_targets):
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.executescript(
+        "CREATE TABLE block_target (bt_id INTEGER PRIMARY KEY, bt_address TEXT, bt_user INTEGER);"
+        "CREATE TABLE block (bl_id INTEGER PRIMARY KEY, bl_target INTEGER, bl_expiry TEXT);"
+        "CREATE TABLE logging_logindex (log_type TEXT, log_action TEXT, log_namespace INTEGER, "
+        "log_title TEXT, log_timestamp TEXT);"
+    )
+    for bt_id, target in enumerate(stored_targets, start=1):
+        conn.execute("INSERT INTO block_target VALUES (?, ?, NULL)", (bt_id, target))
+        conn.execute("INSERT INTO block VALUES (?, ?, 'infinity')", (bt_id, bt_id))
+        conn.execute(
+            "INSERT INTO logging_logindex VALUES ('block', 'block', 2, ?, '20260101000000')",
+            (target,),
+        )
+    return conn
+
+
+class RangeblockReplicaTargetSpellingTests(TestCase):
+    """Live replica lookups must match the targets as MediaWiki stores them (IPUtils::sanitizeIP)."""
+
+    async def _query_live(self, ip, stored_targets):
+        conn = _seed_replica(stored_targets)
+        self.addCleanup(conn.close)
+
+        def _sqlite_replica(wiki_dbname, db_targets, _creds):
+            return {wiki_dbname: rangeblock_service._query_local_wiki_tables(_ReplicaCursor(conn), db_targets, "0")}
+
+        with (
+            patch("detector.rangeblock_service.discover_wiki_replica_credentials", return_value=("u", "p")),
+            patch("detector.rangeblock_service._resolve_realtime_wiki_list", return_value=("enwiki",)),
+            patch("detector.rangeblock_service._query_single_replica_wiki_sync", side_effect=_sqlite_replica),
+        ):
+            summary = await rangeblock_service.query_rangeblocks_for_ip(ip)
+        return [(row["target"], row["count"], row["isActive"]) for wiki in summary["wikis"] for row in wiki["rows"]]
+
+    async def test_ipv6_single_ip_block_matches_expanded_spelling(self):
+        rows = await self._query_live("2606:4700:4700::1111", ["2606:4700:4700:0:0:0:0:1111"])
+        self.assertEqual(rows, [("2606:4700:4700::1111", 1, True)])
+
+    async def test_ipv6_cidr_block_matches_expanded_spelling(self):
+        rows = await self._query_live("2606:4700:4700::1111", ["2606:4700:4700:0:0:0:0:0/48"])
+        self.assertEqual(rows, [("2606:4700:4700::/48", 1, True)])
+
+    async def test_ipv4_blocks_still_match(self):
+        rows = await self._query_live("8.8.8.8", ["8.8.8.8", "8.8.8.0/24"])
+        self.assertEqual(rows, [("8.8.8.8", 1, True), ("8.8.8.0/24", 1, True)])
+
+    def test_lookup_targets_include_mediawiki_spelling(self):
+        self.assertEqual(
+            rangeblock_service.expand_db_lookup_targets(["8.8.8.0/24", "2606:4700:4700::1111", "2606:4700:4700::/48"]),
+            [
+                "8.8.8.0/24",
+                "2606:4700:4700::1111",
+                "2606:4700:4700:0:0:0:0:1111",
+                "2606:4700:4700::/48",
+                "2606:4700:4700:0:0:0:0:0/48",
+            ],
+        )

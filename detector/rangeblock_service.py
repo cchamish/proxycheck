@@ -286,11 +286,25 @@ def _query_toolsdb_aggregates_sync(
     return rows, domain_map
 
 
-def _expand_db_lookup_targets(targets: Sequence[str]) -> List[str]:
+def _mediawiki_target_spelling(target: str) -> str:
+    """Spells an IPv6 target as MediaWiki stores it (IPUtils::sanitizeIP): eight uppercase words, no leading zeros."""
+    address, separator, prefix = target.partition("/")
+    try:
+        addr = ipaddress.ip_address(address)
+    except ValueError:
+        return target
+    if addr.version == 4:
+        return target
+    words = ":".join(f"{int(word, 16):X}" for word in addr.exploded.split(":"))
+    return f"{words}{separator}{prefix}"
+
+
+def expand_db_lookup_targets(targets: Sequence[str]) -> List[str]:
+    """Returns each target alongside its MediaWiki spelling for exact-match replica lookups."""
     expanded: List[str] = []
     seen: Set[str] = set()
     for target in targets:
-        for variant in (target, target.upper()):
+        for variant in (target, _mediawiki_target_spelling(target)):
             if variant not in seen:
                 seen.add(variant)
                 expanded.append(variant)
@@ -481,7 +495,7 @@ async def _fetch_realtime_wiki_blocks(
     if creds is None:
         return {}, set(), False
 
-    expanded_targets = _expand_db_lookup_targets(all_targets)
+    expanded_targets = expand_db_lookup_targets(all_targets)
     results = await asyncio.gather(
         *(
             asyncio.to_thread(_query_single_replica_wiki_sync, wiki_name, expanded_targets, creds)

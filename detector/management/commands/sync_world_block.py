@@ -22,6 +22,7 @@ from detector.cache_backends import get_redis_namespace
 from detector.models import RangeblockAggregate, RangeblockSyncState
 from detector.provider_registry import REDIS_TRANSPORT_ERRORS
 from detector.rangeblock_service import (
+    get_configured_realtime_wikis,
     normalize_block_target,
     parse_mw_expiry,
     parse_mw_timestamp,
@@ -271,6 +272,15 @@ _FETCH_EXPIRED_ACTIVE_WIKIS_SQL = (
     "AND active_expiry IS NOT NULL AND active_expiry <= %s"
 )
 
+_FETCH_EXPIRED_ACTIVE_WIKIS_BY_WIKI_SQL_PREFIX = (
+    "SELECT DISTINCT wiki_dbname "
+    "FROM detector_rangeblock_agg "
+    "WHERE wiki_dbname IN ({placeholders}) "
+    "AND has_active = 1 AND active_indefinite = 0 "
+    "AND active_expiry IS NOT NULL AND active_expiry <= %s"
+)
+_EXPIRED_WIKIS_BATCH_SIZE = 50
+
 _DEACTIVATE_EXPIRED_ACTIVE_MYSQL_SQL = (
     "UPDATE detector_rangeblock_agg "
     "SET has_active = 0, active_expiry = NULL, active_indefinite = 0, updated_at = %s "
@@ -288,6 +298,13 @@ _DEACTIVATE_EXPIRED_ACTIVE_SQLITE_SQL = (
     "AND active_expiry IS NOT NULL AND active_expiry <= %s "
     "LIMIT 5000"
     ")"
+)
+
+_PURGE_WIKI_AGG_MYSQL_SQL = "DELETE FROM detector_rangeblock_agg WHERE wiki_dbname = %s LIMIT 5000"
+
+_PURGE_WIKI_AGG_SQLITE_SQL = (
+    "DELETE FROM detector_rangeblock_agg "
+    "WHERE id IN (SELECT id FROM detector_rangeblock_agg WHERE wiki_dbname = %s LIMIT 5000)"
 )
 
 _T = TypeVar("_T")
@@ -588,6 +605,7 @@ def _fetch_active_wikis(
     *,
     filter_wikis: Optional[Set[str]] = None,
     filter_sections: Optional[Set[str]] = None,
+    exclude_wikis: Optional[Set[str]] = None,
 ) -> List[Tuple[str, str, str]]:
     conn = _connect_replica("meta.analytics.db.svc.wikimedia.cloud", "meta_p", creds)
     try:
@@ -599,6 +617,8 @@ def _fetch_active_wikis(
                 domain = _extract_domain_from_url(raw_url)
                 section = _normalise_section(raw_slice)
                 if not dbname:
+                    continue
+                if exclude_wikis and dbname in exclude_wikis:
                     continue
                 if filter_wikis and dbname not in filter_wikis:
                     continue
@@ -1307,12 +1327,57 @@ def _stream_incremental_logs(
     )
 
 
-def _fetch_wikis_with_expired_active_blocks(now_dt: datetime) -> Set[str]:
-    """Finds wikis that currently hold naturally expired rows still marked as active in ToolsDB."""
+def _fetch_wikis_with_expired_active_blocks_for_batch(now_dt: datetime, wikis: Sequence[str]) -> Set[str]:
+    """Queries expired active rows scoped to an explicit batch of wiki_dbnames."""
+    if not wikis:
+        return set()
     now_db = _prep_db_datetime(now_dt)
+    placeholders = ", ".join(["%s"] * len(wikis))
+    sql = _FETCH_EXPIRED_ACTIVE_WIKIS_BY_WIKI_SQL_PREFIX.format(placeholders=placeholders)
     with connection.cursor() as db_cursor:
-        db_cursor.execute(_FETCH_EXPIRED_ACTIVE_WIKIS_SQL, [now_db])
+        db_cursor.execute(sql, [*wikis, now_db])
         return {_decode_str(row[0]).strip().lower() for row in db_cursor.fetchall() if row and row[0]}
+
+
+def _fetch_wikis_with_expired_active_blocks_batched(now_dt: datetime, wikis: Sequence[str]) -> Set[str]:
+    """Scans expired active rows in bounded wiki batches using idx_rb_agg_wiki_active."""
+    expired: Set[str] = set()
+    for start in range(0, len(wikis), _EXPIRED_WIKIS_BATCH_SIZE):
+        batch = wikis[start : start + _EXPIRED_WIKIS_BATCH_SIZE]
+        expired.update(
+            _run_toolsdb_with_retry(
+                lambda batch=batch: _fetch_wikis_with_expired_active_blocks_for_batch(now_dt, batch),
+                context="startup expired active blocks batched scan",
+            )
+        )
+    return expired
+
+
+def _fetch_wikis_with_expired_active_blocks(
+    now_dt: datetime,
+    *,
+    filter_wikis: Optional[Set[str]] = None,
+    known_wikis: Optional[Iterable[str]] = None,
+) -> Set[str]:
+    """Finds wikis that currently hold naturally expired rows still marked as active in ToolsDB."""
+    if filter_wikis:
+        return _fetch_wikis_with_expired_active_blocks_batched(now_dt, sorted(filter_wikis))
+
+    now_db = _prep_db_datetime(now_dt)
+    try:
+        with connection.cursor() as db_cursor:
+            db_cursor.execute(_FETCH_EXPIRED_ACTIVE_WIKIS_SQL, [now_db])
+            return {_decode_str(row[0]).strip().lower() for row in db_cursor.fetchall() if row and row[0]}
+    except OperationalError as exc:
+        error_code = _extract_mysql_error_code(exc)
+        if error_code in {2013, _MYSQL_MAX_STATEMENT_TIME_ERR} and known_wikis:
+            logger.warning(
+                "Global expired active blocks scan timed out (code=%s); falling back to per-wiki batched scan.",
+                error_code,
+            )
+            connection.close()
+            return _fetch_wikis_with_expired_active_blocks_batched(now_dt, sorted(set(known_wikis)))
+        raise
 
 
 def _deactivate_stale_active_blocks(storage_wiki: str, *, sync_mark_dt: datetime) -> int:
@@ -1364,6 +1429,37 @@ def _deactivate_expired_active_blocks(storage_wiki: str, *, now_dt: datetime, up
             break
         total_deactivated += affected
     return total_deactivated
+
+
+def _purge_wiki_rangeblocks(storage_wiki: str) -> Tuple[int, int]:
+    """Deletes all aggregate rows (in 5000-row batches) and sync state for an excluded wiki."""
+    total_agg_deleted = 0
+
+    def _delete_agg_batch() -> int:
+        sql = _PURGE_WIKI_AGG_SQLITE_SQL if connection.vendor == "sqlite" else _PURGE_WIKI_AGG_MYSQL_SQL
+        with transaction.atomic(), connection.cursor() as db_cursor:
+            db_cursor.execute(sql, [storage_wiki])
+            return max(0, int(db_cursor.rowcount or 0))
+
+    while True:
+        deleted = _run_toolsdb_with_retry(
+            _delete_agg_batch,
+            context=f"excluded wiki aggregate purge for {storage_wiki}",
+        )
+        if deleted == 0:
+            break
+        total_agg_deleted += deleted
+
+    def _delete_sync_state() -> int:
+        with transaction.atomic():
+            count, _ = RangeblockSyncState.objects.filter(wiki_dbname=storage_wiki).delete()
+            return int(count or 0)
+
+    state_deleted = _run_toolsdb_with_retry(
+        _delete_sync_state,
+        context=f"excluded wiki sync state purge for {storage_wiki}",
+    )
+    return total_agg_deleted, state_deleted
 
 
 def _reconcile_full_active(
@@ -1427,6 +1523,22 @@ class Command(BaseCommand):
             "--full-active-reconcile",
             action="store_true",
             help="Force full streaming mark-and-sweep reconciliation of active blocks.",
+        )
+        parser.add_argument(
+            "--exclude-wikis",
+            type=str,
+            default="",
+            help="Comma-separated wiki dbnames to exclude from syncing (in addition to RANGEBLOCK_REALTIME_WIKIS).",
+        )
+        parser.add_argument(
+            "--include-realtime-wikis",
+            action="store_true",
+            help="Do not automatically exclude RANGEBLOCK_REALTIME_WIKIS from syncing.",
+        )
+        parser.add_argument(
+            "--purge-excluded",
+            action="store_true",
+            help="Delete existing ToolsDB aggregate and sync-state rows for excluded wikis in bounded batches.",
         )
         parser.add_argument("--dry-run", action="store_true", help="Inspect counts without modifying ToolsDB.")
 
@@ -1704,6 +1816,14 @@ class Command(BaseCommand):
         filter_sections = {
             _normalise_section(s) for s in str(options.get("sections") or "").split(",") if s.strip()
         } or None
+        exclude_wikis: Set[str] = {
+            w.strip().lower() for w in str(options.get("exclude_wikis") or "").split(",") if w.strip()
+        }
+        if not bool(options.get("include_realtime_wikis")):
+            exclude_wikis.update(get_configured_realtime_wikis())
+        if filter_wikis:
+            exclude_wikis -= filter_wikis
+        purge_excluded = bool(options.get("purge_excluded"))
 
         lock_client: Optional[Any] = None
         lock_redis_url = ""
@@ -1718,16 +1838,37 @@ class Command(BaseCommand):
                 return
 
         try:
+            if purge_excluded and exclude_wikis:
+                for excluded_wiki in sorted(exclude_wikis):
+                    if dry_run:
+                        self._write_progress(f"[dry-run] Would purge excluded wiki {excluded_wiki} from ToolsDB.")
+                    else:
+                        agg_del, state_del = _purge_wiki_rangeblocks(excluded_wiki)
+                        self._write_progress(
+                            f"Purged excluded wiki {excluded_wiki}: "
+                            f"{agg_del} aggregate rows, {state_del} sync-state rows."
+                        )
+
             now_dt = datetime.now(timezone.utc)
             now_mw = now_dt.strftime("%Y%m%d%H%M%S")
             sync_states = _run_toolsdb_with_retry(
                 lambda: {state.wiki_dbname: state for state in RangeblockSyncState.objects.all()},
                 context="startup sync state prefetch",
             )
-            expired_wikis = _run_toolsdb_with_retry(
-                lambda: _fetch_wikis_with_expired_active_blocks(now_dt),
-                context="startup expired active blocks scan",
-            )
+            known_non_excluded = [w for w in sync_states if w not in exclude_wikis]
+            if filter_wikis:
+                expired_wikis = _fetch_wikis_with_expired_active_blocks(
+                    now_dt,
+                    filter_wikis=filter_wikis,
+                )
+            else:
+                expired_wikis = _run_toolsdb_with_retry(
+                    lambda: _fetch_wikis_with_expired_active_blocks(
+                        now_dt,
+                        known_wikis=known_non_excluded,
+                    ),
+                    context="startup expired active blocks scan",
+                )
             config = _SyncRunConfig(
                 creds=creds,
                 now_mw=now_mw,
@@ -1740,7 +1881,12 @@ class Command(BaseCommand):
                 expired_wikis=expired_wikis,
             )
 
-            wikis = _fetch_active_wikis(creds, filter_wikis=filter_wikis, filter_sections=filter_sections)
+            wikis = _fetch_active_wikis(
+                creds,
+                filter_wikis=filter_wikis,
+                filter_sections=filter_sections,
+                exclude_wikis=exclude_wikis or None,
+            )
             by_section: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
             for dbname, domain, section in wikis:
                 by_section[section].append((dbname, domain))

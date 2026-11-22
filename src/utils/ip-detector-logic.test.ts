@@ -57,6 +57,33 @@ test('validates and canonicalises IPv4 and IPv6 addresses consistently', () => {
   }
 });
 
+test('validates IPv6 IPv4 tails and canonicalises them like their hex equivalents', () => {
+  const cases = [
+    ['2001:db8:0:0:0:0:8.8.8.8', '2001:db8::808:808'],
+    ['2001:db8::8.8.8.8', '2001:db8::808:808'],
+    ['::ffff:1.2.3.4', '::ffff:102:304'],
+    ['::8.8.8.8', '::808:808'],
+    [' 2001:DB8::192.0.2.255 ', '2001:db8::c000:2ff'],
+    ['1:2:3:4:5:6:0.0.0.0', '1:2:3:4:5:6::'],
+    ['::255.255.255.255', '::ffff:ffff'],
+  ];
+  for (const [raw, hex] of cases) {
+    assert.equal(isValidIpAddress(raw), true, raw);
+    assert.equal(canonicalizeIpAddress(raw), hex, raw);
+    assert.equal(canonicalizeIpAddress(raw), canonicalizeIpAddress(hex), raw);
+  }
+
+  for (const raw of [
+    '', '2001:db8::256.8.8.8', '::ffff:1.2.3', '::ffff:1.2.3.4.5',
+    '::ffff:01.2.3.4', '::ffff:1.2.3.-4', '::ffff:1.2.3.4junk',
+    '1:2:3:4:5:8.8.8.8', '1:2:3:4:5:6:7:8.8.8.8',
+    '1:2:3:4:5:6::8.8.8.8', '2001:::8.8.8.8', '1.2.3.4::',
+  ]) {
+    assert.equal(isValidIpAddress(raw), false, raw);
+    assert.equal(canonicalizeIpAddress(raw), null, raw);
+  }
+});
+
 test('discards stale detection responses when concurrent requests overlap', async () => {
   const pending: Array<{
     url: string;

@@ -105,17 +105,15 @@ _TARGETED_GLOBAL_ACTIVE_SQL = (
 )
 
 _MAX_LOG_ID_LOCAL_SQL = (
-    "SELECT log_id FROM logging_logindex "
+    "SELECT COALESCE(MAX(log_id), 0) FROM logging_logindex "
     "WHERE log_id > %s AND log_type = %s "
-    "AND log_action IN (%s, %s, %s) AND log_namespace = 2 "
-    "ORDER BY log_id DESC LIMIT 1"
+    "AND log_action IN (%s, %s, %s) AND log_namespace = 2"
 )
 
 _MAX_LOG_ID_GLOBAL_SQL = (
-    "SELECT log_id FROM logging_logindex "
+    "SELECT COALESCE(MAX(log_id), 0) FROM logging_logindex "
     "WHERE log_id > %s AND log_type = %s "
-    "AND log_action IN (%s, %s, %s, %s) AND log_namespace = 2 "
-    "ORDER BY log_id DESC LIMIT 1"
+    "AND log_action IN (%s, %s, %s, %s) AND log_namespace = 2"
 )
 
 _INCREMENTAL_LOGS_LOCAL_SQL = (

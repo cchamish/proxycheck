@@ -293,12 +293,10 @@
                           </span>
                         </div>
                         <cdx-message v-if="isMobileOrCgnat" type="warning" :inline="true">
-                          <strong>Mobile Cellular / CGNAT Shared Gateway:</strong>
-                          Locked to single-host <code>/32</code> IPv4 or <code>/64</code> IPv6 鈥?avoid broad <code>/24</code> or <code>/48</code> range blocks to prevent collateral damage.
+                          <strong>Mobile Cellular / CGNAT Shared Gateway</strong>
                         </cdx-message>
                         <cdx-message v-if="detectionData.highlySuspectedResidentialProxy" type="error" :inline="true">
-                          <strong>Highly Suspected Residential Proxy:</strong>
-                          This IP is highly likely to use residential proxy infrastructure. CIDR blocking should be restricted to this single IP; proceed with discretion on CIDR.
+                          <strong>Highly Suspected Residential Proxy</strong>
                         </cdx-message>
                         <span
                           v-if="!detectionData.highlySuspectedResidentialProxy && detectionData.cidrRationale"

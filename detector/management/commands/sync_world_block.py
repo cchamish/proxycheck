@@ -43,9 +43,6 @@ _FAST_CHUNK_THRESHOLD_SECONDS = 8.0
 _SLOW_CHUNK_THRESHOLD_SECONDS = 20.0
 _DEFAULT_MAX_SECONDS_PER_WIKI = 600
 _STREAM_FETCH_SIZE = 2000
-_ACTIVE_PAGE_SIZE = 5000
-_MAX_LOG_ID_WINDOW = 200000
-_MAX_LOG_ID_WINDOW_CAP = 2000000
 _UPSERT_SQL_BATCH_SIZE = 200
 _TARGETED_ACTIVE_BATCH_SIZE = 200
 _REPLICA_CONNECT_TIMEOUT_SECONDS = 5
@@ -67,6 +64,7 @@ _GLOBAL_LOG_ACTIONS: Tuple[str, ...] = ("gblock", "gblock2", "gunblock", "modify
 _GLOBAL_COUNT_ACTIONS: frozenset[str] = frozenset({"gblock", "gblock2"})
 
 _SET_REPLICA_STATEMENT_TIMEOUT_SQL = "SET SESSION max_statement_time = 100"
+_RESET_REPLICA_STATEMENT_TIMEOUT_SQL = "SET SESSION max_statement_time = DEFAULT"
 
 _RELEASE_LOCK_LUA = """
 if redis.call("GET", KEYS[1]) == ARGV[1] then
@@ -76,22 +74,18 @@ else
 end
 """
 
-# Active blocks are read in keyset-paginated short queries (never one long-lived unbuffered result set), so each
-# page finishes well inside max_statement_time and no replica result stays open while ToolsDB writes happen.
-_LOCAL_ACTIVE_BLOCKS_PAGE_SQL = (
-    "SELECT b.bl_id, bt.bt_address, b.bl_expiry "
+_LOCAL_ACTIVE_BLOCKS_SQL = (
+    "SELECT bt.bt_address, b.bl_expiry "
     "FROM block b "
     "JOIN block_target bt ON b.bl_target = bt.bt_id "
-    "WHERE b.bl_id > %s AND bt.bt_user IS NULL AND bt.bt_auto = 0 AND bt.bt_address IS NOT NULL "
-    "AND (b.bl_expiry = 'infinity' OR b.bl_expiry > %s) "
-    "ORDER BY b.bl_id LIMIT %s"
+    "WHERE bt.bt_user IS NULL AND bt.bt_auto = 0 AND bt.bt_address IS NOT NULL "
+    "AND (b.bl_expiry = 'infinity' OR b.bl_expiry > %s)"
 )
 
-_GLOBAL_ACTIVE_BLOCKS_PAGE_SQL = (
-    "SELECT gb_id, gb_address, gb_expiry "
+_GLOBAL_ACTIVE_BLOCKS_SQL = (
+    "SELECT gb_address, gb_expiry "
     "FROM globalblocks "
-    "WHERE gb_id > %s AND gb_address IS NOT NULL AND (gb_expiry = 'infinity' OR gb_expiry > %s) "
-    "ORDER BY gb_id LIMIT %s"
+    "WHERE gb_address IS NOT NULL AND (gb_expiry = 'infinity' OR gb_expiry > %s)"
 )
 
 _TARGETED_LOCAL_ACTIVE_SQL = (
@@ -110,19 +104,16 @@ _TARGETED_GLOBAL_ACTIVE_SQL = (
     "AND (gb_expiry = 'infinity' OR gb_expiry > %s)"
 )
 
-_LATEST_LOG_ID_SQL = "SELECT log_id FROM logging_logindex ORDER BY log_id DESC LIMIT 1"
-
-# Bounded to a log_id window so the scan cost has an upper limit regardless of which index the optimizer picks.
 _MAX_LOG_ID_LOCAL_SQL = (
     "SELECT log_id FROM logging_logindex "
-    "WHERE log_id > %s AND log_id <= %s AND log_type = %s "
+    "WHERE log_id > %s AND log_type = %s "
     "AND log_action IN (%s, %s, %s) AND log_namespace = 2 "
     "ORDER BY log_id DESC LIMIT 1"
 )
 
 _MAX_LOG_ID_GLOBAL_SQL = (
     "SELECT log_id FROM logging_logindex "
-    "WHERE log_id > %s AND log_id <= %s AND log_type = %s "
+    "WHERE log_id > %s AND log_type = %s "
     "AND log_action IN (%s, %s, %s, %s) AND log_namespace = 2 "
     "ORDER BY log_id DESC LIMIT 1"
 )
@@ -628,27 +619,11 @@ def _safe_close_replica(conn: Any) -> None:
         conn.close()
 
 
-def _abandon_unbuffered_result(cursor: Any) -> None:
-    """Detaches an unbuffered cursor from a dead connection so neither close() nor __del__ drains it."""
-    result = getattr(cursor, "_result", None)
-    if result is not None:
-        result.unbuffered_active = False
-    conn = getattr(cursor, "connection", None)
-    if conn is not None and getattr(conn, "_result", None) is result:
-        conn._result = None
-    cursor.connection = None
-
-
 def _safe_close_cursor(cursor: Any) -> None:
     if cursor is None:
         return
-    try:
+    with contextlib.suppress(pymysql.MySQLError, OSError):
         cursor.close()
-    except Exception:  # noqa: BLE001
-        # SSCursor.close() drains the unread result set. When the server already dropped the socket, pymysql
-        # raises AttributeError ('NoneType' has no attribute 'read'), not MySQLError, which previously escaped
-        # and aborted the whole run while masking the original 2013 error.
-        _abandon_unbuffered_result(cursor)
 
 
 def _expand_db_lookup_targets(targets: Sequence[str]) -> List[str]:
@@ -705,48 +680,59 @@ def _next_sync_mark_dt(now_dt: datetime, state: Optional[RangeblockSyncState]) -
     return sync_mark_dt
 
 
+def _set_replica_statement_timeout(conn: Any, sql: str) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute(sql)
+
+
 def _stream_active_from_conn(
     conn: Any,
     sql: str,
-    now_mw: str,
+    params: Sequence[Any],
     *,
     storage_wiki: str,
     sync_mark_dt: datetime,
     dry_run: bool,
 ) -> Tuple[int, float, float]:
-    """Reads active blocks page by page (keyset on the first column) and upserts each page immediately."""
+    """Streams active blocks in bounded batches and upserts each batch immediately to keep memory constant."""
     total_processed = 0
     read_seconds = 0.0
     write_seconds = 0.0
-    last_id = 0
-    while True:
+    # Full active table streams on large wikis exceed 100s when interleaved with ToolsDB writes.
+    _set_replica_statement_timeout(conn, _RESET_REPLICA_STATEMENT_TIMEOUT_SQL)
+    stream_cursor = conn.cursor(pymysql.cursors.SSCursor)
+    try:
         read_start = time.monotonic()
-        with conn.cursor() as cursor:
-            cursor.execute(sql, (last_id, now_mw, _ACTIVE_PAGE_SIZE))
-            rows = cursor.fetchall()
+        stream_cursor.execute(sql, params)
         read_seconds += time.monotonic() - read_start
-        if not rows:
-            break
-        last_id = int(rows[-1][0])
-        page_active: Dict[str, Dict[str, Any]] = {}
-        _merge_active_rows(page_active, [(raw_target, raw_expiry) for _, raw_target, raw_expiry in rows])
-        if page_active:
-            if dry_run:
-                total_processed += len(page_active)
-            else:
+        while True:
+            fetch_start = time.monotonic()
+            rows = stream_cursor.fetchmany(_STREAM_FETCH_SIZE)
+            read_seconds += time.monotonic() - fetch_start
+            if not rows:
+                break
+            batch_active: Dict[str, Dict[str, Any]] = {}
+            _merge_active_rows(batch_active, rows)
+            if batch_active:
+                if dry_run:
+                    total_processed += len(batch_active)
+                else:
 
-                def _commit_active_batch(entries: Dict[str, Dict[str, Any]] = page_active) -> int:
-                    with transaction.atomic():
-                        return _upsert_active_blocks(storage_wiki, entries, now_dt=sync_mark_dt)
+                    def _commit_active_batch(entries: Dict[str, Dict[str, Any]] = batch_active) -> int:
+                        with transaction.atomic():
+                            return _upsert_active_blocks(storage_wiki, entries, now_dt=sync_mark_dt)
 
-                write_start = time.monotonic()
-                total_processed += _run_toolsdb_with_retry(
-                    _commit_active_batch,
-                    context=f"active block batch upsert for {storage_wiki}",
-                )
-                write_seconds += time.monotonic() - write_start
-        if len(rows) < _ACTIVE_PAGE_SIZE:
-            break
+                    write_start = time.monotonic()
+                    total_processed += _run_toolsdb_with_retry(
+                        _commit_active_batch,
+                        context=f"active block batch upsert for {storage_wiki}",
+                    )
+                    write_seconds += time.monotonic() - write_start
+                batch_active.clear()
+    finally:
+        _safe_close_cursor(stream_cursor)
+        with contextlib.suppress(pymysql.MySQLError, OSError):
+            _set_replica_statement_timeout(conn, _SET_REPLICA_STATEMENT_TIMEOUT_SQL)
     return total_processed, read_seconds, write_seconds
 
 
@@ -762,8 +748,8 @@ def _stream_active_local_blocks(
     conn = session.select_db(wiki_db)
     return _stream_active_from_conn(
         conn,
-        _LOCAL_ACTIVE_BLOCKS_PAGE_SQL,
-        now_mw,
+        _LOCAL_ACTIVE_BLOCKS_SQL,
+        [now_mw],
         storage_wiki=storage_wiki,
         sync_mark_dt=sync_mark_dt,
         dry_run=dry_run,
@@ -782,8 +768,8 @@ def _stream_active_global_blocks(
     try:
         return _stream_active_from_conn(
             conn,
-            _GLOBAL_ACTIVE_BLOCKS_PAGE_SQL,
-            now_mw,
+            _GLOBAL_ACTIVE_BLOCKS_SQL,
+            [now_mw],
             storage_wiki=storage_wiki,
             sync_mark_dt=sync_mark_dt,
             dry_run=dry_run,
@@ -1051,25 +1037,15 @@ def _query_max_log_id(
     spec: _SyncTargetSpec,
     last_log_id: int,
 ) -> int:
-    """Finds the newest matching log_id above last_log_id by probing log_id windows backwards from the log tail."""
     if not isinstance(spec.replica_db, str) or not _REPLICA_DB_RE.fullmatch(spec.replica_db):
         raise ValueError(f"Invalid replica database name: {spec.replica_db!r}")
     max_log_id_sql, _ = _resolve_log_queries(spec.log_actions)
     conn = session.select_db(spec.replica_db)
     with conn.cursor() as cursor:
-        cursor.execute(_LATEST_LOG_ID_SQL)
-        latest_row = cursor.fetchone()
-        upper = int(latest_row[0] or 0) if latest_row else 0
-        window = _MAX_LOG_ID_WINDOW
-        while upper > last_log_id:
-            lower = max(last_log_id, upper - window)
-            cursor.execute(max_log_id_sql, [lower, upper, spec.log_type, *spec.log_actions])
-            hit = cursor.fetchone()
-            if hit and hit[0]:
-                return int(hit[0])
-            upper = lower
-            window = min(_MAX_LOG_ID_WINDOW_CAP, window * 2)
-    return 0
+        cursor.execute(max_log_id_sql, [last_log_id, spec.log_type, *spec.log_actions])
+        max_row = cursor.fetchone()
+    target_max_id = int(max_row[0] or 0) if max_row else 0
+    return target_max_id if target_max_id > last_log_id else 0
 
 
 def _fetch_log_chunk(

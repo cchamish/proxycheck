@@ -396,14 +396,12 @@ export function extractCanonicalIpFromSearch(search?: string | null): string | n
 }
 
 /**
- * Builds the backend OAuth login URL while preserving a validated IP target for post-login lookup.
+ * Builds the backend OAuth login URL while preserving validated route state.
  */
 export function buildOAuthLoginUrl(search?: string | null, fallbackIp?: string | null): string {
   const targetIp = extractCanonicalIpFromSearch(search) ?? canonicalizeIpAddress(fallbackIp || '');
-  if (!targetIp) {
-    return '/api/v1/auth/login/';
-  }
-  return `/api/v1/auth/login/?ip=${encodeURIComponent(targetIp)}`;
+  const { tab, wiki } = parseInitialRouteParams(search);
+  return buildPageUrlWithState('/api/v1/auth/login/', '', { ip: targetIp, tab, wiki });
 }
 
 /**

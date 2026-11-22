@@ -62,6 +62,7 @@ from .session_auth import (
     get_gadget_token_ttl_seconds,
     get_session_user,
     issue_gadget_token,
+    normalize_post_login_route,
     parse_gadget_token_payload,
     persist_authenticated_session,
     persist_oauth_login_context,
@@ -573,12 +574,11 @@ async def oauth_login(request):
     client_id = getattr(settings, "WIKIMEDIA_CLIENT_ID", "")
     redirect_uri = getattr(settings, "WIKIMEDIA_REDIRECT_URI", "")
     auth_base = getattr(settings, "WIKIMEDIA_OAUTH_URL", "https://meta.wikimedia.org/w/rest.php/oauth2")
-    raw_next_ip = request.GET.get("ip")
-    post_login_ip = canonicalize_ip(str(raw_next_ip)) if raw_next_ip is not None else None
+    post_login_route = normalize_post_login_route(request.GET)
 
     if client_id and redirect_uri:
         state = secrets.token_urlsafe(32)
-        if not await persist_oauth_login_context(request, state, post_login_ip):
+        if not await persist_oauth_login_context(request, state, post_login_route):
             return JsonResponse({"error": SESSION_UNAVAILABLE_ERROR}, status=503)
         query_params = urlencode(
             {
@@ -605,7 +605,7 @@ async def oauth_login(request):
     }
     if not await persist_authenticated_session(request, user_data, context="oauth_login_test_auth"):
         return JsonResponse({"error": SESSION_UNAVAILABLE_ERROR}, status=503)
-    fallback_redirect = f"/?{urlencode({'ip': post_login_ip})}" if post_login_ip else "/"
+    fallback_redirect = f"/?{urlencode(post_login_route)}" if post_login_route else "/"
     return HttpResponseRedirect(fallback_redirect)
 
 
@@ -614,7 +614,7 @@ async def oauth_callback(request):
     Exchanges the OAuth 2.0 authorisation code for an access token, inspects Wikimedia
     temporary-account IP reveal rights, and persists the evaluated role in the session.
     """
-    expected_state, post_login_ip, state_saved = await pop_oauth_login_context(request)
+    expected_state, post_login_route, state_saved = await pop_oauth_login_context(request)
     if not state_saved:
         return JsonResponse({"error": SESSION_UNAVAILABLE_ERROR}, status=503)
 
@@ -722,8 +722,8 @@ async def oauth_callback(request):
             }
             if not await persist_authenticated_session(request, user_session_payload):
                 return JsonResponse({"error": SESSION_UNAVAILABLE_ERROR}, status=503)
-            if has_access and post_login_ip:
-                redirect_target = f"/?{urlencode({'ip': post_login_ip})}"
+            if has_access and post_login_route:
+                redirect_target = f"/?{urlencode(post_login_route)}"
             logger.info(f"User {username} successfully authenticated with role: {role_label}")
     # Top-level OAuth callback boundary prevents upstream or runtime failures from leaking tokens in error pages.
     except Exception as exc:  # noqa: BLE001

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildOAuthLoginUrl,
   canonicalizeIpAddress,
   createDetectionCoordinator,
   isAuthorisedAdminUser,
@@ -8,6 +9,18 @@ import {
   type DetectionCoordinatorState,
   type DetectionResponse,
 } from './ip-detector-logic';
+
+test('OAuth login preserves validated deep-link state', () => {
+  assert.equal(
+    buildOAuthLoginUrl('?ip=2001:0db8::1&tab=rb&wiki=enwiki'),
+    '/api/v1/auth/login/?ip=2001%3Adb8%3A%3A1&tab=rb&wiki=enwiki'
+  );
+  assert.equal(buildOAuthLoginUrl('?tab= RangeBlock &wiki= ENWIKI '), '/api/v1/auth/login/?tab=rb&wiki=enwiki');
+  assert.equal(buildOAuthLoginUrl('?tab=rb&wiki=https://evil.test'), '/api/v1/auth/login/?tab=rb');
+  assert.equal(buildOAuthLoginUrl('?tab=evil&wiki=x'), '/api/v1/auth/login/');
+  assert.equal(buildOAuthLoginUrl(), '/api/v1/auth/login/');
+  assert.equal(buildOAuthLoginUrl('?ip=invalid', '8.8.8.8'), '/api/v1/auth/login/?ip=8.8.8.8');
+});
 
 function makeDetectionPayload(ip: string): DetectionResponse {
   return {

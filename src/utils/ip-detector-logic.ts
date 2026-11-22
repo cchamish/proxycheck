@@ -446,6 +446,25 @@ export function parseInitialRouteParams(search?: string | null): {
 /**
  * Updates the relative page URL with ip, tab, and optional wiki query parameters.
  */
+export type TabSwitchLookup = 'detect' | 'rangeblock' | null;
+
+export function resolveTabSwitchLookup(params: {
+  nextTab: AppTab;
+  currentIp: string | null;
+  canQuery: boolean;
+  detectionIp: string | null;
+  hasActiveRangeblock: boolean;
+}): TabSwitchLookup {
+  const { nextTab, currentIp, canQuery, detectionIp, hasActiveRangeblock } = params;
+  if (!currentIp || !canQuery) {
+    return null;
+  }
+  if (nextTab === 'rb') {
+    return hasActiveRangeblock ? null : 'rangeblock';
+  }
+  return detectionIp === currentIp ? null : 'detect';
+}
+
 export function buildPageUrlWithState(
   pathname: string,
   search: string,

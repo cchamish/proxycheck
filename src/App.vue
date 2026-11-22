@@ -540,6 +540,7 @@ import {
   getSecurityFlagChipStatus,
   simplifySecurityFlags,
   createDetectionCoordinator,
+  resolveTabSwitchLookup,
   resolveRepoBaseUrl,
   formatCommitVersionLabel,
   resolveProviderUpdatedLabel,
@@ -870,14 +871,17 @@ async function executeRangeblockLookup(ipToQuery: string, wikiOverride?: string 
 watch(activeTab, (nextTab) => {
   const currentIp = canonicalizeIpAddress(inputIp.value) ?? detectionData.value?.ip ?? rbData.value?.ip ?? null;
   syncBrowserUrlState(currentIp, nextTab, selectedRbWiki.value);
-  if (
-    nextTab === 'rb' &&
-    currentIp &&
-    user.value.isLoggedIn &&
-    user.value.hasAccess &&
-    !activeRangeblockData.value
-  ) {
+  const lookup = resolveTabSwitchLookup({
+    nextTab,
+    currentIp,
+    canQuery: user.value.isLoggedIn && user.value.hasAccess,
+    detectionIp: isLoading.value ? pendingDetectionIp : detectionData.value?.ip ?? null,
+    hasActiveRangeblock: Boolean(activeRangeblockData.value),
+  });
+  if (lookup === 'rangeblock' && currentIp) {
     void executeRangeblockLookup(currentIp);
+  } else if (lookup === 'detect' && currentIp) {
+    void executeDetection(currentIp);
   }
 });
 
@@ -897,7 +901,10 @@ function handleSelectRbWiki(wiki: string | null): void {
   syncBrowserUrlState(currentIp, 'rb', wiki);
 }
 
+let pendingDetectionIp: string | null = null;
+
 async function executeDetection(ipToQuery: string): Promise<void> {
+  pendingDetectionIp = canonicalizeIpAddress(ipToQuery);
   rbData.value = null;
   rbError.value = '';
   await coordinator.executeDetection(ipToQuery);

@@ -13,7 +13,8 @@
         <div class="rb-header__title">
           <h2 class="card-heading">Cross-Wiki Rangeblock Finder</h2>
           <cdx-info-chip :status="rangeblock.hasActive ? 'error' : 'notice'">
-            rangeblock: {{ rangeblock.localTotal }}/{{ rangeblock.globalTotal }}
+            <template v-if="rangeblock.blockDataDegraded">rangeblock: unavailable</template>
+            <template v-else>rangeblock: {{ rangeblock.localTotal }}/{{ rangeblock.globalTotal }}</template>
           </cdx-info-chip>
         </div>
         <span class="text-subtle">
@@ -25,7 +26,10 @@
         </span>
       </div>
 
-      <cdx-message v-if="rangeblock.realtimeDegraded" type="warning" :inline="false">
+      <cdx-message v-if="rangeblock.blockDataDegraded" type="warning" :inline="false">
+        Block data unavailable: the stored block records could not be queried. Any records shown are partial; try again later.
+      </cdx-message>
+      <cdx-message v-if="rangeblock.realtimeDegraded && !rangeblock.blockDataDegraded" type="warning" :inline="false">
         Real-time Wiki Replicas lookup was temporarily unavailable; displaying cached ToolsDB aggregate records.
       </cdx-message>
 
@@ -72,7 +76,8 @@
           </div>
         </template>
         <template #empty-state>
-          No rangeblock or single-IP block records found for {{ rangeblock.ip }}.
+          <template v-if="rangeblock.blockDataDegraded">Block data unavailable for {{ rangeblock.ip }}.</template>
+          <template v-else>No rangeblock or single-IP block records found for {{ rangeblock.ip }}.</template>
         </template>
       </cdx-table>
     </template>

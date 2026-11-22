@@ -155,6 +155,7 @@ export interface RangeblockSummary {
   globalTotal: number;
   hasActive: boolean;
   realtimeDegraded?: boolean;
+  blockDataDegraded?: boolean;
   wikis: RangeblockWikiSummary[];
 }
 

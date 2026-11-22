@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -76,6 +77,26 @@ def normalize_wiki_dbname(raw_wiki: Any) -> Optional[str]:
     if not cleaned or not _WIKI_DBNAME_RE.fullmatch(cleaned):
         return None
     return cleaned
+
+
+def _get_replica_timeouts() -> Tuple[int, int, int]:
+    """Returns (connect_timeout, read_timeout, write_timeout) in seconds for real-time Wiki Replicas queries."""
+
+    def _parse_pos(name: str, default: int) -> int:
+        raw = getattr(settings, name, None)
+        if raw is None:
+            raw = os.environ.get(name, "")
+        try:
+            val = int(str(raw).strip())
+            return val if val > 0 else default
+        except TypeError, ValueError:
+            return default
+
+    return (
+        _parse_pos("RANGEBLOCK_REPLICA_CONNECT_TIMEOUT", 3),
+        _parse_pos("RANGEBLOCK_REPLICA_READ_TIMEOUT", 10),
+        _parse_pos("RANGEBLOCK_REPLICA_WRITE_TIMEOUT", 5),
+    )
 
 
 def get_configured_realtime_wikis() -> Tuple[str, ...]:
@@ -411,15 +432,16 @@ def _query_active_global_blocks(
 ) -> None:
     user, password = creds
     placeholders = ", ".join(["%s"] * len(targets))
+    connect_timeout, read_timeout, write_timeout = _get_replica_timeouts()
     conn = pymysql.connect(
         host="centralauth.web.db.svc.wikimedia.cloud",
         user=user,
         password=password,
         database="centralauth_p",
         port=3306,
-        connect_timeout=2,
-        read_timeout=3,
-        write_timeout=3,
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+        write_timeout=write_timeout,
         charset="utf8mb4",
         autocommit=True,
     )
@@ -446,15 +468,16 @@ def _query_single_replica_wiki_sync(
         return {}
     user, password = creds
     now_mw = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    connect_timeout, read_timeout, write_timeout = _get_replica_timeouts()
     conn = pymysql.connect(
         host=f"{wiki_dbname}.web.db.svc.wikimedia.cloud",
         user=user,
         password=password,
         database=f"{wiki_dbname}_p",
         port=3306,
-        connect_timeout=2,
-        read_timeout=3,
-        write_timeout=3,
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+        write_timeout=write_timeout,
         charset="utf8mb4",
         autocommit=True,
     )

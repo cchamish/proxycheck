@@ -17,39 +17,14 @@ from django.http import HttpResponse, HttpResponseRedirect, JsonResponse, Stream
 from django.middleware.csrf import get_token
 from django.views.decorators.csrf import csrf_exempt
 
-from . import http_client, oauth, rangeblock_service
-from .dashboard import build_dashboard_snapshot
-from .detection_service import (
-    detect_canonical_ip_batch,
-    detect_single_canonical_ip,
-    is_compact_request,
-    refresh_single_canonical_ip,
-    resolve_query_mode,
-)
-from .intelligence import (
-    MAX_BATCH_IPS,
-    aggregate_intelligence_metrics,
-    attach_request_diagnostics,
-    canonicalize_ip,
-    parse_batch_ip_list,
-)
-from .oauth import (
+from .auth import oauth
+from .auth.oauth import (
     CentralAuthVerificationError,
     InvalidCentralAuthTokenError,
     MetaWikiRightsFetchError,
     normalize_and_validate_wikimedia_domain,
 )
-from .offline_dbs import collect_offline_databases_status
-from .provider_registry import USER_AGENT_HEADER
-from .quota_telemetry import (
-    RefreshRateLimitResult,
-    check_and_consume_endpoint_rate_limit,
-)
-from .sanitization import (
-    sanitize_error_message,
-    sanitize_payload,
-)
-from .session_auth import (
+from .auth.session import (
     GADGET_TOKEN_SALT,
     SESSION_UNAVAILABLE_ERROR,
     TEST_ROLE_PROFILES,
@@ -67,7 +42,31 @@ from .session_auth import (
     resolve_wikimedia_access,
     verify_gadget_bearer_token,
 )
-from .stream_service import stream_single_canonical_ip_sse
+from .cache.dashboard import build_dashboard_snapshot
+from .cache.quota_telemetry import (
+    RefreshRateLimitResult,
+    check_and_consume_endpoint_rate_limit,
+)
+from .core import http_client
+from .core.ip_utils import MAX_BATCH_IPS, canonicalize_ip, parse_batch_ip_list
+from .core.sanitization import sanitize_error_message, sanitize_payload
+from .detection.arbitration import (
+    aggregate_intelligence_metrics,
+    attach_request_diagnostics,
+)
+from .detection.pipeline import (
+    is_compact_request,
+    resolve_query_mode,
+)
+from .detection.service import (
+    detect_canonical_ip_batch,
+    detect_single_canonical_ip,
+    refresh_single_canonical_ip,
+)
+from .detection.stream import stream_single_canonical_ip_sse
+from .offline import collect_offline_databases_status
+from .provider_registry import USER_AGENT_HEADER
+from .rangeblock import service as rangeblock_service
 
 __all__ = [
     "GADGET_TOKEN_SALT",

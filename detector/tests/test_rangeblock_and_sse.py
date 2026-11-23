@@ -7,8 +7,9 @@ import dns.resolver
 from asgiref.sync import sync_to_async
 from django.test import AsyncClient, TestCase, override_settings
 
-from detector import cache_backends, rangeblock_service
+from detector.cache import redis_backend as cache_backends
 from detector.models import RangeblockAggregate
+from detector.rangeblock import service as rangeblock_service
 
 from .helpers import _login_authorised, start_non_dnsbl_provider_stubs
 
@@ -55,9 +56,9 @@ class RangeblockAndSseTests(TestCase):
             return {"metawiki": {}, "global": {}}
 
         with (
-            patch("detector.rangeblock_service.discover_wiki_replica_credentials", return_value=("u", "p")),
-            patch("detector.rangeblock_service._resolve_realtime_wiki_list", return_value=("enwiki",)),
-            patch("detector.rangeblock_service._query_single_replica_wiki_sync", side_effect=_mock_replica),
+            patch("detector.rangeblock.service.discover_wiki_replica_credentials", return_value=("u", "p")),
+            patch("detector.rangeblock.service._resolve_realtime_wiki_list", return_value=("enwiki",)),
+            patch("detector.rangeblock.service._query_single_replica_wiki_sync", side_effect=_mock_replica),
         ):
             merged = await rangeblock_service.query_rangeblocks_for_ip("8.8.8.8")
         self.assertFalse(merged["realtimeDegraded"])
@@ -65,8 +66,8 @@ class RangeblockAndSseTests(TestCase):
         self.assertEqual([w["wiki"] for w in merged["wikis"]], ["global", "enwiki", "metawiki"])
 
         with (
-            patch("detector.rangeblock_service.discover_wiki_replica_credentials", return_value=("u", "p")),
-            patch("detector.rangeblock_service._query_single_replica_wiki_sync", side_effect=OSError("down")),
+            patch("detector.rangeblock.service.discover_wiki_replica_credentials", return_value=("u", "p")),
+            patch("detector.rangeblock.service._query_single_replica_wiki_sync", side_effect=OSError("down")),
         ):
             degraded = await rangeblock_service.query_rangeblocks_for_ip("8.8.8.8")
         self.assertTrue(degraded["realtimeDegraded"])
@@ -108,7 +109,7 @@ class RangeblockAndSseTests(TestCase):
         client.cookies.load(self.client.cookies.output(header=""))
         with (
             override_settings(PROXYCHECK_API_KEY="test-key"),
-            patch("detector.rangeblock_service.discover_wiki_replica_credentials", return_value=None),
+            patch("detector.rangeblock.service.discover_wiki_replica_credentials", return_value=None),
         ):
             resp = await client.get("/api/v1/detect/stream?ip=8.8.8.8")
             self.assertEqual(resp.status_code, 200)

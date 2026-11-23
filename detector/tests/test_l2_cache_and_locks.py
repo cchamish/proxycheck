@@ -6,7 +6,7 @@ from unittest.mock import patch
 from django.db import OperationalError
 from django.test import TestCase
 
-from detector import l2_cache
+from detector.cache import l2_store as l2_cache
 from detector.provider_registry import JsonRedisSerializer, build_redis_namespace, hash_ip_for_redis
 from proxycheck.settings import _build_default_cache_config
 
@@ -85,7 +85,9 @@ class L2CacheAndRedisHardeningTests(TestCase):
 
     def test_l2_toolsdb_failure_degrades_cleanly_to_upstream(self):
         """Returns None and unsaved fallback without crashing when ToolsDB raises OperationalError."""
-        with patch("detector.l2_cache.IpIntelligenceCache.objects.filter", side_effect=OperationalError("db down")):
+        with patch(
+            "detector.cache.l2_store.IpIntelligenceCache.objects.filter", side_effect=OperationalError("db down")
+        ):
             self.assertIsNone(l2_cache.get_ip_snapshot("8.8.8.8", mode="full"))
             merge_res = l2_cache.merge_and_upsert_l2_snapshot("8.8.8.8", {"ip": "8.8.8.8", "results": []})
             self.assertFalse(merge_res.saved)

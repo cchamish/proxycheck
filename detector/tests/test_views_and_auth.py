@@ -8,9 +8,10 @@ import dns.resolver
 from django.conf import settings
 from django.test import Client, TestCase, override_settings
 
-from detector import cache_backends, views
-from detector.adapters import adapt_dshield, adapt_stopforumspam, adapt_tor_onionoo
-from detector.oauth import MetaWikiRightsFetchError
+from detector import views
+from detector.auth.oauth import MetaWikiRightsFetchError
+from detector.cache import redis_backend as cache_backends
+from detector.providers import adapt_dshield, adapt_stopforumspam, adapt_tor_onionoo
 
 from .helpers import FakeAsyncRedis, _login_authorised, _mock_response, start_non_dnsbl_provider_stubs
 
@@ -125,7 +126,7 @@ class DetectorViewsAndAuthTests(TestCase):
 
             fake_redis = FakeAsyncRedis()
             with (
-                patch("detector.cache_backends.redis_client", fake_redis),
+                patch("detector.cache.redis_backend.redis_client", fake_redis),
                 override_settings(REFRESH_USER_RPM_LIMIT=1, REFRESH_USER_RPH_LIMIT=60, REFRESH_GLOBAL_RPM_LIMIT=30),
             ):
                 first = csrf_client.post(
@@ -164,9 +165,9 @@ class DetectorViewsAndAuthTests(TestCase):
         mock_client.__aenter__.return_value = mock_client
 
         with (
-            patch("detector.http_client.httpx.AsyncClient", return_value=mock_client),
+            patch("detector.core.http_client.httpx.AsyncClient", return_value=mock_client),
             patch(
-                "detector.oauth.fetch_user_rights_from_meta",
+                "detector.auth.oauth.fetch_user_rights_from_meta",
                 AsyncMock(return_value={"global_groups": [], "global_rights": [], "merged_projects": []}),
             ),
         ):
@@ -189,9 +190,10 @@ class DetectorViewsAndAuthTests(TestCase):
         next_state = fail_client.session["oauth_state"]
         mock_client.get.return_value = _mock_response(200, {"username": "Patroller", "groups": ["user"]})
         with (
-            patch("detector.http_client.httpx.AsyncClient", return_value=mock_client),
+            patch("detector.core.http_client.httpx.AsyncClient", return_value=mock_client),
             patch(
-                "detector.oauth.fetch_user_rights_from_meta", AsyncMock(side_effect=MetaWikiRightsFetchError("down"))
+                "detector.auth.oauth.fetch_user_rights_from_meta",
+                AsyncMock(side_effect=MetaWikiRightsFetchError("down")),
             ),
         ):
             fail_client.get(f"/api/v1/auth/callback/?code=auth-code&state={next_state}")

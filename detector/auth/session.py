@@ -16,9 +16,9 @@ from django.core import signing
 from django.http import JsonResponse
 from django.middleware.csrf import CsrfViewMiddleware
 
+from ..core.ip_utils import canonicalize_ip
+from ..middleware import is_session_backend_error
 from . import oauth
-from .intelligence import canonicalize_ip
-from .middleware import is_session_backend_error
 from .oauth import (
     DEFAULT_RIGHTS_TTL_SECONDS,
     REQUIRED_WIKIMEDIA_RIGHTS_SET,

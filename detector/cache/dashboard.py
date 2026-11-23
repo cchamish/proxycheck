@@ -16,14 +16,9 @@ from django.conf import settings
 from django.db import Error as DjangoDbError
 from django.db import close_old_connections, connections
 
-from .cache_backends import (
-    get_redis_client,
-    mark_redis_failure,
-    provider_cooldown_key,
-)
-from .models import IpIntelligenceCache
-from .offline_dbs import collect_offline_databases_status
-from .provider_registry import PROVIDER_REGISTRY, REDIS_TRANSPORT_ERRORS
+from ..models import IpIntelligenceCache
+from ..offline import collect_offline_databases_status
+from ..provider_registry import PROVIDER_REGISTRY, REDIS_TRANSPORT_ERRORS
 from .quota_telemetry import (
     _decode_redis_str,
     _global_telemetry_key,
@@ -33,6 +28,11 @@ from .quota_telemetry import (
     _quota_minute_key,
     get_provider_quota_limits,
     is_provider_configured,
+)
+from .redis_backend import (
+    get_redis_client,
+    mark_redis_failure,
+    provider_cooldown_key,
 )
 
 logger = logging.getLogger(__name__)

@@ -19,14 +19,14 @@ from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequ
 from django.conf import settings
 from django.core.signals import setting_changed
 
-from . import sanitization
-from .offline_dbs import (
+from ..core import sanitization
+from ..offline import (
     get_maxmind_newest_mtime_iso,
     get_positive_int_setting,
     get_stopforumspam_db_version,
     has_local_maxmind_city_db,
 )
-from .provider_registry import (
+from ..provider_registry import (
     REDIS_TRANSPORT_ERRORS,
     build_redis_namespace,
     hash_ip_for_redis,
@@ -276,7 +276,7 @@ def _on_redis_setting_changed(*, setting: str, enter: bool, **kwargs: Any) -> No
             _OVERRIDDEN_REDIS_SETTINGS.discard(setting)
 
 
-setting_changed.connect(_on_redis_setting_changed, dispatch_uid="detector.cache_backends.setting_changed")
+setting_changed.connect(_on_redis_setting_changed, dispatch_uid="detector.cache.redis_backend.setting_changed")
 
 
 def _resolve_effective_redis_secret() -> str:

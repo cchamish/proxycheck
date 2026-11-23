@@ -6,7 +6,7 @@ import dns.resolver
 from django.conf import settings
 from django.test import Client, TestCase
 
-from detector import cache_backends
+from detector.cache import redis_backend as cache_backends
 
 from .helpers import _login_authorised, start_non_dnsbl_provider_stubs
 
@@ -37,7 +37,7 @@ class RedisAndSessionResilienceTests(TestCase):
         broken_pipe.execute = AsyncMock(side_effect=ConnectionError("redis down"))
         broken.pipeline = MagicMock(return_value=broken_pipe)
 
-        with patch("detector.cache_backends.redis_client", broken):
+        with patch("detector.cache.redis_backend.redis_client", broken):
             resp = self.client.get("/api/v1/detect?ip=8.8.8.8")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["ip"], "8.8.8.8")

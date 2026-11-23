@@ -9,8 +9,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import httpx
 from django.conf import settings
 
-from .http_client import clear_client_cookies
-from .provider_registry import USER_AGENT_HEADER
+from ..core.http_client import clear_client_cookies
+from ..provider_registry import USER_AGENT_HEADER
 
 logger = logging.getLogger(__name__)
 

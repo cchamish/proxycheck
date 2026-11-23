@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from django.core.management.base import BaseCommand, CommandError
 
-from detector.l2_cache import purge_expired_provider_fields
+from detector.cache.l2_store import purge_expired_provider_fields
 
 
 class Command(BaseCommand):

@@ -78,10 +78,6 @@ class ProviderMetadata:
     has_quota_env_vars: bool = True
 
     @property
-    def env_prefix(self) -> str:
-        return self.key.upper()
-
-    @property
     def rpm_setting(self) -> str:
         return f"{self.key.upper()}_RPM_LIMIT"
 

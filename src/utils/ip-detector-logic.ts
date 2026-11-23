@@ -407,22 +407,6 @@ export function buildOAuthLoginUrl(search?: string | null, fallbackIp?: string |
 }
 
 /**
- * Updates the relative page URL with a canonical `ip` query parameter while keeping unrelated parameters intact.
- */
-export function buildPageUrlWithIp(pathname: string, search: string, ip: string | null): string {
-  const basePath = pathname && pathname.startsWith('/') ? pathname : '/';
-  const params = new URLSearchParams(search || '');
-  const canonical = ip ? canonicalizeIpAddress(ip) : null;
-  if (canonical) {
-    params.set('ip', canonical);
-  } else {
-    params.delete('ip');
-  }
-  const queryString = params.toString();
-  return queryString ? `${basePath}?${queryString}` : basePath;
-}
-
-/**
  * Parses initial ip, tab, and wiki query parameters from window.location.search.
  */
 export function parseInitialRouteParams(search?: string | null): {
@@ -1815,23 +1799,6 @@ export function computeQuotaUsagePercent(used: number, limit: number): number {
     return 0;
   }
   return Math.min(100, Math.round((used / limit) * 100));
-}
-
-/**
- * Determines the visual severity tone for a quota progress bar.
- */
-export function getQuotaProgressTone(used: number, limit: number): 'normal' | 'warning' | 'danger' {
-  if (!Number.isFinite(limit) || limit <= 0) {
-    return 'normal';
-  }
-  const ratio = used / limit;
-  if (ratio >= 1) {
-    return 'danger';
-  }
-  if (ratio >= 0.8) {
-    return 'warning';
-  }
-  return 'normal';
 }
 
 /**

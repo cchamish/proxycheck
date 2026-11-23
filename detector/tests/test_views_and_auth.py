@@ -6,13 +6,23 @@ from urllib.parse import parse_qs, urlparse
 
 import dns.resolver
 from django.conf import settings
-from django.test import Client, TestCase, override_settings
+from django.test import Client, SimpleTestCase, TestCase, override_settings
 
 from detector import cache_backends, views
 from detector.adapters import adapt_dshield, adapt_stopforumspam, adapt_tor_onionoo
 from detector.oauth import MetaWikiRightsFetchError
 
 from .helpers import FakeAsyncRedis, _login_authorised, _mock_response, start_non_dnsbl_provider_stubs
+
+
+class RobotsTxtTests(SimpleTestCase):
+    async def test_robots_txt_serves_plain_text_instead_of_spa(self):
+        response = await self.async_client.get("/robots.txt")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "text/plain; charset=utf-8")
+        self.assertEqual(response.content, b"User-agent: *\nDisallow: /\n")
+        self.assertNotIn("csrftoken", response.cookies)
 
 
 class DetectorViewsAndAuthTests(TestCase):
@@ -65,6 +75,24 @@ class DetectorViewsAndAuthTests(TestCase):
                 bad_resp = self.client.get(f"/api/v1/detect{query}")
                 self.assertEqual(bad_resp.status_code, 400)
                 self.assertEqual(bad_resp.json()["error"], "invalid_ip")
+
+    @override_settings(RESTRICT_TO_ALLOWED_WIKI_USERS=False)
+    def test_detect_logs_only_validated_auth_mode(self):
+        _login_authorised(self)
+        guest = Client()
+        token = views.issue_gadget_token("GadgetEditor")
+        cases = [
+            (self.client, {}, 200, "session"),
+            (guest, {"Authorization": f"Bearer {token}"}, 200, "gadget"),
+            (guest, {}, 401, "unauthenticated"),
+            (self.client, {"Authorization": "Bearer invalid-token"}, 401, "unauthenticated"),
+        ]
+        with patch("detector.views.detect_single_canonical_ip", new_callable=AsyncMock, return_value={}):
+            for client, headers, status, mode in cases:
+                with self.subTest(status=status, mode=mode), self.assertLogs("detector.auth_mode", "INFO") as logs:
+                    response = client.get("/api/v1/detect?ip=8.8.8.8", headers=headers, REMOTE_ADDR="192.0.2.10")
+                    self.assertEqual(response.status_code, status)
+                    self.assertEqual([record.getMessage() for record in logs.records], [f"auth_mode={mode}"])
 
     def test_refresh_endpoint_enforces_auth_session_csrf_and_body_ip(self):
         """Enforces auth, session CSRF, JSON body IP without query fallback, and Bearer refresh limits."""

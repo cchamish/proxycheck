@@ -35,6 +35,7 @@ from .oauth import (
 from .quota_telemetry import is_admin_user
 
 logger = logging.getLogger("detector.views")
+auth_mode_logger = logging.getLogger("detector.auth_mode")
 
 _WIKIMEDIA_ORIGIN_RE = re.compile(rf"^https://([a-z0-9-]+\.)*(?:{WIKIMEDIA_HOST_SUFFIXES})\.org$")
 _WIKIMEDIA_BETA_ORIGIN_RE = re.compile(
@@ -451,6 +452,16 @@ async def authenticate_detect_request(
     require_csrf_for_session: bool = False,
 ) -> Tuple[Optional[str], Optional[JsonResponse]]:
     """Validates gadget Bearer token or Wikimedia session credentials for IP detection endpoints."""
+    auth_mode, error = await _authenticate_detect_request(request, require_csrf_for_session=require_csrf_for_session)
+    auth_mode_logger.info("auth_mode=%s", auth_mode or "unauthenticated")
+    return auth_mode, error
+
+
+async def _authenticate_detect_request(
+    request,
+    *,
+    require_csrf_for_session: bool,
+) -> Tuple[Optional[str], Optional[JsonResponse]]:
     auth_header = request.headers.get("Authorization")
     if auth_header is not None and str(auth_header).strip():
         token_user, token_error = _verify_gadget_bearer_token(str(auth_header))

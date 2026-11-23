@@ -136,6 +136,7 @@
               v-if="detectionData"
               :detection-data="detectionData"
               :is-loading="isLoading"
+              :is-streaming="Boolean(isStreaming)"
               :is-refreshing="Boolean(isRefreshing)"
               :refresh-warning-message="refreshWarningMessage ?? ''"
               :last-refreshed-at="lastRefreshedAt ?? null"
@@ -347,6 +348,7 @@ const uiState = reactive<DetectionCoordinatorState>({
 const {
   user,
   isLoading,
+  isStreaming,
   isRefreshing,
   validationError,
   sessionExpiredMessage,

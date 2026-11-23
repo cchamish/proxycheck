@@ -335,6 +335,7 @@ import {
   formatCompactDuration,
   formatExactUtcTimestamp,
   formatOfflineDbTimestamp,
+  getRefetchButtonState,
   type ChipStatus,
   type DetectionResponse,
   type ProviderRawResult,
@@ -359,6 +360,7 @@ const groundTruthColumns = computed<TableColumn[]>(() => [
 const props = defineProps<{
   detectionData: DetectionResponse;
   isLoading: boolean;
+  isStreaming: boolean;
   isRefreshing: boolean;
   refreshWarningMessage: string;
   lastRefreshedAt: string | null;
@@ -502,17 +504,13 @@ const shodanTags = computed(() => {
   return shodanRow.tags.filter((tag): tag is string => typeof tag === 'string' && tag.trim().length > 0);
 });
 
-const refetchButtonState = computed(() => {
-  const data = props.detectionData;
-  const visible = Boolean(!data.isNonPublic && data.cacheMeta?.status !== 'bypassed');
-  const isBusy = Boolean(props.isRefreshing || data.cacheMeta?.refreshInProgress);
-  return {
-    visible,
-    label: isBusy ? t('detector-refetch-updating') : t('detector-refetch'),
-    disabled: Boolean(isBusy || props.isLoading),
-    isBusy,
-  };
-});
+const refetchButtonState = computed(() =>
+  getRefetchButtonState(props.detectionData, {
+    isLoading: props.isLoading,
+    isStreaming: props.isStreaming,
+    isRefreshing: props.isRefreshing,
+  })
+);
 
 const isCurrentCacheStale = computed(() => {
   const meta = props.detectionData.cacheMeta;

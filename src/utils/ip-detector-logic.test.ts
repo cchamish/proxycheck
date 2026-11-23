@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   canonicalizeIpAddress,
   createDetectionCoordinator,
+  getRefetchButtonState,
   isAuthorisedAdminUser,
   isValidIpAddress,
   type DetectionCoordinatorState,
@@ -151,4 +152,148 @@ test('enforces allowlist admin authorisation strictly', () => {
   for (const item of cases) {
     assert.equal(isAuthorisedAdminUser(item.user), item.expected);
   }
+});
+
+test('blocks refreshDetection while an SSE detection stream is still active, then allows it after done', async () => {
+  const encoder = new TextEncoder();
+  let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+  const streamBody = new ReadableStream<Uint8Array>({
+    start(controller) {
+      streamController = controller;
+    },
+  });
+
+  const requestedUrls: string[] = [];
+  const coordinator = createDetectionCoordinator(async (url) => {
+    requestedUrls.push(url);
+    if (url.startsWith('/api/v1/detect/stream')) {
+      return {
+        ok: true,
+        status: 200,
+        headers: {
+          get(name: string) {
+            return name.toLowerCase() === 'content-type' ? 'text/event-stream' : null;
+          },
+        },
+        body: streamBody,
+        json: async () => ({}),
+      };
+    }
+    if (url === '/api/v1/detect/refresh') {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ...makeDetectionPayload('8.8.8.8'),
+          arbitrationVerdict: 'Refreshed Verdict',
+          fetchedAt: '2026-11-24T00:00:00Z',
+        }),
+      };
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  });
+
+  const detectPromise = coordinator.executeDetection('8.8.8.8');
+
+  // Deliver initial SSE snapshot while AbuseIPDB is still pending.
+  const snapshotPayload: DetectionResponse = {
+    ...makeDetectionPayload('8.8.8.8'),
+    pendingProviders: ['AbuseIPDB'],
+  };
+  streamController!.enqueue(
+    encoder.encode(`event: snapshot\ndata: ${JSON.stringify(snapshotPayload)}\n\n`)
+  );
+
+  // Wait for snapshot to be processed.
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(coordinator.state.detectionData?.ip, '8.8.8.8');
+  assert.equal(coordinator.state.isLoading, false);
+  assert.equal(coordinator.state.isStreaming, true);
+
+  // Attempting to refresh while streaming must be a no-op and must not fire /api/v1/detect/refresh.
+  await coordinator.refreshDetection();
+  assert.deepEqual(requestedUrls, ['/api/v1/detect/stream?ip=8.8.8.8']);
+  assert.equal(coordinator.state.isRefreshing, false);
+
+  // Complete the stream with provider + done events.
+  streamController!.enqueue(
+    encoder.encode(
+      `event: provider\ndata: ${JSON.stringify({
+        provider: 'AbuseIPDB',
+        providerKey: 'abuseipdb',
+        pendingProviders: [],
+        row: {
+          provider: 'AbuseIPDB',
+          status: '200 OK',
+          statusCode: 200,
+          asn: 'AS15169',
+          isp: 'Google LLC',
+          organisation: 'Google LLC',
+          location: 'United States',
+          usageType: 'isp',
+          securityFlags: [{ label: 'No Flags', isHighRisk: false }],
+          rawJson: {},
+        },
+      })}\n\n`
+    )
+  );
+  streamController!.enqueue(
+    encoder.encode(
+      `event: done\ndata: ${JSON.stringify({
+        ip: '8.8.8.8',
+        isCached: false,
+        pendingProviders: [],
+        arbitrationVerdict: 'Stream Done Verdict',
+      })}\n\n`
+    )
+  );
+  streamController!.close();
+  await detectPromise;
+
+  assert.equal(coordinator.state.isStreaming, false);
+  assert.equal(coordinator.state.detectionData?.arbitrationVerdict, 'Stream Done Verdict');
+  assert.equal(coordinator.state.detectionData?.results.length, 2);
+
+  // Once streaming finishes, Refetch is allowed and updates the result.
+  await coordinator.refreshDetection();
+  assert.deepEqual(requestedUrls, ['/api/v1/detect/stream?ip=8.8.8.8', '/api/v1/detect/refresh']);
+  assert.equal(coordinator.state.detectionData?.arbitrationVerdict, 'Refreshed Verdict');
+});
+
+test('disables Refetch button state while detector stream is active or has pending providers', () => {
+  const basePayload = makeDetectionPayload('8.8.8.8');
+
+  assert.deepEqual(getRefetchButtonState(basePayload, { isLoading: false, isStreaming: true, isRefreshing: false }), {
+    visible: true,
+    label: 'Refetch',
+    disabled: true,
+    isBusy: false,
+  });
+
+  assert.deepEqual(
+    getRefetchButtonState(
+      { ...basePayload, pendingProviders: ['AbuseIPDB'] },
+      { isLoading: false, isStreaming: false, isRefreshing: false }
+    ),
+    {
+      visible: true,
+      label: 'Refetch',
+      disabled: true,
+      isBusy: false,
+    }
+  );
+
+  assert.deepEqual(getRefetchButtonState(basePayload, { isLoading: false, isStreaming: false, isRefreshing: false }), {
+    visible: true,
+    label: 'Refetch',
+    disabled: false,
+    isBusy: false,
+  });
+
+  assert.deepEqual(getRefetchButtonState(basePayload, { isLoading: false, isStreaming: false, isRefreshing: true }), {
+    visible: true,
+    label: 'Updating...',
+    disabled: true,
+    isBusy: true,
+  });
 });

@@ -484,6 +484,28 @@ export function createLoggedOutUserState(): UserSessionState {
   };
 }
 
+export interface RefetchButtonState {
+  visible: boolean;
+  label: string;
+  disabled: boolean;
+  isBusy: boolean;
+}
+
+export function getRefetchButtonState(
+  data: DetectionResponse,
+  flags: { isLoading?: boolean; isStreaming?: boolean; isRefreshing?: boolean } = {}
+): RefetchButtonState {
+  const visible = Boolean(!data.isNonPublic && data.cacheMeta?.status !== 'bypassed');
+  const isBusy = Boolean(flags.isRefreshing || data.cacheMeta?.refreshInProgress);
+  const isStreaming = Boolean(flags.isStreaming || (data.pendingProviders?.length ?? 0) > 0);
+  return {
+    visible,
+    label: isBusy ? t('detector-refetch-updating') : t('detector-refetch'),
+    disabled: Boolean(isBusy || flags.isLoading || isStreaming),
+    isBusy,
+  };
+}
+
 export function isAuthorisedAdminUser(user?: Partial<UserSessionState> | null): boolean {
   return Boolean(user && user.isLoggedIn && user.hasAccess && user.isAdmin === true);
 }
@@ -582,6 +604,7 @@ export function createDetectionCoordinator(
     state.user = createLoggedOutUserState();
     state.detectionData = null;
     state.diagnostic = null;
+    state.isStreaming = false;
     state.isRefreshing = false;
   }
 
@@ -743,6 +766,9 @@ export function createDetectionCoordinator(
   }
 
   async function refreshDetection(ipOverride?: string): Promise<void> {
+    if (state.isLoading || state.isStreaming) {
+      return;
+    }
     if (state.isRefreshing) {
       if (activeRefreshPromise) await activeRefreshPromise;
       return;
@@ -752,7 +778,11 @@ export function createDetectionCoordinator(
       state.validationError = t('error-invalid-ip');
       return;
     }
-    if (state.detectionData?.isNonPublic || state.detectionData?.cacheMeta?.refreshInProgress) {
+    if (
+      state.detectionData?.isNonPublic ||
+      state.detectionData?.cacheMeta?.refreshInProgress ||
+      (state.detectionData?.pendingProviders?.length ?? 0) > 0
+    ) {
       return;
     }
     await startRefreshForCanonicalIp(canonicalIp, latestRequestId);
@@ -835,7 +865,7 @@ export function createDetectionCoordinator(
                   state.detectionData = snapshot;
                   state.diagnostic = buildDiagnosticMetrics(snapshot);
                   state.isLoading = false;
-                  state.isStreaming = Array.isArray(snapshot.pendingProviders) && snapshot.pendingProviders.length > 0;
+                  state.isStreaming = true;
                   recordDetectionSuccess(snapshot, targetIp);
                 } else if (eventName === 'provider' && state.detectionData) {
                   const existingResults = Array.isArray(state.detectionData.results)

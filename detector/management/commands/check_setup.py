@@ -12,9 +12,8 @@ import shutil
 import subprocess  # noqa: S404
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from django.conf import settings
@@ -68,13 +67,39 @@ _FAILED_JOB_STATUS_TOKENS = ("failed", "error", "crash", "backoff", "oom", "evic
 
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SEPARATOR_LINE_RE = re.compile(r"^[-=+|:\s]+$")
+_GRANT_STMT_RE = re.compile(r"^\s*GRANT\s+(.+?)\s+ON\s+(.+?)\s+TO\s+(.+?)\s*;?\s*$", re.IGNORECASE)
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_WIKI_REPLICA_READONLY_PRIVS = frozenset({"SELECT", "SHOW VIEW"})
+_MYSQL_PROBE_ERRORS: Tuple[type[BaseException], ...] = (
+    (ImportError, OSError, RuntimeError, ValueError, DjangoDbError, _PyMySqlError)
+    if _PyMySqlError is not None
+    else (ImportError, OSError, RuntimeError, ValueError, DjangoDbError)
+)
+_OFFLINE_SOURCE_ALIASES = {
+    "stopforumspam": "stopforumspam",
+    "sfs": "stopforumspam",
+    "maxmind": "maxmind",
+    "shared_cidrs": "shared_cidrs",
+    "shared-cidrs": "shared_cidrs",
+    "rezmoss": "shared_cidrs",
+    "privacy_relays": "privacy_relays",
+    "privacy-relays": "privacy_relays",
+    "ipsum_drop": "ipsum_drop",
+    "ipsum-drop": "ipsum_drop",
+    "tor_onionoo": "tor_onionoo",
+    "tor-onionoo": "tor_onionoo",
+    "bgp_tools": "bgp_tools",
+    "bgp-tools": "bgp_tools",
+    "openasn": "openasn",
+    "open-asn": "openasn",
+    "peeringdb_mobile": "peeringdb_mobile",
+    "peeringdb-mobile": "peeringdb_mobile",
+}
+_ALL_OFFLINE_SOURCES = frozenset(_OFFLINE_SOURCE_ALIASES.values())
 
 
 @dataclass(frozen=True)
 class EnvVarSpec:
-    """Metadata describing an environment variable used by Proxycheck."""
-
     name: str
     tier: str
     category: str
@@ -83,10 +108,8 @@ class EnvVarSpec:
     description: str = ""
 
 
-@dataclass(frozen=True)
+@dataclass
 class EnvLoadResult:
-    """Loaded environment values alongside their resolved source labels."""
-
     values: Dict[str, str]
     sources: Dict[str, str]
     hidden_keys: frozenset[str]
@@ -96,8 +119,6 @@ class EnvLoadResult:
 
 @dataclass(frozen=True)
 class DirectoryStatus:
-    """Filesystem permission and mount status for a checked directory."""
-
     label: str
     path: Path
     required: bool
@@ -113,8 +134,6 @@ class DirectoryStatus:
 
 @dataclass(frozen=True)
 class JobSpec:
-    """Expected Toolforge scheduled job definition parsed from jobs.yaml or defaults."""
-
     name: str
     command: str
     image: str
@@ -124,8 +143,6 @@ class JobSpec:
 
 @dataclass(frozen=True)
 class RegisteredJob:
-    """Active Toolforge job metadata parsed from toolforge jobs list or jobs show."""
-
     name: str
     command: str = ""
     job_type: str = ""
@@ -136,8 +153,6 @@ class RegisteredJob:
 
 @dataclass(frozen=True)
 class BastionJobCheck:
-    """Comparison outcome between jobs.yaml and active Toolforge jobs."""
-
     expected: JobSpec
     registered: bool
     job_type: str
@@ -149,8 +164,6 @@ class BastionJobCheck:
 
 @dataclass(frozen=True)
 class ToolsDbCheckResult:
-    """Diagnostic outcome for ToolsDB MariaDB connectivity, schema privacy, and grants."""
-
     status: str
     db_name: str = ""
     host: str = ""
@@ -161,10 +174,9 @@ class ToolsDbCheckResult:
     message: str = ""
 
 
-def _build_core_and_oauth_env_specs() -> Tuple[EnvVarSpec, ...]:
-    """Returns required core and Toolforge OAuth environment variable specs."""
-    core_defs = (
-        (
+def _build_env_specs() -> Tuple[EnvVarSpec, ...]:
+    specs: List[EnvVarSpec] = [
+        EnvVarSpec(
             "DJANGO_SECRET_KEY",
             "required",
             "Core & OAuth",
@@ -172,7 +184,7 @@ def _build_core_and_oauth_env_specs() -> Tuple[EnvVarSpec, ...]:
             "(none in production)",
             "Django cryptographic signing key and gadget Bearer token secret",
         ),
-        (
+        EnvVarSpec(
             "WIKIMEDIA_CLIENT_ID",
             "required",
             "Core & OAuth",
@@ -180,7 +192,7 @@ def _build_core_and_oauth_env_specs() -> Tuple[EnvVarSpec, ...]:
             "(unset)",
             "Wikimedia OAuth 2.0 application client ID",
         ),
-        (
+        EnvVarSpec(
             "WIKIMEDIA_CLIENT_SECRET",
             "required",
             "Core & OAuth",
@@ -188,7 +200,7 @@ def _build_core_and_oauth_env_specs() -> Tuple[EnvVarSpec, ...]:
             "(unset)",
             "Wikimedia OAuth 2.0 application client secret",
         ),
-        (
+        EnvVarSpec(
             "DJANGO_ALLOWED_HOSTS",
             "recommended",
             "Production / Toolforge Recommended",
@@ -196,7 +208,7 @@ def _build_core_and_oauth_env_specs() -> Tuple[EnvVarSpec, ...]:
             "127.0.0.1,localhost",
             "Comma-separated allowed hostnames (include .toolforge.org,.wmcloud.org in production)",
         ),
-        (
+        EnvVarSpec(
             "WIKIMEDIA_REDIRECT_URI",
             "recommended",
             "Production / Toolforge Recommended",
@@ -204,7 +216,7 @@ def _build_core_and_oauth_env_specs() -> Tuple[EnvVarSpec, ...]:
             DEFAULT_PRODUCTION_REDIRECT_URI,
             "OAuth 2.0 callback URL matching the deployed tool domain",
         ),
-        (
+        EnvVarSpec(
             "REDIS_URL",
             "recommended",
             "Production / Toolforge Recommended",
@@ -212,7 +224,7 @@ def _build_core_and_oauth_env_specs() -> Tuple[EnvVarSpec, ...]:
             "redis://127.0.0.1:6379/0",
             "Redis connection URL for sessions, IP caches, quota guard, and telemetry",
         ),
-        (
+        EnvVarSpec(
             "TOOL_DATA_DIR",
             "recommended",
             "Production / Toolforge Recommended",
@@ -220,7 +232,7 @@ def _build_core_and_oauth_env_specs() -> Tuple[EnvVarSpec, ...]:
             "(unset)",
             "Toolforge tool home or persistent data root for .env and offline databases (for example /data/project/<tool>)",
         ),
-        (
+        EnvVarSpec(
             "MAXMIND_ACCOUNT_ID",
             "recommended",
             "Production / Toolforge Recommended",
@@ -228,7 +240,7 @@ def _build_core_and_oauth_env_specs() -> Tuple[EnvVarSpec, ...]:
             "(unset)",
             "MaxMind account ID required by update_offline_dbs to fetch GeoLite2 MMDBs",
         ),
-        (
+        EnvVarSpec(
             "MAXMIND_LICENSE_KEY",
             "recommended",
             "Production / Toolforge Recommended",
@@ -236,7 +248,7 @@ def _build_core_and_oauth_env_specs() -> Tuple[EnvVarSpec, ...]:
             "(unset)",
             "MaxMind license key paired with MAXMIND_ACCOUNT_ID",
         ),
-        (
+        EnvVarSpec(
             "ALLOWED_WIKI_USERS",
             "recommended",
             "Production / Toolforge Recommended",
@@ -244,38 +256,21 @@ def _build_core_and_oauth_env_specs() -> Tuple[EnvVarSpec, ...]:
             "(unset)",
             "Comma-separated Wikimedia usernames granted admin dashboard and status access",
         ),
-    )
-    return tuple(
-        EnvVarSpec(
-            name=name,
-            tier=tier,
-            category=category,
-            sensitive=sensitive,
-            default_display=default_display,
-            description=description,
-        )
-        for name, tier, category, sensitive, default_display, description in core_defs
-    )
+    ]
 
+    for meta in PROVIDER_REGISTRY:
+        if meta.credential_setting is not None:
+            specs.append(
+                EnvVarSpec(
+                    name=meta.credential_setting,
+                    tier="provider",
+                    category="Upstream IP Intelligence Providers",
+                    sensitive=True,
+                    description=meta.credential_description or f"{meta.label} API credential",
+                )
+            )
 
-def _build_provider_api_env_specs() -> Tuple[EnvVarSpec, ...]:
-    """Returns commercial IP intelligence provider credential variable specs from the shared registry."""
-    return tuple(
-        EnvVarSpec(
-            name=meta.credential_setting,
-            tier="provider",
-            category="Upstream IP Intelligence Providers",
-            sensitive=True,
-            description=meta.credential_description or f"{meta.label} API credential",
-        )
-        for meta in PROVIDER_REGISTRY
-        if meta.credential_setting is not None
-    )
-
-
-def _build_runtime_and_path_env_specs() -> Tuple[EnvVarSpec, ...]:
-    """Returns optional runtime, ToolsDB storage, offline database path, and build metadata specs."""
-    runtime_defs: Tuple[Tuple[str, str, str, bool], ...] = (
+    runtime_defs = (
         ("DJANGO_DEBUG", "False", "Enable Django debug mode (local development only)", False),
         ("DJANGO_SECURE_HSTS_SECONDS", "31536000", "HSTS max-age in seconds when DJANGO_DEBUG is False", False),
         ("PORT", "8000", "Gunicorn HTTP bind port", False),
@@ -312,12 +307,7 @@ def _build_runtime_and_path_env_specs() -> Tuple[EnvVarSpec, ...]:
             False,
         ),
         ("STOPFORUMSPAM_TOXIC_CIDR_PATH", "(auto)", "Override file or directory path for toxic_ip_cidr.txt", False),
-        (
-            "STOPFORUMSPAM_LISTED_90_PATH",
-            "(auto)",
-            "Override path for StopForumSpam 90-day listed IP archive",
-            False,
-        ),
+        ("STOPFORUMSPAM_LISTED_90_PATH", "(auto)", "Override path for StopForumSpam 90-day listed IP archive", False),
         ("STOPFORUMSPAM_LISTED_1_PATH", "(auto)", "Override path for StopForumSpam 1-day listed IP archive", False),
         ("STOPFORUMSPAM_SQLITE_PATH", "(auto)", "Override path for stopforumspam.sqlite3 index", False),
         ("OPENASN_MMDB_PATH", "(auto)", "Override path for openasn.mmdb", False),
@@ -334,7 +324,7 @@ def _build_runtime_and_path_env_specs() -> Tuple[EnvVarSpec, ...]:
             False,
         ),
     )
-    return tuple(
+    specs.extend(
         EnvVarSpec(
             name=name,
             tier="optional",
@@ -346,9 +336,6 @@ def _build_runtime_and_path_env_specs() -> Tuple[EnvVarSpec, ...]:
         for name, default_display, description, sensitive in runtime_defs
     )
 
-
-def _build_tuning_and_quota_env_specs() -> Tuple[EnvVarSpec, ...]:
-    """Returns cache, resolver, staleness threshold, and per-provider quota tuning specs."""
     tuning_defs = (
         ("PROVIDER_STATIC_CACHE_TTL_SECONDS", "86400", "Cache TTL for static commercial intelligence providers"),
         ("PROVIDER_DYNAMIC_CACHE_TTL_SECONDS", "7200", "Cache TTL for dynamic threat feeds"),
@@ -389,7 +376,7 @@ def _build_tuning_and_quota_env_specs() -> Tuple[EnvVarSpec, ...]:
         ),
         ("OFFLINE_DB_RULES_STALE_SECONDS", str(DEFAULT_STALE_RULES_SECONDS), "Hosting ASN rules staleness threshold"),
     )
-    specs = [
+    specs.extend(
         EnvVarSpec(
             name=name,
             tier="tuning",
@@ -398,7 +385,8 @@ def _build_tuning_and_quota_env_specs() -> Tuple[EnvVarSpec, ...]:
             description=description,
         )
         for name, default_display, description in tuning_defs
-    ]
+    )
+
     for meta in PROVIDER_REGISTRY:
         if not meta.has_quota_env_vars:
             continue
@@ -421,16 +409,6 @@ def _build_tuning_and_quota_env_specs() -> Tuple[EnvVarSpec, ...]:
             )
         )
     return tuple(specs)
-
-
-def _build_env_specs() -> Tuple[EnvVarSpec, ...]:
-    """Returns all scanned environment variable definitions in display order."""
-    return (
-        *_build_core_and_oauth_env_specs(),
-        *_build_provider_api_env_specs(),
-        *_build_runtime_and_path_env_specs(),
-        *_build_tuning_and_quota_env_specs(),
-    )
 
 
 ENV_SPECS: Tuple[EnvVarSpec, ...] = _build_env_specs()
@@ -470,7 +448,6 @@ DEFAULT_JOB_SPEC = DEFAULT_JOB_SPECS[0]
 
 
 def mask_secret(value: str) -> str:
-    """Masks sensitive credentials while retaining safe prefix and suffix characters."""
     cleaned = value.strip()
     if not cleaned:
         return ""
@@ -484,103 +461,42 @@ def mask_secret(value: str) -> str:
     return "*" * length
 
 
-def redact_url_credentials(raw_url: str) -> str:
-    """Redacts password components inside connection URLs such as REDIS_URL."""
-    cleaned = raw_url.strip()
-    if not cleaned:
-        return ""
-    try:
-        parsed = urlsplit(cleaned)
-    except ValueError:
-        return mask_secret(cleaned)
-    if parsed.password is None:
-        return cleaned
-    host_part = parsed.hostname or ""
-    if ":" in host_part and not host_part.startswith("["):
-        host_part = f"[{host_part}]"
-    if parsed.port is not None:
-        host_part = f"{host_part}:{parsed.port}"
-    user_part = parsed.username or ""
-    netloc = f"{user_part}:***@{host_part}" if user_part else f":***@{host_part}"
-    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
-
-
 def format_display_value(spec: EnvVarSpec, value: str) -> str:
-    """Formats an environment variable value for terminal display."""
     if spec.sensitive:
         return mask_secret(value)
     if spec.name == "REDIS_URL":
-        return redact_url_credentials(value)
+        cleaned = value.strip()
+        if not cleaned:
+            return ""
+        try:
+            parsed = urlsplit(cleaned)
+        except ValueError:
+            return mask_secret(cleaned)
+        if parsed.password is None:
+            return cleaned
+        host_part = parsed.hostname or ""
+        if ":" in host_part and not host_part.startswith("["):
+            host_part = f"[{host_part}]"
+        if parsed.port is not None:
+            host_part = f"{host_part}:{parsed.port}"
+        user_part = parsed.username or ""
+        netloc = f"{user_part}:***@{host_part}" if user_part else f":***@{host_part}"
+        return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
     return value
 
 
-def generate_secret_key(length: int = 50) -> str:
-    """Generates a cryptographically random Django secret key."""
-    return get_random_string(length, _SECRET_KEY_CHARS)
+def _is_weak_secret_key(value: str) -> Tuple[bool, Optional[str]]:
+    cleaned = value.strip()
+    if any(cleaned.lower().startswith(prefix) for prefix in _PLACEHOLDER_SECRET_PREFIXES):
+        return True, "appears to be a placeholder secret"
+    if len(cleaned) < 32:
+        return False, f"short secret ({len(cleaned)} chars; 50+ recommended)"
+    return False, None
 
 
-def detect_toolforge_account(
-    *,
-    environ: Optional[Mapping[str, str]] = None,
-    home_dir: Optional[Path] = None,
-) -> Optional[str]:
-    """Extracts the active Toolforge tool name from USER, TOOL_DATA_DIR, or HOME."""
-    env = os.environ if environ is None else environ
-    for user_var in ("USER", "LOGNAME"):
-        raw_user = str(env.get(user_var) or "").strip()
-        for prefix in ("tools.", "toolsbeta."):
-            if raw_user.startswith(prefix) and len(raw_user) > len(prefix):
-                return raw_user[len(prefix) :]
-
-    candidates = [str(env.get(k) or "") for k in ("TOOL_DATA_DIR", "HOME") if env.get(k)]
-    if home_dir is not None:
-        candidates.append(str(home_dir))
-
-    for candidate in candidates:
-        match = re.match(r"^/data/project/([^/]+)(?:/|$)", candidate.strip())
-        if match:
-            return match.group(1)
-    return None
-
-
-def detect_runtime_environment(
-    requested_mode: str = "auto",
-    *,
-    environ: Optional[Mapping[str, str]] = None,
-    which_fn: Optional[Callable[[str], Optional[str]]] = None,
-    wmcs_project_path: Path = Path("/etc/wmcs-project"),
-    home_dir: Optional[Path] = None,
-) -> Tuple[str, Optional[str], Optional[str]]:
-    """Detects whether execution targets Toolforge Bastion or a local or container environment."""
-    normalized_mode = requested_mode.strip().lower()
-    if normalized_mode not in ENV_MODES:
-        raise CommandError(f"Unsupported --env mode '{requested_mode}'. Choose from: {', '.join(ENV_MODES)}.")
-
-    env = os.environ if environ is None else environ
-    lookup_bin = shutil.which if which_fn is None else which_fn
-    toolforge_bin = lookup_bin("toolforge")
-    tool_account = detect_toolforge_account(environ=env, home_dir=home_dir)
-
-    if normalized_mode == "bastion":
-        if not toolforge_bin:
-            raise CommandError("Cannot run in bastion mode: 'toolforge' CLI was not found on PATH.")
-        return "bastion", toolforge_bin, tool_account
-
-    if normalized_mode == "local":
-        return "local", toolforge_bin, tool_account
-
-    # Auto mode requires both the toolforge CLI and a WMCS host marker outside buildpack containers.
-    raw_user = str(env.get("USER") or env.get("LOGNAME") or "").strip()
-    raw_home = str(env.get("HOME") or (home_dir or "")).strip()
-    is_container = bool(env.get("CNB_STACK_ID") or env.get("TOOL_TOOLFORGE_API_URL") or Path("/.dockerenv").exists())
-    has_bastion_marker = (
-        wmcs_project_path.exists()
-        or raw_user.startswith(("tools.", "toolsbeta."))
-        or raw_home.startswith("/data/project/")
-    )
-    if toolforge_bin and has_bastion_marker and not is_container:
-        return "bastion", toolforge_bin, tool_account
-    return "local", toolforge_bin, tool_account
+def is_public_toolsdb_name(db_name: str) -> bool:
+    cleaned = str(db_name or "").strip().strip("`'\"")
+    return bool(cleaned) and cleaned.lower().endswith("_p")
 
 
 def _run_toolforge_command(
@@ -590,7 +506,6 @@ def _run_toolforge_command(
     input_text: Optional[str] = None,
     timeout: float = 30.0,
 ) -> Tuple[int, str, str]:
-    """Executes the Toolforge CLI safely without shell interpolation."""
     try:
         completed = subprocess.run(  # noqa: S603
             [toolforge_bin, *args],
@@ -607,39 +522,31 @@ def _run_toolforge_command(
     return completed.returncode, completed.stdout or "", completed.stderr or ""
 
 
-def _parse_envvars_json(stripped: str) -> Optional[Tuple[Dict[str, str], set[str]]]:
-    try:
-        payload = json.loads(stripped)
-    except ValueError:
-        return None
-    if isinstance(payload, dict):
-        values = {str(k): str(v) for k, v in payload.items() if _ENV_NAME_RE.match(str(k))}
-        return values, set(values.keys())
-    if isinstance(payload, list):
-        values: Dict[str, str] = {}
-        names: set[str] = set()
-        for entry in payload:
-            if isinstance(entry, dict) and entry.get("name"):
-                key = str(entry["name"]).strip()
-                names.add(key)
-                if entry.get("value") is not None:
-                    values[key] = str(entry["value"])
-            elif isinstance(entry, str) and _ENV_NAME_RE.match(entry.strip()):
-                names.add(entry.strip())
-        return values, names
-    return None
-
-
 def _parse_envvars_list_output(raw_output: str, *, with_values: bool) -> Tuple[Dict[str, str], set[str]]:
-    """Parses tabular or JSON output from toolforge envvars list."""
     stripped = raw_output.strip()
     if not stripped:
         return {}, set()
 
     if stripped.startswith(("{", "[")):
-        parsed_json = _parse_envvars_json(stripped)
-        if parsed_json is not None:
-            return parsed_json
+        try:
+            payload = json.loads(stripped)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            values = {str(k): str(v) for k, v in payload.items() if _ENV_NAME_RE.match(str(k))}
+            return values, set(values.keys())
+        if isinstance(payload, list):
+            values = {}
+            names: set[str] = set()
+            for entry in payload:
+                if isinstance(entry, dict) and entry.get("name"):
+                    key = str(entry["name"]).strip()
+                    names.add(key)
+                    if entry.get("value") is not None:
+                        values[key] = str(entry["value"])
+                elif isinstance(entry, str) and _ENV_NAME_RE.match(entry.strip()):
+                    names.add(entry.strip())
+            return values, names
 
     values_out: Dict[str, str] = {}
     names_out: set[str] = set()
@@ -662,35 +569,53 @@ def _parse_envvars_list_output(raw_output: str, *, with_values: bool) -> Tuple[D
     return values_out, names_out
 
 
-def _parse_envvar_show_output(name: str, raw_output: str) -> Optional[str]:
-    """Parses output from toolforge envvars show, returning None when masked or unreadable."""
-    filtered = [
-        line.rstrip("\r\n")
-        for line in raw_output.splitlines()
-        if line.strip() and not _SEPARATOR_LINE_RE.match(line.strip())
-    ]
-    if not filtered:
-        return None
-    for line in filtered:
-        stripped = line.strip()
-        parts = stripped.split(None, 1)
-        if len(parts) == 2 and parts[0].lower() in ("name", "key") and parts[1].strip().lower() == "value":
-            continue
-        if len(parts) == 2 and parts[0] == name:
-            val = parts[1].strip()
-            return None if set(val) == {"*"} else val
-        if stripped.startswith((f"{name}:", f"{name}=")):
-            val = stripped[len(name) + 1 :].strip()
-            return None if set(val) == {"*"} else val
-    if len(filtered) == 1:
-        single = filtered[0].strip()
-        if single != name and set(single) != {"*"}:
-            return single
-    return None
+def _detect_runtime_environment(requested_mode: str) -> Tuple[str, Optional[str], Optional[str]]:
+    normalised_mode = requested_mode.strip().lower()
+    if normalised_mode not in ENV_MODES:
+        raise CommandError(f"Unsupported --env mode '{requested_mode}'. Choose from: {', '.join(ENV_MODES)}.")
+
+    env = os.environ
+    toolforge_bin = shutil.which("toolforge")
+
+    tool_account: Optional[str] = None
+    for user_var in ("USER", "LOGNAME"):
+        raw_user = str(env.get(user_var) or "").strip()
+        for prefix in ("tools.", "toolsbeta."):
+            if raw_user.startswith(prefix) and len(raw_user) > len(prefix):
+                tool_account = raw_user[len(prefix) :]
+                break
+        if tool_account:
+            break
+    if not tool_account:
+        for candidate in (str(env.get(k) or "") for k in ("TOOL_DATA_DIR", "HOME") if env.get(k)):
+            match = re.match(r"^/data/project/([^/]+)(?:/|$)", candidate.strip())
+            if match:
+                tool_account = match.group(1)
+                break
+
+    if normalised_mode == "bastion":
+        if not toolforge_bin:
+            raise CommandError("Cannot run in bastion mode: 'toolforge' CLI was not found on PATH.")
+        return "bastion", toolforge_bin, tool_account
+
+    if normalised_mode == "local":
+        return "local", toolforge_bin, tool_account
+
+    # Auto mode requires both the toolforge CLI and a WMCS host marker outside buildpack containers.
+    raw_user = str(env.get("USER") or env.get("LOGNAME") or "").strip()
+    raw_home = str(env.get("HOME") or "").strip()
+    is_container = bool(env.get("CNB_STACK_ID") or env.get("TOOL_TOOLFORGE_API_URL") or Path("/.dockerenv").exists())
+    has_bastion_marker = (
+        Path("/etc/wmcs-project").exists()
+        or raw_user.startswith(("tools.", "toolsbeta."))
+        or raw_home.startswith("/data/project/")
+    )
+    if toolforge_bin and has_bastion_marker and not is_container:
+        return "bastion", toolforge_bin, tool_account
+    return "local", toolforge_bin, tool_account
 
 
-def load_bastion_envvars(toolforge_bin: str, base_dir: Path) -> EnvLoadResult:
-    """Reads configured environment variables via toolforge envvars list and show."""
+def _load_bastion_envvars(toolforge_bin: str, base_dir: Path) -> EnvLoadResult:
     values: Dict[str, str] = {}
     sources: Dict[str, str] = {}
     hidden_keys: set[str] = set()
@@ -715,7 +640,31 @@ def load_bastion_envvars(toolforge_bin: str, base_dir: Path) -> EnvLoadResult:
         if key not in ENV_SPEC_BY_NAME:
             continue
         rc_show, stdout_show, _ = _run_toolforge_command(toolforge_bin, ("envvars", "show", key))
-        shown_val = _parse_envvar_show_output(key, stdout_show) if rc_show == 0 else None
+        shown_val: Optional[str] = None
+        if rc_show == 0:
+            filtered = [
+                line.rstrip("\r\n")
+                for line in stdout_show.splitlines()
+                if line.strip() and not _SEPARATOR_LINE_RE.match(line.strip())
+            ]
+            for line in filtered:
+                stripped = line.strip()
+                parts = stripped.split(None, 1)
+                if len(parts) == 2 and parts[0].lower() in ("name", "key") and parts[1].strip().lower() == "value":
+                    continue
+                if len(parts) == 2 and parts[0] == key:
+                    val = parts[1].strip()
+                    shown_val = None if set(val) == {"*"} else val
+                    break
+                if stripped.startswith((f"{key}:", f"{key}=")):
+                    val = stripped[len(key) + 1 :].strip()
+                    shown_val = None if set(val) == {"*"} else val
+                    break
+            else:
+                if len(filtered) == 1:
+                    single = filtered[0].strip()
+                    if single != key and set(single) != {"*"}:
+                        shown_val = single
         values[key] = shown_val or ""
         sources[key] = "toolforge envvars"
         if not shown_val:
@@ -729,9 +678,8 @@ def load_bastion_envvars(toolforge_bin: str, base_dir: Path) -> EnvLoadResult:
     )
 
 
-def load_local_envvars(base_dir: Path, *, environ: Optional[Mapping[str, str]] = None) -> EnvLoadResult:
-    """Loads environment variables from process environment and local .env files."""
-    env = os.environ if environ is None else environ
+def _load_local_envvars(base_dir: Path) -> EnvLoadResult:
+    env = os.environ
     warnings: List[str] = []
 
     raw_tool_dir = str(env.get("TOOL_DATA_DIR") or "").strip()
@@ -772,194 +720,6 @@ def load_local_envvars(base_dir: Path, *, environ: Optional[Mapping[str, str]] =
     )
 
 
-def ensure_env_in_gitignore(base_dir: Path) -> Tuple[bool, str]:
-    """Ensures .env is ignored by Git before writing secrets to the project root."""
-    gitignore_path = base_dir / ".gitignore"
-    if gitignore_path.is_file():
-        existing = gitignore_path.read_text(encoding="utf-8")
-        for line in existing.splitlines():
-            if line.split("#", 1)[0].strip() in (".env", "/.env", "*.env"):
-                return False, "already ignored"
-        prefix = "\n" if existing and not existing.endswith("\n") else ""
-        gitignore_path.write_text(f"{existing}{prefix}.env\n", encoding="utf-8")
-        return True, f"appended '.env' to {gitignore_path}"
-
-    gitignore_path.write_text(".env\n", encoding="utf-8")
-    return True, f"created {gitignore_path} with '.env'"
-
-
-def save_envvar_bastion(toolforge_bin: str, key: str, value: str) -> None:
-    """Writes an environment variable to Toolforge via stdin so secrets stay off process argv."""
-    rc, stdout, stderr = _run_toolforge_command(toolforge_bin, ("envvars", "create", key), input_text=value)
-    if rc != 0:
-        detail = (stderr or stdout).strip()
-        raise CommandError(f"Failed to set Toolforge envvar {key}: {detail or f'exit code {rc}'}")
-
-
-def save_envvar_local(base_dir: Path, dotenv_path: Path, key: str, value: str) -> Optional[str]:
-    """Persists an environment variable to .env while guaranteeing .gitignore coverage."""
-    _, gitignore_note = ensure_env_in_gitignore(base_dir)
-    created_new = not dotenv_path.exists()
-    dotenv_path.parent.mkdir(parents=True, exist_ok=True)
-    set_key(dotenv_path, key, value, quote_mode="always", encoding="utf-8")
-    if created_new:
-        with contextlib.suppress(OSError):
-            os.chmod(dotenv_path, 0o600)
-    os.environ[key] = value
-    return gitignore_note if gitignore_note != "already ignored" else None
-
-
-def _is_weak_secret_key(value: str) -> Tuple[bool, Optional[str]]:
-    cleaned = value.strip()
-    if any(cleaned.lower().startswith(prefix) for prefix in _PLACEHOLDER_SECRET_PREFIXES):
-        return True, "appears to be a placeholder secret"
-    if len(cleaned) < 32:
-        return False, f"short secret ({len(cleaned)} chars; 50+ recommended)"
-    return False, None
-
-
-def _is_recommended_local_fallback(
-    spec: EnvVarSpec,
-    value: str,
-    *,
-    mode: str,
-    tool_account: Optional[str],
-) -> Optional[str]:
-    cleaned = value.strip()
-    if not cleaned:
-        return None
-    if spec.name == "DJANGO_ALLOWED_HOSTS" and mode == "bastion":
-        hosts = [entry.strip().lower() for entry in cleaned.split(",") if entry.strip()]
-        if hosts and all(host in _LOCAL_HOSTS for host in hosts):
-            return "contains only local hosts for a Toolforge environment"
-    if (
-        spec.name == "REDIS_URL"
-        and mode == "bastion"
-        and ("127.0.0.1" in cleaned.lower() or "localhost" in cleaned.lower())
-    ):
-        return "points to localhost Redis inside Toolforge"
-    if (
-        spec.name == "WIKIMEDIA_REDIRECT_URI"
-        and tool_account == "proxycheck-dev"
-        and "proxycheck.toolforge.org" in cleaned
-        and "proxycheck-dev.toolforge.org" not in cleaned
-    ):
-        return "points to production callback URL while active tool is proxycheck-dev"
-    return None
-
-
-def _suggested_value_hint(spec: EnvVarSpec, *, mode: str, tool_account: Optional[str]) -> str:
-    if spec.name == "DJANGO_ALLOWED_HOSTS" and mode == "bastion":
-        return DEFAULT_TOOLFORGE_ALLOWED_HOSTS
-    if spec.name == "WIKIMEDIA_REDIRECT_URI":
-        if tool_account:
-            return f"https://{tool_account}.toolforge.org/oauth/callback"
-        return "http://127.0.0.1:8000/oauth/callback" if mode == "local" else DEFAULT_PRODUCTION_REDIRECT_URI
-    if spec.name == "REDIS_URL" and mode == "bastion":
-        return DEFAULT_TOOLFORGE_REDIS_URL
-    if spec.name == "TOOL_DATA_DIR" and mode == "bastion" and tool_account:
-        return f"/data/project/{tool_account}"
-    return ""
-
-
-def _parse_mounts_table(mounts_path: Path = Path("/proc/mounts")) -> List[Tuple[str, str, str]]:
-    """Reads Linux mount points as (mount_point, fs_type, options) tuples."""
-    if not mounts_path.is_file():
-        return []
-    try:
-        raw_lines = mounts_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return []
-    entries: List[Tuple[str, str, str]] = []
-    for line in raw_lines:
-        parts = line.split()
-        if len(parts) >= 4:
-            entries.append((parts[1].replace("\\040", " "), parts[2], parts[3]))
-    return entries
-
-
-def _detect_mount_info(target_path: Path, *, mounts: Sequence[Tuple[str, str, str]]) -> Tuple[str, bool]:
-    """Determines the filesystem type and persistence status for a target path."""
-    if not mounts:
-        return "local filesystem", False
-    try:
-        probe = target_path.resolve()
-    except OSError:
-        probe = target_path
-
-    probe_str = probe.as_posix()
-    best_match: Optional[Tuple[str, str, str]] = None
-    for mount_point, fs_type, options in mounts:
-        normalized_mp = mount_point.rstrip("/") or "/"
-        is_match = normalized_mp == "/" or probe_str == normalized_mp or probe_str.startswith(f"{normalized_mp}/")
-        if is_match and (best_match is None or len(normalized_mp) > len(best_match[0].rstrip("/") or "/")):
-            best_match = (mount_point, fs_type, options)
-
-    if best_match is None:
-        return "local filesystem", False
-
-    mount_point, fs_type, options = best_match
-    rw_flag = "ro" if "ro" in options.split(",") else "rw"
-    kind = "NFS" if fs_type.startswith("nfs") else fs_type
-    return f"{kind} ({fs_type}, {rw_flag}) at {mount_point}", fs_type in ("overlay", "tmpfs", "ramfs")
-
-
-def _collect_target_directories(
-    base_dir: Path,
-    env_values: Mapping[str, str],
-    *,
-    mode: str,
-) -> List[Tuple[str, Path, bool, bool]]:
-    entries: List[List[Any]] = []
-    index_by_resolved: Dict[Path, int] = {}
-
-    def _add(source_tag: str, fallback_label: str, raw_path: Path, *, required: bool, persistent: bool) -> None:
-        try:
-            normalized = raw_path.resolve()
-        except OSError:
-            normalized = raw_path
-        existing_idx = index_by_resolved.get(normalized)
-        if existing_idx is not None:
-            existing = entries[existing_idx]
-            if source_tag and source_tag not in existing[0]:
-                existing[0].append(source_tag)
-            existing[3] = existing[3] or required
-            existing[4] = existing[4] or persistent
-            return
-        index_by_resolved[normalized] = len(entries)
-        entries.append([[source_tag] if source_tag else [], fallback_label, raw_path, required, persistent])
-
-    tool_data_dir = expand_configured_path(env_values.get("TOOL_DATA_DIR", ""))
-    if tool_data_dir:
-        _add(
-            "TOOL_DATA_DIR",
-            "Persistent data directory",
-            resolve_tool_data_subdir(tool_data_dir),
-            required=True,
-            persistent=True,
-        )
-    elif mode == "bastion" or base_dir.parent == Path(base_dir.anchor):
-        _add("~/data", "Persistent data directory", Path.home() / "data", required=True, persistent=True)
-    else:
-        local_candidates = (base_dir.parent / "data", base_dir / "data", Path.home() / "data")
-        chosen_local = next((cand for cand in local_candidates if cand.is_dir()), base_dir.parent / "data")
-        _add("", "Default offline data directory", chosen_local, required=True, persistent=True)
-
-    _add("", "Frontend build assets (dist/assets)", base_dir / "dist" / "assets", required=False, persistent=False)
-    _add("", "Collected static directory (staticfiles)", base_dir / "staticfiles", required=False, persistent=False)
-
-    targets: List[Tuple[str, Path, bool, bool]] = []
-    for source_tags, fallback_label, raw_path, required, persistent in entries:
-        if len(source_tags) > 1:
-            label = f"Offline data directory ({', '.join(source_tags)})"
-        elif len(source_tags) == 1:
-            label = f"{fallback_label} ({source_tags[0]})"
-        else:
-            label = fallback_label
-        targets.append((label, raw_path, required, persistent))
-    return targets
-
-
 def _inspect_directory(
     label: str,
     path: Path,
@@ -968,7 +728,27 @@ def _inspect_directory(
     persistent: bool,
     mounts: Sequence[Tuple[str, str, str]],
 ) -> DirectoryStatus:
-    mount_summary, is_ephemeral = _detect_mount_info(path, mounts=mounts)
+    mount_summary = "local filesystem"
+    is_ephemeral = False
+    if mounts:
+        try:
+            probe = path.resolve()
+        except OSError:
+            probe = path
+        probe_str = probe.as_posix()
+        best_match: Optional[Tuple[str, str, str]] = None
+        for mount_point, fs_type, options in mounts:
+            normalised_mp = mount_point.rstrip("/") or "/"
+            is_match = normalised_mp == "/" or probe_str == normalised_mp or probe_str.startswith(f"{normalised_mp}/")
+            if is_match and (best_match is None or len(normalised_mp) > len(best_match[0].rstrip("/") or "/")):
+                best_match = (mount_point, fs_type, options)
+        if best_match is not None:
+            mount_point, fs_type, options = best_match
+            rw_flag = "ro" if "ro" in options.split(",") else "rw"
+            kind = "NFS" if fs_type.startswith("nfs") else fs_type
+            mount_summary = f"{kind} ({fs_type}, {rw_flag}) at {mount_point}"
+            is_ephemeral = fs_type in ("overlay", "tmpfs", "ramfs")
+
     if not path.exists():
         return DirectoryStatus(
             label=label,
@@ -1036,184 +816,6 @@ def _inspect_directory(
     )
 
 
-def collect_offline_status_for_env(
-    base_dir: Path,
-    env_values: Mapping[str, str],
-    *,
-    now_dt: Optional[datetime] = None,
-) -> List[Dict[str, Any]]:
-    """Inventories offline database and rule files against a resolved environment mapping."""
-    return collect_offline_databases_status(
-        now_dt=now_dt,
-        env_overrides=env_values,
-        base_dir=base_dir,
-        include_resolved_path=True,
-    )
-
-
-def _strip_yaml_quotes(raw_val: str) -> str:
-    cleaned = raw_val.strip()
-    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in ("'", '"'):
-        return cleaned[1:-1]
-    return cleaned
-
-
-def parse_jobs_yaml(jobs_path: Path) -> List[JobSpec]:
-    """Parses simple Toolforge jobs.yaml entries without requiring PyYAML."""
-    if not jobs_path.is_file():
-        return list(DEFAULT_JOB_SPECS)
-
-    raw_items: List[Dict[str, str]] = []
-    current: Optional[Dict[str, str]] = None
-    for raw_line in jobs_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or line == "---":
-            continue
-        if line.startswith("- "):
-            if current:
-                raw_items.append(current)
-            current = {}
-            line = line[2:].strip()
-        if current is None or ":" not in line:
-            continue
-        key, val = line.split(":", 1)
-        current[key.strip()] = _strip_yaml_quotes(val)
-    if current:
-        raw_items.append(current)
-
-    parsed = [
-        JobSpec(
-            name=item["name"].strip(),
-            command=item.get("command", DEFAULT_JOB_SPEC.command).strip(),
-            image=item.get("image", DEFAULT_JOB_SPEC.image).strip(),
-            schedule=item.get("schedule", DEFAULT_JOB_SPEC.schedule).strip(),
-            mount=item.get("mount", DEFAULT_JOB_SPEC.mount).strip(),
-        )
-        for item in raw_items
-        if item.get("name", "").strip()
-    ]
-    return parsed or list(DEFAULT_JOB_SPECS)
-
-
-def _split_bordered_row(line: str, plus_positions: Optional[List[int]]) -> List[str]:
-    if plus_positions and len(plus_positions) >= 2 and len(line) >= plus_positions[-1] + 1:
-        return [
-            line[plus_positions[idx] + 1 : plus_positions[idx + 1]].strip() for idx in range(len(plus_positions) - 1)
-        ]
-    return [cell.strip() for cell in line.strip().strip("|").split("|")]
-
-
-def _parse_bordered_jobs_table(raw_output: str) -> Dict[str, RegisteredJob]:
-    """Parses prettytable grid output from toolforge jobs list --output long."""
-    plus_positions: Optional[List[int]] = None
-    headers: Optional[List[str]] = None
-    jobs: Dict[str, RegisteredJob] = {}
-
-    for line in (ln.rstrip("\r\n") for ln in raw_output.splitlines() if ln.strip()):
-        stripped = line.strip()
-        if stripped.startswith("+") and "+" in stripped[1:] and set(stripped) <= {"+", "-", "="}:
-            candidate_positions = [idx for idx, ch in enumerate(line) if ch == "+"]
-            if len(candidate_positions) >= 2:
-                plus_positions = candidate_positions
-            continue
-        if not (stripped.startswith("|") and stripped.endswith("|")):
-            continue
-
-        cells = _split_bordered_row(line, plus_positions)
-        if headers is None:
-            headers = [cell.rstrip(":").strip().lower() for cell in cells]
-            continue
-
-        row_map = {header: cells[idx] for idx, header in enumerate(headers) if idx < len(cells)}
-        name = row_map.get("job name") or row_map.get("name") or ""
-        if name:
-            jobs[name] = RegisteredJob(
-                name=name,
-                command=row_map.get("command", ""),
-                job_type=row_map.get("job type") or row_map.get("type") or "",
-                image=row_map.get("image", ""),
-                mount=row_map.get("mounts") or row_map.get("mount") or "",
-                status=row_map.get("status", ""),
-            )
-    return jobs
-
-
-def _parse_toolforge_jobs_json(stripped: str) -> Optional[Dict[str, RegisteredJob]]:
-    try:
-        payload = json.loads(stripped)
-    except ValueError:
-        return None
-    if not isinstance(payload, list):
-        return None
-    return {
-        str(entry["name"]).strip(): RegisteredJob(
-            name=str(entry["name"]).strip(),
-            command=str(entry.get("command") or ""),
-            job_type=str(entry.get("type") or entry.get("job_type") or ""),
-            image=str(entry.get("image") or ""),
-            mount=str(entry.get("mount") or entry.get("mounts") or ""),
-            status=str(entry.get("status") or ""),
-        )
-        for entry in payload
-        if isinstance(entry, dict) and entry.get("name")
-    }
-
-
-def _parse_toolforge_jobs_list(raw_output: str) -> Dict[str, RegisteredJob]:
-    """Parses toolforge jobs list output across long, compact, and JSON formats."""
-    stripped = raw_output.strip()
-    if not stripped or "no jobs found" in stripped.lower():
-        return {}
-
-    if stripped.startswith(("{", "[")):
-        parsed_json = _parse_toolforge_jobs_json(stripped)
-        if parsed_json is not None:
-            return parsed_json
-
-    if any(line.strip().startswith("|") and line.strip().endswith("|") for line in raw_output.splitlines()):
-        bordered = _parse_bordered_jobs_table(raw_output)
-        if bordered:
-            return bordered
-
-    jobs: Dict[str, RegisteredJob] = {}
-    col_bounds: Optional[List[Tuple[int, int]]] = None
-    for line in (ln.rstrip("\r\n") for ln in raw_output.splitlines() if ln.strip()):
-        if line.strip().lower().startswith("job name"):
-            continue
-        if _SEPARATOR_LINE_RE.match(line.strip()):
-            spans = [m.span() for m in re.finditer(r"-+", line)]
-            if len(spans) >= 2:
-                col_bounds = spans
-            continue
-
-        if col_bounds and len(col_bounds) >= 3:
-            name = line[col_bounds[0][0] : col_bounds[1][0]].strip()
-            job_type = line[col_bounds[1][0] : col_bounds[2][0]].strip()
-            status = line[col_bounds[2][0] :].strip()
-        else:
-            parts = line.split(None, 2)
-            if not parts:
-                continue
-            name = parts[0].strip()
-            job_type = parts[1].strip() if len(parts) > 1 else ""
-            status = parts[2].strip() if len(parts) > 2 else ""
-
-        if name and not name.endswith(":"):
-            jobs[name] = RegisteredJob(name=name, job_type=job_type, status=status)
-    return jobs
-
-
-def _parse_toolforge_job_show(raw_output: str) -> Dict[str, str]:
-    details: Dict[str, str] = {}
-    for line in raw_output.splitlines():
-        if ":" in line:
-            key, val = line.split(":", 1)
-            cleaned_key = key.strip().lower()
-            if cleaned_key:
-                details[cleaned_key] = val.strip()
-    return details
-
-
 def _extract_update_offline_sources(command: str) -> set[str]:
     if not command or "update_offline_dbs" not in command:
         return set()
@@ -1248,39 +850,8 @@ def _extract_update_offline_sources(command: str) -> set[str]:
         idx += 1
 
     if not source_tokens or "all" in source_tokens:
-        return {
-            "stopforumspam",
-            "maxmind",
-            "shared_cidrs",
-            "privacy_relays",
-            "ipsum_drop",
-            "tor_onionoo",
-            "bgp_tools",
-            "openasn",
-            "peeringdb_mobile",
-        }
-
-    alias_map = {
-        "stopforumspam": "stopforumspam",
-        "sfs": "stopforumspam",
-        "maxmind": "maxmind",
-        "shared_cidrs": "shared_cidrs",
-        "shared-cidrs": "shared_cidrs",
-        "rezmoss": "shared_cidrs",
-        "privacy_relays": "privacy_relays",
-        "privacy-relays": "privacy_relays",
-        "ipsum_drop": "ipsum_drop",
-        "ipsum-drop": "ipsum_drop",
-        "tor_onionoo": "tor_onionoo",
-        "tor-onionoo": "tor_onionoo",
-        "bgp_tools": "bgp_tools",
-        "bgp-tools": "bgp_tools",
-        "openasn": "openasn",
-        "open-asn": "openasn",
-        "peeringdb_mobile": "peeringdb_mobile",
-        "peeringdb-mobile": "peeringdb_mobile",
-    }
-    return {alias_map[tok] for tok in source_tokens if tok in alias_map}
+        return set(_ALL_OFFLINE_SOURCES)
+    return {_OFFLINE_SOURCE_ALIASES[tok] for tok in source_tokens if tok in _OFFLINE_SOURCE_ALIASES}
 
 
 def _schedule_matches_expected(expected_schedule: str, actual_job_type: str) -> bool:
@@ -1348,32 +919,91 @@ def _validate_registered_job(
     )
 
 
-def _hydrate_missing_job_details(
-    toolforge_bin: str,
-    active_jobs: Dict[str, RegisteredJob],
-    expected_names: set[str],
-) -> None:
-    for job_name, reg in list(active_jobs.items()):
-        if (
-            job_name not in expected_names
-            and "update" not in job_name
-            and "db" not in job_name
-            and "purge" not in job_name
-        ):
+def _parse_toolforge_jobs_list(raw_output: str) -> Dict[str, RegisteredJob]:
+    stripped = raw_output.strip()
+    if not stripped or "no jobs found" in stripped.lower():
+        return {}
+
+    if stripped.startswith(("{", "[")):
+        try:
+            payload = json.loads(stripped)
+        except ValueError:
+            payload = None
+        if isinstance(payload, list):
+            return {
+                str(entry["name"]).strip(): RegisteredJob(
+                    name=str(entry["name"]).strip(),
+                    command=str(entry.get("command") or ""),
+                    job_type=str(entry.get("type") or entry.get("job_type") or ""),
+                    image=str(entry.get("image") or ""),
+                    mount=str(entry.get("mount") or entry.get("mounts") or ""),
+                    status=str(entry.get("status") or ""),
+                )
+                for entry in payload
+                if isinstance(entry, dict) and entry.get("name")
+            }
+
+    if any(line.strip().startswith("|") and line.strip().endswith("|") for line in raw_output.splitlines()):
+        plus_positions: Optional[List[int]] = None
+        headers: Optional[List[str]] = None
+        bordered: Dict[str, RegisteredJob] = {}
+        for line in (ln.rstrip("\r\n") for ln in raw_output.splitlines() if ln.strip()):
+            line_stripped = line.strip()
+            if line_stripped.startswith("+") and "+" in line_stripped[1:] and set(line_stripped) <= {"+", "-", "="}:
+                candidate_positions = [idx for idx, ch in enumerate(line) if ch == "+"]
+                if len(candidate_positions) >= 2:
+                    plus_positions = candidate_positions
+                continue
+            if not (line_stripped.startswith("|") and line_stripped.endswith("|")):
+                continue
+            if plus_positions and len(plus_positions) >= 2 and len(line) >= plus_positions[-1] + 1:
+                cells = [
+                    line[plus_positions[idx] + 1 : plus_positions[idx + 1]].strip()
+                    for idx in range(len(plus_positions) - 1)
+                ]
+            else:
+                cells = [cell.strip() for cell in line_stripped.strip("|").split("|")]
+            if headers is None:
+                headers = [cell.rstrip(":").strip().lower() for cell in cells]
+                continue
+            row_map = {header: cells[idx] for idx, header in enumerate(headers) if idx < len(cells)}
+            name = row_map.get("job name") or row_map.get("name") or ""
+            if name:
+                bordered[name] = RegisteredJob(
+                    name=name,
+                    command=row_map.get("command", ""),
+                    job_type=row_map.get("job type") or row_map.get("type") or "",
+                    image=row_map.get("image", ""),
+                    mount=row_map.get("mounts") or row_map.get("mount") or "",
+                    status=row_map.get("status", ""),
+                )
+        if bordered:
+            return bordered
+
+    jobs: Dict[str, RegisteredJob] = {}
+    col_bounds: Optional[List[Tuple[int, int]]] = None
+    for line in (ln.rstrip("\r\n") for ln in raw_output.splitlines() if ln.strip()):
+        if line.strip().lower().startswith("job name"):
             continue
-        if reg.command and reg.image and reg.mount:
+        if _SEPARATOR_LINE_RE.match(line.strip()):
+            spans = [m.span() for m in re.finditer(r"-+", line)]
+            if len(spans) >= 2:
+                col_bounds = spans
             continue
-        rc_show, show_stdout, _ = _run_toolforge_command(toolforge_bin, ("jobs", "show", job_name))
-        if rc_show == 0:
-            details = _parse_toolforge_job_show(show_stdout)
-            active_jobs[job_name] = RegisteredJob(
-                name=job_name,
-                command=details.get("command", reg.command),
-                job_type=reg.job_type or details.get("job type") or details.get("type") or "",
-                image=details.get("image", reg.image),
-                mount=details.get("mounts") or details.get("mount") or reg.mount,
-                status=reg.status or details.get("status", ""),
-            )
+        if col_bounds and len(col_bounds) >= 3:
+            name = line[col_bounds[0][0] : col_bounds[1][0]].strip()
+            job_type = line[col_bounds[1][0] : col_bounds[2][0]].strip()
+            status = line[col_bounds[2][0] :].strip()
+        else:
+            parts = line.split(None, 2)
+            if not parts:
+                continue
+            name = parts[0].strip()
+            job_type = parts[1].strip() if len(parts) > 1 else ""
+            status = parts[2].strip() if len(parts) > 2 else ""
+        if name and not name.endswith(":"):
+            jobs[name] = RegisteredJob(name=name, job_type=job_type, status=status)
+    return jobs
 
 
 def _check_bastion_jobs(
@@ -1381,7 +1011,43 @@ def _check_bastion_jobs(
     base_dir: Path,
     tool_account: Optional[str],
 ) -> Tuple[List[BastionJobCheck], Optional[str]]:
-    expected_jobs = parse_jobs_yaml(base_dir / "jobs.yaml")
+    jobs_path = base_dir / "jobs.yaml"
+    expected_jobs: List[JobSpec] = []
+    if jobs_path.is_file():
+        raw_items: List[Dict[str, str]] = []
+        current: Optional[Dict[str, str]] = None
+        for raw_line in jobs_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or line == "---":
+                continue
+            if line.startswith("- "):
+                if current:
+                    raw_items.append(current)
+                current = {}
+                line = line[2:].strip()
+            if current is None or ":" not in line:
+                continue
+            key, val = line.split(":", 1)
+            cleaned_val = val.strip()
+            if len(cleaned_val) >= 2 and cleaned_val[0] == cleaned_val[-1] and cleaned_val[0] in ("'", '"'):
+                cleaned_val = cleaned_val[1:-1]
+            current[key.strip()] = cleaned_val
+        if current:
+            raw_items.append(current)
+        expected_jobs = [
+            JobSpec(
+                name=item["name"].strip(),
+                command=item.get("command", DEFAULT_JOB_SPEC.command).strip(),
+                image=item.get("image", DEFAULT_JOB_SPEC.image).strip(),
+                schedule=item.get("schedule", DEFAULT_JOB_SPEC.schedule).strip(),
+                mount=item.get("mount", DEFAULT_JOB_SPEC.mount).strip(),
+            )
+            for item in raw_items
+            if item.get("name", "").strip()
+        ]
+    if not expected_jobs:
+        expected_jobs = list(DEFAULT_JOB_SPECS)
+
     used_long_output = True
     rc, stdout, stderr = _run_toolforge_command(toolforge_bin, ("jobs", "list", "--output", "long"))
     if rc != 0:
@@ -1393,7 +1059,34 @@ def _check_bastion_jobs(
 
     active_jobs = _parse_toolforge_jobs_list(stdout)
     if not used_long_output:
-        _hydrate_missing_job_details(toolforge_bin, active_jobs, {spec.name for spec in expected_jobs})
+        expected_names = {spec.name for spec in expected_jobs}
+        for job_name, reg in list(active_jobs.items()):
+            if (
+                job_name not in expected_names
+                and "update" not in job_name
+                and "db" not in job_name
+                and "purge" not in job_name
+            ):
+                continue
+            if reg.command and reg.image and reg.mount:
+                continue
+            rc_show, show_stdout, _ = _run_toolforge_command(toolforge_bin, ("jobs", "show", job_name))
+            if rc_show == 0:
+                details: Dict[str, str] = {}
+                for show_line in show_stdout.splitlines():
+                    if ":" in show_line:
+                        k, v = show_line.split(":", 1)
+                        cleaned_k = k.strip().lower()
+                        if cleaned_k:
+                            details[cleaned_k] = v.strip()
+                active_jobs[job_name] = RegisteredJob(
+                    name=job_name,
+                    command=details.get("command", reg.command),
+                    job_type=reg.job_type or details.get("job type") or details.get("type") or "",
+                    image=details.get("image", reg.image),
+                    mount=details.get("mounts") or details.get("mount") or reg.mount,
+                    status=reg.status or details.get("status", ""),
+                )
 
     results: List[BastionJobCheck] = []
     for spec in expected_jobs:
@@ -1449,213 +1142,12 @@ def _check_bastion_jobs(
     return results, None
 
 
-def _format_age(age_seconds: Optional[int]) -> str:
-    if age_seconds is None:
-        return "-"
-    if age_seconds < 60:
-        return f"{age_seconds}s"
-    if age_seconds < 3600:
-        return f"{age_seconds // 60}m"
-    if age_seconds < 86400:
-        return f"{age_seconds // 3600}h"
-    return f"{age_seconds // 86400}d"
-
-
-def _format_bytes(size_bytes: Optional[int]) -> str:
-    if size_bytes is None:
-        return "-"
-    if size_bytes < 1024:
-        return f"{size_bytes} B"
-    if size_bytes < 1024 * 1024:
-        return f"{size_bytes / 1024:.1f} KiB"
-    return f"{size_bytes / (1024 * 1024):.1f} MiB"
-
-
-_GRANT_STMT_RE = re.compile(r"^\s*GRANT\s+(.+?)\s+ON\s+(.+?)\s+TO\s+(.+?)\s*;?\s*$", re.IGNORECASE)
-_MYSQL_PROBE_ERRORS: Tuple[type[BaseException], ...] = (
-    (ImportError, OSError, RuntimeError, ValueError, DjangoDbError, _PyMySqlError)
-    if _PyMySqlError is not None
-    else (ImportError, OSError, RuntimeError, ValueError, DjangoDbError)
-)
-
-
-def is_public_toolsdb_name(db_name: str) -> bool:
-    """Returns True when a ToolsDB schema name ends with the public exposure suffix _p."""
-    cleaned = str(db_name or "").strip().strip("`'\"")
-    return bool(cleaned) and cleaned.lower().endswith("_p")
-
-
-def _extract_grantee_user(grantee_clause: str) -> Tuple[str, bool]:
-    trimmed = re.split(r"\s+(?:IDENTIFIED|WITH|REQUIRE)\b", grantee_clause.strip(), maxsplit=1, flags=re.IGNORECASE)[0]
-    trimmed = trimmed.strip()
-    if trimmed.upper() == "PUBLIC" or trimmed.upper().startswith("PUBLIC "):
-        return "PUBLIC", True
-    if "@" not in trimmed:
-        user_only = trimmed.strip("`'\"")
-        return user_only, user_only.upper() == "PUBLIC"
-    user_part, _ = trimmed.rsplit("@", 1)
-    cleaned_user = user_part.strip().strip("`'\"")
-    is_public_or_wildcard = cleaned_user == "" or "%" in cleaned_user or cleaned_user.lower() == "public"
-    return cleaned_user, is_public_or_wildcard
-
-
-_WIKI_REPLICA_SCHEMA_PATTERN = "%_p"
-_WIKI_REPLICA_READONLY_PRIVS = frozenset({"SELECT", "SHOW VIEW"})
-
-
-def _is_wiki_replica_readonly_grant(normalized_schema: str, privs_upper: str) -> bool:
-    """Toolforge grants every tool read-only access to Wiki Replicas (`%\\_p`); this is expected."""
-    if normalized_schema != _WIKI_REPLICA_SCHEMA_PATTERN:
-        return False
-    privs = {part.strip() for part in privs_upper.split(",") if part.strip()}
-    return bool(privs) and privs <= _WIKI_REPLICA_READONLY_PRIVS
-
-
-def _is_unsafe_grant_statement(stmt: str, *, expected_user: str) -> bool:
-    match = _GRANT_STMT_RE.match(stmt)
-    if not match:
-        return False
-    privs_raw, target_raw, grantee_raw = match.groups()
-    privs_upper = " ".join(privs_raw.upper().split())
-
-    grantee_user, is_public_grantee = _extract_grantee_user(grantee_raw)
-    if is_public_grantee:
-        return True
-    if expected_user and grantee_user and grantee_user != expected_user.strip():
-        return True
-
-    schema_part = target_raw.strip().split(".", 1)[0].strip().strip("`'\"")
-    normalized_schema = schema_part.replace("\\_", "_")
-    if _is_wiki_replica_readonly_grant(normalized_schema, privs_upper):
-        return False
-    if is_public_toolsdb_name(normalized_schema):
-        return True
-    return normalized_schema in ("*", "%") and privs_upper != "USAGE"
-
-
-def find_unsafe_grant_statements(
-    grant_rows: Sequence[Any],
-    *,
-    expected_user: str = "",
-    db_name: str = "",
-) -> List[str]:
-    """Extracts any SHOW GRANTS statements that expose schemas to public or wildcard users."""
-    unsafe: List[str] = []
-    if db_name and is_public_toolsdb_name(db_name):
-        unsafe.append(f"PUBLIC_SCHEMA_NAME:{db_name}")
-    for row in grant_rows:
-        if isinstance(row, str):
-            stmt = row.strip()
-        elif isinstance(row, Sequence) and row:
-            stmt = str(row[0]).strip()
-        else:
-            continue
-        if stmt and _is_unsafe_grant_statement(stmt, expected_user=expected_user):
-            unsafe.append(stmt)
-    return unsafe
-
-
-def check_redis_key_secret_status(
-    env_values: Mapping[str, str],
-    *,
-    hidden_keys: frozenset[str] = frozenset(),
-) -> Tuple[str, str]:
-    """Validates REDIS_KEY_SECRET presence and entropy for multi-tenant Redis isolation."""
-    if "REDIS_KEY_SECRET" in hidden_keys:
-        return "ok", "configured in Toolforge envvars (hidden by CLI)"
-    raw_secret = str(env_values.get("REDIS_KEY_SECRET") or "").strip()
-    if not raw_secret:
-        return "warning", "unset; falling back to DJANGO_SECRET_KEY for Redis namespace HMAC isolation"
-    is_placeholder, weak_reason = _is_weak_secret_key(raw_secret)
-    if is_placeholder:
-        return "error", f"{mask_secret(raw_secret)} ({weak_reason})"
-    if weak_reason:
-        return "warning", f"{mask_secret(raw_secret)} ({weak_reason})"
-    return "ok", f"configured = {mask_secret(raw_secret)}"
-
-
-def _open_mysql_probe_connection(db_cfg: Mapping[str, Any]) -> Any:
-    if pymysql is None:
-        raise ImportError("PyMySQL is not installed in the active Python environment.")
-    options = db_cfg.get("OPTIONS") if isinstance(db_cfg.get("OPTIONS"), Mapping) else {}
-    return pymysql.connect(
-        host=str(db_cfg.get("HOST") or "tools.db.svc.wikimedia.cloud"),
-        port=int(db_cfg.get("PORT") or 3306),
-        user=str(db_cfg.get("USER") or ""),
-        password=str(db_cfg.get("PASSWORD") or ""),
-        database=str(db_cfg.get("NAME") or ""),
-        connect_timeout=int(options.get("connect_timeout") or 3),
-        read_timeout=int(options.get("read_timeout") or 5),
-        write_timeout=int(options.get("write_timeout") or 5),
-        charset=str(options.get("charset") or "utf8mb4"),
-    )
-
-
-def _probe_mysql_connectivity_and_grants(
-    default_cfg: Mapping[str, Any],
-    *,
-    connection_factory: Optional[Callable[[Mapping[str, Any]], Any]],
-) -> ToolsDbCheckResult:
-    resolved_db_name = str(default_cfg.get("NAME") or "").strip()
-    resolved_host = str(default_cfg.get("HOST") or "")
-    resolved_port = int(default_cfg.get("PORT") or 3306)
-    resolved_user = str(default_cfg.get("USER") or "")
-
-    conn_fn = _open_mysql_probe_connection if connection_factory is None else connection_factory
-    conn = None
-    try:
-        conn = conn_fn(default_cfg)
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT 1")
-            cursor.fetchone()
-            cursor.execute("SHOW GRANTS")
-            grant_rows = list(cursor.fetchall() or ())
-    except _MYSQL_PROBE_ERRORS as exc:
-        safe_msg = sanitize_error_message(str(exc))
-        return ToolsDbCheckResult(
-            status="error",
-            db_name=resolved_db_name,
-            host=resolved_host,
-            port=resolved_port,
-            user=resolved_user,
-            message=f"ToolsDB connection check failed: {safe_msg}",
-        )
-    finally:
-        close_fn = getattr(conn, "close", None)
-        if callable(close_fn):
-            with contextlib.suppress(*_MYSQL_PROBE_ERRORS):
-                close_fn()
-
-    unsafe = tuple(find_unsafe_grant_statements(grant_rows, expected_user=resolved_user, db_name=resolved_db_name))
-    if unsafe:
-        return ToolsDbCheckResult(
-            status="error",
-            db_name=resolved_db_name,
-            host=resolved_host,
-            port=resolved_port,
-            user=resolved_user,
-            unsafe_grants=unsafe,
-            message=f"Unsafe wildcard or public MariaDB grants detected ({len(unsafe)} statement(s)).",
-        )
-    return ToolsDbCheckResult(
-        status="ok",
-        db_name=resolved_db_name,
-        host=resolved_host,
-        port=resolved_port,
-        user=resolved_user,
-        message=f"Connected to {resolved_host}:{resolved_port} schema '{resolved_db_name}' as '{resolved_user}'.",
-    )
-
-
-def check_toolsdb_status(
+def _check_toolsdb_status(
     base_dir: Path,
     env_values: Mapping[str, str],
     *,
     hidden_keys: frozenset[str] = frozenset(),
-    home_dir: Optional[Path] = None,
-    connection_factory: Optional[Callable[[Mapping[str, Any]], Any]] = None,
 ) -> ToolsDbCheckResult:
-    """Verifies ToolsDB configuration, rejects _p public schema names, and audits MariaDB grants."""
     raw_db_name = str(env_values.get("TOOLSDB_NAME") or env_values.get("TOOL_TOOLSDB_NAME") or "").strip()
     if is_public_toolsdb_name(raw_db_name):
         return ToolsDbCheckResult(
@@ -1676,14 +1168,12 @@ def check_toolsdb_status(
             message="ToolsDB L2 cache is disabled via ENABLE_L2_TOOLSDB_CACHE.",
         )
 
-    resolved_home = home_dir if home_dir is not None else Path.home()
-    db_configs = build_databases_config(
+    default_cfg = build_databases_config(
         env=env_values,
         base_dir=base_dir,
         is_test_run=False,
-        home_dir=resolved_home,
-    )
-    default_cfg = db_configs["default"]
+        home_dir=Path.home(),
+    )["default"]
     if default_cfg.get("ENGINE") != "django.db.backends.mysql":
         if raw_db_name:
             if "TOOLSDB_PASSWORD" in hidden_keys or "TOOL_TOOLSDB_PASSWORD" in hidden_keys:
@@ -1703,13 +1193,16 @@ def check_toolsdb_status(
         )
 
     resolved_db_name = str(default_cfg.get("NAME") or "").strip()
+    resolved_host = str(default_cfg.get("HOST") or "")
+    resolved_port = int(default_cfg.get("PORT") or 3306)
+    resolved_user = str(default_cfg.get("USER") or "")
     if is_public_toolsdb_name(resolved_db_name):
         return ToolsDbCheckResult(
             status="error",
             db_name=resolved_db_name,
-            host=str(default_cfg.get("HOST") or ""),
-            port=int(default_cfg.get("PORT") or 3306),
-            user=str(default_cfg.get("USER") or ""),
+            host=resolved_host,
+            port=resolved_port,
+            user=resolved_user,
             is_public_name_hazard=True,
             message=(
                 f"Database name '{resolved_db_name}' ends with '_p', which exposes tables publicly across "
@@ -1717,7 +1210,99 @@ def check_toolsdb_status(
             ),
         )
 
-    return _probe_mysql_connectivity_and_grants(default_cfg, connection_factory=connection_factory)
+    conn = None
+    try:
+        if pymysql is None:
+            raise ImportError("PyMySQL is not installed in the active Python environment.")
+        options = default_cfg.get("OPTIONS") if isinstance(default_cfg.get("OPTIONS"), Mapping) else {}
+        conn = pymysql.connect(
+            host=resolved_host or "tools.db.svc.wikimedia.cloud",
+            port=resolved_port,
+            user=resolved_user,
+            password=str(default_cfg.get("PASSWORD") or ""),
+            database=resolved_db_name,
+            connect_timeout=int(options.get("connect_timeout") or 3),
+            read_timeout=int(options.get("read_timeout") or 5),
+            write_timeout=int(options.get("write_timeout") or 5),
+            charset=str(options.get("charset") or "utf8mb4"),
+        )
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+            cursor.execute("SHOW GRANTS")
+            grant_rows = list(cursor.fetchall() or ())
+    except _MYSQL_PROBE_ERRORS as exc:
+        return ToolsDbCheckResult(
+            status="error",
+            db_name=resolved_db_name,
+            host=resolved_host,
+            port=resolved_port,
+            user=resolved_user,
+            message=f"ToolsDB connection check failed: {sanitize_error_message(str(exc))}",
+        )
+    finally:
+        close_fn = getattr(conn, "close", None)
+        if callable(close_fn):
+            with contextlib.suppress(*_MYSQL_PROBE_ERRORS):
+                close_fn()
+
+    unsafe: List[str] = []
+    if resolved_db_name and is_public_toolsdb_name(resolved_db_name):
+        unsafe.append(f"PUBLIC_SCHEMA_NAME:{resolved_db_name}")
+    for row in grant_rows:
+        if isinstance(row, str):
+            stmt = row.strip()
+        elif isinstance(row, Sequence) and row:
+            stmt = str(row[0]).strip()
+        else:
+            continue
+        match = _GRANT_STMT_RE.match(stmt) if stmt else None
+        if not match:
+            continue
+        privs_raw, target_raw, grantee_raw = match.groups()
+        privs_upper = " ".join(privs_raw.upper().split())
+        trimmed_grantee = re.split(
+            r"\s+(?:IDENTIFIED|WITH|REQUIRE)\b", grantee_raw.strip(), maxsplit=1, flags=re.IGNORECASE
+        )[0].strip()
+        if trimmed_grantee.upper() == "PUBLIC" or trimmed_grantee.upper().startswith("PUBLIC "):
+            unsafe.append(stmt)
+            continue
+        if "@" not in trimmed_grantee:
+            grantee_user = trimmed_grantee.strip("`'\"")
+            is_public_grantee = grantee_user.upper() == "PUBLIC"
+        else:
+            grantee_user = trimmed_grantee.rsplit("@", 1)[0].strip().strip("`'\"")
+            is_public_grantee = grantee_user == "" or "%" in grantee_user or grantee_user.lower() == "public"
+        if is_public_grantee or (resolved_user and grantee_user and grantee_user != resolved_user.strip()):
+            unsafe.append(stmt)
+            continue
+
+        normalised_schema = target_raw.strip().split(".", 1)[0].strip().strip("`'\"").replace("\\_", "_")
+        # Toolforge grants every tool read-only access to Wiki Replicas (`%_p`); this is expected.
+        privs_set = {part.strip() for part in privs_upper.split(",") if part.strip()}
+        if normalised_schema == "%_p" and privs_set and privs_set <= _WIKI_REPLICA_READONLY_PRIVS:
+            continue
+        if is_public_toolsdb_name(normalised_schema) or (normalised_schema in ("*", "%") and privs_upper != "USAGE"):
+            unsafe.append(stmt)
+
+    if unsafe:
+        return ToolsDbCheckResult(
+            status="error",
+            db_name=resolved_db_name,
+            host=resolved_host,
+            port=resolved_port,
+            user=resolved_user,
+            unsafe_grants=tuple(unsafe),
+            message=f"Unsafe wildcard or public MariaDB grants detected ({len(unsafe)} statement(s)).",
+        )
+    return ToolsDbCheckResult(
+        status="ok",
+        db_name=resolved_db_name,
+        host=resolved_host,
+        port=resolved_port,
+        user=resolved_user,
+        message=f"Connected to {resolved_host}:{resolved_port} schema '{resolved_db_name}' as '{resolved_user}'.",
+    )
 
 
 class Command(BaseCommand):
@@ -1777,119 +1362,39 @@ class Command(BaseCommand):
         if mode == "bastion":
             if not toolforge_bin:
                 raise CommandError("Cannot write Toolforge envvars without 'toolforge' CLI.")
-            save_envvar_bastion(toolforge_bin, key, value)
+            rc, stdout, stderr = _run_toolforge_command(toolforge_bin, ("envvars", "create", key), input_text=value)
+            if rc != 0:
+                detail = (stderr or stdout).strip()
+                raise CommandError(f"Failed to set Toolforge envvar {key}: {detail or f'exit code {rc}'}")
             env_result.values[key] = value
             env_result.sources[key] = "toolforge envvars"
             return
 
-        gitignore_note = save_envvar_local(base_dir, env_result.dotenv_path, key, value)
+        gitignore_path = base_dir / ".gitignore"
+        gitignore_note: Optional[str] = None
+        if gitignore_path.is_file():
+            existing = gitignore_path.read_text(encoding="utf-8")
+            if not any(line.split("#", 1)[0].strip() in (".env", "/.env", "*.env") for line in existing.splitlines()):
+                prefix = "\n" if existing and not existing.endswith("\n") else ""
+                gitignore_path.write_text(f"{existing}{prefix}.env\n", encoding="utf-8")
+                gitignore_note = f"appended '.env' to {gitignore_path}"
+        else:
+            gitignore_path.write_text(".env\n", encoding="utf-8")
+            gitignore_note = f"created {gitignore_path} with '.env'"
+
+        dotenv_path = env_result.dotenv_path
+        created_new = not dotenv_path.exists()
+        dotenv_path.parent.mkdir(parents=True, exist_ok=True)
+        set_key(dotenv_path, key, value, quote_mode="always", encoding="utf-8")
+        if created_new:
+            with contextlib.suppress(OSError):
+                os.chmod(dotenv_path, 0o600)
+        os.environ[key] = value
+
         if gitignore_note:
             self.stdout.write(self.style.WARNING(f"  Git safety: {gitignore_note}"))
         env_result.values[key] = value
-        env_result.sources[key] = env_result.dotenv_path.name
-
-    def _report_missing_env_spec(
-        self,
-        spec: EnvVarSpec,
-        *,
-        tag: str,
-        missing_required: List[EnvVarSpec],
-        attention_recommended: List[EnvVarSpec],
-        missing_providers: List[EnvVarSpec],
-        missing_optional_all: List[EnvVarSpec],
-    ) -> None:
-        if spec.tier == "required":
-            missing_required.append(spec)
-            self.stdout.write(self.style.ERROR(f"  - {tag} {spec.name}: MISSING ({spec.description})"))
-        elif spec.tier == "recommended":
-            attention_recommended.append(spec)
-            self.stdout.write(self.style.WARNING(f"  - {tag} {spec.name}: MISSING (default: {spec.default_display})"))
-        elif spec.tier == "provider":
-            missing_providers.append(spec)
-            self.stdout.write(f"  - {tag} {spec.name}: MISSING (provider skipped)")
-        else:
-            missing_optional_all.append(spec)
-            self.stdout.write(f"  - {tag} {spec.name}: USING DEFAULT ({spec.default_display})")
-
-    def _report_configured_env_spec(
-        self,
-        spec: EnvVarSpec,
-        val: str,
-        *,
-        tag: str,
-        source_label: str,
-        mode: str,
-        tool_account: Optional[str],
-        missing_required: List[EnvVarSpec],
-        attention_recommended: List[EnvVarSpec],
-    ) -> None:
-        if spec.name == "DJANGO_SECRET_KEY" and val == INSECURE_DEV_SECRET_KEY:
-            missing_required.append(spec)
-            self.stdout.write(self.style.ERROR(f"  - {tag} {spec.name}: INSECURE DEFAULT ({source_label})"))
-            return
-
-        if spec.name == "DJANGO_SECRET_KEY":
-            is_placeholder, weak_reason = _is_weak_secret_key(val)
-            if weak_reason:
-                shown_val = format_display_value(spec, val)
-                if is_placeholder:
-                    missing_required.append(spec)
-                self.stdout.write(
-                    self.style.WARNING(
-                        f"  - {tag} {spec.name}: WEAK / PLACEHOLDER = {shown_val} ({weak_reason}; {source_label})"
-                    )
-                )
-                return
-
-        review_reason = (
-            _is_recommended_local_fallback(spec, val, mode=mode, tool_account=tool_account)
-            if spec.tier == "recommended"
-            else None
-        )
-        shown_val = format_display_value(spec, val)
-        if review_reason:
-            attention_recommended.append(spec)
-            self.stdout.write(
-                self.style.WARNING(
-                    f"  - {tag} {spec.name}: NEEDS REVIEW = {shown_val} ({review_reason}; {source_label})"
-                )
-            )
-        else:
-            self.stdout.write(self.style.SUCCESS(f"  - {tag} {spec.name}: CONFIGURED = {shown_val} ({source_label})"))
-
-    def _print_tuning_env_section(
-        self,
-        values: Dict[str, str],
-        sources: Dict[str, str],
-        *,
-        show_all_options: bool,
-        missing_optional_all: List[EnvVarSpec],
-    ) -> None:
-        tuning_specs = [spec for spec in ENV_SPECS if spec.tier == "tuning"]
-        custom_tuning = [spec for spec in tuning_specs if values.get(spec.name, "")]
-        if show_all_options:
-            self.stdout.write("\n  Tuning & Quota Limits (Optional):")
-            for spec in tuning_specs:
-                val = values.get(spec.name, "")
-                if val:
-                    self.stdout.write(
-                        self.style.SUCCESS(
-                            f"  - [OPTIONAL] {spec.name}: CUSTOMISED = {val} ({sources.get(spec.name, '')})"
-                        )
-                    )
-                else:
-                    missing_optional_all.append(spec)
-                    self.stdout.write(f"  - [OPTIONAL] {spec.name}: USING DEFAULT ({spec.default_display})")
-            return
-
-        self.stdout.write(f"\n  Tuning & Quota Limits ({len(tuning_specs)} optional vars):")
-        if custom_tuning:
-            custom_summary = ", ".join(f"{spec.name}={values[spec.name]}" for spec in custom_tuning)
-            self.stdout.write(f"  - Customised ({len(custom_tuning)}): {custom_summary}")
-        self.stdout.write(
-            f"  - Using built-in defaults ({len(tuning_specs) - len(custom_tuning)} vars); "
-            "pass --all-options to inspect or edit individually."
-        )
+        env_result.sources[key] = dotenv_path.name
 
     def _print_env_section(
         self,
@@ -1925,24 +1430,72 @@ class Command(BaseCommand):
                     continue
                 val = values.get(spec.name, "")
                 if not val:
-                    self._report_missing_env_spec(
-                        spec,
-                        tag=tag,
-                        missing_required=missing_required,
-                        attention_recommended=attention_recommended,
-                        missing_providers=missing_providers,
-                        missing_optional_all=missing_optional_all,
+                    if spec.tier == "required":
+                        missing_required.append(spec)
+                        self.stdout.write(self.style.ERROR(f"  - {tag} {spec.name}: MISSING ({spec.description})"))
+                    elif spec.tier == "recommended":
+                        attention_recommended.append(spec)
+                        self.stdout.write(
+                            self.style.WARNING(f"  - {tag} {spec.name}: MISSING (default: {spec.default_display})")
+                        )
+                    elif spec.tier == "provider":
+                        missing_providers.append(spec)
+                        self.stdout.write(f"  - {tag} {spec.name}: MISSING (provider skipped)")
+                    else:
+                        missing_optional_all.append(spec)
+                        self.stdout.write(f"  - {tag} {spec.name}: USING DEFAULT ({spec.default_display})")
+                    continue
+
+                source_label = sources.get(spec.name, "configured")
+                if spec.name == "DJANGO_SECRET_KEY" and val == INSECURE_DEV_SECRET_KEY:
+                    missing_required.append(spec)
+                    self.stdout.write(self.style.ERROR(f"  - {tag} {spec.name}: INSECURE DEFAULT ({source_label})"))
+                    continue
+                if spec.name == "DJANGO_SECRET_KEY":
+                    is_placeholder, weak_reason = _is_weak_secret_key(val)
+                    if weak_reason:
+                        if is_placeholder:
+                            missing_required.append(spec)
+                        shown_val = format_display_value(spec, val)
+                        self.stdout.write(
+                            self.style.WARNING(
+                                f"  - {tag} {spec.name}: WEAK / PLACEHOLDER = {shown_val} ({weak_reason}; {source_label})"
+                            )
+                        )
+                        continue
+
+                review_reason: Optional[str] = None
+                if spec.tier == "recommended":
+                    cleaned_val = val.strip()
+                    if spec.name == "DJANGO_ALLOWED_HOSTS" and mode == "bastion":
+                        hosts = [entry.strip().lower() for entry in cleaned_val.split(",") if entry.strip()]
+                        if hosts and all(host in _LOCAL_HOSTS for host in hosts):
+                            review_reason = "contains only local hosts for a Toolforge environment"
+                    elif (
+                        spec.name == "REDIS_URL"
+                        and mode == "bastion"
+                        and ("127.0.0.1" in cleaned_val.lower() or "localhost" in cleaned_val.lower())
+                    ):
+                        review_reason = "points to localhost Redis inside Toolforge"
+                    elif (
+                        spec.name == "WIKIMEDIA_REDIRECT_URI"
+                        and tool_account == "proxycheck-dev"
+                        and "proxycheck.toolforge.org" in cleaned_val
+                        and "proxycheck-dev.toolforge.org" not in cleaned_val
+                    ):
+                        review_reason = "points to production callback URL while active tool is proxycheck-dev"
+
+                shown_val = format_display_value(spec, val)
+                if review_reason:
+                    attention_recommended.append(spec)
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"  - {tag} {spec.name}: NEEDS REVIEW = {shown_val} ({review_reason}; {source_label})"
+                        )
                     )
                 else:
-                    self._report_configured_env_spec(
-                        spec,
-                        val,
-                        tag=tag,
-                        source_label=sources.get(spec.name, "configured"),
-                        mode=mode,
-                        tool_account=tool_account,
-                        missing_required=missing_required,
-                        attention_recommended=attention_recommended,
+                    self.stdout.write(
+                        self.style.SUCCESS(f"  - {tag} {spec.name}: CONFIGURED = {shown_val} ({source_label})")
                     )
 
         if values.get("ENABLE_TEST_AUTH") == "1" and (
@@ -1954,12 +1507,31 @@ class Command(BaseCommand):
                 )
             )
 
-        self._print_tuning_env_section(
-            values,
-            sources,
-            show_all_options=show_all_options,
-            missing_optional_all=missing_optional_all,
-        )
+        tuning_specs = [spec for spec in ENV_SPECS if spec.tier == "tuning"]
+        custom_tuning = [spec for spec in tuning_specs if values.get(spec.name, "")]
+        if show_all_options:
+            self.stdout.write("\n  Tuning & Quota Limits (Optional):")
+            for spec in tuning_specs:
+                val = values.get(spec.name, "")
+                if val:
+                    self.stdout.write(
+                        self.style.SUCCESS(
+                            f"  - [OPTIONAL] {spec.name}: CUSTOMISED = {val} ({sources.get(spec.name, '')})"
+                        )
+                    )
+                else:
+                    missing_optional_all.append(spec)
+                    self.stdout.write(f"  - [OPTIONAL] {spec.name}: USING DEFAULT ({spec.default_display})")
+        else:
+            self.stdout.write(f"\n  Tuning & Quota Limits ({len(tuning_specs)} optional vars):")
+            if custom_tuning:
+                custom_summary = ", ".join(f"{spec.name}={values[spec.name]}" for spec in custom_tuning)
+                self.stdout.write(f"  - Customised ({len(custom_tuning)}): {custom_summary}")
+            self.stdout.write(
+                f"  - Using built-in defaults ({len(tuning_specs) - len(custom_tuning)} vars); "
+                "pass --all-options to inspect or edit individually."
+            )
+
         return missing_required, attention_recommended, missing_providers, missing_optional_all
 
     def _run_interactive_env_prompts(
@@ -1995,7 +1567,9 @@ class Command(BaseCommand):
                 return
 
             final_val = (
-                generate_secret_key() if spec.name == "DJANGO_SECRET_KEY" and entered.lower() == "gen" else entered
+                get_random_string(50, _SECRET_KEY_CHARS)
+                if spec.name == "DJANGO_SECRET_KEY" and entered.lower() == "gen"
+                else entered
             )
             self._save_env_value(
                 mode=mode,
@@ -2016,7 +1590,23 @@ class Command(BaseCommand):
         if attention_recommended:
             self.stdout.write("\n  Interactive Setup: Recommended Variables")
             for spec in attention_recommended:
-                _prompt_and_store(spec, hint=_suggested_value_hint(spec, mode=mode, tool_account=tool_account))
+                hint = ""
+                if spec.name == "DJANGO_ALLOWED_HOSTS" and mode == "bastion":
+                    hint = DEFAULT_TOOLFORGE_ALLOWED_HOSTS
+                elif spec.name == "WIKIMEDIA_REDIRECT_URI":
+                    if tool_account:
+                        hint = f"https://{tool_account}.toolforge.org/oauth/callback"
+                    else:
+                        hint = (
+                            "http://127.0.0.1:8000/oauth/callback"
+                            if mode == "local"
+                            else DEFAULT_PRODUCTION_REDIRECT_URI
+                        )
+                elif spec.name == "REDIS_URL" and mode == "bastion":
+                    hint = DEFAULT_TOOLFORGE_REDIS_URL
+                elif spec.name == "TOOL_DATA_DIR" and mode == "bastion" and tool_account:
+                    hint = f"/data/project/{tool_account}"
+                _prompt_and_store(spec, hint=hint)
 
         if missing_providers:
             self.stdout.write("")
@@ -2043,14 +1633,35 @@ class Command(BaseCommand):
         env_values: Mapping[str, str],
         mode: str,
         no_input: bool,
-    ) -> Tuple[List[DirectoryStatus], List[Path]]:
+    ) -> List[DirectoryStatus]:
         self.stdout.write("\n[2/4] Persistent Directories & Mount Status")
-        mounts = _parse_mounts_table()
-        targets = _collect_target_directories(base_dir, env_values, mode=mode)
-        statuses: List[DirectoryStatus] = []
-        created_dirs: List[Path] = []
 
-        for label, path, required, persistent in targets:
+        mounts: List[Tuple[str, str, str]] = []
+        mounts_path = Path("/proc/mounts")
+        if mounts_path.is_file():
+            with contextlib.suppress(OSError):
+                for line in mounts_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        mounts.append((parts[1].replace("\\040", " "), parts[2], parts[3]))
+
+        raw_targets: List[Tuple[str, Path, bool, bool]] = []
+        tool_data_dir = expand_configured_path(env_values.get("TOOL_DATA_DIR", ""))
+        if tool_data_dir:
+            raw_targets.append(
+                ("Persistent data directory (TOOL_DATA_DIR)", resolve_tool_data_subdir(tool_data_dir), True, True)
+            )
+        elif mode == "bastion" or base_dir.parent == Path(base_dir.anchor):
+            raw_targets.append(("Persistent data directory (~/data)", Path.home() / "data", True, True))
+        else:
+            local_candidates = (base_dir.parent / "data", base_dir / "data", Path.home() / "data")
+            chosen_local = next((cand for cand in local_candidates if cand.is_dir()), base_dir.parent / "data")
+            raw_targets.append(("Default offline data directory", chosen_local, True, True))
+        raw_targets.append(("Frontend build assets (dist/assets)", base_dir / "dist" / "assets", False, False))
+        raw_targets.append(("Collected static directory (staticfiles)", base_dir / "staticfiles", False, False))
+
+        statuses: List[DirectoryStatus] = []
+        for label, path, required, persistent in raw_targets:
             status = _inspect_directory(label, path, required=required, persistent=persistent, mounts=mounts)
             tag = "[REQUIRED]" if required else "[OPTIONAL]"
             if not status.exists:
@@ -2066,7 +1677,6 @@ class Command(BaseCommand):
                 if persistent and not no_input and self._prompt_yes_no(f"    Create directory '{path}'? [y/N]: "):
                     try:
                         path.mkdir(parents=True, exist_ok=True)
-                        created_dirs.append(path)
                         status = _inspect_directory(
                             label, path, required=required, persistent=persistent, mounts=mounts
                         )
@@ -2103,16 +1713,20 @@ class Command(BaseCommand):
                     self.stdout.write(self.style.SUCCESS(line))
             statuses.append(status)
 
-        return statuses, created_dirs
+        return statuses
 
-    def _print_offline_db_section(
+    def _print_offline_db_and_storage_section(
         self,
         *,
         base_dir: Path,
-        env_values: Mapping[str, str],
-    ) -> List[Dict[str, Any]]:
+        env_result: EnvLoadResult,
+    ) -> Tuple[List[Dict[str, Any]], Tuple[str, str], ToolsDbCheckResult]:
         self.stdout.write("\n[3/4] Offline Databases & Rule Files")
-        entries = collect_offline_status_for_env(base_dir, env_values)
+        entries = collect_offline_databases_status(
+            env_overrides=env_result.values,
+            base_dir=base_dir,
+            include_resolved_path=True,
+        )
 
         for entry in entries:
             tag = "[OPTIONAL]" if entry["optional"] else "[REQUIRED]"
@@ -2123,10 +1737,33 @@ class Command(BaseCommand):
                 entry["resolvedPath"],
             )
             if status in ("healthy", "stale"):
-                meta = f"{_format_bytes(entry['sizeBytes'])}, age {_format_age(entry['ageSeconds'])}"
+                size_bytes = entry["sizeBytes"]
+                if size_bytes is None:
+                    size_str = "-"
+                elif size_bytes < 1024:
+                    size_str = f"{size_bytes} B"
+                elif size_bytes < 1024 * 1024:
+                    size_str = f"{size_bytes / 1024:.1f} KiB"
+                else:
+                    size_str = f"{size_bytes / (1024 * 1024):.1f} MiB"
+
+                age_seconds = entry["ageSeconds"]
+                if age_seconds is None:
+                    age_str = "-"
+                elif age_seconds < 60:
+                    age_str = f"{age_seconds}s"
+                elif age_seconds < 3600:
+                    age_str = f"{age_seconds // 60}m"
+                elif age_seconds < 86400:
+                    age_str = f"{age_seconds // 3600}h"
+                else:
+                    age_str = f"{age_seconds // 86400}d"
+
                 style_fn = self.style.SUCCESS if status == "healthy" else self.style.WARNING
                 self.stdout.write(
-                    style_fn(f"  - {tag} {name} ({filename}): {status.upper()} ({meta}) -> {resolved_path}")
+                    style_fn(
+                        f"  - {tag} {name} ({filename}): {status.upper()} ({size_str}, age {age_str}) -> {resolved_path}"
+                    )
                 )
             elif entry["optional"] and entry["key"] == "hosting_asn_rules":
                 self.stdout.write(f"  - {tag} {name} ({filename}): BUILT-IN FALLBACK (no override file found)")
@@ -2134,19 +1771,26 @@ class Command(BaseCommand):
                 self.stdout.write(f"  - {tag} {name} ({filename}): MISSING (optional)")
             else:
                 self.stdout.write(self.style.ERROR(f"  - {tag} {name} ({filename}): MISSING"))
-        return entries
 
-    def _print_storage_security_section(
-        self,
-        *,
-        base_dir: Path,
-        env_result: EnvLoadResult,
-    ) -> Tuple[Tuple[str, str], ToolsDbCheckResult]:
         self.stdout.write("\n  Cache Isolation & ToolsDB Storage:")
-        redis_status, redis_note = check_redis_key_secret_status(
-            env_result.values,
-            hidden_keys=env_result.hidden_keys,
-        )
+        if "REDIS_KEY_SECRET" in env_result.hidden_keys:
+            redis_status, redis_note = "ok", "configured in Toolforge envvars (hidden by CLI)"
+        else:
+            raw_secret = str(env_result.values.get("REDIS_KEY_SECRET") or "").strip()
+            if not raw_secret:
+                redis_status, redis_note = (
+                    "warning",
+                    "unset; falling back to DJANGO_SECRET_KEY for Redis namespace HMAC isolation",
+                )
+            else:
+                is_placeholder, weak_reason = _is_weak_secret_key(raw_secret)
+                if is_placeholder:
+                    redis_status, redis_note = "error", f"{mask_secret(raw_secret)} ({weak_reason})"
+                elif weak_reason:
+                    redis_status, redis_note = "warning", f"{mask_secret(raw_secret)} ({weak_reason})"
+                else:
+                    redis_status, redis_note = "ok", f"configured = {mask_secret(raw_secret)}"
+
         if redis_status == "ok":
             self.stdout.write(self.style.SUCCESS(f"  - REDIS_KEY_SECRET: OK ({redis_note})"))
         elif redis_status == "warning":
@@ -2154,7 +1798,7 @@ class Command(BaseCommand):
         else:
             self.stdout.write(self.style.ERROR(f"  - REDIS_KEY_SECRET: ERROR ({redis_note})"))
 
-        toolsdb_result = check_toolsdb_status(
+        toolsdb_result = _check_toolsdb_status(
             base_dir,
             env_result.values,
             hidden_keys=env_result.hidden_keys,
@@ -2170,7 +1814,7 @@ class Command(BaseCommand):
         else:
             self.stdout.write(f"  - ToolsDB L2: {toolsdb_result.status.upper()} ({toolsdb_result.message})")
 
-        return (redis_status, redis_note), toolsdb_result
+        return entries, (redis_status, redis_note), toolsdb_result
 
     def _print_jobs_section(
         self,
@@ -2221,71 +1865,6 @@ class Command(BaseCommand):
                 )
         return checks, None
 
-    def _collect_db_update_commands(
-        self,
-        *,
-        mode: str,
-        tool_account: Optional[str],
-        values: Dict[str, str],
-        hidden: frozenset[str],
-        missing_or_stale_core_dbs: Sequence[Dict[str, Any]],
-    ) -> List[str]:
-        if not missing_or_stale_core_dbs:
-            return []
-        missing_sfs_dbs = [e for e in missing_or_stale_core_dbs if e["source"] == "StopForumSpam"]
-        missing_maxmind_dbs = [e for e in missing_or_stale_core_dbs if e["source"] == "MaxMind"]
-        has_maxmind_creds = bool(
-            (values.get("MAXMIND_ACCOUNT_ID") or "MAXMIND_ACCOUNT_ID" in hidden)
-            and (values.get("MAXMIND_LICENSE_KEY") or "MAXMIND_LICENSE_KEY" in hidden)
-        )
-        if mode == "bastion":
-            target_image = f"tool-{tool_account}/tool-{tool_account}:latest" if tool_account else DEFAULT_JOB_SPEC.image
-            if missing_maxmind_dbs and not has_maxmind_creds:
-                self.stdout.write(
-                    self.style.WARNING(
-                        "  - MaxMind credentials (MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY) are not configured; "
-                        "configure them first or upload GeoLite2-*.mmdb manually into ~/data."
-                    )
-                )
-            return [
-                f"toolforge jobs run update-offline-dbs-init --image {target_image} "
-                '--mount=all --wait --command "python manage.py update_offline_dbs"'
-            ]
-
-        if missing_sfs_dbs and not missing_maxmind_dbs:
-            return ["python manage.py update_offline_dbs --sources stopforumspam"]
-        commands: List[str] = []
-        if missing_maxmind_dbs and not has_maxmind_creds:
-            self.stdout.write(
-                self.style.WARNING(
-                    "  - MaxMind credentials (MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY) are not configured; "
-                    "StopForumSpam can still update via '--sources stopforumspam'."
-                )
-            )
-            if missing_sfs_dbs:
-                commands.append("python manage.py update_offline_dbs --sources stopforumspam")
-        commands.append("python manage.py update_offline_dbs")
-        return commands
-
-    def _collect_job_remediation_commands(self, missing_or_warn_jobs: Sequence[BastionJobCheck]) -> List[str]:
-        if not missing_or_warn_jobs:
-            return []
-        commands = [
-            f'toolforge jobs run {job.covered_by or job.expected.name} --command "{job.expected.command}" '
-            f'--image {job.adapted_image} --schedule "{job.expected.schedule}" --mount={job.expected.mount}'
-            for job in missing_or_warn_jobs
-        ]
-        if any(job.expected.image != job.adapted_image for job in missing_or_warn_jobs):
-            template_img = missing_or_warn_jobs[0].expected.image
-            adapted_img = missing_or_warn_jobs[0].adapted_image
-            commands.append(
-                f"tmp_jobs=$(mktemp) && sed 's|{template_img}|{adapted_img}|g' jobs.yaml > \"$tmp_jobs\" "
-                '&& toolforge jobs load "$tmp_jobs" && rm -f "$tmp_jobs"'
-            )
-        else:
-            commands.append("toolforge jobs load jobs.yaml")
-        return commands
-
     def _print_remediation_and_summary(
         self,
         *,
@@ -2330,16 +1909,58 @@ class Command(BaseCommand):
         if mode == "bastion" and updated_env_count > 0:
             commands_to_run.append("toolforge webservice buildservice restart --mount=all")
         commands_to_run.extend(f"mkdir -p {d.path}" for d in missing_dirs)
-        commands_to_run.extend(
-            self._collect_db_update_commands(
-                mode=mode,
-                tool_account=tool_account,
-                values=values,
-                hidden=hidden,
-                missing_or_stale_core_dbs=missing_or_stale_core_dbs,
+
+        if missing_or_stale_core_dbs:
+            missing_sfs_dbs = [e for e in missing_or_stale_core_dbs if e["source"] == "StopForumSpam"]
+            missing_maxmind_dbs = [e for e in missing_or_stale_core_dbs if e["source"] == "MaxMind"]
+            has_maxmind_creds = bool(
+                (values.get("MAXMIND_ACCOUNT_ID") or "MAXMIND_ACCOUNT_ID" in hidden)
+                and (values.get("MAXMIND_LICENSE_KEY") or "MAXMIND_LICENSE_KEY" in hidden)
             )
-        )
-        commands_to_run.extend(self._collect_job_remediation_commands(missing_or_warn_jobs))
+            if mode == "bastion":
+                target_image = (
+                    f"tool-{tool_account}/tool-{tool_account}:latest" if tool_account else DEFAULT_JOB_SPEC.image
+                )
+                if missing_maxmind_dbs and not has_maxmind_creds:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            "  - MaxMind credentials (MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY) are not configured; "
+                            "configure them first or upload GeoLite2-*.mmdb manually into ~/data."
+                        )
+                    )
+                commands_to_run.append(
+                    f"toolforge jobs run update-offline-dbs-init --image {target_image} "
+                    '--mount=all --wait --command "python manage.py update_offline_dbs"'
+                )
+            elif missing_sfs_dbs and not missing_maxmind_dbs:
+                commands_to_run.append("python manage.py update_offline_dbs --sources stopforumspam")
+            else:
+                if missing_maxmind_dbs and not has_maxmind_creds:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            "  - MaxMind credentials (MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY) are not configured; "
+                            "StopForumSpam can still update via '--sources stopforumspam'."
+                        )
+                    )
+                    if missing_sfs_dbs:
+                        commands_to_run.append("python manage.py update_offline_dbs --sources stopforumspam")
+                commands_to_run.append("python manage.py update_offline_dbs")
+
+        if missing_or_warn_jobs:
+            commands_to_run.extend(
+                f'toolforge jobs run {job.covered_by or job.expected.name} --command "{job.expected.command}" '
+                f'--image {job.adapted_image} --schedule "{job.expected.schedule}" --mount={job.expected.mount}'
+                for job in missing_or_warn_jobs
+            )
+            if any(job.expected.image != job.adapted_image for job in missing_or_warn_jobs):
+                template_img = missing_or_warn_jobs[0].expected.image
+                adapted_img = missing_or_warn_jobs[0].adapted_image
+                commands_to_run.append(
+                    f"tmp_jobs=$(mktemp) && sed 's|{template_img}|{adapted_img}|g' jobs.yaml > \"$tmp_jobs\" "
+                    '&& toolforge jobs load "$tmp_jobs" && rm -f "$tmp_jobs"'
+                )
+            else:
+                commands_to_run.append("toolforge jobs load jobs.yaml")
 
         if unresolved_required_env:
             self.stdout.write(
@@ -2412,7 +2033,7 @@ class Command(BaseCommand):
         show_all_options = bool(options.get("all_options"))
         strict = bool(options.get("strict"))
 
-        mode, toolforge_bin, tool_account = detect_runtime_environment(requested_mode)
+        mode, toolforge_bin, tool_account = _detect_runtime_environment(requested_mode)
         mode_desc = (
             f"Toolforge Bastion (account: {tool_account})"
             if mode == "bastion" and tool_account
@@ -2428,9 +2049,9 @@ class Command(BaseCommand):
             )
 
         env_result = (
-            load_bastion_envvars(toolforge_bin, base_dir)
+            _load_bastion_envvars(toolforge_bin, base_dir)
             if mode == "bastion" and toolforge_bin
-            else load_local_envvars(base_dir)
+            else _load_local_envvars(base_dir)
         )
         for warning in env_result.warnings:
             self.stdout.write(self.style.WARNING(f"  Warning: {warning}"))
@@ -2457,14 +2078,13 @@ class Command(BaseCommand):
                 show_all_options=show_all_options,
             )
 
-        dir_statuses, _ = self._print_directory_section(
+        dir_statuses = self._print_directory_section(
             base_dir=base_dir,
             env_values=env_result.values,
             mode=mode,
             no_input=no_input,
         )
-        offline_entries = self._print_offline_db_section(base_dir=base_dir, env_values=env_result.values)
-        redis_secret_check, toolsdb_check = self._print_storage_security_section(
+        offline_entries, redis_secret_check, toolsdb_check = self._print_offline_db_and_storage_section(
             base_dir=base_dir,
             env_result=env_result,
         )

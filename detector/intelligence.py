@@ -19,13 +19,6 @@ _proc_rss_lock = threading.Lock()
 _proc_rss_cache: Optional[Tuple[float, float]] = None
 
 
-def clear_proc_rss_cache() -> None:
-    """Clears the short-lived process RSS diagnostic cache."""
-    global _proc_rss_cache
-    with _proc_rss_lock:
-        _proc_rss_cache = None
-
-
 def _read_proc_rss_mb() -> Optional[float]:
     """Reads live resident set size (RSS) from Linux procfs in megabytes when available."""
     global _proc_rss_cache

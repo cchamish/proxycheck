@@ -79,13 +79,6 @@ async def _close_redis_client_safely(client: Any) -> None:
         logger.debug("Ignoring error while closing superseded Redis client: %s", exc)
 
 
-def clear_redis_clients() -> None:
-    """Clears per-loop Redis client references and resets the Redis circuit breaker."""
-    with _redis_client_lock:
-        _redis_clients_by_loop.clear()
-    reset_redis_circuit_breaker()
-
-
 def _get_circuit_breaker_cooldown_seconds() -> float:
     """Returns the configured circuit breaker cooldown in seconds."""
     raw_value = getattr(settings, "REDIS_CIRCUIT_BREAKER_SECONDS", _REDIS_CIRCUIT_BREAKER_DEFAULT_SECONDS)
@@ -376,14 +369,6 @@ _resolve_maxmind_db_paths = resolve_maxmind_db_paths
 
 _DEFAULT_RESOLVE_MAXMIND_DB_PATHS = resolve_maxmind_db_paths
 _DEFAULT_RESOLVE_DB_FILE = _resolve_db_file
-
-
-def clear_maxmind_probe_cache() -> None:
-    """Clears short-TTL MaxMind file existence probe caches."""
-    global _maxmind_city_db_cache, _maxmind_any_db_cache
-    with _maxmind_probe_lock:
-        _maxmind_city_db_cache = None
-        _maxmind_any_db_cache = None
 
 
 def _has_custom_maxmind_probe() -> bool:

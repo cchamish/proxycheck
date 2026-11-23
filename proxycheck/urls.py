@@ -12,6 +12,7 @@ from django.conf import settings
 from django.http import HttpResponse, HttpResponseNotFound
 from django.middleware.csrf import get_token
 from django.urls import include, path, re_path
+from django.views.decorators.http import require_safe
 
 from detector import views as detector_views
 
@@ -57,6 +58,11 @@ async def spa_index(request):
     return HttpResponse(_FALLBACK_SPA_HTML, content_type="text/html; charset=utf-8")
 
 
+@require_safe
+async def serve_robots_txt(_request):
+    return HttpResponse("User-agent: *\nDisallow: /\n", content_type="text/plain; charset=utf-8")
+
+
 async def serve_favicon(_request):
     """Serves the site SVG icon asynchronously for icon endpoints without blocking ASGI."""
     svg_bytes = await asyncio.to_thread(_read_favicon_svg, Path(settings.BASE_DIR))
@@ -87,6 +93,7 @@ if settings.DEBUG:
     ]
 
 urlpatterns += [
+    path("robots.txt", serve_robots_txt, name="robots_txt"),
     path("Proxycheck.svg", serve_favicon),
     path("favicon.svg", serve_favicon),
     path("favicon.ico", serve_favicon),

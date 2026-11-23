@@ -152,3 +152,100 @@ test('enforces allowlist admin authorisation strictly', () => {
     assert.equal(isAuthorisedAdminUser(item.user), item.expected);
   }
 });
+
+test('surfaces non-401 stream errors without issuing a duplicate /api/v1/detect request', async () => {
+  const cases: Array<{
+    status: number;
+    json: () => Promise<unknown>;
+    expectedError: string;
+  }> = [
+    {
+      status: 429,
+      json: async () => ({
+        error: 'rate_limited',
+        message: 'Detection rate limit exceeded. Please wait before retrying.',
+      }),
+      expectedError: 'Detection rate limit exceeded. Please wait before retrying.',
+    },
+    {
+      status: 400,
+      json: async () => ({ error: 'Invalid IP address format.' }),
+      expectedError: 'Invalid IP address format.',
+    },
+    {
+      status: 403,
+      json: async () => ({
+        error: 'forbidden',
+        message: 'Insufficient Wikimedia permissions.',
+      }),
+      expectedError: 'Insufficient Wikimedia permissions.',
+    },
+    {
+      status: 500,
+      json: async () => {
+        throw new SyntaxError('Unexpected token < in JSON');
+      },
+      expectedError: 'Server returned HTTP 500',
+    },
+  ];
+
+  for (const item of cases) {
+    const requestedUrls: string[] = [];
+    const coordinator = createDetectionCoordinator(async (url) => {
+      requestedUrls.push(url);
+      return {
+        ok: false,
+        status: item.status,
+        headers: { get: () => 'application/json' },
+        json: item.json,
+      };
+    });
+
+    await coordinator.executeDetection('8.8.8.8');
+
+    assert.deepEqual(
+      requestedUrls,
+      ['/api/v1/detect/stream?ip=8.8.8.8'],
+      `HTTP ${item.status} should not fall back to /api/v1/detect`
+    );
+    assert.equal(coordinator.state.validationError, item.expectedError);
+    assert.equal(coordinator.state.isLoading, false);
+    assert.equal(coordinator.state.isStreaming, false);
+    assert.equal(coordinator.state.user.isLoggedIn, true);
+  }
+});
+
+test('falls back to /api/v1/detect when an OK SSE stream ends before a done event', async () => {
+  const requestedUrls: string[] = [];
+  const encoder = new TextEncoder();
+  const coordinator = createDetectionCoordinator(async (url) => {
+    requestedUrls.push(url);
+    if (url.startsWith('/api/v1/detect/stream')) {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode('event: snapshot\ndata: {"ip":"8.8.8.8","results":[]}\n\n'));
+          controller.close();
+        },
+      });
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => 'text/event-stream; charset=utf-8' },
+        body,
+        json: async () => ({}),
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => makeDetectionPayload('8.8.8.8'),
+    };
+  });
+
+  await coordinator.executeDetection('8.8.8.8');
+
+  assert.deepEqual(requestedUrls, ['/api/v1/detect/stream?ip=8.8.8.8', '/api/v1/detect?ip=8.8.8.8']);
+  assert.equal(coordinator.state.validationError, '');
+  assert.equal(coordinator.state.detectionData?.ip, '8.8.8.8');
+});

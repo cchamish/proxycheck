@@ -801,8 +801,14 @@ export function createDetectionCoordinator(
         return;
       }
 
+      if (!response.ok) {
+        const errData = (await response.json().catch(() => ({}))) as { message?: string; error?: string };
+        if (requestId !== latestRequestId) return;
+        throw new Error(errData.message || errData.error || `Server returned HTTP ${response.status}`);
+      }
+
       const contentType = response.headers?.get?.('content-type') || '';
-      if (response.ok && contentType.includes('text/event-stream') && response.body?.getReader) {
+      if (contentType.includes('text/event-stream') && response.body?.getReader) {
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
@@ -877,7 +883,7 @@ export function createDetectionCoordinator(
         }
 
         if (requestId !== latestRequestId || sawDone) return;
-      } else if (response.ok && !contentType.includes('text/event-stream')) {
+      } else if (!contentType.includes('text/event-stream')) {
         const data = (await response.json()) as DetectionResponse;
         applyCompletePayload(data, targetIp, requestId);
         return;

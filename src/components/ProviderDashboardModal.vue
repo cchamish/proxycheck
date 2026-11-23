@@ -14,8 +14,8 @@
           <cdx-info-chip :status="snapshot?.redisAvailable ? 'success' : 'warning'">
             {{ snapshot?.redisAvailable ? 'Redis Connected' : 'Redis Unavailable (Fail-open)' }}
           </cdx-info-chip>
-          <span v-if="snapshot?.generatedAt" class="text-subtle">
-            Updated {{ formatGeneratedTimestamp(snapshot.generatedAt) }}
+          <span v-if="generatedTimestamp" class="text-subtle">
+            Updated {{ generatedTimestamp }}
           </span>
         </div>
         <cdx-button
@@ -239,17 +239,93 @@ import {
   CdxTable,
   type TableColumn,
 } from '@wikimedia/codex';
-import {
-  computeQuotaUsagePercent,
-  formatByteSize,
-  formatOfflineDbTimestamp,
-  formatUpstreamQuotaLabel,
-  resolveDashboardCacheTelemetry,
-  type ChipStatus,
-  type OfflineDatabaseEntry,
-  type ProviderDashboardResponse,
-  type ProviderDashboardRow,
-} from '../utils/ip-detector-logic';
+import { formatOfflineDbTimestamp, type ChipStatus } from '../utils/ip-detector-logic';
+
+interface OfflineDatabaseEntry {
+  key: string;
+  source: string;
+  name: string;
+  filename: string;
+  exists: boolean;
+  optional: boolean;
+  sizeBytes: number | null;
+  lastModifiedIso: string | null;
+  ageSeconds: number | null;
+  staleAfterSeconds: number;
+  status: 'healthy' | 'stale' | 'missing';
+  statusLabel: string;
+}
+
+interface ProviderDashboardTelemetry {
+  ok: number;
+  cacheHit: number;
+  rateLimited429: number;
+  error5xx: number;
+  timeout: number;
+  quotaBlocked: number;
+}
+
+interface ProviderDashboardRow {
+  key: string;
+  name: string;
+  usesHttp: boolean;
+  configured: boolean;
+  status: string;
+  statusKey: 'healthy' | 'quota_guarded' | 'cooldown' | 'no_api_key' | 'db_missing';
+  cooldownTtlSeconds: number;
+  cooldownReason?: string | null;
+  minuteUsed: number;
+  minuteLimit: number;
+  dailyUsed: number;
+  dailyLimit: number;
+  upstreamRemaining: number | null;
+  upstreamLimit: number | null;
+  upstreamUsed: number | null;
+  lastStatusAt: string | null;
+  telemetry: ProviderDashboardTelemetry;
+}
+
+interface ProviderDashboardCacheTelemetry {
+  l1Hit: number;
+  l2HitFresh: number;
+  l2HitStaleSwr: number;
+  upstreamMiss: number;
+  refreshOk: number;
+  refreshRateLimited: number;
+  dualLayerHitRatePercent: number;
+  l2EstimatedRows: number | null;
+}
+
+interface ProviderDashboardResponse {
+  generatedAt: string;
+  dateBucket: string;
+  redisAvailable: boolean;
+  cacheTelemetry?: Partial<ProviderDashboardCacheTelemetry>;
+  global: {
+    totalRequestsToday: number;
+    authSession: number;
+    authGadget: number;
+    cacheHit: number;
+    cachePartial: number;
+    cacheMiss: number;
+    fullCacheHitRatePercent: number;
+    l1Hit?: number;
+    l2HitFresh?: number;
+    l2HitStaleSwr?: number;
+    upstreamMiss?: number;
+    refreshOk?: number;
+    refreshRateLimited?: number;
+    dualLayerHitRatePercent?: number;
+    l2EstimatedRows?: number | null;
+    totalQuotaBlocksToday: number;
+    activeCooldownCount: number;
+    activeQuotaGuardCount: number;
+  };
+  providers: ProviderDashboardRow[];
+  offlineDatabases?: OfflineDatabaseEntry[];
+  durationSeconds?: number;
+  memoryMb?: number | null;
+}
 
 const providerColumns: TableColumn[] = [
   { id: 'name', label: 'Provider' },
@@ -285,8 +361,39 @@ const dialogOpen = computed({
 const isLoading = ref(false);
 const errorMessage = ref('');
 const snapshot = ref<ProviderDashboardResponse | null>(null);
-const cacheTelemetry = computed(() => resolveDashboardCacheTelemetry(snapshot.value));
 let activeController: AbortController | null = null;
+
+const generatedTimestamp = computed(() => {
+  const isoValue = snapshot.value?.generatedAt;
+  if (!isoValue) return '';
+  const parsed = new Date(isoValue);
+  return Number.isNaN(parsed.getTime()) ? isoValue : `${parsed.toISOString().slice(11, 19)} UTC`;
+});
+
+const cacheTelemetry = computed<ProviderDashboardCacheTelemetry>(() => {
+  const ct = snapshot.value?.cacheTelemetry;
+  const globalMetrics = snapshot.value?.global;
+  const nonNeg = (value: unknown): number => {
+    const num = Number(value ?? 0);
+    return Number.isFinite(num) && num >= 0 ? num : 0;
+  };
+  const rawEstimatedRows =
+    ct?.l2EstimatedRows !== undefined ? ct.l2EstimatedRows : globalMetrics?.l2EstimatedRows;
+
+  return {
+    l1Hit: nonNeg(ct?.l1Hit ?? globalMetrics?.l1Hit),
+    l2HitFresh: nonNeg(ct?.l2HitFresh ?? globalMetrics?.l2HitFresh),
+    l2HitStaleSwr: nonNeg(ct?.l2HitStaleSwr ?? globalMetrics?.l2HitStaleSwr),
+    upstreamMiss: nonNeg(ct?.upstreamMiss ?? globalMetrics?.upstreamMiss),
+    refreshOk: nonNeg(ct?.refreshOk ?? globalMetrics?.refreshOk),
+    refreshRateLimited: nonNeg(ct?.refreshRateLimited ?? globalMetrics?.refreshRateLimited),
+    dualLayerHitRatePercent: nonNeg(ct?.dualLayerHitRatePercent ?? globalMetrics?.dualLayerHitRatePercent),
+    l2EstimatedRows:
+      typeof rawEstimatedRows === 'number' && Number.isFinite(rawEstimatedRows) && rawEstimatedRows >= 0
+        ? Math.floor(rawEstimatedRows)
+        : null,
+  };
+});
 
 function formatCount(value: number | null | undefined): string {
   const num = Number(value ?? 0);
@@ -294,18 +401,12 @@ function formatCount(value: number | null | undefined): string {
 }
 
 function formatQuotaPair(used: number, limit: number, unit: string): string {
-  if (limit <= 0) {
-    return `${formatCount(used)} (Unlimited)`;
-  }
-  return `${formatCount(used)} / ${formatCount(limit)} ${unit}`;
+  return limit <= 0 ? `${formatCount(used)} (Unlimited)` : `${formatCount(used)} / ${formatCount(limit)} ${unit}`;
 }
 
-function formatGeneratedTimestamp(isoValue: string): string {
-  const parsed = new Date(isoValue);
-  if (Number.isNaN(parsed.getTime())) {
-    return isoValue;
-  }
-  return `${parsed.toISOString().slice(11, 19)} UTC`;
+function computeQuotaUsagePercent(used: number, limit: number): number {
+  if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0 || used <= 0) return 0;
+  return Math.min(100, Math.round((used / limit) * 100));
 }
 
 function getQuotaChipStatus(used: number, limit: number): ChipStatus | null {
@@ -325,10 +426,29 @@ function getOfflineDbChipStatus(entry: OfflineDatabaseEntry): ChipStatus {
   return entry.optional ? 'notice' : 'error';
 }
 
-async function loadDashboard(): Promise<void> {
-  if (activeController) {
-    activeController.abort();
+function formatUpstreamQuotaLabel(row: ProviderDashboardRow): string {
+  if (row.upstreamRemaining !== null && row.upstreamRemaining !== undefined) {
+    if (row.upstreamLimit !== null && row.upstreamLimit !== undefined && row.upstreamLimit > 0) {
+      return `${row.upstreamRemaining.toLocaleString('en-GB')} / ${row.upstreamLimit.toLocaleString('en-GB')} left`;
+    }
+    return `${row.upstreamRemaining.toLocaleString('en-GB')} left`;
   }
+  if (row.upstreamUsed !== null && row.upstreamUsed !== undefined) {
+    return `${row.upstreamUsed.toLocaleString('en-GB')} used`;
+  }
+  return '-';
+}
+
+function formatByteSize(sizeBytes?: number | null): string {
+  if (typeof sizeBytes !== 'number' || !Number.isFinite(sizeBytes) || sizeBytes < 0) return '-';
+  if (sizeBytes < 1024) return `${Math.round(sizeBytes)} B`;
+  if (sizeBytes < 1024 * 1024) return `${(sizeBytes / 1024).toFixed(1)} KB`;
+  if (sizeBytes < 1024 * 1024 * 1024) return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(sizeBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+async function loadDashboard(): Promise<void> {
+  activeController?.abort();
   const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
   activeController = controller;
 
@@ -340,23 +460,19 @@ async function loadDashboard(): Promise<void> {
       signal: controller?.signal,
     });
     if (res.status === 401 || res.status === 403) {
-      const errData = await res.json().catch(() => ({}));
-      errorMessage.value = errData?.error || 'You are not authorised to view this diagnostic dashboard.';
-      if (res.status === 401) {
-        emit('unauthorised');
-      }
+      const errData = (await res.json().catch(() => ({}))) as { error?: string };
+      errorMessage.value = errData.error || 'You are not authorised to view this diagnostic dashboard.';
+      if (res.status === 401) emit('unauthorised');
       return;
     }
     if (!res.ok) {
-      const errData = await res.json().catch(() => ({}));
-      errorMessage.value = errData?.error || `Failed to load quota telemetry (HTTP ${res.status}).`;
+      const errData = (await res.json().catch(() => ({}))) as { error?: string };
+      errorMessage.value = errData.error || `Failed to load quota telemetry (HTTP ${res.status}).`;
       return;
     }
     snapshot.value = (await res.json()) as ProviderDashboardResponse;
   } catch (err: unknown) {
-    if (err instanceof Error && err.name === 'AbortError') {
-      return;
-    }
+    if (err instanceof Error && err.name === 'AbortError') return;
     errorMessage.value = 'Unable to reach the backend quota telemetry endpoint.';
   } finally {
     if (activeController === controller) {
@@ -369,18 +485,16 @@ watch(
   () => props.open,
   (isOpen) => {
     if (isOpen) {
-      loadDashboard();
-    } else if (activeController) {
-      activeController.abort();
+      void loadDashboard();
+    } else {
+      activeController?.abort();
       activeController = null;
     }
   }
 );
 
 onUnmounted(() => {
-  if (activeController) {
-    activeController.abort();
-    activeController = null;
-  }
+  activeController?.abort();
+  activeController = null;
 });
 </script>

@@ -9,49 +9,20 @@ from django.contrib.sessions.middleware import SessionMiddleware
 from django.utils.cache import patch_vary_headers
 from whitenoise.middleware import WhiteNoiseFileResponse, WhiteNoiseMiddleware
 
-try:
-    from redis.exceptions import RedisError as _RedisError
-except ImportError:
-    _RedisError = ()
+from .provider_registry import REDIS_TRANSPORT_ERRORS
 
 logger = logging.getLogger(__name__)
 
-_SESSION_BACKEND_ERRORS = (ConnectionError, TimeoutError, OSError) + (
-    (_RedisError,) if isinstance(_RedisError, type) else tuple(_RedisError)
-)
+_GADGET_TOKEN_PATHS = ("/api/v1/auth/gadget-token", "/api/v1/auth/gadget-token/")
+_STATIC_STREAM_CHUNK_SIZE = 65536
 
 
 def is_session_backend_error(exc: BaseException) -> bool:
     """Returns True when an exception indicates cache or Redis backend unavailability."""
-    if isinstance(exc, _SESSION_BACKEND_ERRORS):
+    if isinstance(exc, REDIS_TRANSPORT_ERRORS):
         return True
-    # Django's cache SessionStore raises RuntimeError after exhausting retries when cache writes fail
+    # Django's cache SessionStore raises RuntimeError after exhausting retries when cache writes fail.
     return isinstance(exc, RuntimeError) and "cache is unavailable" in str(exc).lower()
-
-
-_GADGET_TOKEN_PATHS = ("/api/v1/auth/gadget-token", "/api/v1/auth/gadget-token/")
-
-
-def _is_stateless_api_request(request) -> bool:
-    """Return True for stateless API requests that do not read or write session state."""
-    method = (getattr(request, "method", None) or "").upper()
-    path = getattr(request, "path_info", None) or getattr(request, "path", "") or ""
-    if method == "OPTIONS" and path.startswith("/api/v1/"):
-        return True
-    if path in _GADGET_TOKEN_PATHS:
-        return True
-    if path.startswith(("/api/v1/detect", "/api/v1/rangeblock")):
-        headers = getattr(request, "headers", None)
-        auth_header = ""
-        if hasattr(headers, "get"):
-            auth_header = headers.get("Authorization")
-            if auth_header is None:
-                auth_header = headers.get("authorization", "")
-        if isinstance(auth_header, bytes):
-            auth_header = auth_header.decode("latin1", errors="ignore")
-        if str(auth_header).strip().lower().startswith("bearer "):
-            return True
-    return False
 
 
 class ResilientSessionMiddleware(SessionMiddleware):
@@ -73,14 +44,25 @@ class ResilientSessionMiddleware(SessionMiddleware):
             return response
 
     async def __acall__(self, request):
-        if _is_stateless_api_request(request):
-            # Attach an untouched session handle so downstream middleware attribute checks pass without sync bridging
+        method = (getattr(request, "method", None) or "").upper()
+        path = getattr(request, "path_info", None) or getattr(request, "path", "") or ""
+        is_stateless = (method == "OPTIONS" and path.startswith("/api/v1/")) or path in _GADGET_TOKEN_PATHS
+        if not is_stateless and path.startswith(("/api/v1/detect", "/api/v1/rangeblock")):
+            headers = getattr(request, "headers", None)
+            auth_header = ""
+            if hasattr(headers, "get"):
+                auth_header = headers.get("Authorization")
+                if auth_header is None:
+                    auth_header = headers.get("authorization", "")
+            if isinstance(auth_header, bytes):
+                auth_header = auth_header.decode("latin1", errors="ignore")
+            is_stateless = str(auth_header).strip().lower().startswith("bearer ")
+
+        if is_stateless:
+            # Attach an untouched session handle so downstream middleware checks pass without sync bridging.
             request.session = self.SessionStore()
             return await self.get_response(request)
         return await super().__acall__(request)
-
-
-_STATIC_STREAM_CHUNK_SIZE = 65536
 
 
 class AsyncWhiteNoiseMiddleware(WhiteNoiseMiddleware):
@@ -105,34 +87,27 @@ class AsyncWhiteNoiseMiddleware(WhiteNoiseMiddleware):
             static_file = await asyncio.to_thread(self.find_file, request.path_info)
         else:
             static_file = self.files.get(request.path_info)
-        if static_file is not None:
-            return await self.aserve(static_file, request)
-        return await self.get_response(request)
+        if static_file is None:
+            return await self.get_response(request)
 
-    @staticmethod
-    async def _empty_async_stream():
-        if False:
-            yield b""
-
-    @staticmethod
-    async def _iter_file_async(filelike, chunk_size: int = _STATIC_STREAM_CHUNK_SIZE):
-        try:
-            while chunk := await asyncio.to_thread(filelike.read, chunk_size):
-                yield chunk
-        finally:
-            await asyncio.to_thread(filelike.close)
-
-    @classmethod
-    async def aserve(cls, static_file, request):
-        """Serve a matched WhiteNoise static file with an async byte stream."""
         response = await asyncio.to_thread(static_file.get_response, request.method, request.META)
-        status = int(response.status)
         filelike = response.file
-        # Provide an async iterator even for empty bodies so ASGIHandler avoids sync fallback warnings
-        stream = cls._empty_async_stream() if filelike is None else cls._iter_file_async(filelike)
-        http_response = WhiteNoiseFileResponse(stream, status=status)
+
+        # Provide an async iterator even for empty bodies so ASGIHandler avoids sync fallback warnings.
+        async def empty_stream():
+            if False:
+                yield b""
+
+        async def iter_file():
+            try:
+                while chunk := await asyncio.to_thread(filelike.read, _STATIC_STREAM_CHUNK_SIZE):
+                    yield chunk
+            finally:
+                await asyncio.to_thread(filelike.close)
+
+        stream = empty_stream() if filelike is None else iter_file()
+        http_response = WhiteNoiseFileResponse(stream, status=int(response.status))
         if filelike is not None and hasattr(filelike, "close"):
-            # Register file closer in case the client disconnects before body iteration begins
             http_response._resource_closers.append(filelike.close)
         del http_response["content-type"]
         for key, value in response.headers:

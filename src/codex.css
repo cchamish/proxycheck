@@ -113,11 +113,6 @@ code {
   gap: var(--spacing-50);
 }
 
-.app-logo {
-  width: 50px;
-  height: 50px;
-}
-
 .app-title {
   margin: 0;
   font-size: var(--font-size-x-large);

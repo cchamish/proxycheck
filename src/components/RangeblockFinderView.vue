@@ -53,7 +53,7 @@
         </template>
         <template #item-status="{ row }">
           <cdx-info-chip v-if="row.hit.isActive" status="error">
-            Active · {{ formatExpiry(row.hit) }}
+            Active · {{ row.hit.indefinite ? 'Indefinite' : (formatExactUtcTimestamp(row.hit.expiry) || 'Active') }}
           </cdx-info-chip>
           <cdx-info-chip v-else-if="row.hit.count > 0" status="notice">
             Historical
@@ -95,7 +95,7 @@ import {
   type TableColumn,
 } from '@wikimedia/codex';
 import {
-  buildFullCidrLadder,
+  canonicalizeIpAddress,
   formatExactUtcTimestamp,
   type RangeblockHitRow,
   type RangeblockSummary,
@@ -143,50 +143,116 @@ const wikiButtons = computed<ButtonGroupItem[]>(() => [
 watch(
   () => props.selectedWiki,
   (nextWiki) => {
-    if (!nextWiki) {
-      showFullLadder.value = false;
-    }
+    if (!nextWiki) showFullLadder.value = false;
   }
 );
 
 const selectedWikiSummary = computed<RangeblockWikiSummary | null>(() => {
-  if (!props.rangeblock || !props.selectedWiki) {
-    return null;
-  }
+  if (!props.rangeblock || !props.selectedWiki) return null;
   return props.rangeblock.wikis.find((w) => w.wiki === props.selectedWiki) ?? null;
 });
 
-const displayedRows = computed<Array<{ wiki: string; row: RangeblockHitRow }>>(() => {
-  if (!props.rangeblock) {
-    return [];
+function buildFullCidrLadder(rawIp: string, wikiSummary: RangeblockWikiSummary): RangeblockHitRow[] {
+  const canonical = canonicalizeIpAddress(rawIp)?.split('%')[0] ?? '';
+  if (!canonical) return wikiSummary.rows;
+
+  const hitByTarget = new Map(wikiSummary.rows.map((row) => [row.target, row]));
+  const isV6 = canonical.includes(':');
+  const maxBits = isV6 ? 128n : 32n;
+  const allMask = (1n << maxBits) - 1n;
+
+  let addrInt = 0n;
+  if (isV6) {
+    const [leftRaw, rightRaw] = canonical.split('::');
+    const left = leftRaw ? leftRaw.split(':') : [];
+    const right = canonical.includes('::') && rightRaw ? rightRaw.split(':') : [];
+    const missing = canonical.includes('::') ? Math.max(0, 8 - (left.length + right.length)) : 0;
+    const groups = [...left, ...Array.from({ length: missing }, () => '0'), ...right];
+    for (const g of groups) {
+      addrInt = (addrInt << 16n) | BigInt(parseInt(g || '0', 16));
+    }
+  } else {
+    const parts = canonical.split('.').map((part) => BigInt(Number(part)));
+    addrInt = (parts[0]! << 24n) | (parts[1]! << 16n) | (parts[2]! << 8n) | parts[3]!;
   }
+
+  const formatAddr = (val: bigint): string => {
+    if (!isV6) {
+      return [
+        Number((val >> 24n) & 0xffn),
+        Number((val >> 16n) & 0xffn),
+        Number((val >> 8n) & 0xffn),
+        Number(val & 0xffn),
+      ].join('.');
+    }
+    const groups: string[] = [];
+    for (let i = 7; i >= 0; i -= 1) {
+      groups.push(((val >> BigInt(i * 16)) & 0xffffn).toString(16));
+    }
+    return canonicalizeIpAddress(groups.join(':')) ?? groups.join(':');
+  };
+
+  const makeRow = (target: string, cidr: number | null, upperBound: string): RangeblockHitRow => {
+    const existing = hitByTarget.get(target);
+    if (existing) return existing;
+    const encoded = encodeURIComponent(target).replaceAll('%2F', '/').replaceAll('%3A', ':');
+    const isGlobal = wikiSummary.wiki === 'global';
+    return {
+      target,
+      cidr,
+      upperBound,
+      count: 0,
+      isActive: false,
+      expiry: null,
+      indefinite: false,
+      lastBlockedAt: null,
+      logUrl: isGlobal
+        ? `https://meta.wikimedia.org/wiki/Special:Log?type=gblblock&page=User:${encoded}`
+        : `https://${wikiSummary.domain}/wiki/Special:Log?type=block&page=User:${encoded}`,
+      blockListUrl: isGlobal
+        ? `https://meta.wikimedia.org/wiki/Special:GlobalBlockList?ip=${encoded}`
+        : `https://${wikiSummary.domain}/wiki/Special:BlockList?wpTarget=${encoded}`,
+    };
+  };
+
+  const prefixes = isV6
+    ? Array.from({ length: 46 }, (_, i) => 64 - i)
+    : Array.from({ length: 17 }, (_, i) => 32 - i);
+
+  const rows: RangeblockHitRow[] = [makeRow(canonical, null, canonical)];
+  for (const prefix of prefixes) {
+    const hostBits = maxBits - BigInt(prefix);
+    const netMask = (allMask << hostBits) & allMask;
+    const netStart = addrInt & netMask;
+    const netEnd = netStart | ((1n << hostBits) - 1n);
+    rows.push(makeRow(`${formatAddr(netStart)}/${prefix}`, prefix, formatAddr(netEnd)));
+  }
+  return rows;
+}
+
+const tableRows = computed(() => {
+  if (!props.rangeblock) return [];
+
+  const toTableRow = (wiki: string, hit: RangeblockHitRow) => ({
+    wiki,
+    hit,
+    cidr: hit.cidr === null ? 'Single IP' : `/${hit.cidr}`,
+  });
+
   if (selectedWikiSummary.value) {
+    const wiki = selectedWikiSummary.value.wiki;
     const rows = showFullLadder.value
       ? buildFullCidrLadder(props.rangeblock.ip, selectedWikiSummary.value)
       : selectedWikiSummary.value.rows;
-    return rows.map((row) => ({ wiki: selectedWikiSummary.value!.wiki, row }));
+    return rows.map((row) => toTableRow(wiki, row));
   }
-  const out: Array<{ wiki: string; row: RangeblockHitRow }> = [];
+
+  const out: Array<{ wiki: string; hit: RangeblockHitRow; cidr: string }> = [];
   for (const wikiItem of props.rangeblock.wikis) {
     for (const row of wikiItem.rows) {
-      out.push({ wiki: wikiItem.wiki, row });
+      out.push(toTableRow(wikiItem.wiki, row));
     }
   }
   return out;
 });
-
-const tableRows = computed(() =>
-  displayedRows.value.map(({ wiki, row }) => ({
-    wiki,
-    hit: row,
-    cidr: row.cidr === null ? 'Single IP' : `/${row.cidr}`,
-  }))
-);
-
-function formatExpiry(row: RangeblockHitRow): string {
-  if (row.indefinite) {
-    return 'Indefinite';
-  }
-  return formatExactUtcTimestamp(row.expiry) || 'Active';
-}
 </script>

@@ -1,13 +1,11 @@
-"""
-Django configuration for Proxycheck on Wikimedia Toolforge.
-"""
+"""Django configuration for Proxycheck on Wikimedia Toolforge."""
 
 import configparser
 import math
 import os
 import sys
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from typing import Any, Mapping, Optional, Tuple
 
 from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
@@ -49,9 +47,6 @@ if _dotenv_path is not None:
 else:
     load_dotenv()
 
-DEBUG = os.environ.get("DJANGO_DEBUG", "False").lower() in ("true", "1", "yes")
-ENABLE_TEST_AUTH = os.environ.get("ENABLE_TEST_AUTH") == "1"
-
 
 def _parse_bool_env(name: str, default: bool = False) -> bool:
     value = os.environ.get(name, "").strip().lower()
@@ -60,11 +55,48 @@ def _parse_bool_env(name: str, default: bool = False) -> bool:
     return value in ("1", "true", "yes", "on")
 
 
+def _parse_int_env(
+    name: str,
+    default: int,
+    *,
+    min_value: int = 1,
+    mapping: Optional[Mapping[str, str]] = None,
+) -> int:
+    source = os.environ if mapping is None else mapping
+    raw_value = str(source.get(name) or "").strip()
+    if not raw_value:
+        return default
+    try:
+        parsed = int(raw_value)
+        return parsed if parsed >= min_value else default
+    except ValueError:
+        return default
+
+
+def _parse_positive_float_env(name: str, default: float) -> float:
+    raw_value = os.environ.get(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        parsed = float(raw_value)
+        return parsed if math.isfinite(parsed) and parsed > 0 else default
+    except ValueError:
+        return default
+
+
+def _parse_csv_env(name: str) -> tuple[str, ...]:
+    raw_value = os.environ.get(name, "").strip()
+    if not raw_value:
+        return ()
+    return tuple(item.strip() for item in raw_value.split(",") if item.strip())
+
+
+DEBUG = os.environ.get("DJANGO_DEBUG", "False").lower() in ("true", "1", "yes")
+ENABLE_TEST_AUTH = os.environ.get("ENABLE_TEST_AUTH") == "1"
 RESTRICT_TO_ALLOWED_WIKI_USERS = _parse_bool_env("RESTRICT_TO_ALLOWED_WIKI_USERS")
 
 _IS_TEST_RUN = "test" in sys.argv or "pytest" in sys.modules
 _IS_SETUP_CHECK = "check_setup" in sys.argv[1:]
-
 _IS_MIGRATION_CHECK = "makemigrations" in sys.argv[1:]
 
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY")
@@ -79,21 +111,12 @@ if not SECRET_KEY:
         raise ImproperlyConfigured("DJANGO_SECRET_KEY must be set in production.")
     SECRET_KEY = "django-insecure-dev-key"  # noqa: S105
 
-
-def _parse_allowed_hosts(raw_value: str) -> list[str]:
-    """Parses comma-separated hosts and converts leading *. wildcards to Django dot syntax."""
-    hosts: list[str] = []
-    for entry in raw_value.split(","):
-        host = entry.strip()
-        if not host:
-            continue
-        if host.startswith("*.") and len(host) > 2:
-            host = host[1:]
-        hosts.append(host)
-    return hosts or ["127.0.0.1", "localhost"]
-
-
-ALLOWED_HOSTS = _parse_allowed_hosts(os.environ.get("DJANGO_ALLOWED_HOSTS", ""))
+# Convert leading *. wildcards to Django dot syntax.
+ALLOWED_HOSTS = [
+    host[1:] if host.startswith("*.") and len(host) > 2 else host
+    for entry in os.environ.get("DJANGO_ALLOWED_HOSTS", "").split(",")
+    if (host := entry.strip())
+] or ["127.0.0.1", "localhost"]
 
 INSTALLED_APPS = [
     "django.contrib.auth",
@@ -116,10 +139,9 @@ MIDDLEWARE = [
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
-# Toolforge Kubernetes Ingress passes HTTPS termination via X-Forwarded-Proto
+# Toolforge Kubernetes Ingress passes HTTPS termination via X-Forwarded-Proto.
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
-# Session cookie and production security baseline configuration for Toolforge
 SESSION_ENGINE = "django.contrib.sessions.backends.cache"
 SESSION_CACHE_ALIAS = "default"
 SESSION_COOKIE_NAME = "proxycheck_sessionid"
@@ -181,36 +203,6 @@ _MANAGEMENT_COMMAND_DB_TIMEOUT_COMMANDS = frozenset(
 )
 
 
-def _is_management_command_argv(argv: Optional[Sequence[str]] = None) -> bool:
-    """Returns True when invoked as a non-server Django management command."""
-    args = sys.argv if argv is None else argv
-    if len(args) < 2:
-        return False
-    subcommand = str(args[1]).strip().lower()
-    if subcommand in _MANAGEMENT_COMMAND_DB_TIMEOUT_COMMANDS:
-        return True
-    script_name = Path(str(args[0])).name.lower()
-    return script_name == "manage.py" and subcommand not in {"runserver", "test"}
-
-
-def _parse_positive_int_from_mapping(mapping: Mapping[str, str], name: str, default: int) -> int:
-    raw_value = str(mapping.get(name) or "").strip()
-    if not raw_value:
-        return default
-    try:
-        parsed = int(raw_value)
-        return parsed if parsed > 0 else default
-    except ValueError:
-        return default
-
-
-def _strip_cnf_quotes(raw_value: str) -> str:
-    cleaned = str(raw_value or "").strip()
-    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in ("'", '"'):
-        return cleaned[1:-1]
-    return cleaned
-
-
 def _parse_port_value(raw_value: str, default: int = DEFAULT_TOOLSDB_PORT) -> int:
     cleaned = str(raw_value or "").strip()
     if not cleaned:
@@ -234,14 +226,20 @@ def _read_replica_my_cnf(cnf_path: Path) -> Optional[Tuple[str, str, str, Option
         return None
     if not parser.has_section("client"):
         return None
-    user = _strip_cnf_quotes(parser.get("client", "user", fallback=""))
-    password = _strip_cnf_quotes(parser.get("client", "password", fallback=""))
+
+    def get_clean(option: str) -> str:
+        cleaned = str(parser.get("client", option, fallback="") or "").strip()
+        if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in ("'", '"'):
+            return cleaned[1:-1]
+        return cleaned
+
+    user = get_clean("user")
+    password = get_clean("password")
     if not user or not password:
         return None
-    host = _strip_cnf_quotes(parser.get("client", "host", fallback=""))
-    raw_port = _strip_cnf_quotes(parser.get("client", "port", fallback=""))
-    port = _parse_port_value(raw_port, 0) or None
-    database = _strip_cnf_quotes(parser.get("client", "database", fallback=""))
+    host = get_clean("host")
+    port = _parse_port_value(get_clean("port"), 0) or None
+    database = get_clean("database")
     return user, password, host, port, database
 
 
@@ -260,51 +258,6 @@ def _replica_cnf_candidates(active_env: Mapping[str, str], home_dir: Optional[Pa
     if home_cnf not in candidates:
         candidates.append(home_cnf)
     return candidates
-
-
-def _discover_toolsdb_credentials(
-    active_env: Mapping[str, str],
-    *,
-    home_dir: Optional[Path | str] = None,
-) -> Optional[Tuple[str, str, str, int, str]]:
-    env_host = str(active_env.get("TOOLSDB_HOST") or active_env.get("TOOL_TOOLSDB_HOST") or "").strip()
-    env_port_raw = str(active_env.get("TOOLSDB_PORT") or active_env.get("TOOL_TOOLSDB_PORT") or "").strip()
-    env_db_name = str(active_env.get("TOOLSDB_NAME") or active_env.get("TOOL_TOOLSDB_NAME") or "").strip()
-
-    explicit_user = str(active_env.get("TOOLSDB_USER") or "").strip()
-    explicit_pass = str(active_env.get("TOOLSDB_PASSWORD") or "").strip()
-    if explicit_user and explicit_pass:
-        return (
-            explicit_user,
-            explicit_pass,
-            env_host or DEFAULT_TOOLSDB_HOST,
-            _parse_port_value(env_port_raw, DEFAULT_TOOLSDB_PORT),
-            env_db_name,
-        )
-
-    tool_user = str(active_env.get("TOOL_TOOLSDB_USER") or "").strip()
-    tool_pass = str(active_env.get("TOOL_TOOLSDB_PASSWORD") or "").strip()
-    if tool_user and tool_pass:
-        return (
-            tool_user,
-            tool_pass,
-            env_host or DEFAULT_TOOLSDB_HOST,
-            _parse_port_value(env_port_raw, DEFAULT_TOOLSDB_PORT),
-            env_db_name,
-        )
-
-    for cnf_path in _replica_cnf_candidates(active_env, home_dir=home_dir):
-        parsed_cnf = _read_replica_my_cnf(cnf_path)
-        if parsed_cnf is not None:
-            cnf_user, cnf_pass, cnf_host, cnf_port, cnf_db = parsed_cnf
-            return (
-                cnf_user,
-                cnf_pass,
-                env_host or cnf_host or DEFAULT_TOOLSDB_HOST,
-                _parse_port_value(env_port_raw, cnf_port or DEFAULT_TOOLSDB_PORT),
-                env_db_name or cnf_db,
-            )
-    return None
 
 
 def discover_wiki_replica_credentials(
@@ -347,16 +300,58 @@ def build_databases_config(
         }
 
     active_env = os.environ if env is None else env
-    discovered = _discover_toolsdb_credentials(active_env, home_dir=home_dir)
+    env_host = str(active_env.get("TOOLSDB_HOST") or active_env.get("TOOL_TOOLSDB_HOST") or "").strip()
+    env_port_raw = str(active_env.get("TOOLSDB_PORT") or active_env.get("TOOL_TOOLSDB_PORT") or "").strip()
+    env_db_name = str(active_env.get("TOOLSDB_NAME") or active_env.get("TOOL_TOOLSDB_NAME") or "").strip()
+
+    discovered: Optional[Tuple[str, str, str, int, str]] = None
+    explicit_user = str(active_env.get("TOOLSDB_USER") or "").strip()
+    explicit_pass = str(active_env.get("TOOLSDB_PASSWORD") or "").strip()
+    tool_user = str(active_env.get("TOOL_TOOLSDB_USER") or "").strip()
+    tool_pass = str(active_env.get("TOOL_TOOLSDB_PASSWORD") or "").strip()
+
+    if explicit_user and explicit_pass:
+        discovered = (
+            explicit_user,
+            explicit_pass,
+            env_host or DEFAULT_TOOLSDB_HOST,
+            _parse_port_value(env_port_raw, DEFAULT_TOOLSDB_PORT),
+            env_db_name,
+        )
+    elif tool_user and tool_pass:
+        discovered = (
+            tool_user,
+            tool_pass,
+            env_host or DEFAULT_TOOLSDB_HOST,
+            _parse_port_value(env_port_raw, DEFAULT_TOOLSDB_PORT),
+            env_db_name,
+        )
+    else:
+        for cnf_path in _replica_cnf_candidates(active_env, home_dir=home_dir):
+            parsed_cnf = _read_replica_my_cnf(cnf_path)
+            if parsed_cnf is not None:
+                cnf_user, cnf_pass, cnf_host, cnf_port, cnf_db = parsed_cnf
+                discovered = (
+                    cnf_user,
+                    cnf_pass,
+                    env_host or cnf_host or DEFAULT_TOOLSDB_HOST,
+                    _parse_port_value(env_port_raw, cnf_port or DEFAULT_TOOLSDB_PORT),
+                    env_db_name or cnf_db,
+                )
+                break
+
     if discovered is not None:
         db_user, db_password, db_host, db_port, db_name = discovered
         if db_name:
-            use_management_timeouts = (
-                _is_management_command_argv() if is_management_command is None else bool(is_management_command)
-            )
-            default_connect_timeout = 10 if use_management_timeouts else 3
-            default_read_timeout = 120 if use_management_timeouts else 5
-            default_write_timeout = 30 if use_management_timeouts else 5
+            if is_management_command is None:
+                subcommand = str(sys.argv[1]).strip().lower() if len(sys.argv) >= 2 else ""
+                script_name = Path(str(sys.argv[0])).name.lower() if sys.argv else ""
+                use_management_timeouts = subcommand in _MANAGEMENT_COMMAND_DB_TIMEOUT_COMMANDS or (
+                    script_name == "manage.py" and bool(subcommand) and subcommand not in {"runserver", "test"}
+                )
+            else:
+                use_management_timeouts = bool(is_management_command)
+
             return {
                 "default": {
                     "ENGINE": "django.db.backends.mysql",
@@ -367,14 +362,20 @@ def build_databases_config(
                     "PORT": db_port,
                     "CONN_MAX_AGE": 0,
                     "OPTIONS": {
-                        "connect_timeout": _parse_positive_int_from_mapping(
-                            active_env, "TOOLSDB_CONNECT_TIMEOUT", default_connect_timeout
+                        "connect_timeout": _parse_int_env(
+                            "TOOLSDB_CONNECT_TIMEOUT",
+                            10 if use_management_timeouts else 3,
+                            mapping=active_env,
                         ),
-                        "read_timeout": _parse_positive_int_from_mapping(
-                            active_env, "TOOLSDB_READ_TIMEOUT", default_read_timeout
+                        "read_timeout": _parse_int_env(
+                            "TOOLSDB_READ_TIMEOUT",
+                            120 if use_management_timeouts else 5,
+                            mapping=active_env,
                         ),
-                        "write_timeout": _parse_positive_int_from_mapping(
-                            active_env, "TOOLSDB_WRITE_TIMEOUT", default_write_timeout
+                        "write_timeout": _parse_int_env(
+                            "TOOLSDB_WRITE_TIMEOUT",
+                            30 if use_management_timeouts else 5,
+                            mapping=active_env,
                         ),
                         "charset": "utf8mb4",
                     },
@@ -447,13 +448,7 @@ USE_TZ = True
 # Match Vite assets directory output so WhiteNoise serves static assets directly on port 8000.
 STATIC_URL = "/assets/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
-STATICFILES_DIRS = (
-    [
-        BASE_DIR / "dist" / "assets",
-    ]
-    if (BASE_DIR / "dist" / "assets").exists()
-    else []
-)
+STATICFILES_DIRS = [BASE_DIR / "dist" / "assets"] if (BASE_DIR / "dist" / "assets").exists() else []
 
 WHITENOISE_USE_FINDERS = True
 WHITENOISE_AUTOREFRESH = DEBUG
@@ -469,72 +464,37 @@ STORAGES = {
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-
-def _parse_positive_int_env(name: str, default: int) -> int:
-    raw_value = os.environ.get(name, "").strip()
-    if not raw_value:
-        return default
-    try:
-        parsed = int(raw_value)
-        return parsed if parsed > 0 else default
-    except ValueError:
-        return default
-
-
-def _parse_non_negative_int_env(name: str, default: int) -> int:
-    """Parses a non-negative integer environment variable where zero disables local interception."""
-    raw_value = os.environ.get(name, "").strip()
-    if not raw_value:
-        return default
-    try:
-        parsed = int(raw_value)
-        return parsed if parsed >= 0 else default
-    except ValueError:
-        return default
-
-
-def _parse_positive_float_env(name: str, default: float) -> float:
-    raw_value = os.environ.get(name, "").strip()
-    if not raw_value:
-        return default
-    try:
-        parsed = float(raw_value)
-        return parsed if math.isfinite(parsed) and parsed > 0 else default
-    except ValueError:
-        return default
-
-
 WIKIMEDIA_OAUTH_URL = os.environ.get("WIKIMEDIA_OAUTH_URL", "https://meta.wikimedia.org/w/rest.php/oauth2").strip()
 WIKIMEDIA_CLIENT_ID = os.environ.get("WIKIMEDIA_CLIENT_ID", "").strip()
 WIKIMEDIA_CLIENT_SECRET = os.environ.get("WIKIMEDIA_CLIENT_SECRET", "").strip()
 WIKIMEDIA_REDIRECT_URI = os.environ.get(
     "WIKIMEDIA_REDIRECT_URI", "https://proxycheck.toolforge.org/oauth/callback"
 ).strip()
-GADGET_TOKEN_TTL_SECONDS = _parse_positive_int_env("GADGET_TOKEN_TTL_SECONDS", 900)
-DETECT_USER_RPM_LIMIT = _parse_non_negative_int_env("DETECT_USER_RPM_LIMIT", 120)
-DETECT_GLOBAL_RPM_LIMIT = _parse_non_negative_int_env("DETECT_GLOBAL_RPM_LIMIT", 600)
-DETECT_BATCH_USER_RPM_LIMIT = _parse_non_negative_int_env("DETECT_BATCH_USER_RPM_LIMIT", 20)
-DETECT_BATCH_GLOBAL_RPM_LIMIT = _parse_non_negative_int_env("DETECT_BATCH_GLOBAL_RPM_LIMIT", 100)
-RANGEBLOCK_USER_RPM_LIMIT = _parse_non_negative_int_env("RANGEBLOCK_USER_RPM_LIMIT", 120)
-RANGEBLOCK_GLOBAL_RPM_LIMIT = _parse_non_negative_int_env("RANGEBLOCK_GLOBAL_RPM_LIMIT", 600)
-GADGET_TOKEN_USER_RPM_LIMIT = _parse_non_negative_int_env("GADGET_TOKEN_USER_RPM_LIMIT", 15)
-GADGET_TOKEN_GLOBAL_RPM_LIMIT = _parse_non_negative_int_env("GADGET_TOKEN_GLOBAL_RPM_LIMIT", 240)
-REFRESH_USER_RPM_LIMIT = _parse_non_negative_int_env("REFRESH_USER_RPM_LIMIT", 6)
-REFRESH_USER_RPH_LIMIT = _parse_non_negative_int_env("REFRESH_USER_RPH_LIMIT", 60)
-REFRESH_GLOBAL_RPM_LIMIT = _parse_non_negative_int_env("REFRESH_GLOBAL_RPM_LIMIT", 30)
+GADGET_TOKEN_TTL_SECONDS = _parse_int_env("GADGET_TOKEN_TTL_SECONDS", 900)
+DETECT_USER_RPM_LIMIT = _parse_int_env("DETECT_USER_RPM_LIMIT", 120, min_value=0)
+DETECT_GLOBAL_RPM_LIMIT = _parse_int_env("DETECT_GLOBAL_RPM_LIMIT", 600, min_value=0)
+DETECT_BATCH_USER_RPM_LIMIT = _parse_int_env("DETECT_BATCH_USER_RPM_LIMIT", 20, min_value=0)
+DETECT_BATCH_GLOBAL_RPM_LIMIT = _parse_int_env("DETECT_BATCH_GLOBAL_RPM_LIMIT", 100, min_value=0)
+RANGEBLOCK_USER_RPM_LIMIT = _parse_int_env("RANGEBLOCK_USER_RPM_LIMIT", 120, min_value=0)
+RANGEBLOCK_GLOBAL_RPM_LIMIT = _parse_int_env("RANGEBLOCK_GLOBAL_RPM_LIMIT", 600, min_value=0)
+GADGET_TOKEN_USER_RPM_LIMIT = _parse_int_env("GADGET_TOKEN_USER_RPM_LIMIT", 15, min_value=0)
+GADGET_TOKEN_GLOBAL_RPM_LIMIT = _parse_int_env("GADGET_TOKEN_GLOBAL_RPM_LIMIT", 240, min_value=0)
+REFRESH_USER_RPM_LIMIT = _parse_int_env("REFRESH_USER_RPM_LIMIT", 6, min_value=0)
+REFRESH_USER_RPH_LIMIT = _parse_int_env("REFRESH_USER_RPH_LIMIT", 60, min_value=0)
+REFRESH_GLOBAL_RPM_LIMIT = _parse_int_env("REFRESH_GLOBAL_RPM_LIMIT", 30, min_value=0)
 ALLOWED_WIKI_USERS = os.environ.get("ALLOWED_WIKI_USERS", "")
 
-PROVIDER_STATIC_CACHE_TTL_SECONDS = _parse_positive_int_env("PROVIDER_STATIC_CACHE_TTL_SECONDS", 86400)
-PROVIDER_DYNAMIC_CACHE_TTL_SECONDS = _parse_positive_int_env("PROVIDER_DYNAMIC_CACHE_TTL_SECONDS", 7200)
-GETIPINTEL_STABLE_CACHE_TTL_SECONDS = _parse_positive_int_env("GETIPINTEL_STABLE_CACHE_TTL_SECONDS", 259200)
-PROVIDER_COOLDOWN_DEFAULT_SECONDS = _parse_positive_int_env("PROVIDER_COOLDOWN_DEFAULT_SECONDS", 120)
-PROVIDER_COOLDOWN_MIN_SECONDS = _parse_positive_int_env("PROVIDER_COOLDOWN_MIN_SECONDS", 60)
-PROVIDER_COOLDOWN_MAX_SECONDS = _parse_positive_int_env("PROVIDER_COOLDOWN_MAX_SECONDS", 300)
+PROVIDER_STATIC_CACHE_TTL_SECONDS = _parse_int_env("PROVIDER_STATIC_CACHE_TTL_SECONDS", 86400)
+PROVIDER_DYNAMIC_CACHE_TTL_SECONDS = _parse_int_env("PROVIDER_DYNAMIC_CACHE_TTL_SECONDS", 7200)
+GETIPINTEL_STABLE_CACHE_TTL_SECONDS = _parse_int_env("GETIPINTEL_STABLE_CACHE_TTL_SECONDS", 259200)
+PROVIDER_COOLDOWN_DEFAULT_SECONDS = _parse_int_env("PROVIDER_COOLDOWN_DEFAULT_SECONDS", 120)
+PROVIDER_COOLDOWN_MIN_SECONDS = _parse_int_env("PROVIDER_COOLDOWN_MIN_SECONDS", 60)
+PROVIDER_COOLDOWN_MAX_SECONDS = _parse_int_env("PROVIDER_COOLDOWN_MAX_SECONDS", 300)
 DNS_QUERY_TIMEOUT_SECONDS = _parse_positive_float_env("DNS_QUERY_TIMEOUT_SECONDS", 2.0)
 DNS_QUERY_LIFETIME_SECONDS = _parse_positive_float_env("DNS_QUERY_LIFETIME_SECONDS", 2.0)
 
 ENABLE_L2_TOOLSDB_CACHE = _parse_bool_env("ENABLE_L2_TOOLSDB_CACHE", default=True)
-CACHE_SWR_STALE_DAYS = _parse_positive_int_env("CACHE_SWR_STALE_DAYS", 90)
+CACHE_SWR_STALE_DAYS = _parse_int_env("CACHE_SWR_STALE_DAYS", 90)
 CACHE_SWR_STALE_SECONDS = CACHE_SWR_STALE_DAYS * 86400
 PROVIDER_L2_MAX_RETENTION_DAYS = dict(DEFAULT_PROVIDER_L2_MAX_RETENTION_DAYS)
 
@@ -542,8 +502,8 @@ for _provider_meta in PROVIDER_REGISTRY:
     if _provider_meta.credential_setting is not None:
         globals()[_provider_meta.credential_setting] = os.environ.get(_provider_meta.credential_setting, "")
     if _provider_meta.has_quota_env_vars:
-        _rpm_limit = _parse_non_negative_int_env(_provider_meta.rpm_setting, _provider_meta.default_rpm_limit)
-        _daily_limit = _parse_non_negative_int_env(_provider_meta.daily_setting, _provider_meta.default_daily_limit)
+        _rpm_limit = _parse_int_env(_provider_meta.rpm_setting, _provider_meta.default_rpm_limit, min_value=0)
+        _daily_limit = _parse_int_env(_provider_meta.daily_setting, _provider_meta.default_daily_limit, min_value=0)
     else:
         _rpm_limit = 0
         _daily_limit = 0
@@ -560,13 +520,6 @@ PROVIDER_QUOTA_LIMITS = {
 del _provider_meta, _rpm_limit, _daily_limit
 
 
-def _parse_csv_env(name: str) -> tuple[str, ...]:
-    raw_value = os.environ.get(name, "").strip()
-    if not raw_value:
-        return ()
-    return tuple(item.strip() for item in raw_value.split(",") if item.strip())
-
-
 def expand_configured_path(raw_path: str) -> str:
     """Expands environment variables and user home shortcuts in configured paths."""
     cleaned = str(raw_path or "").strip()
@@ -576,7 +529,6 @@ def expand_configured_path(raw_path: str) -> str:
 
 
 def _configured_tool_data_dir(explicit_tool_data_dir: Optional[str] = None) -> str:
-    """Returns the configured TOOL_DATA_DIR from an explicit override, Django settings, or environment."""
     if explicit_tool_data_dir is not None:
         return expand_configured_path(explicit_tool_data_dir)
     try:
@@ -650,7 +602,6 @@ def resolve_data_file(
         if configured.is_dir():
             return str(configured / filename)
 
-    # Check local workspace directories and Toolforge mounted data paths in order.
     for directory in standard_data_directories(base_dir):
         candidate = directory / filename
         if candidate.exists():
@@ -682,12 +633,7 @@ def resolve_mmdb_file(
         resolve_tool_data_subdir(resolved_tool_dir) if resolved_tool_dir else (Path(str(base_dir)).parent / "data")
     )
     fallback = default_missing if default_missing is not None else str(default_dir / filename)
-    resolved_direct = resolve_data_file(
-        "",
-        filename,
-        base_dir,
-        default_missing="",
-    )
+    resolved_direct = resolve_data_file("", filename, base_dir, default_missing="")
     if resolved_direct:
         return resolved_direct
 
@@ -697,18 +643,6 @@ def resolve_mmdb_file(
             return str(matched)
 
     return fallback
-
-
-def _resolve_optional_data_path(env_var_name: str, filenames: str | tuple[str, ...]) -> str:
-    custom_path = os.environ.get(env_var_name, "").strip()
-    if custom_path:
-        return custom_path
-    candidate_names = (filenames,) if isinstance(filenames, str) else filenames
-    for filename in candidate_names:
-        resolved = resolve_data_file("", filename, BASE_DIR, default_missing="")
-        if resolved:
-            return resolved
-    return str(BASE_DIR.parent / "data" / candidate_names[0])
 
 
 TOOL_DATA_DIR = os.environ.get("TOOL_DATA_DIR", "").strip()
@@ -721,16 +655,20 @@ STOPFORUMSPAM_TOXIC_CIDR_PATH = os.environ.get("STOPFORUMSPAM_TOXIC_CIDR_PATH", 
 STOPFORUMSPAM_LISTED_90_PATH = os.environ.get("STOPFORUMSPAM_LISTED_90_PATH", "").strip()
 STOPFORUMSPAM_LISTED_1_PATH = os.environ.get("STOPFORUMSPAM_LISTED_1_PATH", "").strip()
 STOPFORUMSPAM_SQLITE_PATH = os.environ.get("STOPFORUMSPAM_SQLITE_PATH", "").strip()
-OFFLINE_DB_MAXMIND_STALE_SECONDS = _parse_positive_int_env("OFFLINE_DB_MAXMIND_STALE_SECONDS", 14 * 86400)
-OFFLINE_DB_SFS_TOXIC_STALE_SECONDS = _parse_positive_int_env("OFFLINE_DB_SFS_TOXIC_STALE_SECONDS", 7 * 86400)
-OFFLINE_DB_SFS_90_STALE_SECONDS = _parse_positive_int_env("OFFLINE_DB_SFS_90_STALE_SECONDS", 2 * 86400)
-OFFLINE_DB_SFS_1_STALE_SECONDS = _parse_positive_int_env("OFFLINE_DB_SFS_1_STALE_SECONDS", 6 * 3600)
+OFFLINE_DB_MAXMIND_STALE_SECONDS = _parse_int_env("OFFLINE_DB_MAXMIND_STALE_SECONDS", 14 * 86400)
+OFFLINE_DB_SFS_TOXIC_STALE_SECONDS = _parse_int_env("OFFLINE_DB_SFS_TOXIC_STALE_SECONDS", 7 * 86400)
+OFFLINE_DB_SFS_90_STALE_SECONDS = _parse_int_env("OFFLINE_DB_SFS_90_STALE_SECONDS", 2 * 86400)
+OFFLINE_DB_SFS_1_STALE_SECONDS = _parse_int_env("OFFLINE_DB_SFS_1_STALE_SECONDS", 6 * 3600)
 OPENASN_MMDB_PATH = os.environ.get("OPENASN_MMDB_PATH", "").strip()
-OFFLINE_DB_OPENASN_STALE_SECONDS = _parse_positive_int_env("OFFLINE_DB_OPENASN_STALE_SECONDS", 14 * 86400)
+OFFLINE_DB_OPENASN_STALE_SECONDS = _parse_int_env("OFFLINE_DB_OPENASN_STALE_SECONDS", 14 * 86400)
 SHARED_CIDRS_BIN_PATH = os.environ.get("SHARED_CIDRS_BIN_PATH", "").strip()
-OFFLINE_DB_SHARED_CIDRS_STALE_SECONDS = _parse_positive_int_env("OFFLINE_DB_SHARED_CIDRS_STALE_SECONDS", 7 * 86400)
-OFFLINE_DB_RULES_STALE_SECONDS = _parse_positive_int_env("OFFLINE_DB_RULES_STALE_SECONDS", 90 * 86400)
-HOSTING_ASN_RULES_PATH = _resolve_optional_data_path("HOSTING_ASN_RULES_PATH", "hosting_asn_rules.json")
+OFFLINE_DB_SHARED_CIDRS_STALE_SECONDS = _parse_int_env("OFFLINE_DB_SHARED_CIDRS_STALE_SECONDS", 7 * 86400)
+OFFLINE_DB_RULES_STALE_SECONDS = _parse_int_env("OFFLINE_DB_RULES_STALE_SECONDS", 90 * 86400)
+HOSTING_ASN_RULES_PATH = (
+    os.environ.get("HOSTING_ASN_RULES_PATH", "").strip()
+    or resolve_data_file("", "hosting_asn_rules.json", BASE_DIR, default_missing="")
+    or str(BASE_DIR.parent / "data" / "hosting_asn_rules.json")
+)
 HOSTING_ASNS = _parse_csv_env("HOSTING_ASNS")
 HOSTING_ORG_KEYWORDS = _parse_csv_env("HOSTING_ORG_KEYWORDS")
 

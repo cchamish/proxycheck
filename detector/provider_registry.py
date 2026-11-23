@@ -35,7 +35,7 @@ def hash_ip_for_redis(canonical_ip: str, secret: str) -> str:
 
 
 class JsonRedisSerializer:
-    """JSON-based Redis cache serializer replacing Pickle to prevent unsafe deserialisation."""
+    """JSON-based Redis cache serialiser replacing Pickle to prevent unsafe deserialisation."""
 
     def dumps(self, obj: Any) -> bytes | int:
         if type(obj) is int:
@@ -76,10 +76,6 @@ class ProviderMetadata:
     default_rpm_limit: int = 0
     default_daily_limit: int = 0
     has_quota_env_vars: bool = True
-
-    @property
-    def env_prefix(self) -> str:
-        return self.key.upper()
 
     @property
     def rpm_setting(self) -> str:
@@ -301,7 +297,7 @@ DNSBL_PROVIDER_KEYS: FrozenSet[str] = frozenset(meta.key for meta in PROVIDER_RE
 
 OFFLINE_PROVIDER_KEYS: FrozenSet[str] = frozenset(meta.key for meta in PROVIDER_REGISTRY if meta.is_offline)
 
-OFFLINE_REHYDRATE_PROVIDERS: FrozenSet[str] = frozenset({"maxmind", "stopforumspam", "ipsum_drop", "openasn"})
+OFFLINE_REHYDRATE_PROVIDERS: FrozenSet[str] = OFFLINE_PROVIDER_KEYS
 
 # Local mmap lookups cost microseconds, so these providers never touch Redis or the L1/L2 snapshots.
 NO_REDIS_CACHE_PROVIDER_KEYS: FrozenSet[str] = frozenset({"openasn"})

@@ -19,8 +19,8 @@ _proc_rss_lock = threading.Lock()
 _proc_rss_cache: Optional[Tuple[float, float]] = None
 
 
-def _read_proc_rss_mb() -> Optional[float]:
-    """Reads live resident set size (RSS) from Linux procfs in megabytes when available."""
+def get_process_memory_mb() -> Optional[float]:
+    """Returns current worker RSS in megabytes, falling back to peak RSS when procfs is unavailable."""
     global _proc_rss_cache
 
     now_mono = time.monotonic()
@@ -32,32 +32,21 @@ def _read_proc_rss_mb() -> Optional[float]:
     try:
         with open("/proc/self/statm", encoding="ascii") as statm_file:
             fields = statm_file.read().split()
-        if len(fields) < 2:
-            return None
-        rss_pages = int(fields[1])
-        page_size = os.sysconf("SC_PAGESIZE")
+        if len(fields) >= 2:
+            rss_pages = int(fields[1])
+            page_size = os.sysconf("SC_PAGESIZE")
+            if rss_pages >= 0 and page_size > 0:
+                rss_mb = round((rss_pages * page_size) / (1024.0 * 1024.0), 2)
+                with _proc_rss_lock:
+                    _proc_rss_cache = (now_mono, rss_mb)
+                return rss_mb
     except OSError, AttributeError, ValueError, TypeError:
-        return None
-
-    if rss_pages < 0 or page_size <= 0:
-        return None
-    rss_mb = round((rss_pages * page_size) / (1024.0 * 1024.0), 2)
-    with _proc_rss_lock:
-        _proc_rss_cache = (now_mono, rss_mb)
-    return rss_mb
-
-
-def get_process_memory_mb() -> Optional[float]:
-    """Returns current worker RSS in megabytes, falling back to peak RSS when procfs is unavailable."""
-    proc_rss = _read_proc_rss_mb()
-    if proc_rss is not None:
-        return proc_rss
+        pass
 
     try:
         import resource
 
         usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        # Linux reports ru_maxrss in KiB.
         return round(usage / 1024.0, 2)
     except ImportError, OSError, AttributeError:
         return None
@@ -282,418 +271,258 @@ def build_non_public_response_payload(
     return attach_request_diagnostics(payload, start_time)
 
 
-_build_non_public_response_payload = build_non_public_response_payload
-
-
 _HOSTING_KEYWORDS = ("datacenter", "data center", "hosting", "cloud", "transit", "cdn")
 _RESIDENTIAL_KEYWORDS = ("isp", "residential", "fixed line", "mobile", "commercial", "education")
-_ANONYMIZER_KEYWORDS = ("proxy", "vpn", "tor", "relay", "abuser", "attacker", "threat", "block 1", "spam", "botnet")
+_ANONYMISER_KEYWORDS = ("proxy", "vpn", "tor", "relay", "abuser", "attacker", "threat", "block 1", "spam", "botnet")
 _SHODAN_PARADOX_TAGS = frozenset({"proxy", "vpn", "compromised"})
 _RECENT_ACTIVITY_WINDOW_SECONDS = 30 * 86400
 
 
-@dataclass
-class _TorOverview:
-    is_tor: bool = False
-    tor_is_exit: bool = False
-    tor_running: bool = False
-    tor_flags: List[str] = field(default_factory=list)
-    tor_label: Optional[str] = None
-    tor_summary: Optional[str] = None
-
-
-@dataclass
-class _ArbitrationAccumulator:
-    valid_country_codes: Set[str] = field(default_factory=set)
-    valid_asns: List[str] = field(default_factory=list)
-    valid_orgs: List[str] = field(default_factory=list)
-    valid_locations: List[str] = field(default_factory=list)
-    getipintel_chance: Optional[float] = None
-    residential_proxy: Optional[float] = None
-    positive_proxy_vpn_votes: float = 0.0
-    total_commercial_responses: int = 0
-    hosting_source_count: int = 0
-    behavioral_threat_votes: int = 0
-    clean_source_count: int = 0
-    residential_source_count: int = 0
-    has_datacenter_or_hosting: bool = False
-    has_anonymizer_flag: bool = False
-    has_shodan_proxy_ports: bool = False
-    has_shodan_paradox_tag: bool = False
-    max_ipsum_score: int = 0
-    has_spamhaus_sbl_xbl_drop: bool = False
-    has_recent_sfs_activity: bool = False
-    has_recent_dshield_activity: bool = False
-    has_high_abuseipdb: bool = False
-
-
-def _parse_activity_datetime(raw_value: Any) -> Optional[datetime]:
+def _is_recent_or_undated(raw_value: Any) -> bool:
+    """Treats missing or unparseable timestamps as recent so undated listings still count."""
     if not isinstance(raw_value, str) or not raw_value.strip():
-        return None
+        return True
     cleaned = raw_value.strip()
     if cleaned.endswith("Z"):
         cleaned = f"{cleaned[:-1]}+00:00"
     for fmt in (None, "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
         try:
             parsed = datetime.fromisoformat(cleaned) if fmt is None else datetime.strptime(cleaned, fmt)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.astimezone(timezone.utc)
         except ValueError:
             continue
-    return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - parsed).total_seconds() <= _RECENT_ACTIVITY_WINDOW_SECONDS
+    return True
 
 
-def _is_timestamp_recent(raw_value: Any, *, window_seconds: int = _RECENT_ACTIVITY_WINDOW_SECONDS) -> Optional[bool]:
-    parsed = _parse_activity_datetime(raw_value)
-    if parsed is None:
-        return None
-    age_seconds = (datetime.now(timezone.utc) - parsed).total_seconds()
-    return age_seconds <= window_seconds
+def _as_int(raw_value: Any) -> int:
+    return int(raw_value) if isinstance(raw_value, int) and not isinstance(raw_value, bool) else 0
 
 
-def _format_vote_count(votes: float) -> str:
-    rounded = round(float(votes), 2)
-    if rounded.is_integer():
-        return str(int(rounded))
-    return f"{rounded:.1f}"
-
-
-def _extract_tor_overview(row: Dict[str, Any]) -> _TorOverview:
-    if row.get("status") != "200 OK" or not row.get("isTor"):
-        return _TorOverview()
-    tor_is_exit = bool(row.get("torIsExit"))
-    raw_tor_flags = row.get("torFlags")
-    tor_flags = [str(flag) for flag in raw_tor_flags if flag] if isinstance(raw_tor_flags, list) else []
-    raw_tor_summary = row.get("torSummary")
-    return _TorOverview(
-        is_tor=True,
-        tor_is_exit=tor_is_exit,
-        tor_running=bool(row.get("torRunning")),
-        tor_flags=tor_flags,
-        tor_label=str(row.get("torLabel") or ("Tor Exit" if tor_is_exit else "Tor Node")),
-        tor_summary=str(raw_tor_summary) if raw_tor_summary else None,
-    )
-
-
-def _record_row_network_metadata(row: Dict[str, Any], acc: _ArbitrationAccumulator) -> None:
-    c_code = row.get("countryCode")
-    if isinstance(c_code, str):
-        c_code_clean = c_code.strip().upper()
-        if len(c_code_clean) == 2 and c_code_clean.isalpha():
-            acc.valid_country_codes.add(c_code_clean)
-
-    asn_val = row.get("asn")
-    if asn_val and asn_val != "-" and str(asn_val).startswith("AS"):
-        acc.valid_asns.append(str(asn_val))
-
-    org_val = row.get("organisation") or row.get("isp")
-    if isinstance(org_val, str) and org_val.strip() and org_val.strip() != "-":
-        acc.valid_orgs.append(org_val.strip())
-
-    loc_val = row.get("location")
-    if loc_val and loc_val != "-":
-        acc.valid_locations.append(loc_val)
-
-    if row.get("provider") == "GetIPIntel":
-        chance_val = row.get("chance")
-        if isinstance(chance_val, (int, float)):
-            acc.getipintel_chance = round(float(chance_val), 3)
-        residential_proxy = row.get("residentialProxy")
-        if isinstance(residential_proxy, (int, float)) and not isinstance(residential_proxy, bool):
-            acc.residential_proxy = round(float(residential_proxy), 4)
-
-
-def _resolve_getipintel_vote_weight(row: Dict[str, Any], flags: List[Dict[str, Any]]) -> float:
-    raw_weight = row.get("arbitrationWeight")
-    if isinstance(raw_weight, (int, float)) and not isinstance(raw_weight, bool):
-        return max(0.0, min(1.0, float(raw_weight)))
-    chance_val = row.get("chance")
-    if isinstance(chance_val, (int, float)) and not isinstance(chance_val, bool):
-        if float(chance_val) >= 90.0:
-            return 1.0
-        if float(chance_val) >= 75.0:
-            return 0.5
-        return 0.0
-    return 1.0 if any(f.get("isHighRisk") for f in flags) else 0.0
-
-
-def _add_affirmative_osint_vote(acc: _ArbitrationAccumulator) -> None:
-    acc.behavioral_threat_votes += 1
-    acc.has_anonymizer_flag = True
-    acc.total_commercial_responses += 1
-    acc.positive_proxy_vpn_votes += 1.0
-
-
-def _classify_spamhaus_or_ipsum_row(p_name: str, row: Dict[str, Any], acc: _ArbitrationAccumulator) -> None:
-    if p_name == "Spamhaus ZEN":
-        is_listed = bool(row.get("isListed"))
-        is_policy = bool(row.get("isPolicyRange"))
-        codes = row.get("listedCodes")
-        has_non_pbl_code = (
-            any(code not in ("127.0.0.10", "127.0.0.11") for code in codes if isinstance(code, str))
-            if isinstance(codes, list) and codes
-            else (is_listed and not is_policy)
-        )
-        if is_listed and not is_policy and has_non_pbl_code:
-            acc.has_spamhaus_sbl_xbl_drop = True
-            _add_affirmative_osint_vote(acc)
-        return
-
-    in_drop = bool(row.get("inSpamhausDrop"))
-    raw_score = row.get("ipsumScore")
-    ipsum_score = int(raw_score) if isinstance(raw_score, int) and not isinstance(raw_score, bool) else 0
-    acc.max_ipsum_score = max(acc.max_ipsum_score, ipsum_score)
-    if in_drop:
-        acc.has_spamhaus_sbl_xbl_drop = True
-    if in_drop or ipsum_score >= 3:
-        _add_affirmative_osint_vote(acc)
-
-
-def _classify_activity_feed_row(p_name: str, row: Dict[str, Any], acc: _ArbitrationAccumulator) -> None:
-    if p_name == "StopForumSpam":
-        if bool(row.get("blacklisted")):
-            acc.has_recent_sfs_activity = True
-            return
-        raw_freq = row.get("frequency")
-        freq = int(raw_freq) if isinstance(raw_freq, int) and not isinstance(raw_freq, bool) else 0
-        if bool(row.get("appears")) and freq > 0 and _is_timestamp_recent(row.get("lastSeen")) in (True, None):
-            acc.has_recent_sfs_activity = True
-        return
-
-    raw_attacks = row.get("attacks")
-    attacks = int(raw_attacks) if isinstance(raw_attacks, int) and not isinstance(raw_attacks, bool) else 0
-    raw_count = row.get("count")
-    count = int(raw_count) if isinstance(raw_count, int) and not isinstance(raw_count, bool) else 0
-    if (attacks > 0 or count > 0 or bool(row.get("threatfeeds"))) and _is_timestamp_recent(
-        row.get("lastSeen") or row.get("maxDate")
-    ) in (True, None):
-        acc.has_recent_dshield_activity = True
-
-
-def _classify_osint_arbitration_signals(row: Dict[str, Any], acc: _ArbitrationAccumulator) -> None:
-    p_name = row.get("provider")
-    if p_name in ("Spamhaus ZEN", "IPsum / DROP"):
-        _classify_spamhaus_or_ipsum_row(str(p_name), row, acc)
-    elif p_name == "OpenASN":
-        if bool(row.get("isVpn")):
-            _add_affirmative_osint_vote(acc)
-        elif bool(row.get("isHosting")):
-            acc.has_datacenter_or_hosting = True
-    elif p_name == "Shodan InternetDB":
-        raw_proxy_ports = row.get("openProxyPorts")
-        if isinstance(raw_proxy_ports, list) and len(raw_proxy_ports) > 0:
-            acc.has_shodan_proxy_ports = True
-            _add_affirmative_osint_vote(acc)
-        raw_tags = row.get("tags")
-        if isinstance(raw_tags, list):
-            lowered_tags = {str(tag).strip().lower() for tag in raw_tags if isinstance(tag, str)}
-            if lowered_tags & _SHODAN_PARADOX_TAGS:
-                acc.has_shodan_paradox_tag = True
-    elif p_name in ("StopForumSpam", "DShield"):
-        _classify_activity_feed_row(str(p_name), row, acc)
-
-
-def _row_has_high_abuseipdb(row: Dict[str, Any], flags: List[Dict[str, Any]]) -> bool:
-    raw_abuse = row.get("abuseConfidenceScore")
-    if isinstance(raw_abuse, (int, float)) and not isinstance(raw_abuse, bool) and float(raw_abuse) >= 25.0:
-        return True
-    return any(f.get("isHighRisk") and "abuse score" in str(f.get("label") or "").lower() for f in flags)
-
-
-def _extract_commercial_or_maxmind_traits(
-    row: Dict[str, Any],
-    flags: List[Dict[str, Any]],
-    acc: _ArbitrationAccumulator,
-) -> Tuple[bool, bool]:
-    usage_str = str(row.get("usageType") or "").lower()
-    row_is_hosting = any(k in usage_str for k in _HOSTING_KEYWORDS)
-    if not row_is_hosting and any(k in usage_str for k in _RESIDENTIAL_KEYWORDS):
-        acc.residential_source_count += 1
-
-    row_is_anonymizer = False
-    for flag in flags:
-        if not flag.get("isHighRisk"):
-            continue
-        label_lower = str(flag.get("label") or "").lower()
-        if any(k in label_lower for k in _HOSTING_KEYWORDS):
-            row_is_hosting = True
-        if any(k in label_lower for k in _ANONYMIZER_KEYWORDS):
-            row_is_anonymizer = True
-
-    if row_is_hosting:
-        acc.has_datacenter_or_hosting = True
-        acc.hosting_source_count += 1
-        if not any(f.get("isHighRisk") for f in flags):
-            flags = [{"label": "Hosting", "isHighRisk": True}]
-            row["securityFlags"] = flags
-    if row_is_anonymizer:
-        acc.has_anonymizer_flag = True
-
-    explicit_risk = row.get("riskScore")
-    has_explicit_risk = (
-        isinstance(explicit_risk, (int, float)) and not isinstance(explicit_risk, bool) and explicit_risk > 0
-    )
-    has_row_high_risk_flag = any(f.get("isHighRisk") for f in flags)
-    if row_is_anonymizer or has_explicit_risk or (not row_is_hosting and has_row_high_risk_flag):
-        acc.behavioral_threat_votes += 1
-    elif not row_is_hosting and not has_row_high_risk_flag:
-        acc.clean_source_count += 1
-    return row_is_hosting, row_is_anonymizer
-
-
-def _classify_row_arbitration_signals(row: Dict[str, Any], acc: _ArbitrationAccumulator) -> None:
-    """Updates hosting, anonymiser, behavioural, OSINT, and commercial vote counters for one 200 OK row."""
-    p_name = row.get("provider")
-    flags = row.get("securityFlags") or []
-    row_is_hosting = False
-    row_is_anonymizer = False
-
-    if p_name == "AbuseIPDB" and _row_has_high_abuseipdb(row, flags):
-        acc.has_high_abuseipdb = True
-
-    if p_name in COMMERCIAL_ARBITRATION_PROVIDERS or p_name == "MaxMind":
-        row_is_hosting, row_is_anonymizer = _extract_commercial_or_maxmind_traits(row, flags, acc)
-        flags = row.get("securityFlags") or flags
-
-    if p_name in COMMERCIAL_ARBITRATION_PROVIDERS:
-        acc.total_commercial_responses += 1
-        if p_name == "GetIPIntel":
-            gii_weight = _resolve_getipintel_vote_weight(row, flags)
-            acc.positive_proxy_vpn_votes += gii_weight
-            if gii_weight >= 0.5:
-                acc.has_anonymizer_flag = True
-        elif any(f.get("isHighRisk") for f in flags) or row_is_hosting or row_is_anonymizer:
-            acc.positive_proxy_vpn_votes += 1.0
-        return
-
-    _classify_osint_arbitration_signals(row, acc)
-
-
-def _compute_getipintel_prediction(getipintel_chance: Optional[float]) -> Tuple[float, str, str]:
-    if getipintel_chance is None:
-        return 0.0, "GetIPIntel Unavailable", "neutral"
-    if getipintel_chance >= 90.0:
-        return getipintel_chance, "Proxy / VPN", "destructive"
-    if getipintel_chance < 20.0:
-        return getipintel_chance, "Normal", "success"
-    return getipintel_chance, "Needs Human Review", "neutral"
-
-
-def _has_malicious_abuse_records(acc: _ArbitrationAccumulator) -> bool:
-    return (
-        acc.has_recent_sfs_activity
-        or acc.has_recent_dshield_activity
-        or acc.has_high_abuseipdb
-        or acc.has_spamhaus_sbl_xbl_drop
-        or acc.max_ipsum_score >= 3
-    )
-
-
-def _detect_residential_signal_paradox(
-    acc: _ArbitrationAccumulator,
-    *,
-    ptr_category: str,
-    shared_privacy_egress: Optional[str],
-    is_tor: bool,
-) -> bool:
-    if shared_privacy_egress is not None or is_tor:
-        return False
-    is_residential_context = acc.residential_source_count >= 2 or ptr_category == "dynamic_residential"
-    if not is_residential_context:
-        return False
-    has_shodan_signal = acc.has_shodan_proxy_ports or acc.has_shodan_paradox_tag
-    has_ipsum_attack_signal = acc.max_ipsum_score >= 3 and (
-        acc.has_recent_sfs_activity or acc.has_recent_dshield_activity
-    )
-    return has_shodan_signal or has_ipsum_attack_signal
-
-
-def _resolve_arbitration_verdict(
-    acc: _ArbitrationAccumulator,
-    tor: _TorOverview,
-    *,
-    shared_privacy_egress: Optional[str] = None,
-    suspected_residential_proxy: bool = False,
-) -> Tuple[str, str, bool]:
-    """Resolves final multi-source verdict label, tier, and majority proxy or VPN flag."""
-    if (
-        shared_privacy_egress in ("icloud_private_relay", "cloudflare_warp")
-        and not tor.is_tor
-        and not _has_malicious_abuse_records(acc)
-    ):
-        return (
-            "Shared Privacy Egress (iCloud Relay / WARP)",
-            "warning",
-            False,
-        )
-
-    total = acc.total_commercial_responses
-    votes = acc.positive_proxy_vpn_votes
-    votes_str = _format_vote_count(votes)
-
-    if total == 0:
-        verdict, tier, is_majority = "Direct Connection (No Commercial Threats)", "neutral", False
-    elif votes > (total / 2.0):
-        prefix = (
-            "Confirmed Datacenter / Hosting"
-            if acc.has_datacenter_or_hosting and not acc.has_anonymizer_flag
-            else "Confirmed Proxy / VPN"
-        )
-        verdict, tier, is_majority = f"{prefix} ({votes_str}/{total} Sources)", "destructive", True
-    elif acc.behavioral_threat_votes == 0 and acc.hosting_source_count == 1 and votes == 1.0:
-        # Treat a lone hosting classification without behavioural threat votes as a minor attribute dispute.
-        verdict, tier, is_majority = "Clean Residential (1 Minor Attribute Dispute)", "success", False
-    elif votes > 0:
-        if acc.has_anonymizer_flag:
-            prefix = "Disputed Proxy / VPN"
-        elif acc.has_datacenter_or_hosting and acc.residential_source_count == 0:
-            prefix = "Disputed Datacenter / Hosting"
-        else:
-            prefix = "Disputed Residential / VPN"
-        verdict, tier, is_majority = f"{prefix} ({votes_str}/{total} Sources)", "warning", False
-    else:
-        verdict, tier, is_majority = f"Clean Residential / Direct (0/{total} Sources)", "success", False
-
-    if tor.is_tor and tor.tor_running and not is_majority:
-        tor_verdict_label = tor.tor_label or ("Tor Exit" if tor.tor_is_exit else "Tor Node")
-        return f"Confirmed {tor_verdict_label} (Tor Onionoo)", "destructive", False
-
-    if suspected_residential_proxy:
-        paradox_tier = "destructive" if is_majority else "warning"
-        return "Suspected Residential Proxy / Compromised Host", paradox_tier, is_majority
-
-    return verdict, tier, is_majority
-
-
-def _extract_maxmind_cidr_hints(
-    comparison_results: List[Dict[str, Any]],
-) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
+@dataclass
+class _ArbitrationSignals:
+    comparison_results: List[Dict[str, Any]] = field(default_factory=list)
+    is_tor: bool = False
+    tor_is_exit: bool = False
+    tor_running: bool = False
+    tor_flags: List[str] = field(default_factory=list)
+    tor_label: Optional[str] = None
+    tor_summary: Optional[str] = None
+    country_codes: Set[str] = field(default_factory=set)
+    asns: List[str] = field(default_factory=list)
+    orgs: List[str] = field(default_factory=list)
+    locations: List[str] = field(default_factory=list)
+    getipintel_chance: Optional[float] = None
+    residential_proxy: Optional[float] = None
     mmdb_prefix_len: Optional[int] = None
     shared_cidr: Optional[str] = None
     shared_provider: Optional[str] = None
     shared_category: Optional[str] = None
-    for row in comparison_results:
-        if row.get("provider") != "MaxMind" or row.get("status") != "200 OK":
+    proxy_vpn_votes: float = 0.0
+    commercial_responses: int = 0
+    hosting_source_count: int = 0
+    behavioural_threat_votes: int = 0
+    residential_source_count: int = 0
+    has_hosting: bool = False
+    has_anonymiser_flag: bool = False
+    has_shodan_proxy_ports: bool = False
+    has_shodan_paradox_tag: bool = False
+    max_ipsum_score: int = 0
+    has_spamhaus_listing: bool = False
+    has_recent_sfs_activity: bool = False
+    has_recent_dshield_activity: bool = False
+    has_high_abuseipdb: bool = False
+
+
+def _collect_arbitration_signals(rows: List[Dict[str, Any]]) -> _ArbitrationSignals:  # noqa: C901
+    """Scans provider rows once and tallies every network, Tor, commercial, and OSINT arbitration signal."""
+    sig = _ArbitrationSignals()
+
+    for row in rows:
+        provider = row.get("provider")
+        # Tor Onionoo only feeds the overview Tor fields, never the comparison panel.
+        if provider == "Tor Onionoo":
+            sig.is_tor = row.get("status") == "200 OK" and bool(row.get("isTor"))
+            sig.tor_is_exit = sig.is_tor and bool(row.get("torIsExit"))
+            sig.tor_running = sig.is_tor and bool(row.get("torRunning"))
+            raw_tor_flags = row.get("torFlags")
+            sig.tor_flags = (
+                [str(f) for f in raw_tor_flags if f] if sig.is_tor and isinstance(raw_tor_flags, list) else []
+            )
+            sig.tor_label = (
+                str(row.get("torLabel") or ("Tor Exit" if sig.tor_is_exit else "Tor Node")) if sig.is_tor else None
+            )
+            sig.tor_summary = str(row["torSummary"]) if sig.is_tor and row.get("torSummary") else None
             continue
-        candidate_len = row.get("prefixLength")
-        if candidate_len is None and isinstance(row.get("rawJson"), dict):
-            candidate_len = row["rawJson"].get("prefix_len")
-        if not isinstance(candidate_len, bool) and isinstance(candidate_len, int):
-            mmdb_prefix_len = candidate_len
-        raw_shared_cidr = row.get("sharedCidr") or row.get("cloudCidr")
-        if isinstance(raw_shared_cidr, str) and raw_shared_cidr:
-            shared_cidr = raw_shared_cidr
-        raw_shared_provider = row.get("sharedProvider") or row.get("cloudProvider")
-        if isinstance(raw_shared_provider, str) and raw_shared_provider:
-            shared_provider = raw_shared_provider
-        raw_shared_category = row.get("sharedCategory") or ("cloud" if row.get("cloudProvider") else None)
-        if isinstance(raw_shared_category, str) and raw_shared_category:
-            shared_category = raw_shared_category
-    return mmdb_prefix_len, shared_cidr, shared_provider, shared_category
+
+        sig.comparison_results.append(row)
+        if row.get("status") != "200 OK":
+            continue
+
+        c_code = row.get("countryCode")
+        if isinstance(c_code, str):
+            c_code = c_code.strip().upper()
+            if len(c_code) == 2 and c_code.isalpha():
+                sig.country_codes.add(c_code)
+        asn_val = row.get("asn")
+        if asn_val and asn_val != "-" and str(asn_val).startswith("AS"):
+            sig.asns.append(str(asn_val))
+        org_val = row.get("organisation") or row.get("isp")
+        if isinstance(org_val, str) and org_val.strip() and org_val.strip() != "-":
+            sig.orgs.append(org_val.strip())
+        loc_val = row.get("location")
+        if loc_val and loc_val != "-":
+            sig.locations.append(loc_val)
+
+        flags = row.get("securityFlags") or []
+
+        if provider == "GetIPIntel":
+            chance_val = row.get("chance")
+            if isinstance(chance_val, (int, float)):
+                sig.getipintel_chance = round(float(chance_val), 3)
+            residential_proxy = row.get("residentialProxy")
+            if isinstance(residential_proxy, (int, float)) and not isinstance(residential_proxy, bool):
+                sig.residential_proxy = round(float(residential_proxy), 4)
+
+        if provider == "MaxMind":
+            candidate_len = row.get("prefixLength")
+            if candidate_len is None and isinstance(row.get("rawJson"), dict):
+                candidate_len = row["rawJson"].get("prefix_len")
+            if not isinstance(candidate_len, bool) and isinstance(candidate_len, int):
+                sig.mmdb_prefix_len = candidate_len
+            raw_shared_cidr = row.get("sharedCidr") or row.get("cloudCidr")
+            if isinstance(raw_shared_cidr, str) and raw_shared_cidr:
+                sig.shared_cidr = raw_shared_cidr
+            raw_shared_provider = row.get("sharedProvider") or row.get("cloudProvider")
+            if isinstance(raw_shared_provider, str) and raw_shared_provider:
+                sig.shared_provider = raw_shared_provider
+            raw_shared_category = row.get("sharedCategory") or ("cloud" if row.get("cloudProvider") else None)
+            if isinstance(raw_shared_category, str) and raw_shared_category:
+                sig.shared_category = raw_shared_category
+
+        if provider == "AbuseIPDB":
+            raw_abuse = row.get("abuseConfidenceScore")
+            if (
+                isinstance(raw_abuse, (int, float)) and not isinstance(raw_abuse, bool) and float(raw_abuse) >= 25.0
+            ) or any(f.get("isHighRisk") and "abuse score" in str(f.get("label") or "").lower() for f in flags):
+                sig.has_high_abuseipdb = True
+
+        row_is_hosting = False
+        row_is_anonymiser = False
+        if provider in COMMERCIAL_ARBITRATION_PROVIDERS or provider == "MaxMind":
+            usage_str = str(row.get("usageType") or "").lower()
+            row_is_hosting = any(k in usage_str for k in _HOSTING_KEYWORDS)
+            if not row_is_hosting and any(k in usage_str for k in _RESIDENTIAL_KEYWORDS):
+                sig.residential_source_count += 1
+            for flag in flags:
+                if not flag.get("isHighRisk"):
+                    continue
+                label_lower = str(flag.get("label") or "").lower()
+                if any(k in label_lower for k in _HOSTING_KEYWORDS):
+                    row_is_hosting = True
+                if any(k in label_lower for k in _ANONYMISER_KEYWORDS):
+                    row_is_anonymiser = True
+
+            if row_is_hosting:
+                sig.has_hosting = True
+                sig.hosting_source_count += 1
+                if not any(f.get("isHighRisk") for f in flags):
+                    flags = [{"label": "Hosting", "isHighRisk": True}]
+                    row["securityFlags"] = flags
+            if row_is_anonymiser:
+                sig.has_anonymiser_flag = True
+
+            explicit_risk = row.get("riskScore")
+            has_explicit_risk = (
+                isinstance(explicit_risk, (int, float)) and not isinstance(explicit_risk, bool) and explicit_risk > 0
+            )
+            if (
+                row_is_anonymiser
+                or has_explicit_risk
+                or (not row_is_hosting and any(f.get("isHighRisk") for f in flags))
+            ):
+                sig.behavioural_threat_votes += 1
+
+        if provider in COMMERCIAL_ARBITRATION_PROVIDERS:
+            sig.commercial_responses += 1
+            if provider == "GetIPIntel":
+                raw_weight = row.get("arbitrationWeight")
+                chance_val = row.get("chance")
+                if isinstance(raw_weight, (int, float)) and not isinstance(raw_weight, bool):
+                    gii_weight = max(0.0, min(1.0, float(raw_weight)))
+                elif isinstance(chance_val, (int, float)) and not isinstance(chance_val, bool):
+                    gii_weight = 1.0 if float(chance_val) >= 90.0 else 0.5 if float(chance_val) >= 75.0 else 0.0
+                else:
+                    gii_weight = 1.0 if any(f.get("isHighRisk") for f in flags) else 0.0
+                sig.proxy_vpn_votes += gii_weight
+                if gii_weight >= 0.5:
+                    sig.has_anonymiser_flag = True
+            elif any(f.get("isHighRisk") for f in flags) or row_is_hosting or row_is_anonymiser:
+                sig.proxy_vpn_votes += 1.0
+            continue
+
+        # Free OSINT listings count as affirmative commercial-equivalent votes.
+        is_affirmative_osint = False
+        if provider == "Spamhaus ZEN":
+            is_listed = bool(row.get("isListed"))
+            is_policy = bool(row.get("isPolicyRange"))
+            codes = row.get("listedCodes")
+            has_non_pbl_code = (
+                any(code not in ("127.0.0.10", "127.0.0.11") for code in codes if isinstance(code, str))
+                if isinstance(codes, list) and codes
+                else (is_listed and not is_policy)
+            )
+            if is_listed and not is_policy and has_non_pbl_code:
+                sig.has_spamhaus_listing = True
+                is_affirmative_osint = True
+        elif provider == "IPsum / DROP":
+            in_drop = bool(row.get("inSpamhausDrop"))
+            ipsum_score = _as_int(row.get("ipsumScore"))
+            sig.max_ipsum_score = max(sig.max_ipsum_score, ipsum_score)
+            if in_drop:
+                sig.has_spamhaus_listing = True
+            is_affirmative_osint = in_drop or ipsum_score >= 3
+        elif provider == "OpenASN":
+            if bool(row.get("isVpn")):
+                is_affirmative_osint = True
+            elif bool(row.get("isHosting")):
+                sig.has_hosting = True
+        elif provider == "Shodan InternetDB":
+            raw_proxy_ports = row.get("openProxyPorts")
+            if isinstance(raw_proxy_ports, list) and len(raw_proxy_ports) > 0:
+                sig.has_shodan_proxy_ports = True
+                is_affirmative_osint = True
+            raw_tags = row.get("tags")
+            if isinstance(raw_tags, list):
+                lowered_tags = {str(tag).strip().lower() for tag in raw_tags if isinstance(tag, str)}
+                if lowered_tags & _SHODAN_PARADOX_TAGS:
+                    sig.has_shodan_paradox_tag = True
+        elif provider == "StopForumSpam":
+            if bool(row.get("blacklisted")) or (
+                bool(row.get("appears"))
+                and _as_int(row.get("frequency")) > 0
+                and _is_recent_or_undated(row.get("lastSeen"))
+            ):
+                sig.has_recent_sfs_activity = True
+        elif provider == "DShield":
+            has_attacks = (
+                _as_int(row.get("attacks")) > 0 or _as_int(row.get("count")) > 0 or bool(row.get("threatfeeds"))
+            )
+            sig.has_recent_dshield_activity |= has_attacks and _is_recent_or_undated(
+                row.get("lastSeen") or row.get("maxDate")
+            )
+
+        if is_affirmative_osint:
+            sig.behavioural_threat_votes += 1
+            sig.has_anonymiser_flag = True
+            sig.commercial_responses += 1
+            sig.proxy_vpn_votes += 1.0
+
+    return sig
 
 
-def aggregate_intelligence_metrics(
+def aggregate_intelligence_metrics(  # noqa: C901
     ip: str,
     clean_results: List[Dict[str, Any]],
     ptr_hostname: Optional[str] = None,
@@ -704,7 +533,7 @@ def aggregate_intelligence_metrics(
     Computes an independent GetIPIntel prediction, network metadata summary, CIDR block attribution,
     and a confidence-weighted multi-source arbitration verdict.
     """
-    normalized_results: List[Dict[str, Any]] = [
+    normalised_results: List[Dict[str, Any]] = [
         {
             **{k: v for k, v in item.items() if k != "_rehydrate_sig"},
             "securityFlags": [dict(f) for f in item["securityFlags"] if isinstance(f, dict)]
@@ -714,96 +543,141 @@ def aggregate_intelligence_metrics(
         for item in (clean_results or [])
         if isinstance(item, dict)
     ]
+    sig = _collect_arbitration_signals(normalised_results)
 
-    tor = _TorOverview()
-    acc = _ArbitrationAccumulator()
-    comparison_results: List[Dict[str, Any]] = []
+    chance = sig.getipintel_chance
+    if chance is None:
+        prediction_score, prediction_label, prediction_tier = 0.0, "GetIPIntel Unavailable", "neutral"
+    elif chance >= 90.0:
+        prediction_score, prediction_label, prediction_tier = chance, "Proxy / VPN", "destructive"
+    elif chance < 20.0:
+        prediction_score, prediction_label, prediction_tier = chance, "Normal", "success"
+    else:
+        prediction_score, prediction_label, prediction_tier = chance, "Needs Human Review", "neutral"
 
-    for row in normalized_results:
-        # Exclude Tor Onionoo from the comparison panel and surface it only in overview Tor fields
-        if row.get("provider") == "Tor Onionoo":
-            tor = _extract_tor_overview(row)
-            continue
-        comparison_results.append(row)
-        if row.get("status") == "200 OK":
-            _record_row_network_metadata(row, acc)
-            _classify_row_arbitration_signals(row, acc)
-
-    prediction_score, prediction_label, prediction_tier = _compute_getipintel_prediction(acc.getipintel_chance)
-    highly_suspected_residential_proxy = acc.residential_proxy is not None and acc.residential_proxy >= 0.95
-    mmdb_prefix_len, shared_cidr, shared_provider, shared_category = _extract_maxmind_cidr_hints(comparison_results)
+    highly_suspected_residential_proxy = sig.residential_proxy is not None and sig.residential_proxy >= 0.95
     rdns_info = classify_rdns_hostname(ptr_hostname)
-    primary_asn = acc.valid_asns[0] if acc.valid_asns else "-"
-    primary_org = acc.valid_orgs[0] if acc.valid_orgs else None
+    primary_asn = sig.asns[0] if sig.asns else "-"
     cidr_info = compute_cidr_attribution(
         ip,
-        mmdb_prefix_len,
-        shared_cidr=shared_cidr,
-        shared_provider=shared_provider,
-        shared_category=shared_category,
+        sig.mmdb_prefix_len,
+        shared_cidr=sig.shared_cidr,
+        shared_provider=sig.shared_provider,
+        shared_category=sig.shared_category,
         bgp_prefix=bgp_prefix,
         asn=primary_asn if primary_asn != "-" else None,
-        org_name=primary_org,
+        org_name=sig.orgs[0] if sig.orgs else None,
         ptr_hostname=rdns_info["ptrHostname"],
         ptr_category=rdns_info["ptrCategory"],
-        provider_rows=comparison_results,
+        provider_rows=sig.comparison_results,
         highly_suspected_residential_proxy=highly_suspected_residential_proxy,
     )
     shared_privacy_egress = cidr_info["sharedPrivacyEgress"]
-    suspected_residential_proxy = _detect_residential_signal_paradox(
-        acc,
-        ptr_category=rdns_info["ptrCategory"],
-        shared_privacy_egress=shared_privacy_egress,
-        is_tor=tor.is_tor,
-    )
-    if highly_suspected_residential_proxy:
-        arbitration_verdict = "Highly Suspected Residential Proxy"
-        arbitration_tier = "destructive"
-        is_majority_proxy_vpn = True
-    else:
-        arbitration_verdict, arbitration_tier, is_majority_proxy_vpn = _resolve_arbitration_verdict(
-            acc,
-            tor,
-            shared_privacy_egress=shared_privacy_egress,
-            suspected_residential_proxy=suspected_residential_proxy,
+
+    # Residential context paired with proxy ports or attack feeds suggests a compromised home host.
+    is_residential_context = sig.residential_source_count >= 2 or rdns_info["ptrCategory"] == "dynamic_residential"
+    suspected_residential_proxy = (
+        shared_privacy_egress is None
+        and not sig.is_tor
+        and is_residential_context
+        and (
+            sig.has_shodan_proxy_ports
+            or sig.has_shodan_paradox_tag
+            or (sig.max_ipsum_score >= 3 and (sig.has_recent_sfs_activity or sig.has_recent_dshield_activity))
         )
+    )
+    has_malicious_abuse_records = (
+        sig.has_recent_sfs_activity
+        or sig.has_recent_dshield_activity
+        or sig.has_high_abuseipdb
+        or sig.has_spamhaus_listing
+        or sig.max_ipsum_score >= 3
+    )
+
+    total = sig.commercial_responses
+    votes = sig.proxy_vpn_votes
+    rounded_votes = round(float(votes), 2)
+    votes_str = str(int(rounded_votes)) if rounded_votes.is_integer() else f"{rounded_votes:.1f}"
+
+    if highly_suspected_residential_proxy:
+        verdict, tier, is_majority = "Highly Suspected Residential Proxy", "destructive", True
+    elif (
+        shared_privacy_egress in ("icloud_private_relay", "cloudflare_warp")
+        and not sig.is_tor
+        and not has_malicious_abuse_records
+    ):
+        verdict, tier, is_majority = "Shared Privacy Egress (iCloud Relay / WARP)", "warning", False
+    else:
+        if total == 0:
+            verdict, tier, is_majority = "Direct Connection (No Commercial Threats)", "neutral", False
+        elif votes > (total / 2.0):
+            prefix = (
+                "Confirmed Datacenter / Hosting"
+                if sig.has_hosting and not sig.has_anonymiser_flag
+                else "Confirmed Proxy / VPN"
+            )
+            verdict, tier, is_majority = f"{prefix} ({votes_str}/{total} Sources)", "destructive", True
+        elif sig.behavioural_threat_votes == 0 and sig.hosting_source_count == 1 and votes == 1.0:
+            # A lone hosting classification without behavioural threat votes is only a minor attribute dispute.
+            verdict, tier, is_majority = "Clean Residential (1 Minor Attribute Dispute)", "success", False
+        elif votes > 0:
+            if sig.has_anonymiser_flag:
+                prefix = "Disputed Proxy / VPN"
+            elif sig.has_hosting and sig.residential_source_count == 0:
+                prefix = "Disputed Datacenter / Hosting"
+            else:
+                prefix = "Disputed Residential / VPN"
+            verdict, tier, is_majority = f"{prefix} ({votes_str}/{total} Sources)", "warning", False
+        else:
+            verdict, tier, is_majority = f"Clean Residential / Direct (0/{total} Sources)", "success", False
+
+        if sig.is_tor and sig.tor_running and not is_majority:
+            verdict, tier, is_majority = f"Confirmed {sig.tor_label} (Tor Onionoo)", "destructive", False
+        elif suspected_residential_proxy:
+            verdict = "Suspected Residential Proxy / Compromised Host"
+            tier = "destructive" if is_majority else "warning"
 
     return {
         "ip": ip,
-        "is_broadcast_ip": len(acc.valid_country_codes) > 1,
-        "isTor": tor.is_tor,
-        "torIsExit": tor.tor_is_exit,
-        "torRunning": tor.tor_running,
-        "torFlags": tor.tor_flags,
-        "torLabel": tor.tor_label,
-        "torSummary": tor.tor_summary,
+        "is_broadcast_ip": len(sig.country_codes) > 1,
+        "isTor": sig.is_tor,
+        "torIsExit": sig.tor_is_exit,
+        "torRunning": sig.tor_running,
+        "torFlags": sig.tor_flags,
+        "torLabel": sig.tor_label,
+        "torSummary": sig.tor_summary,
         "prediction_score": prediction_score,
         "predictionLabel": prediction_label,
         "predictionTier": prediction_tier,
-        "getipintel_chance": acc.getipintel_chance,
-        "residentialProxy": acc.residential_proxy,
+        "getipintel_chance": sig.getipintel_chance,
+        "residentialProxy": sig.residential_proxy,
         "highlySuspectedResidentialProxy": highly_suspected_residential_proxy,
-        "arbitrationVerdict": arbitration_verdict,
-        "arbitrationTier": arbitration_tier,
-        "isMajorityProxyVpn": is_majority_proxy_vpn,
+        "arbitrationVerdict": verdict,
+        "arbitrationTier": tier,
+        "isMajorityProxyVpn": is_majority,
         "suspectedResidentialProxy": suspected_residential_proxy,
-        "primaryCountry": acc.valid_locations[0].split("(")[0].strip() if acc.valid_locations else "-",
+        "primaryCountry": sig.locations[0].split("(")[0].strip() if sig.locations else "-",
         "primaryAsn": primary_asn,
         "ptrHostname": rdns_info["ptrHostname"],
         "ptrCategory": rdns_info["ptrCategory"],
         "ptrLabel": rdns_info["ptrLabel"],
         "ptrIsHighRisk": rdns_info["isHighRisk"],
-        "recommendedCidr": cidr_info["recommendedCidr"],
-        "defaultCidr": cidr_info["defaultCidr"],
-        "mmdbCidr": cidr_info["mmdbCidr"],
-        "sharedCidr": cidr_info["sharedCidr"],
-        "sharedProvider": cidr_info["sharedProvider"],
-        "sharedCategory": cidr_info["sharedCategory"],
-        "cidrNote": cidr_info["cidrNote"],
-        "bgpPrefix": cidr_info["bgpPrefix"],
-        "escalationCidr": cidr_info["escalationCidr"],
-        "cidrRationale": cidr_info["cidrRationale"],
-        "isMobileOrCgnat": cidr_info["isMobileOrCgnat"],
+        **{
+            key: cidr_info[key]
+            for key in (
+                "recommendedCidr",
+                "defaultCidr",
+                "mmdbCidr",
+                "sharedCidr",
+                "sharedProvider",
+                "sharedCategory",
+                "cidrNote",
+                "bgpPrefix",
+                "escalationCidr",
+                "cidrRationale",
+                "isMobileOrCgnat",
+            )
+        },
         "sharedPrivacyEgress": shared_privacy_egress,
-        "results": comparison_results,
+        "results": sig.comparison_results,
     }

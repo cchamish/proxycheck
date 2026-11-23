@@ -18,7 +18,7 @@ import dns.resolver
 import dns.reversename
 from django.conf import settings
 
-from . import cache_backends, cidr_attribution
+from . import cidr_attribution, offline_dbs
 from .adapters import (
     adapt_ipsum_drop,
     adapt_maxmind,
@@ -27,20 +27,18 @@ from .adapters import (
     adapt_spamhaus_zen,
     adapt_stopforumspam,
 )
-from .cache_backends import (
+from .cache_backends import get_cooldown_bounds
+from .offline_dbs import (
     MAXMIND_DB_SPECS,
     evict_maxmind_reader,
     evict_missing_maxmind_readers,
-    get_cooldown_bounds,
-    get_maxmind_reader,
-    record_city_db_presence,
-)
-from .offline_dbs import (
     get_maxmind_newest_mtime_iso,
+    get_maxmind_reader,
     lookup_bgp_tools_offline,
     query_ipsum_drop_offline,
     query_openasn_offline,
     query_stopforumspam_offline,
+    record_city_db_presence,
 )
 from .sanitization import sanitize_error_message
 
@@ -49,11 +47,9 @@ logger = logging.getLogger("detector.views")
 provider_upstream_events: contextvars.ContextVar[Optional[Dict[str, Dict[str, Any]]]] = contextvars.ContextVar(
     "provider_upstream_events", default=None
 )
-_provider_upstream_events = provider_upstream_events
 rdns_context_state: contextvars.ContextVar[Optional[Dict[str, str]]] = contextvars.ContextVar(
     "rdns_context_state", default=None
 )
-_rdns_context_state = rdns_context_state
 
 DEFAULT_DNS_TIMEOUT_SECONDS = 2.0
 _DEFAULT_ASYNC_RESOLVER_CLS = dns.asyncresolver.Resolver
@@ -90,206 +86,177 @@ def record_upstream_event(
         }
 
 
-def _is_valid_mmdb_prefix_tuple(result: Any) -> bool:
-    """Returns True when a prefix lookup returned a (record_or_none, prefix_len) tuple."""
-    return (
-        isinstance(result, tuple)
-        and len(result) == 2
-        and (result[0] is None or isinstance(result[0], dict))
-        and not isinstance(result[1], bool)
-        and isinstance(result[1], int)
-    )
-
-
-def _lookup_mmdb_record_and_prefix(reader: Any, ip: str) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
-    """
-    Retrieves the MMDB record and routing prefix length in one lookup via get_with_prefix_len
-    when supported, falling back to reader.get otherwise.
-    """
-    getter = getattr(reader, "get_with_prefix_len", None)
-    if callable(getter):
-        try:
-            result = getter(ip)
-        except AttributeError, NotImplementedError:
-            result = None
-        if _is_valid_mmdb_prefix_tuple(result):
-            raw_rec, prefix_len = result
-            return (raw_rec if isinstance(raw_rec, dict) else None, prefix_len)
-
-    rec = reader.get(ip)
-    return (rec if isinstance(rec, dict) else None, None)
-
-
-def _merge_maxmind_dict_field(combined: Dict[str, Any], key: str, value: Any) -> None:
-    """Deep-merges nested MaxMind dictionaries while keeping Country iso_code authoritative."""
-    existing = combined.get(key)
-    if isinstance(existing, dict) and isinstance(value, dict):
-        merged = dict(existing)
-        for sub_key, sub_val in value.items():
-            if sub_key == "names" and isinstance(merged.get("names"), dict) and isinstance(sub_val, dict):
-                merged["names"] = {**merged["names"], **sub_val}
-            elif sub_val is not None:
-                merged[sub_key] = sub_val
-        combined[key] = merged
-    elif value is not None:
-        combined[key] = value
-
-
-def _merge_maxmind_records(
-    country_rec: Optional[Dict[str, Any]],
-    city_rec: Optional[Dict[str, Any]],
-    asn_rec: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Combines Country, City, and ASN MMDB lookups while preserving iso_code consistency."""
-    combined: Dict[str, Any] = {}
-    if isinstance(city_rec, dict):
-        for key, value in city_rec.items():
-            if value is not None:
-                combined[key] = value
-    if isinstance(country_rec, dict):
-        for key, value in country_rec.items():
-            if key in ("country", "registered_country", "represented_country", "continent", "traits"):
-                _merge_maxmind_dict_field(combined, key, value)
-            elif key not in combined and value is not None:
-                combined[key] = value
-    if isinstance(asn_rec, dict):
-        for key, value in asn_rec.items():
-            if value is not None:
-                combined[key] = value
-    return combined
-
-
-def _read_maxmind_sync(ip: str) -> Dict[str, Any]:
-    """
-    Reads local GeoLite2 and GeoIP2 Country, City, and ASN MMDB files synchronously.
-    Offloaded via `asyncio.to_thread` to avoid blocking the ASGI event loop on disk reads.
-    """
-    if not cidr_attribution.are_offline_intelligence_caches_warm():
-        cidr_attribution.warm_offline_intelligence_caches()
-
-    db_paths = cache_backends._resolve_maxmind_db_paths()
-    available_paths = {key: path for key, path in db_paths.items() if os.path.exists(path)}
-
-    for key, filename in MAXMIND_DB_SPECS:
-        if key not in available_paths:
-            evict_missing_maxmind_readers(filename, db_paths[key])
-
-    if not available_paths:
-        return adapt_maxmind(None, has_db=False)
-
-    city_path = db_paths["city"]
-    if record_city_db_presence(city_path, is_present="city" in available_paths):
-        logger.warning(
-            "GeoLite2-City.mmdb was not found at %s; MaxMind lookups will omit city",
-            city_path,
-        )
-
-    try:
-        import maxminddb
-    except ImportError:
-        logger.warning("maxminddb package not installed; returning Database Missing fallback")
-        return adapt_maxmind(None, has_db=False)
-
-    try:
-        records: Dict[str, Optional[Dict[str, Any]]] = {}
-        prefix_lens: Dict[str, Optional[int]] = {}
-        for key, path in available_paths.items():
-            reader = get_maxmind_reader(path, maxminddb)
-            rec, prefix_len = _lookup_mmdb_record_and_prefix(reader, ip)
-            records[key] = rec
-            prefix_lens[key] = prefix_len
-
-        combined_record = _merge_maxmind_records(records.get("country"), records.get("city"), records.get("asn"))
-        resolved_prefix_len = next(
-            (prefix_lens.get(key) for key in ("asn", "country", "city") if prefix_lens.get(key) is not None),
-            None,
-        )
-        if resolved_prefix_len is not None:
-            combined_record["_mmdb_prefix_len"] = resolved_prefix_len
-        offline_updated_at = get_maxmind_newest_mtime_iso()
-        if offline_updated_at:
-            combined_record["_offline_db_updated_at"] = offline_updated_at
-
-        return adapt_maxmind(combined_record, has_db=True, status_code=200, ip=ip)
-    except (OSError, ValueError, RuntimeError) as exc:
-        for path in db_paths.values():
-            evict_maxmind_reader(path)
-        safe_message = sanitize_error_message(str(exc))
-        logger.error(f"Error querying MaxMind local database: {safe_message}")
-        return adapt_maxmind({"error": safe_message}, has_db=True, status_code=500)
-
-
 async def query_maxmind(ip: str) -> Dict[str, Any]:
-    return await asyncio.to_thread(_read_maxmind_sync, ip)
+    """Reads local GeoLite2/GeoIP2 Country, City, and ASN MMDB files off the ASGI event loop."""
 
+    def _run() -> Dict[str, Any]:
+        if not cidr_attribution.are_offline_intelligence_caches_warm():
+            cidr_attribution.warm_offline_intelligence_caches()
 
-def _read_stopforumspam_sync(ip: str) -> Dict[str, Any]:
-    try:
-        lookup = query_stopforumspam_offline(ip)
-    except (OSError, sqlite3.Error, ValueError) as exc:
-        safe_message = sanitize_error_message(str(exc))
-        logger.error("Error querying StopForumSpam offline database: %s", safe_message)
-        return adapt_stopforumspam({"success": 0, "error": safe_message}, status_code=500, has_db=True)
+        db_paths = offline_dbs.resolve_maxmind_db_paths()
+        available_paths = {key: path for key, path in db_paths.items() if os.path.exists(path)}
 
-    if not lookup.get("has_db"):
-        return adapt_stopforumspam(None, has_db=False)
+        for key, filename in MAXMIND_DB_SPECS:
+            if key not in available_paths:
+                evict_missing_maxmind_readers(filename, db_paths[key])
 
-    payload: Dict[str, Any] = {
-        "success": 1,
-        "ip": {
-            "ip": ip,
-            "appears": 1 if lookup.get("appears") else 0,
-            "frequency": int(lookup.get("frequency") or 0),
-            "lastseen": lookup.get("last_seen"),
-            "blacklisted": bool(lookup.get("blacklisted")),
-            "toxicCidr": lookup.get("toxic_cidr"),
-            "sources": lookup.get("sources") or [],
-        },
-    }
-    if lookup.get("offline_db_updated_at"):
-        payload["offlineDbUpdatedAt"] = lookup["offline_db_updated_at"]
-    return adapt_stopforumspam(payload, status_code=200, has_db=True)
+        if not available_paths:
+            return adapt_maxmind(None, has_db=False)
+
+        city_path = db_paths["city"]
+        if record_city_db_presence(city_path, is_present="city" in available_paths):
+            logger.warning("GeoLite2-City.mmdb was not found at %s; MaxMind lookups will omit city", city_path)
+
+        try:
+            import maxminddb
+        except ImportError:
+            logger.warning("maxminddb package not installed; returning Database Missing fallback")
+            return adapt_maxmind(None, has_db=False)
+
+        try:
+            records: Dict[str, Optional[Dict[str, Any]]] = {}
+            prefix_lens: Dict[str, Optional[int]] = {}
+            for key, path in available_paths.items():
+                reader = get_maxmind_reader(path, maxminddb)
+                rec: Optional[Dict[str, Any]] = None
+                prefix_len: Optional[int] = None
+                getter = getattr(reader, "get_with_prefix_len", None)
+                if callable(getter):
+                    try:
+                        res = getter(ip)
+                    except AttributeError, NotImplementedError:
+                        res = None
+                    if (
+                        isinstance(res, tuple)
+                        and len(res) == 2
+                        and (res[0] is None or isinstance(res[0], dict))
+                        and isinstance(res[1], int)
+                        and not isinstance(res[1], bool)
+                    ):
+                        rec = res[0] if isinstance(res[0], dict) else None
+                        prefix_len = res[1]
+                    else:
+                        raw = reader.get(ip)
+                        rec = raw if isinstance(raw, dict) else None
+                else:
+                    raw = reader.get(ip)
+                    rec = raw if isinstance(raw, dict) else None
+                records[key] = rec
+                prefix_lens[key] = prefix_len
+
+            # Combine City, Country (keeping Country iso_code authoritative), and ASN records.
+            combined_record: Dict[str, Any] = {}
+            if isinstance(records.get("city"), dict):
+                combined_record.update({k: v for k, v in records["city"].items() if v is not None})
+            if isinstance(records.get("country"), dict):
+                for key, value in records["country"].items():
+                    if key in ("country", "registered_country", "represented_country", "continent", "traits"):
+                        existing = combined_record.get(key)
+                        if isinstance(existing, dict) and isinstance(value, dict):
+                            merged = dict(existing)
+                            for sub_key, sub_val in value.items():
+                                if (
+                                    sub_key == "names"
+                                    and isinstance(merged.get("names"), dict)
+                                    and isinstance(sub_val, dict)
+                                ):
+                                    merged["names"] = {**merged["names"], **sub_val}
+                                elif sub_val is not None:
+                                    merged[sub_key] = sub_val
+                            combined_record[key] = merged
+                        elif value is not None:
+                            combined_record[key] = value
+                    elif key not in combined_record and value is not None:
+                        combined_record[key] = value
+            if isinstance(records.get("asn"), dict):
+                combined_record.update({k: v for k, v in records["asn"].items() if v is not None})
+
+            resolved_prefix_len = next(
+                (prefix_lens.get(key) for key in ("asn", "country", "city") if prefix_lens.get(key) is not None),
+                None,
+            )
+            if resolved_prefix_len is not None:
+                combined_record["_mmdb_prefix_len"] = resolved_prefix_len
+            offline_updated_at = get_maxmind_newest_mtime_iso()
+            if offline_updated_at:
+                combined_record["_offline_db_updated_at"] = offline_updated_at
+
+            return adapt_maxmind(combined_record, has_db=True, status_code=200, ip=ip)
+        except (OSError, ValueError, RuntimeError) as exc:
+            for path in db_paths.values():
+                evict_maxmind_reader(path)
+            safe_message = sanitize_error_message(str(exc))
+            logger.error("Error querying MaxMind local database: %s", safe_message)
+            return adapt_maxmind({"error": safe_message}, has_db=True, status_code=500)
+
+    return await asyncio.to_thread(_run)
 
 
 async def query_stopforumspam(ip_or_client: Any, ip: Optional[str] = None) -> Dict[str, Any]:
     target_ip = ip if isinstance(ip, str) and ip.strip() else str(ip_or_client)
-    return await asyncio.to_thread(_read_stopforumspam_sync, target_ip)
 
+    def _run() -> Dict[str, Any]:
+        try:
+            lookup = query_stopforumspam_offline(target_ip)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            safe_message = sanitize_error_message(str(exc))
+            logger.error("Error querying StopForumSpam offline database: %s", safe_message)
+            return adapt_stopforumspam({"success": 0, "error": safe_message}, status_code=500, has_db=True)
 
-def _read_ipsum_drop_sync(ip: str) -> Dict[str, Any]:
-    try:
-        lookup = query_ipsum_drop_offline(ip)
-    except (OSError, ValueError, RuntimeError) as exc:
-        safe_message = sanitize_error_message(str(exc))
-        logger.error("Error querying IPsum and Spamhaus DROP offline index: %s", safe_message)
-        return adapt_ipsum_drop({"status": "error", "error": safe_message}, status_code=500, has_db=True)
+        if not lookup.get("has_db"):
+            return adapt_stopforumspam(None, has_db=False)
 
-    if not lookup.get("has_db"):
-        return adapt_ipsum_drop(None, has_db=False)
-    return adapt_ipsum_drop(lookup, status_code=200, has_db=True)
+        payload: Dict[str, Any] = {
+            "success": 1,
+            "ip": {
+                "ip": target_ip,
+                "appears": 1 if lookup.get("appears") else 0,
+                "frequency": int(lookup.get("frequency") or 0),
+                "lastseen": lookup.get("last_seen"),
+                "blacklisted": bool(lookup.get("blacklisted")),
+                "toxicCidr": lookup.get("toxic_cidr"),
+                "sources": lookup.get("sources") or [],
+            },
+        }
+        if lookup.get("offline_db_updated_at"):
+            payload["offlineDbUpdatedAt"] = lookup["offline_db_updated_at"]
+        return adapt_stopforumspam(payload, status_code=200, has_db=True)
+
+    return await asyncio.to_thread(_run)
 
 
 async def query_ipsum_drop(ip_or_client: Any, ip: Optional[str] = None) -> Dict[str, Any]:
     target_ip = ip if isinstance(ip, str) and ip.strip() else str(ip_or_client)
-    return await asyncio.to_thread(_read_ipsum_drop_sync, target_ip)
 
+    def _run() -> Dict[str, Any]:
+        try:
+            lookup = query_ipsum_drop_offline(target_ip)
+        except (OSError, ValueError, RuntimeError) as exc:
+            safe_message = sanitize_error_message(str(exc))
+            logger.error("Error querying IPsum and Spamhaus DROP offline index: %s", safe_message)
+            return adapt_ipsum_drop({"status": "error", "error": safe_message}, status_code=500, has_db=True)
+        if not lookup.get("has_db"):
+            return adapt_ipsum_drop(None, has_db=False)
+        return adapt_ipsum_drop(lookup, status_code=200, has_db=True)
 
-def _read_openasn_sync(ip: str) -> Dict[str, Any]:
-    try:
-        lookup = query_openasn_offline(ip)
-    except (OSError, ValueError, RuntimeError) as exc:
-        safe_message = sanitize_error_message(str(exc))
-        logger.error("Error querying OpenASN offline database: %s", safe_message)
-        return adapt_openasn({"status": "error", "error": safe_message}, status_code=500, has_db=True)
-
-    if not lookup.get("has_db"):
-        return adapt_openasn(None, has_db=False)
-    return adapt_openasn(lookup, status_code=200, has_db=True)
+    return await asyncio.to_thread(_run)
 
 
 async def query_openasn(ip_or_client: Any, ip: Optional[str] = None) -> Dict[str, Any]:
     target_ip = ip if isinstance(ip, str) and ip.strip() else str(ip_or_client)
-    return await asyncio.to_thread(_read_openasn_sync, target_ip)
+
+    def _run() -> Dict[str, Any]:
+        try:
+            lookup = query_openasn_offline(target_ip)
+        except (OSError, ValueError, RuntimeError) as exc:
+            safe_message = sanitize_error_message(str(exc))
+            logger.error("Error querying OpenASN offline database: %s", safe_message)
+            return adapt_openasn({"status": "error", "error": safe_message}, status_code=500, has_db=True)
+        if not lookup.get("has_db"):
+            return adapt_openasn(None, has_db=False)
+        return adapt_openasn(lookup, status_code=200, has_db=True)
+
+    return await asyncio.to_thread(_run)
 
 
 def _get_positive_float_setting(name: str, default: float) -> float:
@@ -304,16 +271,11 @@ def _get_positive_float_setting(name: str, default: float) -> float:
     return float(configured)
 
 
-def _get_dns_timeouts() -> Tuple[float, float]:
-    timeout_s = _get_positive_float_setting("DNS_QUERY_TIMEOUT_SECONDS", DEFAULT_DNS_TIMEOUT_SECONDS)
-    lifetime_s = _get_positive_float_setting("DNS_QUERY_LIFETIME_SECONDS", timeout_s)
-    return timeout_s, lifetime_s
-
-
 def _create_async_resolver() -> dns.asyncresolver.Resolver:
     global _cached_base_nameservers
 
-    timeout_s, lifetime_s = _get_dns_timeouts()
+    timeout_s = _get_positive_float_setting("DNS_QUERY_TIMEOUT_SECONDS", DEFAULT_DNS_TIMEOUT_SECONDS)
+    lifetime_s = _get_positive_float_setting("DNS_QUERY_LIFETIME_SECONDS", timeout_s)
     resolver_cls = dns.asyncresolver.Resolver
     if resolver_cls is not _DEFAULT_ASYNC_RESOLVER_CLS:
         try:
@@ -362,29 +324,6 @@ def _create_async_resolver() -> dns.asyncresolver.Resolver:
         return resolver
 
 
-def _extract_ptr_hostname(answer: Any) -> Optional[str]:
-    if answer is None:
-        return None
-    if isinstance(answer, str):
-        return answer
-    for rdata in answer:
-        target = getattr(rdata, "target", None)
-        if target is not None:
-            to_text = getattr(target, "to_text", None)
-            raw = to_text() if callable(to_text) else str(target)
-            if isinstance(raw, str) and raw.strip():
-                return raw
-        to_text = getattr(rdata, "to_text", None)
-        if callable(to_text):
-            raw = to_text()
-            if isinstance(raw, str) and raw.strip():
-                return raw
-        raw = str(rdata)
-        if raw.strip():
-            return raw
-    return None
-
-
 async def query_rdns_ptr(ip: str) -> Optional[str]:
     """
     Resolves the reverse DNS PTR hostname asynchronously via dnspython without
@@ -401,12 +340,25 @@ async def query_rdns_ptr(ip: str) -> Optional[str]:
     try:
         resolver = _create_async_resolver()
         answer = await resolver.resolve(qname, "PTR")
-        raw_host = _extract_ptr_hostname(answer)
-        if not isinstance(raw_host, str):
-            if isinstance(state, dict):
-                state["status"] = "nxdomain"
-            return None
-        cleaned = sanitize_error_message(raw_host.strip().rstrip(".").lower())
+        raw_host: Optional[str] = None
+        if isinstance(answer, str):
+            raw_host = answer
+        elif answer is not None:
+            for rdata in answer:
+                target = getattr(rdata, "target", None)
+                if target is not None:
+                    to_text = getattr(target, "to_text", None)
+                    cand = to_text() if callable(to_text) else str(target)
+                    if isinstance(cand, str) and cand.strip():
+                        raw_host = cand
+                        break
+                to_text = getattr(rdata, "to_text", None)
+                cand = to_text() if callable(to_text) else str(rdata)
+                if isinstance(cand, str) and cand.strip():
+                    raw_host = cand
+                    break
+
+        cleaned = sanitize_error_message(raw_host.strip().rstrip(".").lower()) if isinstance(raw_host, str) else ""
         if not cleaned:
             if isinstance(state, dict):
                 state["status"] = "nxdomain"
@@ -439,34 +391,6 @@ def reverse_ipv4_octets(ip: str) -> Optional[str]:
     return ".".join(reversed(addr.exploded.split(".")))
 
 
-def _extract_dnsbl_a_records(answer: Any) -> List[str]:
-    if answer is None:
-        return []
-    codes: List[str] = []
-    for rdata in answer:
-        candidate: Optional[str] = None
-        raw_addr = getattr(rdata, "address", None)
-        if isinstance(raw_addr, str):
-            candidate = raw_addr.strip()
-        else:
-            to_text = getattr(rdata, "to_text", None)
-            if callable(to_text):
-                txt = to_text()
-                if isinstance(txt, str):
-                    candidate = txt.strip()
-            if candidate is None:
-                candidate = str(rdata).strip()
-        if not candidate:
-            continue
-        try:
-            normalized = str(ipaddress.IPv4Address(candidate))
-        except ValueError:
-            continue
-        if normalized not in codes:
-            codes.append(normalized)
-    return codes
-
-
 async def _query_dnsbl_zone(
     ip: str,
     zone: str,
@@ -483,7 +407,24 @@ async def _query_dnsbl_zone(
     try:
         resolver = _create_async_resolver()
         answer = await resolver.resolve(qname, "A")
-        codes = _extract_dnsbl_a_records(answer)
+        codes: List[str] = []
+        if answer is not None:
+            for rdata in answer:
+                raw_addr = getattr(rdata, "address", None)
+                if isinstance(raw_addr, str):
+                    candidate = raw_addr.strip()
+                else:
+                    to_text = getattr(rdata, "to_text", None)
+                    txt = to_text() if callable(to_text) else None
+                    candidate = txt.strip() if isinstance(txt, str) else str(rdata).strip()
+                if not candidate:
+                    continue
+                try:
+                    normalised = str(ipaddress.IPv4Address(candidate))
+                except ValueError:
+                    continue
+                if normalised not in codes:
+                    codes.append(normalised)
         return {
             "status": "listed" if codes else "clean",
             "query": qname,
@@ -494,7 +435,7 @@ async def _query_dnsbl_zone(
         return {"status": "clean", "query": qname, "reversedIp": reversed_ip, "codes": []}, 200
     except (dns.exception.Timeout, dns.resolver.LifetimeTimeout, asyncio.TimeoutError, TimeoutError) as exc:
         safe_message = sanitize_error_message(str(exc) or "DNS timeout")
-        logger.warning(f"{provider_label} DNS query timed out: {safe_message}")
+        logger.warning("%s DNS query timed out: %s", provider_label, safe_message)
         record_upstream_event(
             provider_key,
             trigger_cooldown=True,
@@ -506,7 +447,7 @@ async def _query_dnsbl_zone(
         return {"status": "timeout", "query": qname, "reversedIp": reversed_ip, "codes": [], "error": safe_message}, 504
     except (dns.resolver.NoNameservers, dns.exception.DNSException, OSError) as exc:
         safe_message = sanitize_error_message(str(exc) or "DNS resolution failed")
-        logger.warning(f"{provider_label} DNS query failed: {safe_message}")
+        logger.warning("%s DNS query failed: %s", provider_label, safe_message)
         record_upstream_event(
             provider_key,
             trigger_cooldown=True,
@@ -535,72 +476,6 @@ async def query_spamhaus_zen(ip: str) -> Dict[str, Any]:
 async def query_spamcop(ip: str) -> Dict[str, Any]:
     raw_data, status_code = await _query_dnsbl_zone(ip, "bl.spamcop.net", "spamcop", "SpamCop")
     return adapt_spamcop(raw_data, status_code)
-
-
-def _extract_txt_record_strings(answer: Any) -> List[str]:
-    if answer is None:
-        return []
-    if isinstance(answer, str):
-        return [answer.strip().strip('"')] if answer.strip() else []
-    records: List[str] = []
-    for rdata in answer:
-        if isinstance(rdata, str):
-            cleaned = rdata.strip().strip('"')
-            if cleaned:
-                records.append(cleaned)
-            continue
-        raw_strings = getattr(rdata, "strings", None)
-        if isinstance(raw_strings, (list, tuple)) and raw_strings:
-            joined = "".join(
-                chunk.decode("utf-8", errors="ignore") if isinstance(chunk, (bytes, bytearray)) else str(chunk)
-                for chunk in raw_strings
-            ).strip()
-            if joined:
-                records.append(joined)
-                continue
-        to_text = getattr(rdata, "to_text", None)
-        raw_text = to_text() if callable(to_text) else str(rdata)
-        if isinstance(raw_text, str) and raw_text.strip():
-            records.append(raw_text.strip().strip('"'))
-    return records
-
-
-def _parse_cymru_txt_origin(
-    records: List[str],
-    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
-) -> Optional[Dict[str, Any]]:
-    best_prefix: Optional[ipaddress.IPv4Network | ipaddress.IPv6Network] = None
-    best_asn: Optional[int] = None
-    for record in records:
-        parts = [part.strip() for part in record.split("|")]
-        if len(parts) < 2:
-            continue
-        raw_asn_tokens = parts[0].split()
-        raw_prefix = parts[1]
-        if not raw_prefix:
-            continue
-        try:
-            net = ipaddress.ip_network(raw_prefix, strict=False)
-        except ValueError:
-            continue
-        if net.version != addr.version or addr not in net or not (0 < net.prefixlen <= addr.max_prefixlen):
-            continue
-
-        asn_num: Optional[int] = None
-        if raw_asn_tokens:
-            first_token = raw_asn_tokens[0].upper()
-            if first_token.startswith("AS"):
-                first_token = first_token[2:]
-            if first_token.isdigit() and int(first_token) > 0:
-                asn_num = int(first_token)
-
-        if best_prefix is None or net.prefixlen > best_prefix.prefixlen:
-            best_prefix = net
-            best_asn = asn_num
-
-    if best_prefix is None:
-        return None
-    return {"bgpPrefix": str(best_prefix), "asn": best_asn}
 
 
 async def query_cymru_bgp_prefix(ip: str) -> Optional[Dict[str, Any]]:
@@ -651,4 +526,55 @@ async def query_cymru_bgp_prefix(ip: str) -> Optional[Dict[str, Any]]:
     ):
         return None
 
-    return _parse_cymru_txt_origin(_extract_txt_record_strings(answer), addr)
+    records: List[str] = []
+    if isinstance(answer, str):
+        if answer.strip():
+            records.append(answer.strip().strip('"'))
+    elif answer is not None:
+        for rdata in answer:
+            if isinstance(rdata, str):
+                cleaned = rdata.strip().strip('"')
+                if cleaned:
+                    records.append(cleaned)
+                continue
+            raw_strings = getattr(rdata, "strings", None)
+            if isinstance(raw_strings, (list, tuple)) and raw_strings:
+                joined = "".join(
+                    chunk.decode("utf-8", errors="ignore") if isinstance(chunk, (bytes, bytearray)) else str(chunk)
+                    for chunk in raw_strings
+                ).strip()
+                if joined:
+                    records.append(joined)
+                    continue
+            to_text = getattr(rdata, "to_text", None)
+            raw_text = to_text() if callable(to_text) else str(rdata)
+            if isinstance(raw_text, str) and raw_text.strip():
+                records.append(raw_text.strip().strip('"'))
+
+    best_prefix: Optional[ipaddress.IPv4Network | ipaddress.IPv6Network] = None
+    best_asn: Optional[int] = None
+    for record in records:
+        parts = [part.strip() for part in record.split("|")]
+        if len(parts) < 2 or not parts[1]:
+            continue
+        try:
+            net = ipaddress.ip_network(parts[1], strict=False)
+        except ValueError:
+            continue
+        if net.version != addr.version or addr not in net or not (0 < net.prefixlen <= addr.max_prefixlen):
+            continue
+
+        asn_num: Optional[int] = None
+        raw_asn_tokens = parts[0].split()
+        if raw_asn_tokens:
+            first_token = raw_asn_tokens[0].upper().removeprefix("AS")
+            if first_token.isdigit() and int(first_token) > 0:
+                asn_num = int(first_token)
+
+        if best_prefix is None or net.prefixlen > best_prefix.prefixlen:
+            best_prefix = net
+            best_asn = asn_num
+
+    if best_prefix is None:
+        return None
+    return {"bgpPrefix": str(best_prefix), "asn": best_asn}

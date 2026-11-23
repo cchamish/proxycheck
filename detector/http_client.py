@@ -1,6 +1,4 @@
-"""
-Shared event-loop-scoped cookieless HTTP client pool and safe lifecycle helpers.
-"""
+"""Shared event-loop-scoped cookieless HTTP client pool and lifecycle helpers."""
 
 from __future__ import annotations
 
@@ -22,10 +20,6 @@ http_clients_by_loop: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Any] 
 DEFAULT_HTTP_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20)
 
 
-async def _strip_request_cookie_header(request: httpx.Request) -> None:
-    request.headers.pop("cookie", None)
-
-
 def clear_client_cookies(client: Any) -> None:
     """Clears stored cookies on an HTTP client when a non-empty synchronous jar is attached."""
     cookies = getattr(client, "cookies", None)
@@ -33,10 +27,6 @@ def clear_client_cookies(client: Any) -> None:
         return
     clear_fn = getattr(cookies, "clear", None)
     if not callable(clear_fn) or inspect.iscoroutinefunction(clear_fn):
-        return
-    if isinstance(cookies, httpx.Cookies):
-        if len(cookies) > 0:
-            clear_fn()
         return
     try:
         has_entries = len(cookies) > 0 if hasattr(cookies, "__len__") else False
@@ -58,11 +48,15 @@ async def close_http_client_safely(client: Any) -> None:
         if inspect.isawaitable(maybe_coro):
             await maybe_coro
     except (httpx.HTTPError, RuntimeError, OSError) as exc:
-        logger.debug(f"Ignoring error while closing superseded HTTP client: {exc}")
+        logger.debug("Ignoring error whilst closing superseded HTTP client: %s", exc)
 
 
 def build_cookieless_http_client(*, headers: Optional[Dict[str, str]] = None) -> httpx.AsyncClient:
     """Constructs a pooled httpx.AsyncClient that rejects cookies on both storage and request paths."""
+
+    async def strip_request_cookie(request: httpx.Request) -> None:
+        request.headers.pop("cookie", None)
+
     # Pass the CookieJar directly because httpx.AsyncClient copies httpx.Cookies into a new default jar.
     cookie_jar = http.cookiejar.CookieJar(
         policy=http.cookiejar.DefaultCookiePolicy(allowed_domains=[]),
@@ -71,7 +65,7 @@ def build_cookieless_http_client(*, headers: Optional[Dict[str, str]] = None) ->
         "timeout": 10.0,
         "limits": DEFAULT_HTTP_LIMITS,
         "cookies": cookie_jar,
-        "event_hooks": {"request": [_strip_request_cookie_header]},
+        "event_hooks": {"request": [strip_request_cookie]},
     }
     if headers is not None:
         client_kwargs["headers"] = headers
@@ -79,39 +73,23 @@ def build_cookieless_http_client(*, headers: Optional[Dict[str, str]] = None) ->
 
 
 async def get_shared_http_client() -> httpx.AsyncClient:
-    """
-    Returns a reusable cookieless httpx.AsyncClient bound to the currently running event loop.
-    Isolated per event loop so concurrent worker threads never close each other's active clients.
-    """
+    """Returns a reusable cookieless httpx.AsyncClient bound to the currently running event loop."""
     current_loop = asyncio.get_running_loop()
     stale_clients: List[Any] = []
-    selected_client: Optional[Any] = None
 
     with http_client_lock:
-        closed_loops = [
-            loop
-            for loop in list(http_clients_by_loop.keys())
-            if loop.is_closed() or getattr(http_clients_by_loop.get(loop), "is_closed", False) is True
-        ]
-        for dead_loop in closed_loops:
-            dead_client = http_clients_by_loop.pop(dead_loop, None)
-            if dead_client is not None:
-                stale_clients.append(dead_client)
+        for loop in list(http_clients_by_loop.keys()):
+            if loop.is_closed() or getattr(http_clients_by_loop.get(loop), "is_closed", False) is True:
+                dead_client = http_clients_by_loop.pop(loop, None)
+                if dead_client is not None:
+                    stale_clients.append(dead_client)
 
-        existing_client = http_clients_by_loop.get(current_loop)
-        if (
-            existing_client is not None
-            and not current_loop.is_closed()
-            and getattr(existing_client, "is_closed", False) is not True
-        ):
-            selected_client = existing_client
-        else:
-            new_client = build_cookieless_http_client()
-            http_clients_by_loop[current_loop] = new_client
-            selected_client = new_client
+        selected_client = http_clients_by_loop.get(current_loop)
+        if selected_client is None or getattr(selected_client, "is_closed", False) is True:
+            selected_client = build_cookieless_http_client()
+            http_clients_by_loop[current_loop] = selected_client
 
     for stale_client in stale_clients:
-        if stale_client is not selected_client:
-            await close_http_client_safely(stale_client)
+        await close_http_client_safely(stale_client)
 
     return selected_client

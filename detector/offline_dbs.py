@@ -1461,35 +1461,6 @@ def _parse_asn_int(raw_asn: Any) -> Optional[int]:
     return None
 
 
-def _parse_bgp_tags_json_data(payload: Any) -> Tuple[Dict[int, Tuple[str, ...]], FrozenSet[int]]:
-    asn_tags: Dict[int, Tuple[str, ...]] = {}
-    mobile_asns: set[int] = set()
-    if not isinstance(payload, dict):
-        return asn_tags, frozenset()
-
-    raw_map = payload.get("asn_tags") if isinstance(payload.get("asn_tags"), dict) else payload
-    for raw_key, raw_tags in raw_map.items():
-        if raw_key in ("mobile_asns", "tag_counts"):
-            continue
-        asn_num = _parse_asn_int(raw_key)
-        if asn_num is None or not isinstance(raw_tags, list):
-            continue
-        cleaned_tags = tuple(str(t).strip().lower() for t in raw_tags if isinstance(t, str) and str(t).strip())
-        if cleaned_tags:
-            asn_tags[asn_num] = cleaned_tags
-            if any(tag in MOBILE_BGP_TAG_TOKENS for tag in cleaned_tags):
-                mobile_asns.add(asn_num)
-
-    explicit_mobile = payload.get("mobile_asns")
-    if isinstance(explicit_mobile, list):
-        for item in explicit_mobile:
-            asn_num = _parse_asn_int(item)
-            if asn_num is not None:
-                mobile_asns.add(asn_num)
-
-    return asn_tags, frozenset(mobile_asns)
-
-
 def _get_bgp_tags_data() -> Tuple[Dict[int, Tuple[str, ...]], FrozenSet[int]]:
     path = resolve_feed_data_path(BGP_TAGS_JSON_FILENAME, override_setting="BGP_TAGS_JSON_PATH")
     if path is None:
@@ -1504,10 +1475,35 @@ def _get_bgp_tags_data() -> Tuple[Dict[int, Tuple[str, ...]], FrozenSet[int]]:
         return hit
 
     try:
-        parsed = _parse_bgp_tags_json_data(json.loads(path.read_text(encoding="utf-8")))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         logger.warning("Failed to parse BGP tags file %s: %s", path, exc)
         return {}, frozenset()
+
+    asn_tags: Dict[int, Tuple[str, ...]] = {}
+    mobile_asns: set[int] = set()
+    if isinstance(payload, dict):
+        raw_map = payload.get("asn_tags") if isinstance(payload.get("asn_tags"), dict) else payload
+        for raw_key, raw_tags in raw_map.items():
+            if raw_key in ("mobile_asns", "tag_counts"):
+                continue
+            asn_num = _parse_asn_int(raw_key)
+            if asn_num is None or not isinstance(raw_tags, list):
+                continue
+            cleaned_tags = tuple(str(t).strip().lower() for t in raw_tags if isinstance(t, str) and str(t).strip())
+            if cleaned_tags:
+                asn_tags[asn_num] = cleaned_tags
+                if any(tag in MOBILE_BGP_TAG_TOKENS for tag in cleaned_tags):
+                    mobile_asns.add(asn_num)
+
+        explicit_mobile = payload.get("mobile_asns")
+        if isinstance(explicit_mobile, list):
+            for item in explicit_mobile:
+                asn_num = _parse_asn_int(item)
+                if asn_num is not None:
+                    mobile_asns.add(asn_num)
+
+    parsed = (asn_tags, frozenset(mobile_asns))
     return _bgp_tags_cache.get_or_load(target_key, lambda: parsed)
 
 
@@ -1535,25 +1531,175 @@ def lookup_bgp_tools_offline(ip: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def get_maxmind_reader(db_path: str, maxminddb_module: Any) -> Any:
-    """Opens or reuses a cached MMDB reader, importing the cache layer lazily to avoid an import cycle."""
-    from detector.cache_backends import get_maxmind_reader as _get_cached_reader
+_MAX_MAXMIND_READERS = 8
+_MAX_MISSING_CITY_LOGGED_PATHS = 16
+_maxmind_lock = threading.Lock()
+_maxmind_readers: Dict[str, Any] = {}
+_maxmind_reader_stats: Dict[str, Optional[Tuple[int, int]]] = {}
+_missing_city_db_logged_paths: set[str] = set()
 
-    return _get_cached_reader(db_path, maxminddb_module)
+MAXMIND_DB_SPECS = (
+    ("country", MAXMIND_COUNTRY_DB_FILENAME),
+    ("city", MAXMIND_CITY_DB_FILENAME),
+    ("asn", MAXMIND_ASN_DB_FILENAME),
+)
+
+_MAXMIND_PROBE_TTL_SECONDS = 5.0
+_maxmind_probe_lock = threading.Lock()
+_maxmind_city_db_cache: Optional[Tuple[Tuple[Any, ...], float, bool]] = None
+_maxmind_any_db_cache: Optional[Tuple[Tuple[Any, ...], float, bool]] = None
+
+
+def _close_mmdb_reader_safely(reader: Any) -> None:
+    if reader is None:
+        return
+    close_fn = getattr(reader, "close", None)
+    if not callable(close_fn):
+        return
+    try:
+        close_fn()
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.debug("Failed to close MaxMind reader: %s", exc)
+
+
+def get_maxmind_reader(db_path: str, maxminddb_module: Any) -> Any:
+    """Returns a cached MMDB reader, reopening outside the lock when the file changes on disk."""
+    current_sig = get_file_stat_signature(db_path)
+    stale_reader: Optional[Any] = None
+    with _maxmind_lock:
+        reader = _maxmind_readers.get(db_path)
+        if reader is not None:
+            if current_sig is not None and _maxmind_reader_stats.get(db_path) == current_sig:
+                _maxmind_readers[db_path] = _maxmind_readers.pop(db_path)
+                return reader
+            stale_reader = _maxmind_readers.pop(db_path, None)
+            _maxmind_reader_stats.pop(db_path, None)
+
+    _close_mmdb_reader_safely(stale_reader)
+
+    candidate_reader = maxminddb_module.open_database(db_path)
+    duplicate_reader: Optional[Any] = None
+    lru_evicted_reader: Optional[Any] = None
+    selected_reader = candidate_reader
+
+    with _maxmind_lock:
+        existing_reader = _maxmind_readers.get(db_path)
+        if (
+            existing_reader is not None
+            and current_sig is not None
+            and _maxmind_reader_stats.get(db_path) == current_sig
+        ):
+            _maxmind_readers[db_path] = _maxmind_readers.pop(db_path)
+            selected_reader = existing_reader
+            duplicate_reader = candidate_reader
+        else:
+            if existing_reader is not None:
+                lru_evicted_reader = _maxmind_readers.pop(db_path, None)
+                _maxmind_reader_stats.pop(db_path, None)
+            elif len(_maxmind_readers) >= _MAX_MAXMIND_READERS:
+                oldest_key = next(iter(_maxmind_readers))
+                lru_evicted_reader = _maxmind_readers.pop(oldest_key, None)
+                _maxmind_reader_stats.pop(oldest_key, None)
+            if current_sig is not None:
+                _maxmind_readers[db_path] = candidate_reader
+                _maxmind_reader_stats[db_path] = current_sig
+
+    _close_mmdb_reader_safely(duplicate_reader)
+    _close_mmdb_reader_safely(lru_evicted_reader)
+    return selected_reader
 
 
 def evict_maxmind_reader(db_path: str) -> None:
-    """Drops and closes a cached MMDB reader for a specific file path."""
-    from detector.cache_backends import evict_maxmind_reader as _evict_reader
-
-    _evict_reader(db_path)
+    """Removes and closes a cached MMDB reader when an error occurs or the file is absent."""
+    with _maxmind_lock:
+        reader = _maxmind_readers.pop(db_path, None)
+        _maxmind_reader_stats.pop(db_path, None)
+    _close_mmdb_reader_safely(reader)
 
 
 def evict_missing_maxmind_readers(filename: str, resolved_path: str) -> None:
-    """Drops cached MMDB readers for a file that has disappeared from disk."""
-    from detector.cache_backends import evict_missing_maxmind_readers as _evict_missing
+    """Evicts cached readers matching a missing MMDB path or filename so deleted files never leak handles."""
+    with _maxmind_lock:
+        stale_keys = [key for key in _maxmind_readers if key == resolved_path or os.path.basename(key) == filename]
+    for key in stale_keys:
+        evict_maxmind_reader(key)
 
-    _evict_missing(filename, resolved_path)
+
+def clear_maxmind_readers() -> None:
+    """Closes and removes all cached MMDB readers and resets missing-file log tracking."""
+    with _maxmind_lock:
+        readers = list(_maxmind_readers.values())
+        _maxmind_readers.clear()
+        _maxmind_reader_stats.clear()
+        _missing_city_db_logged_paths.clear()
+    for reader in readers:
+        _close_mmdb_reader_safely(reader)
+
+
+def record_city_db_presence(city_path: str, *, is_present: bool) -> bool:
+    """Updates missing City MMDB log state and returns True once per newly missing path."""
+    with _maxmind_lock:
+        if is_present:
+            _missing_city_db_logged_paths.discard(city_path)
+            return False
+        if city_path in _missing_city_db_logged_paths:
+            return False
+        if len(_missing_city_db_logged_paths) >= _MAX_MISSING_CITY_LOGGED_PATHS:
+            _missing_city_db_logged_paths.clear()
+        _missing_city_db_logged_paths.add(city_path)
+        return True
+
+
+def resolve_maxmind_db_paths() -> Dict[str, str]:
+    """Resolves Country, City, and ASN MMDB paths using configured TOOL_DATA_DIR or fallbacks."""
+    base_dir = _effective_base_dir(None)
+    configured_dir = resolve_configured_data_dir()
+    return {key: resolve_mmdb_file(configured_dir, filename, base_dir) for key, filename in MAXMIND_DB_SPECS}
+
+
+def has_local_maxmind_city_db() -> bool:
+    """Returns True when GeoLite2-City.mmdb is present on disk at its resolved location."""
+    global _maxmind_city_db_cache
+    base_dir = _effective_base_dir(None)
+    configured_dir = resolve_configured_data_dir()
+    tool_data_dir = str(get_setting("TOOL_DATA_DIR", "") or os.environ.get("TOOL_DATA_DIR", "")).strip()
+    cache_key = (configured_dir, str(base_dir), tool_data_dir)
+    now_mono = time.monotonic()
+    with _maxmind_probe_lock:
+        if (
+            _maxmind_city_db_cache is not None
+            and _maxmind_city_db_cache[0] == cache_key
+            and 0.0 <= (now_mono - _maxmind_city_db_cache[1]) < _MAXMIND_PROBE_TTL_SECONDS
+        ):
+            return _maxmind_city_db_cache[2]
+
+    city_path = resolve_mmdb_file(configured_dir, MAXMIND_CITY_DB_FILENAME, base_dir)
+    result = bool(city_path and os.path.exists(city_path))
+    with _maxmind_probe_lock:
+        _maxmind_city_db_cache = (cache_key, now_mono, result)
+    return result
+
+
+def has_any_local_maxmind_db() -> bool:
+    """Returns True when at least one local MaxMind MMDB file exists on disk."""
+    global _maxmind_any_db_cache
+    base_dir = _effective_base_dir(None)
+    configured_dir = resolve_configured_data_dir()
+    tool_data_dir = str(get_setting("TOOL_DATA_DIR", "") or os.environ.get("TOOL_DATA_DIR", "")).strip()
+    cache_key = (configured_dir, str(base_dir), tool_data_dir)
+    now_mono = time.monotonic()
+    with _maxmind_probe_lock:
+        if (
+            _maxmind_any_db_cache is not None
+            and _maxmind_any_db_cache[0] == cache_key
+            and 0.0 <= (now_mono - _maxmind_any_db_cache[1]) < _MAXMIND_PROBE_TTL_SECONDS
+        ):
+            return _maxmind_any_db_cache[2]
+
+    result = any(path and os.path.exists(path) for path in resolve_maxmind_db_paths().values())
+    with _maxmind_probe_lock:
+        _maxmind_any_db_cache = (cache_key, now_mono, result)
+    return result
 
 
 def resolve_openasn_mmdb_path(
@@ -1611,7 +1757,44 @@ def _optional_text(value: Any) -> Optional[str]:
     return value if isinstance(value, str) and value else None
 
 
-def _decode_openasn_record(raw: Mapping[str, Any], *, updated_at: Optional[str]) -> Dict[str, Any]:
+def query_openasn_offline(ip: str) -> Dict[str, Any]:
+    """Queries the local OpenASN MMDB without surfacing tree prefix lengths as block ranges."""
+    path = resolve_openasn_mmdb_path()
+    if path is None or maxminddb is None:
+        if path is None:
+            evict_missing_maxmind_readers(OPENASN_MMDB_FILENAME, "")
+        return _empty_openasn_result(has_db=False, updated_at=None)
+
+    updated_at = get_openasn_mtime_iso()
+    cleaned = ip.strip() if isinstance(ip, str) else ""
+    if "%" in cleaned and ":" in cleaned:
+        cleaned = cleaned.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(cleaned)
+    except ValueError:
+        return _empty_openasn_result(has_db=True, updated_at=updated_at)
+
+    if addr.version == 6:
+        mapped = addr.ipv4_mapped
+        if mapped is not None:
+            lookup_ip = str(mapped)
+        elif int(addr) >> 32 == 0:
+            return _empty_openasn_result(has_db=True, updated_at=updated_at)
+        else:
+            lookup_ip = str(addr)
+    else:
+        lookup_ip = str(addr)
+
+    try:
+        reader = get_maxmind_reader(str(path), maxminddb)
+        raw = reader.get(lookup_ip)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.warning("Failed to query OpenASN MMDB %s: %s", path, exc)
+        evict_maxmind_reader(str(path))
+        return _empty_openasn_result(has_db=False, updated_at=None)
+    if not isinstance(raw, Mapping):
+        return _empty_openasn_result(has_db=True, updated_at=updated_at)
+
     raw_asn = raw.get("asn")
     asn = raw_asn if isinstance(raw_asn, int) and not isinstance(raw_asn, bool) else None
     verdict = raw.get("core_verdict")
@@ -1640,95 +1823,50 @@ def _decode_openasn_record(raw: Mapping[str, Any], *, updated_at: Optional[str])
     }
 
 
-def _openasn_lookup_address(ip: str) -> Optional[str]:
-    """Returns the address string to query, or None when the literal must not touch the IPv4 subtree."""
-    cleaned = ip.strip() if isinstance(ip, str) else ""
-    if "%" in cleaned and ":" in cleaned:
-        cleaned = cleaned.split("%", 1)[0]
-    try:
-        addr = ipaddress.ip_address(cleaned)
-    except ValueError:
-        return None
-    if addr.version == 6:
-        mapped = addr.ipv4_mapped
-        if mapped is not None:
-            return str(mapped)
-        if int(addr) >> 32 == 0:
-            return None
-    return str(addr)
-
-
-def query_openasn_offline(ip: str) -> Dict[str, Any]:
-    """Queries the local OpenASN MMDB without surfacing tree prefix lengths as block ranges."""
-    path = resolve_openasn_mmdb_path()
-    if path is None or maxminddb is None:
-        if path is None:
-            evict_missing_maxmind_readers(OPENASN_MMDB_FILENAME, "")
-        return _empty_openasn_result(has_db=False, updated_at=None)
-
-    updated_at = get_openasn_mtime_iso()
-    lookup_ip = _openasn_lookup_address(ip)
-    if lookup_ip is None:
-        return _empty_openasn_result(has_db=True, updated_at=updated_at)
-
-    try:
-        reader = get_maxmind_reader(str(path), maxminddb)
-        raw = reader.get(lookup_ip)
-    except (OSError, ValueError, RuntimeError) as exc:
-        logger.warning("Failed to query OpenASN MMDB %s: %s", path, exc)
-        evict_maxmind_reader(str(path))
-        return _empty_openasn_result(has_db=False, updated_at=None)
-    if not isinstance(raw, Mapping):
-        return _empty_openasn_result(has_db=True, updated_at=updated_at)
-    return _decode_openasn_record(raw, updated_at=updated_at)
-
-
-def _parse_mobile_asns_payload(payload: Any) -> FrozenSet[int]:
-    raw_items: Iterable[Any] = ()
-    if isinstance(payload, list):
-        raw_items = payload
-    elif isinstance(payload, dict):
-        for key in ("mobile_asns", "asns", "data"):
-            candidate = payload.get(key)
-            if isinstance(candidate, list):
-                raw_items = candidate
-                break
-
-    asns: set[int] = set()
-    for item in raw_items:
-        asn_num = _parse_asn_int(item.get("asn")) if isinstance(item, dict) else _parse_asn_int(item)
-        if asn_num is not None:
-            asns.add(asn_num)
-    return frozenset(asns)
-
-
-def _get_peeringdb_mobile_asns() -> FrozenSet[int]:
-    path = resolve_feed_data_path(MOBILE_ASNS_JSON_FILENAME, override_setting="MOBILE_ASNS_JSON_PATH")
-    if path is None:
-        return _mobile_asns_cache.set_constant(("__missing__", -1, -1), frozenset())
-    sig = get_file_stat_signature(path)
-    if sig is None:
-        return _mobile_asns_cache.set_constant(("__missing__", -1, -1), frozenset())
-
-    target_key = (str(path), sig[0], sig[1])
-    hit = _mobile_asns_cache.peek_matching(lambda key, _val: key == target_key)
-    if hit is not None:
-        return hit
-
-    try:
-        parsed = _parse_mobile_asns_payload(json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, ValueError) as exc:
-        logger.warning("Failed to parse mobile ASNs file %s: %s", path, exc)
-        return frozenset()
-    return _mobile_asns_cache.get_or_load(target_key, lambda: parsed)
-
-
 def is_mobile_asn_offline(asn: Optional[int]) -> bool:
     """Returns True when an ASN is tagged as mobile in PeeringDB mobile_asns.json or bgp_tags.json."""
     asn_num = _parse_asn_int(asn)
     if asn_num is None:
         return False
-    if asn_num in _get_peeringdb_mobile_asns():
+
+    path = resolve_feed_data_path(MOBILE_ASNS_JSON_FILENAME, override_setting="MOBILE_ASNS_JSON_PATH")
+    peeringdb_asns: FrozenSet[int]
+    if path is None:
+        peeringdb_asns = _mobile_asns_cache.set_constant(("__missing__", -1, -1), frozenset())
+    else:
+        sig = get_file_stat_signature(path)
+        if sig is None:
+            peeringdb_asns = _mobile_asns_cache.set_constant(("__missing__", -1, -1), frozenset())
+        else:
+            target_key = (str(path), sig[0], sig[1])
+            hit = _mobile_asns_cache.peek_matching(lambda key, _val: key == target_key)
+            if hit is not None:
+                peeringdb_asns = hit
+            else:
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as exc:
+                    logger.warning("Failed to parse mobile ASNs file %s: %s", path, exc)
+                    peeringdb_asns = frozenset()
+                else:
+                    raw_items: Iterable[Any] = ()
+                    if isinstance(payload, list):
+                        raw_items = payload
+                    elif isinstance(payload, dict):
+                        for key in ("mobile_asns", "asns", "data"):
+                            candidate = payload.get(key)
+                            if isinstance(candidate, list):
+                                raw_items = candidate
+                                break
+                    parsed_asns: set[int] = set()
+                    for item in raw_items:
+                        parsed_num = _parse_asn_int(item.get("asn")) if isinstance(item, dict) else _parse_asn_int(item)
+                        if parsed_num is not None:
+                            parsed_asns.add(parsed_num)
+                    frozen_asns = frozenset(parsed_asns)
+                    peeringdb_asns = _mobile_asns_cache.get_or_load(target_key, lambda: frozen_asns)
+
+    if asn_num in peeringdb_asns:
         return True
     _tags_map, bgp_mobile_asns = _get_bgp_tags_data()
     return asn_num in bgp_mobile_asns
@@ -1811,60 +1949,6 @@ def get_maxmind_newest_mtime_iso() -> Optional[str]:
     """Returns the newest UTC ISO-8601 modification timestamp across existing MaxMind MMDB files."""
     paths = resolve_maxmind_paths()
     return _newest_mtime_iso(path for path in paths.values() if _is_regular_file(path))
-
-
-def _build_offline_db_entry(
-    *,
-    key: str,
-    source: str,
-    name: str,
-    file_path: Optional[Path],
-    fallback_filename: str,
-    optional: bool,
-    stale_after_seconds: int,
-    now_ts: float,
-    missing_label: Optional[str] = None,
-) -> Dict[str, Any]:
-    filename = file_path.name if file_path is not None else fallback_filename
-    sig = get_file_stat_signature(file_path, bypass_throttle=True) if file_path is not None else None
-
-    if sig is None:
-        resolved_missing_label = (
-            missing_label if missing_label is not None else ("Optional (Not Configured)" if optional else "Missing")
-        )
-        return {
-            "key": key,
-            "source": source,
-            "name": name,
-            "filename": filename,
-            "exists": False,
-            "optional": optional,
-            "sizeBytes": None,
-            "lastModifiedIso": None,
-            "ageSeconds": None,
-            "staleAfterSeconds": stale_after_seconds,
-            "status": "missing",
-            "statusLabel": resolved_missing_label,
-        }
-
-    mtime_ts = sig[0] / 1_000_000_000.0
-    age_seconds = max(0, int(now_ts - mtime_ts))
-    is_stale = stale_after_seconds > 0 and age_seconds > stale_after_seconds
-    last_modified_iso = datetime.fromtimestamp(mtime_ts, tz=timezone.utc).isoformat()
-    return {
-        "key": key,
-        "source": source,
-        "name": name,
-        "filename": filename,
-        "exists": True,
-        "optional": optional,
-        "sizeBytes": int(sig[1]),
-        "lastModifiedIso": last_modified_iso,
-        "ageSeconds": age_seconds,
-        "staleAfterSeconds": stale_after_seconds,
-        "status": "stale" if is_stale else "healthy",
-        "statusLabel": "Stale" if is_stale else "Healthy",
-    }
 
 
 def build_offline_database_entries(
@@ -1970,17 +2054,44 @@ def build_offline_database_entries(
 
     entries: List[Dict[str, Any]] = []
     for key, source, name, file_path, fallback_filename, optional, stale_after_seconds, missing_label in specs:
-        entry = _build_offline_db_entry(
-            key=key,
-            source=source,
-            name=name,
-            file_path=file_path,
-            fallback_filename=fallback_filename,
-            optional=optional,
-            stale_after_seconds=stale_after_seconds,
-            now_ts=now_ts,
-            missing_label=missing_label,
-        )
+        filename = file_path.name if file_path is not None else fallback_filename
+        sig = get_file_stat_signature(file_path, bypass_throttle=True) if file_path is not None else None
+        if sig is None:
+            resolved_missing_label = (
+                missing_label if missing_label is not None else ("Optional (Not Configured)" if optional else "Missing")
+            )
+            entry: Dict[str, Any] = {
+                "key": key,
+                "source": source,
+                "name": name,
+                "filename": filename,
+                "exists": False,
+                "optional": optional,
+                "sizeBytes": None,
+                "lastModifiedIso": None,
+                "ageSeconds": None,
+                "staleAfterSeconds": stale_after_seconds,
+                "status": "missing",
+                "statusLabel": resolved_missing_label,
+            }
+        else:
+            mtime_ts = sig[0] / 1_000_000_000.0
+            age_seconds = max(0, int(now_ts - mtime_ts))
+            is_stale = stale_after_seconds > 0 and age_seconds > stale_after_seconds
+            entry = {
+                "key": key,
+                "source": source,
+                "name": name,
+                "filename": filename,
+                "exists": True,
+                "optional": optional,
+                "sizeBytes": int(sig[1]),
+                "lastModifiedIso": datetime.fromtimestamp(mtime_ts, tz=timezone.utc).isoformat(),
+                "ageSeconds": age_seconds,
+                "staleAfterSeconds": stale_after_seconds,
+                "status": "stale" if is_stale else "healthy",
+                "statusLabel": "Stale" if is_stale else "Healthy",
+            }
         if include_resolved_path:
             entry["resolvedPath"] = str(file_path) if (file_path is not None and entry["exists"]) else ""
         entries.append(entry)

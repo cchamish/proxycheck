@@ -533,9 +533,12 @@ function handleSelectRbWiki(wiki: string | null): void {
 let pendingDetectionIp: string | null = null;
 
 async function executeDetection(ipToQuery: string): Promise<void> {
-  pendingDetectionIp = canonicalizeIpAddress(ipToQuery);
-  rbData.value = null;
-  rbError.value = '';
+  const canonical = canonicalizeIpAddress(ipToQuery);
+  pendingDetectionIp = canonical;
+  if (!canonical || rbData.value?.ip !== canonical) {
+    rbData.value = null;
+    rbError.value = '';
+  }
   await coordinator.executeDetection(ipToQuery);
 }
 

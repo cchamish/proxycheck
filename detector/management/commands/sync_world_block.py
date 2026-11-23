@@ -11,7 +11,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, TypeVar
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, TypeVar
 
 import pymysql
 from django.conf import settings
@@ -46,6 +46,7 @@ _DEFAULT_MAX_SECONDS_PER_WIKI = 600
 _STREAM_FETCH_SIZE = 2000
 _UPSERT_SQL_BATCH_SIZE = 200
 _TARGETED_ACTIVE_BATCH_SIZE = 200
+_EXPIRED_WIKIS_BATCH_SIZE = 50
 _REPLICA_CONNECT_TIMEOUT_SECONDS = 5
 _REPLICA_READ_TIMEOUT_SECONDS = 120
 _REPLICA_WRITE_TIMEOUT_SECONDS = 10
@@ -279,7 +280,6 @@ _FETCH_EXPIRED_ACTIVE_WIKIS_BY_WIKI_SQL_PREFIX = (
     "AND has_active = 1 AND active_indefinite = 0 "
     "AND active_expiry IS NOT NULL AND active_expiry <= %s"
 )
-_EXPIRED_WIKIS_BATCH_SIZE = 50
 
 _DEACTIVATE_EXPIRED_ACTIVE_MYSQL_SQL = (
     "UPDATE detector_rangeblock_agg "
@@ -312,8 +312,6 @@ _T = TypeVar("_T")
 
 @dataclass
 class _WikiTiming:
-    """Tracks per-stage execution durations in seconds for one wiki target."""
-
     wiki: str
     max_id: float = 0.0
     logs: float = 0.0
@@ -328,29 +326,25 @@ class _WikiTiming:
 
 @dataclass
 class _WikiSyncStage:
-    """Tracks the active processing stage and log watermark for structured error logging."""
-
     stage: str = "init"
     log_id: int = 0
 
 
 @dataclass(frozen=True)
 class _SyncTargetSpec:
-    """Describes one local or global rangeblock synchronisation target."""
-
     replica_db: str
     storage_wiki: str
     wiki_domain: str
     log_type: str
     log_actions: Tuple[str, ...]
     count_actions: frozenset[str]
+    max_log_id_sql: str
+    incremental_logs_sql: str
     is_global: bool
 
 
 @dataclass(frozen=True)
 class _SyncRunConfig:
-    """Immutable run-wide configuration and startup caches shared across sections."""
-
     creds: Tuple[str, str]
     now_mw: str
     now_dt: datetime
@@ -363,19 +357,7 @@ class _SyncRunConfig:
 
 
 @dataclass
-class _LogStreamResult:
-    """Summarises the outcome of an incremental log streaming pass."""
-
-    log_targets: int
-    active_changes: int
-    chunks_committed: int
-    budget_reached: bool
-
-
-@dataclass
 class _WikiSyncResult:
-    """Summarises the outcome of synchronising one wiki target."""
-
     active_changes: int
     log_targets: int
     used_fast_path: bool
@@ -384,8 +366,6 @@ class _WikiSyncResult:
 
 
 class _ReplicaSession:
-    """Manages a section-scoped Wiki Replicas connection with safe reconnection."""
-
     def __init__(self, host: str, creds: Tuple[str, str], conn: Any = None) -> None:
         self.host = host
         self.creds = creds
@@ -422,11 +402,33 @@ def _extract_mysql_error_code(exc: BaseException) -> Optional[int]:
     return None
 
 
-def _is_test_environment() -> bool:
-    if "test" in sys.argv or "pytest" in sys.modules:
-        return True
-    default_cache = getattr(settings, "CACHES", {}).get("default", {})
-    return default_cache.get("BACKEND") == "django.core.cache.backends.locmem.LocMemCache"
+def _decode_str(raw_val: Any) -> str:
+    if isinstance(raw_val, (bytes, bytearray)):
+        return raw_val.decode("utf-8", errors="ignore")
+    return str(raw_val or "")
+
+
+def _normalise_section(raw_section: Any) -> str:
+    return _decode_str(raw_section).strip().lower().split(".", 1)[0] or "s1"
+
+
+def _iter_batches(items: Sequence[Any], size: int) -> Iterable[List[Any]]:
+    for idx in range(0, len(items), size):
+        yield list(items[idx : idx + size])
+
+
+def _prep_db_datetime(dt: Optional[datetime]) -> Optional[str]:
+    if dt is None:
+        return None
+    utc_naive = dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo is not None else dt
+    return connection.ops.adapt_datetimefield_value(utc_naive)
+
+
+def _safe_close_replica(conn: Any) -> None:
+    if conn is None:
+        return
+    with contextlib.suppress(pymysql.MySQLError, OSError):
+        conn.close()
 
 
 def _safe_close_redis(client: Any) -> None:
@@ -461,20 +463,22 @@ def _build_sync_redis_client(redis_url: str) -> Any:
         )
 
 
-def _acquire_sync_lock() -> Tuple[Optional[Any], str, str, str, bool]:
-    """Acquires the distributed Redis mutex lock for sync_world_block.
+@contextlib.contextmanager
+def _distributed_sync_lock(*, enabled: bool) -> Iterator[Tuple[bool, str]]:
+    if not enabled:
+        yield True, ""
+        return
 
-    Returns (client, redis_url, lock_key, token, should_proceed). When should_proceed is False,
-    another process already holds the lock and this invocation should exit cleanly.
-    """
     if sync_redis is None:
         logger.warning("Redis client library is unavailable; running sync_world_block without distributed lock.")
-        return None, "", "", "", True
+        yield True, ""
+        return
 
     redis_url = str(getattr(settings, "REDIS_URL", "") or "").strip()
     if not redis_url:
         logger.warning("REDIS_URL is not configured; running sync_world_block without distributed lock.")
-        return None, "", "", "", True
+        yield True, ""
+        return
 
     lock_key = f"{get_redis_namespace()}:{_SYNC_LOCK_KEY_SUFFIX}"
     token = uuid.uuid4().hex
@@ -488,46 +492,37 @@ def _acquire_sync_lock() -> Tuple[Optional[Any], str, str, str, bool]:
             "Redis unavailable for sync_world_block lock (%s); continuing without distributed lock.",
             sanitize_error_message(str(exc)),
         )
-        return None, "", "", "", True
+        yield True, ""
+        return
 
     if not acquired:
         _safe_close_redis(client)
-        return None, redis_url, lock_key, "", False
-    return client, redis_url, lock_key, token, True
-
-
-def _release_sync_lock(client: Any, lock_key: str, token: str, redis_url: str = "") -> None:
-    """Atomically releases the distributed Redis mutex lock when the token matches."""
-    if client is None or not lock_key or not token:
+        yield False, lock_key
         return
+
     try:
-        client.eval(_RELEASE_LOCK_LUA, 1, lock_key, token)
-        return
-    except REDIS_TRANSPORT_ERRORS as first_exc:
-        _safe_close_redis(client)
-        client = None
-        if sync_redis is not None and redis_url:
+        yield True, lock_key
+    finally:
+        try:
+            client.eval(_RELEASE_LOCK_LUA, 1, lock_key, token)
+        except REDIS_TRANSPORT_ERRORS as first_exc:
+            _safe_close_redis(client)
+            client = None
             retry_client: Any = None
             try:
                 retry_client = _build_sync_redis_client(redis_url)
                 retry_client.eval(_RELEASE_LOCK_LUA, 1, lock_key, token)
-                return
             except (*REDIS_TRANSPORT_ERRORS, ValueError, TypeError) as retry_exc:
                 logger.warning(
-                    "Failed to release Redis sync lock %s after reconnect: %s",
+                    "Failed to release Redis sync lock %s after reconnect: %s (initial: %s)",
                     lock_key,
                     sanitize_error_message(str(retry_exc)),
+                    sanitize_error_message(str(first_exc)),
                 )
-                return
             finally:
                 _safe_close_redis(retry_client)
-        logger.warning(
-            "Failed to release Redis sync lock %s: %s",
-            lock_key,
-            sanitize_error_message(str(first_exc)),
-        )
-    finally:
-        _safe_close_redis(client)
+        finally:
+            _safe_close_redis(client)
 
 
 def _run_toolsdb_with_retry(
@@ -537,7 +532,6 @@ def _run_toolsdb_with_retry(
     max_retries: int = _TOOLSDB_MAX_RETRIES,
     base_delay: float = _TOOLSDB_RETRY_BASE_DELAY_SECONDS,
 ) -> _T:
-    """Runs an idempotent ToolsDB operation, reconnecting and backing off on transient MySQL errors."""
     for attempt in range(max_retries + 1):
         try:
             close_old_connections()
@@ -561,20 +555,27 @@ def _run_toolsdb_with_retry(
     raise AssertionError("Unreachable retry loop exit")
 
 
-def _decode_str(raw_val: Any) -> str:
-    if isinstance(raw_val, (bytes, bytearray)):
-        return raw_val.decode("utf-8", errors="ignore")
-    return str(raw_val or "")
+def _run_bounded_toolsdb_batch(
+    sqlite_sql: str,
+    mysql_sql: str,
+    params_factory: Callable[[], Sequence[Any]],
+    *,
+    context: str,
+) -> int:
+    total_affected = 0
 
+    def _run_batch() -> int:
+        sql = sqlite_sql if connection.vendor == "sqlite" else mysql_sql
+        with transaction.atomic(), connection.cursor() as db_cursor:
+            db_cursor.execute(sql, params_factory())
+            return max(0, int(db_cursor.rowcount or 0))
 
-def _extract_domain_from_url(raw_url: Any) -> str:
-    text = _decode_str(raw_url).strip()
-    text = text.removeprefix("https://").removeprefix("http://")
-    return text.split("/")[0].strip()
-
-
-def _normalise_section(raw_section: Any) -> str:
-    return _decode_str(raw_section).strip().lower().split(".", 1)[0] or "s1"
+    while True:
+        affected = _run_toolsdb_with_retry(_run_batch, context=context)
+        if affected == 0:
+            break
+        total_affected += affected
+    return total_affected
 
 
 def _connect_replica(host: str, database: str, creds: Tuple[str, str]) -> pymysql.connections.Connection:
@@ -598,61 +599,6 @@ def _connect_replica(host: str, database: str, creds: Tuple[str, str]) -> pymysq
         _safe_close_replica(conn)
         raise
     return conn
-
-
-def _fetch_active_wikis(
-    creds: Tuple[str, str],
-    *,
-    filter_wikis: Optional[Set[str]] = None,
-    filter_sections: Optional[Set[str]] = None,
-    exclude_wikis: Optional[Set[str]] = None,
-) -> List[Tuple[str, str, str]]:
-    conn = _connect_replica("meta.analytics.db.svc.wikimedia.cloud", "meta_p", creds)
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT dbname, url, slice FROM meta_p.wiki WHERE is_closed = 0 ORDER BY slice, dbname")
-            out: List[Tuple[str, str, str]] = []
-            for raw_db, raw_url, raw_slice in cursor.fetchall():
-                dbname = _decode_str(raw_db).strip().lower()
-                domain = _extract_domain_from_url(raw_url)
-                section = _normalise_section(raw_slice)
-                if not dbname:
-                    continue
-                if exclude_wikis and dbname in exclude_wikis:
-                    continue
-                if filter_wikis and dbname not in filter_wikis:
-                    continue
-                if filter_sections and section not in filter_sections:
-                    continue
-                out.append((dbname, domain, section))
-            return out
-    finally:
-        _safe_close_replica(conn)
-
-
-def _safe_close_replica(conn: Any) -> None:
-    if conn is None:
-        return
-    with contextlib.suppress(pymysql.MySQLError, OSError):
-        conn.close()
-
-
-def _safe_close_cursor(cursor: Any) -> None:
-    if cursor is None:
-        return
-    with contextlib.suppress(pymysql.MySQLError, OSError):
-        cursor.close()
-
-
-def _expand_db_lookup_targets(targets: Sequence[str]) -> List[str]:
-    expanded: List[str] = []
-    seen: Set[str] = set()
-    for target in targets:
-        for variant in (target, target.upper()):
-            if variant not in seen:
-                seen.add(variant)
-                expanded.append(variant)
-    return expanded
 
 
 def _merge_active_rows(active_map: Dict[str, Dict[str, Any]], rows: Iterable[Tuple[Any, Any]]) -> None:
@@ -685,169 +631,17 @@ def _merge_active_rows(active_map: Dict[str, Dict[str, Any]], rows: Iterable[Tup
 
 
 def _next_sync_mark_dt(now_dt: datetime, state: Optional[RangeblockSyncState]) -> datetime:
-    """Returns a strictly monotonic UTC timestamp for active-block reconciliation."""
     sync_mark_dt = datetime.now(timezone.utc)
     prior_candidates = [now_dt]
     if state is not None and state.synced_at is not None:
-        normalised_synced = _normalise_utc_datetime(state.synced_at)
-        if normalised_synced is not None:
-            prior_candidates.append(normalised_synced)
+        synced_at = state.synced_at
+        prior_candidates.append(
+            synced_at.replace(tzinfo=timezone.utc) if synced_at.tzinfo is None else synced_at.astimezone(timezone.utc)
+        )
     latest_prior = max(prior_candidates)
     if sync_mark_dt <= latest_prior:
         return latest_prior + timedelta(microseconds=1)
     return sync_mark_dt
-
-
-def _set_replica_statement_timeout(conn: Any, sql: str) -> None:
-    with conn.cursor() as cursor:
-        cursor.execute(sql)
-
-
-def _stream_active_from_conn(
-    conn: Any,
-    sql: str,
-    params: Sequence[Any],
-    *,
-    storage_wiki: str,
-    sync_mark_dt: datetime,
-    dry_run: bool,
-) -> Tuple[int, float, float]:
-    """Streams active blocks in bounded batches and upserts each batch immediately to keep memory constant."""
-    total_processed = 0
-    read_seconds = 0.0
-    write_seconds = 0.0
-    # Full active table streams on large wikis exceed 100s when interleaved with ToolsDB writes.
-    _set_replica_statement_timeout(conn, _RESET_REPLICA_STATEMENT_TIMEOUT_SQL)
-    stream_cursor = conn.cursor(pymysql.cursors.SSCursor)
-    try:
-        read_start = time.monotonic()
-        stream_cursor.execute(sql, params)
-        read_seconds += time.monotonic() - read_start
-        while True:
-            fetch_start = time.monotonic()
-            rows = stream_cursor.fetchmany(_STREAM_FETCH_SIZE)
-            read_seconds += time.monotonic() - fetch_start
-            if not rows:
-                break
-            batch_active: Dict[str, Dict[str, Any]] = {}
-            _merge_active_rows(batch_active, rows)
-            if batch_active:
-                if dry_run:
-                    total_processed += len(batch_active)
-                else:
-
-                    def _commit_active_batch(entries: Dict[str, Dict[str, Any]] = batch_active) -> int:
-                        with transaction.atomic():
-                            return _upsert_active_blocks(storage_wiki, entries, now_dt=sync_mark_dt)
-
-                    write_start = time.monotonic()
-                    total_processed += _run_toolsdb_with_retry(
-                        _commit_active_batch,
-                        context=f"active block batch upsert for {storage_wiki}",
-                    )
-                    write_seconds += time.monotonic() - write_start
-                batch_active.clear()
-    finally:
-        _safe_close_cursor(stream_cursor)
-        with contextlib.suppress(pymysql.MySQLError, OSError):
-            _set_replica_statement_timeout(conn, _SET_REPLICA_STATEMENT_TIMEOUT_SQL)
-    return total_processed, read_seconds, write_seconds
-
-
-def _stream_active_local_blocks(
-    session: _ReplicaSession,
-    wiki_db: str,
-    now_mw: str,
-    *,
-    storage_wiki: str,
-    sync_mark_dt: datetime,
-    dry_run: bool,
-) -> Tuple[int, float, float]:
-    conn = session.select_db(wiki_db)
-    return _stream_active_from_conn(
-        conn,
-        _LOCAL_ACTIVE_BLOCKS_SQL,
-        [now_mw],
-        storage_wiki=storage_wiki,
-        sync_mark_dt=sync_mark_dt,
-        dry_run=dry_run,
-    )
-
-
-def _stream_active_global_blocks(
-    creds: Tuple[str, str],
-    now_mw: str,
-    *,
-    storage_wiki: str,
-    sync_mark_dt: datetime,
-    dry_run: bool,
-) -> Tuple[int, float, float]:
-    conn = _connect_replica("centralauth.analytics.db.svc.wikimedia.cloud", "centralauth_p", creds)
-    try:
-        return _stream_active_from_conn(
-            conn,
-            _GLOBAL_ACTIVE_BLOCKS_SQL,
-            [now_mw],
-            storage_wiki=storage_wiki,
-            sync_mark_dt=sync_mark_dt,
-            dry_run=dry_run,
-        )
-    finally:
-        _safe_close_replica(conn)
-
-
-def _fetch_targeted_active_from_conn(
-    conn: Any,
-    sql: str,
-    targets: Sequence[str],
-    now_mw: str,
-) -> Dict[str, Dict[str, Any]]:
-    expanded = _expand_db_lookup_targets(targets)
-    active_map: Dict[str, Dict[str, Any]] = {}
-    with conn.cursor() as cursor:
-        for batch in _iter_batches(expanded, _TARGETED_ACTIVE_BATCH_SIZE):
-            cursor.execute(sql, (tuple(batch), now_mw))
-            rows = cursor.fetchall()
-            if rows:
-                _merge_active_rows(active_map, rows)
-    return active_map
-
-
-def _fetch_targeted_active_local_blocks(
-    session: _ReplicaSession,
-    wiki_db: str,
-    targets: Sequence[str],
-    now_mw: str,
-) -> Dict[str, Dict[str, Any]]:
-    conn = session.select_db(wiki_db)
-    return _fetch_targeted_active_from_conn(conn, _TARGETED_LOCAL_ACTIVE_SQL, targets, now_mw)
-
-
-def _fetch_targeted_active_global_blocks(
-    global_session: _ReplicaSession,
-    targets: Sequence[str],
-    now_mw: str,
-) -> Dict[str, Dict[str, Any]]:
-    conn = global_session.select_db("centralauth_p")
-    return _fetch_targeted_active_from_conn(conn, _TARGETED_GLOBAL_ACTIVE_SQL, targets, now_mw)
-
-
-def _prep_db_datetime(dt: Optional[datetime]) -> Optional[str]:
-    if dt is None:
-        return None
-    utc_naive = dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo is not None else dt
-    return connection.ops.adapt_datetimefield_value(utc_naive)
-
-
-def _normalise_utc_datetime(dt: Optional[datetime]) -> Optional[datetime]:
-    if dt is None:
-        return None
-    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
-
-
-def _iter_batches(items: Sequence[Any], size: int) -> Iterable[List[Any]]:
-    for idx in range(0, len(items), size):
-        yield list(items[idx : idx + size])
 
 
 def _advance_sync_state(
@@ -869,68 +663,19 @@ def _advance_sync_state(
     state_obj.save()
 
 
-def _batch_update_synced_at(wiki_dbnames: Sequence[str], *, synced_at: datetime) -> int:
-    """Updates synced_at in bounded batches for idle wikis that required no per-wiki writes."""
-    if not wiki_dbnames:
-        return 0
-    total_updated = 0
-    unique_wikis = list(dict.fromkeys(wiki_dbnames))
-    for batch in _iter_batches(unique_wikis, _UPSERT_SQL_BATCH_SIZE):
-
-        def _update_batch(target_wikis: List[str] = batch) -> int:
-            with transaction.atomic():
-                return RangeblockSyncState.objects.filter(wiki_dbname__in=target_wikis).update(synced_at=synced_at)
-
-        total_updated += _run_toolsdb_with_retry(
-            _update_batch,
-            context=f"batch synced_at update ({len(batch)} wikis)",
-        )
-    return total_updated
-
-
-def _upsert_log_chunk(
-    storage_wiki: str,
-    chunk_deltas: Dict[str, Dict[str, Any]],
-    *,
-    now_dt: datetime,
-) -> int:
-    if not chunk_deltas:
-        return 0
-
-    now_db = _prep_db_datetime(now_dt)
-    rows: List[Tuple[Any, ...]] = [
-        (
-            storage_wiki,
-            target_cidr,
-            info["ip_version"],
-            info["cidr_prefix"],
-            info["range_start_bin"],
-            info["range_end_bin"],
-            info["delta"],
-            0,
-            None,
-            0,
-            _prep_db_datetime(info["last_blocked_at"]),
-            now_db,
-        )
-        for target_cidr, info in chunk_deltas.items()
-    ]
-
-    sql = _UPSERT_LOG_SQLITE_SQL if connection.vendor == "sqlite" else _UPSERT_LOG_MYSQL_SQL
-    with connection.cursor() as db_cursor:
-        for batch in _iter_batches(rows, _UPSERT_SQL_BATCH_SIZE):
-            db_cursor.executemany(sql, batch)
-    return len(rows)
-
-
-def _build_active_upsert_rows(
+def _upsert_active_blocks(
     storage_wiki: str,
     active_entries: Dict[str, Dict[str, Any]],
     *,
     now_dt: datetime,
-) -> List[Tuple[Any, ...]]:
+    sqlite_sql: str,
+    mysql_sql: str,
+) -> int:
+    if not active_entries:
+        return 0
+
     now_db = _prep_db_datetime(now_dt)
-    return [
+    rows = [
         (
             storage_wiki,
             target_cidr,
@@ -947,275 +692,52 @@ def _build_active_upsert_rows(
         )
         for target_cidr, info in active_entries.items()
     ]
-
-
-def _upsert_active_blocks(
-    storage_wiki: str,
-    active_entries: Dict[str, Dict[str, Any]],
-    *,
-    now_dt: datetime,
-    targeted: bool = False,
-) -> int:
-    if not active_entries:
-        return 0
-
-    rows = _build_active_upsert_rows(storage_wiki, active_entries, now_dt=now_dt)
-    if targeted:
-        sql = _UPSERT_TARGETED_ACTIVE_SQLITE_SQL if connection.vendor == "sqlite" else _UPSERT_TARGETED_ACTIVE_MYSQL_SQL
-    else:
-        sql = _UPSERT_ACTIVE_SQLITE_SQL if connection.vendor == "sqlite" else _UPSERT_ACTIVE_MYSQL_SQL
+    sql = sqlite_sql if connection.vendor == "sqlite" else mysql_sql
     with connection.cursor() as db_cursor:
         for batch in _iter_batches(rows, _UPSERT_SQL_BATCH_SIZE):
             db_cursor.executemany(sql, batch)
     return len(rows)
 
 
-def _deactivate_specific_targets(
-    storage_wiki: str,
-    targets: Sequence[str],
-    *,
+def _fetch_wikis_with_expired_active_blocks(
     now_dt: datetime,
-) -> int:
-    if not targets:
-        return 0
-
-    total_deactivated = 0
-    for batch in _iter_batches(targets, _UPSERT_SQL_BATCH_SIZE):
-        total_deactivated += RangeblockAggregate.objects.filter(
-            wiki_dbname=storage_wiki,
-            target_cidr__in=batch,
-            has_active=True,
-        ).update(
-            has_active=False,
-            active_expiry=None,
-            active_indefinite=False,
-            updated_at=now_dt,
-        )
-    return total_deactivated
-
-
-def _merge_log_rows(
-    chunk_deltas: Dict[str, Dict[str, Any]],
-    rows: Iterable[Tuple[Any, Any, Any, Any]],
-    chunk_latest_ts: str,
     *,
-    count_actions: frozenset[str],
-    touched_targets: Optional[Set[str]],
-) -> str:
-    for raw_title, raw_action, raw_count, raw_ts in rows:
-        normalised = normalize_block_target(_decode_str(raw_title))
-        if normalised is None:
-            continue
-        target_cidr, ip_version, cidr_prefix, start_bin, end_bin = normalised
-        ts_str = _decode_str(raw_ts).strip()
-        if ts_str and ts_str > chunk_latest_ts:
-            chunk_latest_ts = ts_str
-        if touched_targets is not None:
-            touched_targets.add(target_cidr)
-        action = _decode_str(raw_action).strip().lower()
-        if action not in count_actions:
-            continue
-        last_dt = parse_mw_timestamp(ts_str)
-        delta_val = max(0, int(raw_count or 0))
-        entry = chunk_deltas.get(target_cidr)
-        if entry is None:
-            chunk_deltas[target_cidr] = {
-                "ip_version": ip_version,
-                "cidr_prefix": cidr_prefix,
-                "range_start_bin": start_bin,
-                "range_end_bin": end_bin,
-                "delta": delta_val,
-                "last_blocked_at": last_dt,
-            }
-        else:
-            entry["delta"] += delta_val
-            if last_dt is not None and (entry["last_blocked_at"] is None or last_dt > entry["last_blocked_at"]):
-                entry["last_blocked_at"] = last_dt
-    return chunk_latest_ts
+    filter_wikis: Optional[Set[str]] = None,
+    known_wikis: Optional[Iterable[str]] = None,
+) -> Set[str]:
+    def _scan_batched(wikis: Sequence[str]) -> Set[str]:
+        expired: Set[str] = set()
+        now_db = _prep_db_datetime(now_dt)
+        for batch in _iter_batches(wikis, _EXPIRED_WIKIS_BATCH_SIZE):
 
+            def _query_batch(target_batch: List[str] = batch) -> Set[str]:
+                placeholders = ", ".join(["%s"] * len(target_batch))
+                sql = _FETCH_EXPIRED_ACTIVE_WIKIS_BY_WIKI_SQL_PREFIX.format(placeholders=placeholders)
+                with connection.cursor() as db_cursor:
+                    db_cursor.execute(sql, [*target_batch, now_db])
+                    return {_decode_str(row[0]).strip().lower() for row in db_cursor.fetchall() if row and row[0]}
 
-def _resolve_log_queries(log_actions: Tuple[str, ...]) -> Tuple[str, str]:
-    if len(log_actions) == 3:
-        return _MAX_LOG_ID_LOCAL_SQL, _INCREMENTAL_LOGS_LOCAL_SQL
-    if len(log_actions) == 4:
-        return _MAX_LOG_ID_GLOBAL_SQL, _INCREMENTAL_LOGS_GLOBAL_SQL
-    raise ValueError(f"Unsupported log_actions count: {len(log_actions)}")
+            expired.update(_run_toolsdb_with_retry(_query_batch, context="startup expired active blocks batched scan"))
+        return expired
 
+    if filter_wikis:
+        return _scan_batched(sorted(filter_wikis))
 
-def _adjust_chunk_size(current_size: int, replica_elapsed: float) -> int:
-    if replica_elapsed < _FAST_CHUNK_THRESHOLD_SECONDS:
-        return min(_MAX_BATCH_SIZE, current_size * 2)
-    if replica_elapsed > _SLOW_CHUNK_THRESHOLD_SECONDS:
-        return max(_MIN_BATCH_SIZE, current_size // 2)
-    return current_size
-
-
-def _query_max_log_id(
-    session: _ReplicaSession,
-    spec: _SyncTargetSpec,
-    last_log_id: int,
-) -> int:
-    if not isinstance(spec.replica_db, str) or not _REPLICA_DB_RE.fullmatch(spec.replica_db):
-        raise ValueError(f"Invalid replica database name: {spec.replica_db!r}")
-    max_log_id_sql, _ = _resolve_log_queries(spec.log_actions)
-    conn = session.select_db(spec.replica_db)
-    with conn.cursor() as cursor:
-        cursor.execute(max_log_id_sql, [last_log_id, spec.log_type, *spec.log_actions])
-        max_row = cursor.fetchone()
-    target_max_id = int(max_row[0] or 0) if max_row else 0
-    return target_max_id if target_max_id > last_log_id else 0
-
-
-def _fetch_log_chunk(
-    session: _ReplicaSession,
-    spec: _SyncTargetSpec,
-    incremental_logs_sql: str,
-    *,
-    cursor_id: int,
-    upper_id: int,
-    collect_touched: bool,
-) -> Tuple[Dict[str, Dict[str, Any]], Set[str], str, float]:
-    chunk_deltas: Dict[str, Dict[str, Any]] = {}
-    chunk_touched: Set[str] = set()
-    chunk_latest_ts = ""
-    conn = session.select_db(spec.replica_db)
-    stream_cursor = conn.cursor(pymysql.cursors.SSCursor)
-    replica_start = time.monotonic()
+    now_db = _prep_db_datetime(now_dt)
     try:
-        stream_cursor.execute(
-            incremental_logs_sql,
-            [cursor_id, upper_id, spec.log_type, *spec.log_actions],
-        )
-        while rows := stream_cursor.fetchmany(_STREAM_FETCH_SIZE):
-            chunk_latest_ts = _merge_log_rows(
-                chunk_deltas,
-                rows,
-                chunk_latest_ts,
-                count_actions=spec.count_actions,
-                touched_targets=chunk_touched if collect_touched else None,
+        with connection.cursor() as db_cursor:
+            db_cursor.execute(_FETCH_EXPIRED_ACTIVE_WIKIS_SQL, [now_db])
+            return {_decode_str(row[0]).strip().lower() for row in db_cursor.fetchall() if row and row[0]}
+    except OperationalError as exc:
+        error_code = _extract_mysql_error_code(exc)
+        if error_code in {2013, _MYSQL_MAX_STATEMENT_TIME_ERR} and known_wikis:
+            logger.warning(
+                "Global expired active blocks scan timed out (code=%s); falling back to per-wiki batched scan.",
+                error_code,
             )
-    finally:
-        _safe_close_cursor(stream_cursor)
-    replica_elapsed = time.monotonic() - replica_start
-    return chunk_deltas, chunk_touched, chunk_latest_ts, replica_elapsed
-
-
-def _fetch_chunk_targeted_active(
-    session: _ReplicaSession,
-    global_session: Optional[_ReplicaSession],
-    spec: _SyncTargetSpec,
-    chunk_touched: Set[str],
-    *,
-    now_mw: str,
-    stage_ctx: _WikiSyncStage,
-    timing: _WikiTiming,
-) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
-    if not chunk_touched:
-        return {}, []
-    sorted_targets = sorted(chunk_touched)
-    stage_ctx.stage = "active_read"
-    read_start = time.monotonic()
-    if spec.is_global:
-        if global_session is None:
-            raise RuntimeError("Global Replica session is required for targeted global active lookups.")
-        active_map = _fetch_targeted_active_global_blocks(global_session, sorted_targets, now_mw)
-    else:
-        active_map = _fetch_targeted_active_local_blocks(session, spec.replica_db, sorted_targets, now_mw)
-    timing.active_read += time.monotonic() - read_start
-    inactive_targets = sorted(chunk_touched - active_map.keys())
-    return active_map, inactive_targets
-
-
-def _commit_log_chunk_with_retry(
-    spec: _SyncTargetSpec,
-    chunk_deltas: Dict[str, Dict[str, Any]],
-    *,
-    active_map: Dict[str, Dict[str, Any]],
-    inactive_targets: Sequence[str],
-    upper_id: int,
-    latest_ts: str,
-    log_now_dt: datetime,
-    active_now_dt: datetime,
-    stage_ctx: _WikiSyncStage,
-    timing: _WikiTiming,
-) -> int:
-    has_active_writes = bool(active_map or inactive_targets)
-    if has_active_writes:
-        stage_ctx.stage = "active_write"
-
-    def _commit_log_chunk() -> Tuple[int, float, float]:
-        log_write_seconds = 0.0
-        active_write_seconds = 0.0
-        active_changes = 0
-        with transaction.atomic():
-            if chunk_deltas:
-                log_start = time.monotonic()
-                _upsert_log_chunk(spec.storage_wiki, chunk_deltas, now_dt=log_now_dt)
-                log_write_seconds += time.monotonic() - log_start
-            if has_active_writes:
-                active_start = time.monotonic()
-                if active_map:
-                    active_changes += _upsert_active_blocks(
-                        spec.storage_wiki,
-                        active_map,
-                        now_dt=active_now_dt,
-                        targeted=True,
-                    )
-                if inactive_targets:
-                    active_changes += _deactivate_specific_targets(
-                        spec.storage_wiki,
-                        inactive_targets,
-                        now_dt=active_now_dt,
-                    )
-                active_write_seconds += time.monotonic() - active_start
-            state_start = time.monotonic()
-            _advance_sync_state(
-                spec.storage_wiki,
-                wiki_domain=spec.wiki_domain,
-                now_dt=active_now_dt if has_active_writes else log_now_dt,
-                last_log_id=upper_id,
-                last_log_timestamp=latest_ts,
-            )
-            log_write_seconds += time.monotonic() - state_start
-        return active_changes, log_write_seconds, active_write_seconds
-
-    active_changes, log_write_seconds, active_write_seconds = _run_toolsdb_with_retry(
-        _commit_log_chunk,
-        context=f"log chunk upsert for {spec.storage_wiki} (up to log_id={upper_id})",
-    )
-    timing.logs += log_write_seconds
-    timing.active_write += active_write_seconds
-    return active_changes
-
-
-def _handle_log_chunk_timeout(
-    session: _ReplicaSession,
-    spec: _SyncTargetSpec,
-    exc: pymysql.MySQLError,
-    *,
-    cursor_id: int,
-    upper_id: int,
-    current_batch_size: int,
-) -> int:
-    error_code = _extract_mysql_error_code(exc)
-    if error_code != _MYSQL_MAX_STATEMENT_TIME_ERR:
-        raise exc
-    attempted_span = upper_id - cursor_id
-    if attempted_span <= _MIN_BATCH_SIZE or current_batch_size <= _MIN_BATCH_SIZE:
-        session.close()
-        raise exc
-    next_batch_size = max(_MIN_BATCH_SIZE, min(current_batch_size, attempted_span) // 2)
-    session.reconnect(spec.replica_db)
-    logger.warning(
-        "Replica statement timeout (wiki=%s, stage=logs, log_id=%d, error_code=%s); "
-        "reconnected and reduced batch size from %d to %d",
-        spec.storage_wiki,
-        cursor_id,
-        error_code,
-        current_batch_size,
-        next_batch_size,
-    )
-    return next_batch_size
+            connection.close()
+            return _scan_batched(sorted(set(known_wikis)))
+        raise
 
 
 def _stream_incremental_logs(
@@ -1229,9 +751,7 @@ def _stream_incremental_logs(
     active_now_dt: datetime,
     stage_ctx: _WikiSyncStage,
     timing: _WikiTiming,
-) -> _LogStreamResult:
-    """Streams incremental log chunks with adaptive sizing, timeout recovery, and per-chunk active reconciliation."""
-    _, incremental_logs_sql = _resolve_log_queries(spec.log_actions)
+) -> Tuple[int, int, int, bool]:
     total_targets = 0
     total_active_changes = 0
     chunks_committed = 0
@@ -1261,205 +781,211 @@ def _stream_incremental_logs(
             stage_ctx.stage = "logs"
             stage_ctx.log_id = cursor_id
             upper_id = min(target_max_id, cursor_id + current_batch_size)
+
+            chunk_deltas: Dict[str, Dict[str, Any]] = {}
+            chunk_touched: Set[str] = set()
+            chunk_latest_ts = ""
+            replica_start = time.monotonic()
             try:
-                chunk_deltas, chunk_touched, chunk_latest_ts, replica_elapsed = _fetch_log_chunk(
-                    session,
-                    spec,
-                    incremental_logs_sql,
-                    cursor_id=cursor_id,
-                    upper_id=upper_id,
-                    collect_touched=collect_touched,
-                )
+                conn = session.select_db(spec.replica_db)
+                stream_cursor = conn.cursor(pymysql.cursors.SSCursor)
+                try:
+                    stream_cursor.execute(
+                        spec.incremental_logs_sql,
+                        [cursor_id, upper_id, spec.log_type, *spec.log_actions],
+                    )
+                    while rows := stream_cursor.fetchmany(_STREAM_FETCH_SIZE):
+                        for raw_title, raw_action, raw_count, raw_ts in rows:
+                            normalised = normalize_block_target(_decode_str(raw_title))
+                            if normalised is None:
+                                continue
+                            target_cidr, ip_version, cidr_prefix, start_bin, end_bin = normalised
+                            ts_str = _decode_str(raw_ts).strip()
+                            if ts_str and ts_str > chunk_latest_ts:
+                                chunk_latest_ts = ts_str
+                            if collect_touched:
+                                chunk_touched.add(target_cidr)
+                            action = _decode_str(raw_action).strip().lower()
+                            if action not in spec.count_actions:
+                                continue
+                            last_dt = parse_mw_timestamp(ts_str)
+                            delta_val = max(0, int(raw_count or 0))
+                            entry = chunk_deltas.get(target_cidr)
+                            if entry is None:
+                                chunk_deltas[target_cidr] = {
+                                    "ip_version": ip_version,
+                                    "cidr_prefix": cidr_prefix,
+                                    "range_start_bin": start_bin,
+                                    "range_end_bin": end_bin,
+                                    "delta": delta_val,
+                                    "last_blocked_at": last_dt,
+                                }
+                            else:
+                                entry["delta"] += delta_val
+                                if last_dt is not None and (
+                                    entry["last_blocked_at"] is None or last_dt > entry["last_blocked_at"]
+                                ):
+                                    entry["last_blocked_at"] = last_dt
+                finally:
+                    with contextlib.suppress(pymysql.MySQLError, OSError):
+                        stream_cursor.close()
             except pymysql.MySQLError as exc:
-                current_batch_size = _handle_log_chunk_timeout(
-                    session,
-                    spec,
-                    exc,
-                    cursor_id=cursor_id,
-                    upper_id=upper_id,
-                    current_batch_size=current_batch_size,
+                error_code = _extract_mysql_error_code(exc)
+                attempted_span = upper_id - cursor_id
+                if (
+                    error_code != _MYSQL_MAX_STATEMENT_TIME_ERR
+                    or attempted_span <= _MIN_BATCH_SIZE
+                    or current_batch_size <= _MIN_BATCH_SIZE
+                ):
+                    if error_code == _MYSQL_MAX_STATEMENT_TIME_ERR:
+                        session.close()
+                    raise
+                next_batch_size = max(_MIN_BATCH_SIZE, min(current_batch_size, attempted_span) // 2)
+                session.reconnect(spec.replica_db)
+                logger.warning(
+                    "Replica statement timeout (wiki=%s, stage=logs, log_id=%d, error_code=%s); "
+                    "reconnected and reduced batch size from %d to %d",
+                    spec.storage_wiki,
+                    cursor_id,
+                    error_code,
+                    current_batch_size,
+                    next_batch_size,
                 )
+                current_batch_size = next_batch_size
                 continue
 
+            replica_elapsed = time.monotonic() - replica_start
             timing.logs += replica_elapsed
             total_targets += len(chunk_deltas)
+
             active_map: Dict[str, Dict[str, Any]] = {}
             inactive_targets: List[str] = []
             if collect_touched and chunk_touched:
-                active_map, inactive_targets = _fetch_chunk_targeted_active(
-                    session,
-                    global_session,
-                    spec,
-                    chunk_touched,
-                    now_mw=config.now_mw,
-                    stage_ctx=stage_ctx,
-                    timing=timing,
-                )
+                stage_ctx.stage = "active_read"
+                read_start = time.monotonic()
+                expanded_targets: List[str] = []
+                seen_targets: Set[str] = set()
+                for target in sorted(chunk_touched):
+                    for variant in (target, target.upper()):
+                        if variant not in seen_targets:
+                            seen_targets.add(variant)
+                            expanded_targets.append(variant)
+                if spec.is_global:
+                    if global_session is None:
+                        raise RuntimeError("Global Replica session is required for targeted global active lookups.")
+                    active_conn = global_session.select_db("centralauth_p")
+                    targeted_sql = _TARGETED_GLOBAL_ACTIVE_SQL
+                else:
+                    active_conn = session.select_db(spec.replica_db)
+                    targeted_sql = _TARGETED_LOCAL_ACTIVE_SQL
+                with active_conn.cursor() as active_cursor:
+                    for batch in _iter_batches(expanded_targets, _TARGETED_ACTIVE_BATCH_SIZE):
+                        active_cursor.execute(targeted_sql, (tuple(batch), config.now_mw))
+                        active_rows = active_cursor.fetchall()
+                        if active_rows:
+                            _merge_active_rows(active_map, active_rows)
+                timing.active_read += time.monotonic() - read_start
+                inactive_targets = sorted(chunk_touched - active_map.keys())
+
             if config.dry_run:
                 total_active_changes += len(active_map) + len(inactive_targets)
             else:
-                total_active_changes += _commit_log_chunk_with_retry(
-                    spec,
-                    chunk_deltas,
-                    active_map=active_map,
-                    inactive_targets=inactive_targets,
-                    upper_id=upper_id,
-                    latest_ts=chunk_latest_ts,
-                    log_now_dt=config.now_dt,
-                    active_now_dt=active_now_dt,
-                    stage_ctx=stage_ctx,
-                    timing=timing,
+                has_active_writes = bool(active_map or inactive_targets)
+                if has_active_writes:
+                    stage_ctx.stage = "active_write"
+
+                def _commit_chunk(
+                    deltas: Dict[str, Dict[str, Any]] = chunk_deltas,
+                    active_entries: Dict[str, Dict[str, Any]] = active_map,
+                    inactive: List[str] = inactive_targets,
+                    active_writes: bool = has_active_writes,
+                    chunk_upper_id: int = upper_id,
+                    latest_ts: str = chunk_latest_ts,
+                ) -> Tuple[int, float, float]:
+                    log_write_seconds = 0.0
+                    active_write_seconds = 0.0
+                    active_changes = 0
+                    with transaction.atomic():
+                        if deltas:
+                            log_start = time.monotonic()
+                            now_db = _prep_db_datetime(config.now_dt)
+                            log_rows = [
+                                (
+                                    spec.storage_wiki,
+                                    cidr,
+                                    info["ip_version"],
+                                    info["cidr_prefix"],
+                                    info["range_start_bin"],
+                                    info["range_end_bin"],
+                                    info["delta"],
+                                    0,
+                                    None,
+                                    0,
+                                    _prep_db_datetime(info["last_blocked_at"]),
+                                    now_db,
+                                )
+                                for cidr, info in deltas.items()
+                            ]
+                            log_sql = _UPSERT_LOG_SQLITE_SQL if connection.vendor == "sqlite" else _UPSERT_LOG_MYSQL_SQL
+                            with connection.cursor() as db_cursor:
+                                for batch in _iter_batches(log_rows, _UPSERT_SQL_BATCH_SIZE):
+                                    db_cursor.executemany(log_sql, batch)
+                            log_write_seconds += time.monotonic() - log_start
+                        if active_writes:
+                            active_start = time.monotonic()
+                            if active_entries:
+                                active_changes += _upsert_active_blocks(
+                                    spec.storage_wiki,
+                                    active_entries,
+                                    now_dt=active_now_dt,
+                                    sqlite_sql=_UPSERT_TARGETED_ACTIVE_SQLITE_SQL,
+                                    mysql_sql=_UPSERT_TARGETED_ACTIVE_MYSQL_SQL,
+                                )
+                            if inactive:
+                                for batch in _iter_batches(inactive, _UPSERT_SQL_BATCH_SIZE):
+                                    active_changes += RangeblockAggregate.objects.filter(
+                                        wiki_dbname=spec.storage_wiki,
+                                        target_cidr__in=batch,
+                                        has_active=True,
+                                    ).update(
+                                        has_active=False,
+                                        active_expiry=None,
+                                        active_indefinite=False,
+                                        updated_at=active_now_dt,
+                                    )
+                            active_write_seconds += time.monotonic() - active_start
+                        state_start = time.monotonic()
+                        _advance_sync_state(
+                            spec.storage_wiki,
+                            wiki_domain=spec.wiki_domain,
+                            now_dt=active_now_dt if active_writes else config.now_dt,
+                            last_log_id=chunk_upper_id,
+                            last_log_timestamp=latest_ts,
+                        )
+                        log_write_seconds += time.monotonic() - state_start
+                    return active_changes, log_write_seconds, active_write_seconds
+
+                chunk_active_changes, log_write_seconds, active_write_seconds = _run_toolsdb_with_retry(
+                    _commit_chunk,
+                    context=f"log chunk upsert for {spec.storage_wiki} (up to log_id={upper_id})",
                 )
+                timing.logs += log_write_seconds
+                timing.active_write += active_write_seconds
+                total_active_changes += chunk_active_changes
                 chunks_committed += 1
+
             chunk_deltas.clear()
             cursor_id = upper_id
             stage_ctx.log_id = cursor_id
-            current_batch_size = _adjust_chunk_size(current_batch_size, replica_elapsed)
+            if replica_elapsed < _FAST_CHUNK_THRESHOLD_SECONDS:
+                current_batch_size = min(_MAX_BATCH_SIZE, current_batch_size * 2)
+            elif replica_elapsed > _SLOW_CHUNK_THRESHOLD_SECONDS:
+                current_batch_size = max(_MIN_BATCH_SIZE, current_batch_size // 2)
     finally:
         if global_session is not None:
             global_session.close()
 
-    return _LogStreamResult(
-        log_targets=total_targets,
-        active_changes=total_active_changes,
-        chunks_committed=chunks_committed,
-        budget_reached=budget_reached,
-    )
-
-
-def _fetch_wikis_with_expired_active_blocks_for_batch(now_dt: datetime, wikis: Sequence[str]) -> Set[str]:
-    """Queries expired active rows scoped to an explicit batch of wiki_dbnames."""
-    if not wikis:
-        return set()
-    now_db = _prep_db_datetime(now_dt)
-    placeholders = ", ".join(["%s"] * len(wikis))
-    sql = _FETCH_EXPIRED_ACTIVE_WIKIS_BY_WIKI_SQL_PREFIX.format(placeholders=placeholders)
-    with connection.cursor() as db_cursor:
-        db_cursor.execute(sql, [*wikis, now_db])
-        return {_decode_str(row[0]).strip().lower() for row in db_cursor.fetchall() if row and row[0]}
-
-
-def _fetch_wikis_with_expired_active_blocks_batched(now_dt: datetime, wikis: Sequence[str]) -> Set[str]:
-    """Scans expired active rows in bounded wiki batches using idx_rb_agg_wiki_active."""
-    expired: Set[str] = set()
-    for start in range(0, len(wikis), _EXPIRED_WIKIS_BATCH_SIZE):
-        batch = wikis[start : start + _EXPIRED_WIKIS_BATCH_SIZE]
-        expired.update(
-            _run_toolsdb_with_retry(
-                lambda batch=batch: _fetch_wikis_with_expired_active_blocks_for_batch(now_dt, batch),
-                context="startup expired active blocks batched scan",
-            )
-        )
-    return expired
-
-
-def _fetch_wikis_with_expired_active_blocks(
-    now_dt: datetime,
-    *,
-    filter_wikis: Optional[Set[str]] = None,
-    known_wikis: Optional[Iterable[str]] = None,
-) -> Set[str]:
-    """Finds wikis that currently hold naturally expired rows still marked as active in ToolsDB."""
-    if filter_wikis:
-        return _fetch_wikis_with_expired_active_blocks_batched(now_dt, sorted(filter_wikis))
-
-    now_db = _prep_db_datetime(now_dt)
-    try:
-        with connection.cursor() as db_cursor:
-            db_cursor.execute(_FETCH_EXPIRED_ACTIVE_WIKIS_SQL, [now_db])
-            return {_decode_str(row[0]).strip().lower() for row in db_cursor.fetchall() if row and row[0]}
-    except OperationalError as exc:
-        error_code = _extract_mysql_error_code(exc)
-        if error_code in {2013, _MYSQL_MAX_STATEMENT_TIME_ERR} and known_wikis:
-            logger.warning(
-                "Global expired active blocks scan timed out (code=%s); falling back to per-wiki batched scan.",
-                error_code,
-            )
-            connection.close()
-            return _fetch_wikis_with_expired_active_blocks_batched(now_dt, sorted(set(known_wikis)))
-        raise
-
-
-def _deactivate_stale_active_blocks(storage_wiki: str, *, sync_mark_dt: datetime) -> int:
-    """Deactivates rows still marked active from earlier rounds in bounded SQL batches."""
-    total_deactivated = 0
-
-    def _deactivate_batch() -> int:
-        sync_mark_db = _prep_db_datetime(sync_mark_dt)
-        sql = (
-            _DEACTIVATE_STALE_ACTIVE_SQLITE_SQL if connection.vendor == "sqlite" else _DEACTIVATE_STALE_ACTIVE_MYSQL_SQL
-        )
-        with transaction.atomic(), connection.cursor() as db_cursor:
-            db_cursor.execute(sql, [sync_mark_db, storage_wiki, sync_mark_db])
-            return max(0, int(db_cursor.rowcount or 0))
-
-    while True:
-        affected = _run_toolsdb_with_retry(
-            _deactivate_batch,
-            context=f"stale active block deactivation for {storage_wiki}",
-        )
-        if affected == 0:
-            break
-        total_deactivated += affected
-    return total_deactivated
-
-
-def _deactivate_expired_active_blocks(storage_wiki: str, *, now_dt: datetime, updated_dt: datetime) -> int:
-    """Deactivates naturally expired active rows locally in ToolsDB in bounded batches."""
-    total_deactivated = 0
-
-    def _deactivate_batch() -> int:
-        now_db = _prep_db_datetime(now_dt)
-        updated_db = _prep_db_datetime(updated_dt)
-        sql = (
-            _DEACTIVATE_EXPIRED_ACTIVE_SQLITE_SQL
-            if connection.vendor == "sqlite"
-            else _DEACTIVATE_EXPIRED_ACTIVE_MYSQL_SQL
-        )
-        with transaction.atomic(), connection.cursor() as db_cursor:
-            db_cursor.execute(sql, [updated_db, storage_wiki, now_db])
-            return max(0, int(db_cursor.rowcount or 0))
-
-    while True:
-        affected = _run_toolsdb_with_retry(
-            _deactivate_batch,
-            context=f"expired active block deactivation for {storage_wiki}",
-        )
-        if affected == 0:
-            break
-        total_deactivated += affected
-    return total_deactivated
-
-
-def _purge_wiki_rangeblocks(storage_wiki: str) -> Tuple[int, int]:
-    """Deletes all aggregate rows (in 5000-row batches) and sync state for an excluded wiki."""
-    total_agg_deleted = 0
-
-    def _delete_agg_batch() -> int:
-        sql = _PURGE_WIKI_AGG_SQLITE_SQL if connection.vendor == "sqlite" else _PURGE_WIKI_AGG_MYSQL_SQL
-        with transaction.atomic(), connection.cursor() as db_cursor:
-            db_cursor.execute(sql, [storage_wiki])
-            return max(0, int(db_cursor.rowcount or 0))
-
-    while True:
-        deleted = _run_toolsdb_with_retry(
-            _delete_agg_batch,
-            context=f"excluded wiki aggregate purge for {storage_wiki}",
-        )
-        if deleted == 0:
-            break
-        total_agg_deleted += deleted
-
-    def _delete_sync_state() -> int:
-        with transaction.atomic():
-            count, _ = RangeblockSyncState.objects.filter(wiki_dbname=storage_wiki).delete()
-            return int(count or 0)
-
-    state_deleted = _run_toolsdb_with_retry(
-        _delete_sync_state,
-        context=f"excluded wiki sync state purge for {storage_wiki}",
-    )
-    return total_agg_deleted, state_deleted
+    return total_targets, total_active_changes, chunks_committed, budget_reached
 
 
 def _reconcile_full_active(
@@ -1471,33 +997,75 @@ def _reconcile_full_active(
     stage_ctx: _WikiSyncStage,
     timing: _WikiTiming,
 ) -> int:
-    """Executes full O(1)-memory streaming mark-and-sweep reconciliation for one target."""
     stage_ctx.stage = "active_read"
-    if spec.is_global:
-        active_upserted, read_seconds, write_seconds = _stream_active_global_blocks(
-            config.creds,
-            config.now_mw,
-            storage_wiki=spec.storage_wiki,
-            sync_mark_dt=sync_mark_dt,
-            dry_run=config.dry_run,
-        )
-    else:
-        active_upserted, read_seconds, write_seconds = _stream_active_local_blocks(
-            session,
-            spec.replica_db,
-            config.now_mw,
-            storage_wiki=spec.storage_wiki,
-            sync_mark_dt=sync_mark_dt,
-            dry_run=config.dry_run,
-        )
-    timing.active_read += read_seconds
-    timing.active_write += write_seconds
+    owned_conn = (
+        _connect_replica("centralauth.analytics.db.svc.wikimedia.cloud", "centralauth_p", config.creds)
+        if spec.is_global
+        else None
+    )
+    conn = owned_conn if owned_conn is not None else session.select_db(spec.replica_db)
+    active_sql = _GLOBAL_ACTIVE_BLOCKS_SQL if spec.is_global else _LOCAL_ACTIVE_BLOCKS_SQL
+
+    active_upserted = 0
+    try:
+        # Full active table streams on large wikis exceed 100s when interleaved with ToolsDB writes.
+        with conn.cursor() as timeout_cursor:
+            timeout_cursor.execute(_RESET_REPLICA_STATEMENT_TIMEOUT_SQL)
+        stream_cursor = conn.cursor(pymysql.cursors.SSCursor)
+        try:
+            read_start = time.monotonic()
+            stream_cursor.execute(active_sql, [config.now_mw])
+            timing.active_read += time.monotonic() - read_start
+            while True:
+                fetch_start = time.monotonic()
+                rows = stream_cursor.fetchmany(_STREAM_FETCH_SIZE)
+                timing.active_read += time.monotonic() - fetch_start
+                if not rows:
+                    break
+                batch_active: Dict[str, Dict[str, Any]] = {}
+                _merge_active_rows(batch_active, rows)
+                if batch_active:
+                    if config.dry_run:
+                        active_upserted += len(batch_active)
+                    else:
+
+                        def _commit_active_batch(entries: Dict[str, Dict[str, Any]] = batch_active) -> int:
+                            with transaction.atomic():
+                                return _upsert_active_blocks(
+                                    spec.storage_wiki,
+                                    entries,
+                                    now_dt=sync_mark_dt,
+                                    sqlite_sql=_UPSERT_ACTIVE_SQLITE_SQL,
+                                    mysql_sql=_UPSERT_ACTIVE_MYSQL_SQL,
+                                )
+
+                        write_start = time.monotonic()
+                        active_upserted += _run_toolsdb_with_retry(
+                            _commit_active_batch,
+                            context=f"active block batch upsert for {spec.storage_wiki}",
+                        )
+                        timing.active_write += time.monotonic() - write_start
+                    batch_active.clear()
+        finally:
+            with contextlib.suppress(pymysql.MySQLError, OSError):
+                stream_cursor.close()
+            with contextlib.suppress(pymysql.MySQLError, OSError), conn.cursor() as timeout_cursor:
+                timeout_cursor.execute(_SET_REPLICA_STATEMENT_TIMEOUT_SQL)
+    finally:
+        if owned_conn is not None:
+            _safe_close_replica(owned_conn)
+
     if config.dry_run:
         return active_upserted
 
     stage_ctx.stage = "active_write"
     sweep_start = time.monotonic()
-    active_deactivated = _deactivate_stale_active_blocks(spec.storage_wiki, sync_mark_dt=sync_mark_dt)
+    active_deactivated = _run_bounded_toolsdb_batch(
+        _DEACTIVATE_STALE_ACTIVE_SQLITE_SQL,
+        _DEACTIVATE_STALE_ACTIVE_MYSQL_SQL,
+        lambda: (_prep_db_datetime(sync_mark_dt), spec.storage_wiki, _prep_db_datetime(sync_mark_dt)),
+        context=f"stale active block deactivation for {spec.storage_wiki}",
+    )
     timing.active_write += time.monotonic() - sweep_start
     return active_upserted + active_deactivated
 
@@ -1548,104 +1116,6 @@ class Command(BaseCommand):
         if callable(flush):
             flush()
 
-    def _commit_target_sync_state(
-        self,
-        spec: _SyncTargetSpec,
-        *,
-        sync_mark_dt: datetime,
-        stage_ctx: _WikiSyncStage,
-    ) -> None:
-        stage_ctx.stage = "sync_state"
-
-        def _commit_sync_state() -> None:
-            with transaction.atomic():
-                _advance_sync_state(spec.storage_wiki, wiki_domain=spec.wiki_domain, now_dt=sync_mark_dt)
-
-        _run_toolsdb_with_retry(
-            _commit_sync_state,
-            context=f"sync state update for {spec.storage_wiki}",
-        )
-
-    def _sync_wiki_target(
-        self,
-        session: _ReplicaSession,
-        spec: _SyncTargetSpec,
-        *,
-        config: _SyncRunConfig,
-        stage_ctx: _WikiSyncStage,
-    ) -> _WikiSyncResult:
-        timing = _WikiTiming(wiki=spec.storage_wiki)
-        state = config.sync_states.get(spec.storage_wiki)
-        last_log_id = int(state.last_log_id) if state is not None else 0
-        stage_ctx.log_id = last_log_id
-        use_full_active = last_log_id == 0 or config.full_active_reconcile
-        has_expired_rows = spec.storage_wiki in config.expired_wikis
-
-        stage_ctx.stage = "max_id"
-        max_id_start = time.monotonic()
-        target_max_id = _query_max_log_id(session, spec, last_log_id)
-        timing.max_id = time.monotonic() - max_id_start
-        has_new_logs = target_max_id > last_log_id
-
-        if not use_full_active and not has_new_logs and not has_expired_rows:
-            return _WikiSyncResult(
-                active_changes=0,
-                log_targets=0,
-                used_fast_path=True,
-                budget_reached=False,
-                timing=timing,
-            )
-
-        sync_mark_dt = _next_sync_mark_dt(config.now_dt, state)
-        log_result = _LogStreamResult(log_targets=0, active_changes=0, chunks_committed=0, budget_reached=False)
-        if has_new_logs:
-            log_result = _stream_incremental_logs(
-                session,
-                spec,
-                last_log_id=last_log_id,
-                target_max_id=target_max_id,
-                config=config,
-                collect_touched=not use_full_active,
-                active_now_dt=sync_mark_dt,
-                stage_ctx=stage_ctx,
-                timing=timing,
-            )
-
-        if use_full_active:
-            full_sync_mark_dt = _next_sync_mark_dt(config.now_dt, state)
-            active_changes = _reconcile_full_active(
-                session,
-                spec,
-                config=config,
-                sync_mark_dt=full_sync_mark_dt,
-                stage_ctx=stage_ctx,
-                timing=timing,
-            )
-            state_sync_dt = full_sync_mark_dt
-        else:
-            active_changes = log_result.active_changes
-            if has_expired_rows and not config.dry_run:
-                stage_ctx.stage = "expire"
-                expire_start = time.monotonic()
-                active_changes += _deactivate_expired_active_blocks(
-                    spec.storage_wiki,
-                    now_dt=config.now_dt,
-                    updated_dt=sync_mark_dt,
-                )
-                timing.expire = time.monotonic() - expire_start
-            state_sync_dt = sync_mark_dt
-
-        if not config.dry_run and (use_full_active or log_result.chunks_committed == 0):
-            self._commit_target_sync_state(spec, sync_mark_dt=state_sync_dt, stage_ctx=stage_ctx)
-
-        return _WikiSyncResult(
-            active_changes=active_changes,
-            log_targets=log_result.log_targets,
-            used_fast_path=False,
-            budget_reached=log_result.budget_reached,
-            timing=timing,
-        )
-
     def _run_single_target(
         self,
         session: _ReplicaSession,
@@ -1655,7 +1125,95 @@ class Command(BaseCommand):
     ) -> Optional[_WikiSyncResult]:
         stage_ctx = _WikiSyncStage()
         try:
-            return self._sync_wiki_target(session, spec, config=config, stage_ctx=stage_ctx)
+            timing = _WikiTiming(wiki=spec.storage_wiki)
+            state = config.sync_states.get(spec.storage_wiki)
+            last_log_id = int(state.last_log_id) if state is not None else 0
+            stage_ctx.log_id = last_log_id
+            use_full_active = last_log_id == 0 or config.full_active_reconcile
+            has_expired_rows = spec.storage_wiki in config.expired_wikis
+
+            if not isinstance(spec.replica_db, str) or not _REPLICA_DB_RE.fullmatch(spec.replica_db):
+                raise ValueError(f"Invalid replica database name: {spec.replica_db!r}")
+
+            stage_ctx.stage = "max_id"
+            max_id_start = time.monotonic()
+            conn = session.select_db(spec.replica_db)
+            with conn.cursor() as cursor:
+                cursor.execute(spec.max_log_id_sql, [last_log_id, spec.log_type, *spec.log_actions])
+                max_row = cursor.fetchone()
+            raw_max_id = int(max_row[0] or 0) if max_row else 0
+            target_max_id = raw_max_id if raw_max_id > last_log_id else 0
+            timing.max_id = time.monotonic() - max_id_start
+            has_new_logs = target_max_id > last_log_id
+
+            if not use_full_active and not has_new_logs and not has_expired_rows:
+                return _WikiSyncResult(
+                    active_changes=0,
+                    log_targets=0,
+                    used_fast_path=True,
+                    budget_reached=False,
+                    timing=timing,
+                )
+
+            sync_mark_dt = _next_sync_mark_dt(config.now_dt, state)
+            log_targets = 0
+            log_active_changes = 0
+            chunks_committed = 0
+            budget_reached = False
+            if has_new_logs:
+                log_targets, log_active_changes, chunks_committed, budget_reached = _stream_incremental_logs(
+                    session,
+                    spec,
+                    last_log_id=last_log_id,
+                    target_max_id=target_max_id,
+                    config=config,
+                    collect_touched=not use_full_active,
+                    active_now_dt=sync_mark_dt,
+                    stage_ctx=stage_ctx,
+                    timing=timing,
+                )
+
+            if use_full_active:
+                full_sync_mark_dt = _next_sync_mark_dt(config.now_dt, state)
+                active_changes = _reconcile_full_active(
+                    session,
+                    spec,
+                    config=config,
+                    sync_mark_dt=full_sync_mark_dt,
+                    stage_ctx=stage_ctx,
+                    timing=timing,
+                )
+                state_sync_dt = full_sync_mark_dt
+            else:
+                active_changes = log_active_changes
+                if has_expired_rows and not config.dry_run:
+                    stage_ctx.stage = "expire"
+                    expire_start = time.monotonic()
+                    active_changes += _run_bounded_toolsdb_batch(
+                        _DEACTIVATE_EXPIRED_ACTIVE_SQLITE_SQL,
+                        _DEACTIVATE_EXPIRED_ACTIVE_MYSQL_SQL,
+                        lambda: (_prep_db_datetime(sync_mark_dt), spec.storage_wiki, _prep_db_datetime(config.now_dt)),
+                        context=f"expired active block deactivation for {spec.storage_wiki}",
+                    )
+                    timing.expire = time.monotonic() - expire_start
+                state_sync_dt = sync_mark_dt
+
+            if not config.dry_run and (use_full_active or chunks_committed == 0):
+                stage_ctx.stage = "sync_state"
+
+                def _commit_sync_state() -> None:
+                    with transaction.atomic():
+                        _advance_sync_state(spec.storage_wiki, wiki_domain=spec.wiki_domain, now_dt=state_sync_dt)
+
+                _run_toolsdb_with_retry(_commit_sync_state, context=f"sync state update for {spec.storage_wiki}")
+
+            return _WikiSyncResult(
+                active_changes=active_changes,
+                log_targets=log_targets,
+                used_fast_path=False,
+                budget_reached=budget_reached,
+                timing=timing,
+            )
         except (pymysql.MySQLError, DatabaseError, OSError) as exc:
             connection.close()
             session.close()
@@ -1669,32 +1227,6 @@ class Command(BaseCommand):
                 sanitize_error_message(str(exc)),
             )
             return None
-
-    def _report_section_summary(
-        self,
-        section: str,
-        *,
-        section_synced: int,
-        section_failed: int,
-        fast_path_count: int,
-        elapsed_seconds: float,
-        timings: Sequence[_WikiTiming],
-    ) -> None:
-        self._write_progress(
-            f"[section {section}] completed (synced={section_synced}, failed={section_failed}, "
-            f"fast_path={fast_path_count}, elapsed={elapsed_seconds:.2f}s)."
-        )
-        if not timings:
-            return
-        slowest = sorted(timings, key=lambda item: item.total, reverse=True)[:_SLOWEST_WIKIS_LIMIT]
-        self._write_progress(f"[section {section}] slowest wikis (top {len(slowest)}):")
-        for item in slowest:
-            self._write_progress(
-                f"  {item.wiki}: total={item.total:.2f}s "
-                f"(max_id={item.max_id:.2f}s, logs={item.logs:.2f}s, "
-                f"active_read={item.active_read:.2f}s, active_write={item.active_write:.2f}s, "
-                f"expire={item.expire:.2f}s)"
-            )
 
     def _sync_section(
         self,
@@ -1738,6 +1270,8 @@ class Command(BaseCommand):
                     log_type="block",
                     log_actions=_LOCAL_LOG_ACTIONS,
                     count_actions=_LOCAL_COUNT_ACTIONS,
+                    max_log_id_sql=_MAX_LOG_ID_LOCAL_SQL,
+                    incremental_logs_sql=_INCREMENTAL_LOGS_LOCAL_SQL,
                     is_global=False,
                 )
                 local_result = self._run_single_target(session, local_spec, config=config)
@@ -1757,6 +1291,8 @@ class Command(BaseCommand):
                         log_type="gblblock",
                         log_actions=_GLOBAL_LOG_ACTIONS,
                         count_actions=_GLOBAL_COUNT_ACTIONS,
+                        max_log_id_sql=_MAX_LOG_ID_GLOBAL_SQL,
+                        incremental_logs_sql=_INCREMENTAL_LOGS_GLOBAL_SQL,
                         is_global=True,
                     )
                     global_result = self._run_single_target(session, global_spec, config=config)
@@ -1782,7 +1318,20 @@ class Command(BaseCommand):
 
         if deferred_synced_at_wikis and not config.dry_run:
             try:
-                _batch_update_synced_at(deferred_synced_at_wikis, synced_at=datetime.now(timezone.utc))
+                synced_at = datetime.now(timezone.utc)
+                unique_wikis = list(dict.fromkeys(deferred_synced_at_wikis))
+                for batch in _iter_batches(unique_wikis, _UPSERT_SQL_BATCH_SIZE):
+
+                    def _update_synced_at_batch(target_wikis: List[str] = batch) -> int:
+                        with transaction.atomic():
+                            return RangeblockSyncState.objects.filter(wiki_dbname__in=target_wikis).update(
+                                synced_at=synced_at
+                            )
+
+                    _run_toolsdb_with_retry(
+                        _update_synced_at_batch,
+                        context=f"batch synced_at update ({len(batch)} wikis)",
+                    )
             except DatabaseError as exc:
                 error_code = _extract_mysql_error_code(exc)
                 logger.warning(
@@ -1792,14 +1341,21 @@ class Command(BaseCommand):
                     sanitize_error_message(str(exc)),
                 )
 
-        self._report_section_summary(
-            section,
-            section_synced=section_synced,
-            section_failed=len(section_failed_wikis),
-            fast_path_count=len(deferred_synced_at_wikis),
-            elapsed_seconds=time.monotonic() - section_started_at,
-            timings=section_timings,
+        elapsed_seconds = time.monotonic() - section_started_at
+        self._write_progress(
+            f"[section {section}] completed (synced={section_synced}, failed={len(section_failed_wikis)}, "
+            f"fast_path={len(deferred_synced_at_wikis)}, elapsed={elapsed_seconds:.2f}s)."
         )
+        if section_timings:
+            slowest = sorted(section_timings, key=lambda item: item.total, reverse=True)[:_SLOWEST_WIKIS_LIMIT]
+            self._write_progress(f"[section {section}] slowest wikis (top {len(slowest)}):")
+            for item in slowest:
+                self._write_progress(
+                    f"  {item.wiki}: total={item.total:.2f}s "
+                    f"(max_id={item.max_id:.2f}s, logs={item.logs:.2f}s, "
+                    f"active_read={item.active_read:.2f}s, active_write={item.active_write:.2f}s, "
+                    f"expire={item.expire:.2f}s)"
+                )
         return section_synced, section_failed_wikis
 
     def handle(self, *args: Any, **options: Any) -> None:
@@ -1825,25 +1381,41 @@ class Command(BaseCommand):
             exclude_wikis -= filter_wikis
         purge_excluded = bool(options.get("purge_excluded"))
 
-        lock_client: Optional[Any] = None
-        lock_redis_url = ""
-        lock_key = ""
-        lock_token = ""
-        if not dry_run and not _is_test_environment():
-            lock_client, lock_redis_url, lock_key, lock_token, should_proceed = _acquire_sync_lock()
+        default_cache = getattr(settings, "CACHES", {}).get("default", {})
+        is_test_env = (
+            "test" in sys.argv
+            or "pytest" in sys.modules
+            or default_cache.get("BACKEND") == "django.core.cache.backends.locmem.LocMemCache"
+        )
+
+        with _distributed_sync_lock(enabled=not dry_run and not is_test_env) as (should_proceed, lock_key):
             if not should_proceed:
                 self._write_progress(
                     f"Skipping sync_world_block because another instance currently holds lock {lock_key}."
                 )
                 return
 
-        try:
             if purge_excluded and exclude_wikis:
                 for excluded_wiki in sorted(exclude_wikis):
                     if dry_run:
                         self._write_progress(f"[dry-run] Would purge excluded wiki {excluded_wiki} from ToolsDB.")
                     else:
-                        agg_del, state_del = _purge_wiki_rangeblocks(excluded_wiki)
+                        agg_del = _run_bounded_toolsdb_batch(
+                            _PURGE_WIKI_AGG_SQLITE_SQL,
+                            _PURGE_WIKI_AGG_MYSQL_SQL,
+                            lambda w=excluded_wiki: [w],
+                            context=f"excluded wiki aggregate purge for {excluded_wiki}",
+                        )
+
+                        def _delete_sync_state(w: str = excluded_wiki) -> int:
+                            with transaction.atomic():
+                                count, _ = RangeblockSyncState.objects.filter(wiki_dbname=w).delete()
+                                return int(count or 0)
+
+                        state_del = _run_toolsdb_with_retry(
+                            _delete_sync_state,
+                            context=f"excluded wiki sync state purge for {excluded_wiki}",
+                        )
                         self._write_progress(
                             f"Purged excluded wiki {excluded_wiki}: "
                             f"{agg_del} aggregate rows, {state_del} sync-state rows."
@@ -1857,16 +1429,10 @@ class Command(BaseCommand):
             )
             known_non_excluded = [w for w in sync_states if w not in exclude_wikis]
             if filter_wikis:
-                expired_wikis = _fetch_wikis_with_expired_active_blocks(
-                    now_dt,
-                    filter_wikis=filter_wikis,
-                )
+                expired_wikis = _fetch_wikis_with_expired_active_blocks(now_dt, filter_wikis=filter_wikis)
             else:
                 expired_wikis = _run_toolsdb_with_retry(
-                    lambda: _fetch_wikis_with_expired_active_blocks(
-                        now_dt,
-                        known_wikis=known_non_excluded,
-                    ),
+                    lambda: _fetch_wikis_with_expired_active_blocks(now_dt, known_wikis=known_non_excluded),
                     context="startup expired active blocks scan",
                 )
             config = _SyncRunConfig(
@@ -1881,15 +1447,35 @@ class Command(BaseCommand):
                 expired_wikis=expired_wikis,
             )
 
-            wikis = _fetch_active_wikis(
-                creds,
-                filter_wikis=filter_wikis,
-                filter_sections=filter_sections,
-                exclude_wikis=exclude_wikis or None,
-            )
-            by_section: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
-            for dbname, domain, section in wikis:
-                by_section[section].append((dbname, domain))
+            meta_conn = _connect_replica("meta.analytics.db.svc.wikimedia.cloud", "meta_p", creds)
+            try:
+                with meta_conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT dbname, url, slice FROM meta_p.wiki WHERE is_closed = 0 ORDER BY slice, dbname"
+                    )
+                    by_section: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+                    for raw_db, raw_url, raw_slice in cursor.fetchall():
+                        dbname = _decode_str(raw_db).strip().lower()
+                        domain = (
+                            _decode_str(raw_url)
+                            .strip()
+                            .removeprefix("https://")
+                            .removeprefix("http://")
+                            .split("/")[0]
+                            .strip()
+                        )
+                        section = _normalise_section(raw_slice)
+                        if not dbname:
+                            continue
+                        if exclude_wikis and dbname in exclude_wikis:
+                            continue
+                        if filter_wikis and dbname not in filter_wikis:
+                            continue
+                        if filter_sections and section not in filter_sections:
+                            continue
+                        by_section[section].append((dbname, domain))
+            finally:
+                _safe_close_replica(meta_conn)
 
             synced_count = 0
             failed_wikis: List[str] = []
@@ -1906,5 +1492,3 @@ class Command(BaseCommand):
             if synced_count == 0 and failed_wikis:
                 raise CommandError(f"Rangeblock sync failed for all targets: {summary}")
             self._write_progress(self.style.SUCCESS(summary))
-        finally:
-            _release_sync_lock(lock_client, lock_key, lock_token, redis_url=lock_redis_url)

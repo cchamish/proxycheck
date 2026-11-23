@@ -1,7 +1,4 @@
-"""
-Root URL configuration.
-Mounts the v1 API and delegates remaining routes to the compiled SPA entrypoint.
-"""
+"""Root URL configuration mounting the v1 API and compiled SPA entrypoint."""
 
 import asyncio
 import mimetypes
@@ -12,6 +9,7 @@ from django.conf import settings
 from django.http import HttpResponse, HttpResponseNotFound
 from django.middleware.csrf import get_token
 from django.urls import include, path, re_path
+from django.views.decorators.http import require_safe
 
 from detector import views as detector_views
 
@@ -22,53 +20,36 @@ _FALLBACK_SPA_HTML = """<!doctype html>
 </html>"""
 
 
-def _read_text_if_exists(file_path: Path) -> Optional[str]:
-    if file_path.is_file():
-        return file_path.read_text(encoding="utf-8")
-    return None
-
-
-def _read_favicon_svg(base_dir: Path) -> Optional[bytes]:
-    for candidate in (
-        base_dir / "dist" / "Proxycheck.svg",
-        base_dir / "src" / "assets" / "Proxycheck.svg",
-    ):
-        if candidate.is_file():
-            return candidate.read_bytes()
-    return None
-
-
-def _read_asset_bytes(assets_root: Path, rel_path: str) -> Optional[Tuple[bytes, str]]:
-    root = assets_root.resolve()
-    target = (root / rel_path).resolve()
-    if not target.is_relative_to(root) or not target.is_file():
-        return None
-    content_type, _ = mimetypes.guess_type(str(target))
-    return target.read_bytes(), content_type or "application/octet-stream"
-
-
 async def spa_index(request):
     """Serves the compiled index page for client-side SPA routes outside API, OAuth, and static asset paths."""
     get_token(request)
     index_path = Path(settings.BASE_DIR) / "dist" / "index.html"
-    html_content = await asyncio.to_thread(_read_text_if_exists, index_path)
-    if html_content is not None:
-        return HttpResponse(html_content, content_type="text/html; charset=utf-8")
-    return HttpResponse(_FALLBACK_SPA_HTML, content_type="text/html; charset=utf-8")
+
+    def read_index() -> Optional[str]:
+        return index_path.read_text(encoding="utf-8") if index_path.is_file() else None
+
+    html_content = await asyncio.to_thread(read_index)
+    return HttpResponse(html_content or _FALLBACK_SPA_HTML, content_type="text/html; charset=utf-8")
 
 
-async def serve_favicon(_request):
-    """Serves the site SVG icon asynchronously for icon endpoints without blocking ASGI."""
-    svg_bytes = await asyncio.to_thread(_read_favicon_svg, Path(settings.BASE_DIR))
-    if svg_bytes is None:
-        return HttpResponseNotFound()
-    return HttpResponse(svg_bytes, content_type="image/svg+xml")
+@require_safe
+async def serve_robots_txt(_request):
+    return HttpResponse("User-agent: *\nDisallow: /\n", content_type="text/plain; charset=utf-8")
 
 
 async def serve_debug_asset(_request, asset_path: str):
-    """Serves built Vite assets asynchronously in DEBUG mode when WhiteNoise staticfiles are not active."""
+    """Serves built Vite assets asynchronously in DEBUG mode when WhiteNoise staticfiles are inactive."""
     assets_root = Path(settings.BASE_DIR) / "dist" / "assets"
-    loaded = await asyncio.to_thread(_read_asset_bytes, assets_root, asset_path)
+
+    def read_asset() -> Optional[Tuple[bytes, str]]:
+        root = assets_root.resolve()
+        target = (root / asset_path).resolve()
+        if not target.is_relative_to(root) or not target.is_file():
+            return None
+        content_type, _ = mimetypes.guess_type(str(target))
+        return target.read_bytes(), content_type or "application/octet-stream"
+
+    loaded = await asyncio.to_thread(read_asset)
     if loaded is None:
         return HttpResponseNotFound()
     content, content_type = loaded
@@ -87,11 +68,9 @@ if settings.DEBUG:
     ]
 
 urlpatterns += [
-    path("Proxycheck.svg", serve_favicon),
-    path("favicon.svg", serve_favicon),
-    path("favicon.ico", serve_favicon),
+    path("robots.txt", serve_robots_txt, name="robots_txt"),
     re_path(
-        r"^(?!api/|oauth/|assets/|Proxycheck\.svg|favicon\.svg|favicon\.ico).*$",
+        r"^(?!api/|oauth/|assets/).*$",
         spa_index,
         name="spa_index",
     ),

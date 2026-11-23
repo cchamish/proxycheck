@@ -690,11 +690,11 @@ LOGGING = {
             "level": "INFO",
             "propagate": False,
         },
-    },
-    "httpx": {
-        "level": "WARNING",
-    },
-    "httpcore": {
-        "level": "WARNING",
+        "httpx": {
+            "level": "WARNING",
+        },
+        "httpcore": {
+            "level": "WARNING",
+        },
     },
 }

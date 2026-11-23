@@ -297,3 +297,73 @@ test('disables Refetch button state while detector stream is active or has pendi
     isBusy: true,
   });
 });
+
+test('re-enables Refetch and clears pendingProviders when an SSE stream drops mid-flight', async () => {
+  const encoder = new TextEncoder();
+  let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+  const streamBody = new ReadableStream<Uint8Array>({
+    start(controller) {
+      streamController = controller;
+    },
+  });
+
+  const requestedUrls: string[] = [];
+  const coordinator = createDetectionCoordinator(async (url) => {
+    requestedUrls.push(url);
+    if (url.startsWith('/api/v1/detect/stream')) {
+      return {
+        ok: true,
+        status: 200,
+        headers: {
+          get(name: string) {
+            return name.toLowerCase() === 'content-type' ? 'text/event-stream' : null;
+          },
+        },
+        body: streamBody,
+        json: async () => ({}),
+      };
+    }
+    if (url === '/api/v1/detect/refresh') {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ...makeDetectionPayload('8.8.8.8'),
+          arbitrationVerdict: 'Recovered Verdict',
+        }),
+      };
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  });
+
+  const detectPromise = coordinator.executeDetection('8.8.8.8');
+  streamController!.enqueue(
+    encoder.encode(
+      `event: snapshot\ndata: ${JSON.stringify({
+        ...makeDetectionPayload('8.8.8.8'),
+        pendingProviders: ['AbuseIPDB'],
+      })}\n\n`
+    )
+  );
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(coordinator.state.isStreaming, true);
+
+  // Drop the stream connection before `done` arrives.
+  streamController!.error(new Error('network disconnected'));
+  await detectPromise;
+
+  assert.equal(coordinator.state.isStreaming, false);
+  assert.deepEqual(coordinator.state.detectionData?.pendingProviders, []);
+  assert.equal(
+    getRefetchButtonState(coordinator.state.detectionData!, {
+      isLoading: coordinator.state.isLoading,
+      isStreaming: coordinator.state.isStreaming,
+      isRefreshing: coordinator.state.isRefreshing,
+    }).disabled,
+    false
+  );
+
+  await coordinator.refreshDetection();
+  assert.deepEqual(requestedUrls, ['/api/v1/detect/stream?ip=8.8.8.8', '/api/v1/detect/refresh']);
+  assert.equal(coordinator.state.detectionData?.arbitrationVerdict, 'Recovered Verdict');
+});

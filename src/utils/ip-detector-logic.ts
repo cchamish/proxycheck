@@ -937,6 +937,9 @@ export function createDetectionCoordinator(
       if (requestId === latestRequestId) {
         state.isLoading = false;
         state.isStreaming = false;
+        if (state.detectionData?.pendingProviders?.length) {
+          state.detectionData = { ...state.detectionData, pendingProviders: [] };
+        }
       }
     }
   }

@@ -469,6 +469,25 @@ export function formatDiagnosticSummary(diagnostic?: DiagnosticMetrics | null): 
   return parts.join(' \u00b7 ');
 }
 
+export type TabSwitchLookup = 'detect' | 'rangeblock' | null;
+
+export function resolveTabSwitchLookup(params: {
+  nextTab: AppTab;
+  currentIp: string | null;
+  canQuery: boolean;
+  detectionIp: string | null;
+  hasActiveRangeblock: boolean;
+}): TabSwitchLookup {
+  const { nextTab, currentIp, canQuery, detectionIp, hasActiveRangeblock } = params;
+  if (!currentIp || !canQuery) {
+    return null;
+  }
+  if (nextTab === 'rb') {
+    return hasActiveRangeblock ? null : 'rangeblock';
+  }
+  return detectionIp === currentIp ? null : 'detect';
+}
+
 export function createLoggedOutUserState(): UserSessionState {
   return {
     isLoggedIn: false,

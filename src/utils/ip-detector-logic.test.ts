@@ -5,6 +5,7 @@ import {
   createDetectionCoordinator,
   isAuthorisedAdminUser,
   isValidIpAddress,
+  resolveTabSwitchLookup,
   type DetectionCoordinatorState,
   type DetectionResponse,
 } from './ip-detector-logic';
@@ -151,4 +152,28 @@ test('enforces allowlist admin authorisation strictly', () => {
   for (const item of cases) {
     assert.equal(isAuthorisedAdminUser(item.user), item.expected);
   }
+});
+
+test('re-runs detection when switching back to the detector tab with a different IP', () => {
+  const base = { currentIp: '2001:4860:4860::8888', canQuery: true, hasActiveRangeblock: true };
+
+  assert.equal(resolveTabSwitchLookup({ ...base, nextTab: 'detector', detectionIp: '8.8.8.8' }), 'detect');
+  assert.equal(resolveTabSwitchLookup({ ...base, nextTab: 'detector', detectionIp: null }), 'detect');
+  assert.equal(
+    resolveTabSwitchLookup({ ...base, nextTab: 'detector', detectionIp: '2001:4860:4860::8888' }),
+    null
+  );
+  assert.equal(
+    resolveTabSwitchLookup({ ...base, nextTab: 'detector', detectionIp: '8.8.8.8', canQuery: false }),
+    null
+  );
+  assert.equal(
+    resolveTabSwitchLookup({ ...base, nextTab: 'detector', detectionIp: '8.8.8.8', currentIp: null }),
+    null
+  );
+  assert.equal(resolveTabSwitchLookup({ ...base, nextTab: 'rb', detectionIp: '8.8.8.8' }), null);
+  assert.equal(
+    resolveTabSwitchLookup({ ...base, nextTab: 'rb', detectionIp: '8.8.8.8', hasActiveRangeblock: false }),
+    'rangeblock'
+  );
 });

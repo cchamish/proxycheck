@@ -506,7 +506,7 @@ watch(activeTab, (nextTab) => {
   if (lookup === 'rangeblock' && currentIp) {
     void executeRangeblockLookup(currentIp);
   } else if (lookup === 'detect' && currentIp) {
-    void executeDetection(currentIp);
+    void executeDetection(currentIp, { preserveMatchingRangeblock: true });
   }
 });
 
@@ -532,10 +532,13 @@ function handleSelectRbWiki(wiki: string | null): void {
 
 let pendingDetectionIp: string | null = null;
 
-async function executeDetection(ipToQuery: string): Promise<void> {
+async function executeDetection(
+  ipToQuery: string,
+  options?: { preserveMatchingRangeblock?: boolean }
+): Promise<void> {
   const canonical = canonicalizeIpAddress(ipToQuery);
   pendingDetectionIp = canonical;
-  if (!canonical || rbData.value?.ip !== canonical) {
+  if (!options?.preserveMatchingRangeblock || !canonical || rbData.value?.ip !== canonical) {
     rbData.value = null;
     rbError.value = '';
   }

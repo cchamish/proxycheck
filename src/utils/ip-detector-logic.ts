@@ -274,11 +274,29 @@ export interface DetectionCoordinatorOptions {
 
 const IPV4_PATTERN = /^((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.?\b){4}$/;
 const IPV6_PATTERN =
-  /^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))$/;
+  /^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,})$/;
+
+function ipv4TailToHex(ip: string): string {
+  const lastColon = ip.lastIndexOf(':');
+  const octets = ip.slice(lastColon + 1).split('.').map(Number);
+  const high = ((octets[0] << 8) | octets[1]).toString(16);
+  const low = ((octets[2] << 8) | octets[3]).toString(16);
+  return `${ip.slice(0, lastColon + 1)}${high}:${low}`;
+}
 
 export function isValidIpAddress(ip: string): boolean {
   if (!ip || typeof ip !== 'string') return false;
   const trimmed = ip.trim();
+
+  if (trimmed.includes(':') && trimmed.includes('.')) {
+    const octets = trimmed.slice(trimmed.lastIndexOf(':') + 1).split('.');
+    if (octets.length !== 4 || !octets.every((octet) =>
+      /^\d{1,3}$/.test(octet) && String(Number(octet)) === octet && Number(octet) <= 255
+    )) {
+      return false;
+    }
+    return isValidIpAddress(ipv4TailToHex(trimmed));
+  }
 
   if (IPV4_PATTERN.test(trimmed)) {
     const parts = trimmed.split('.');
@@ -304,13 +322,8 @@ export function canonicalizeIpAddress(rawIp: string): string | null {
 
   const [addrWithoutZone, zoneId] = trimmed.split('%');
   let working = addrWithoutZone;
-  const lastColon = working.lastIndexOf(':');
-  const tail = working.slice(lastColon + 1);
-  if (tail.includes('.')) {
-    const octets = tail.split('.').map((o) => Number(o));
-    const high = ((octets[0] << 8) | octets[1]).toString(16);
-    const low = ((octets[2] << 8) | octets[3]).toString(16);
-    working = `${working.slice(0, lastColon + 1)}${high}:${low}`;
+  if (working.includes('.')) {
+    working = ipv4TailToHex(working);
   }
 
   let groups: string[];

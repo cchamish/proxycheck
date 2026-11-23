@@ -1,10 +1,10 @@
 """
-URL routing for the v1 API endpoint namespace.
-Supports both trailing-slash and non-trailing-slash paths to avoid redirect issues
-on POST requests behind Toolforge ingress and Vite development proxies.
+URL routing for the v1 API namespace.
+Accepts both trailing-slash and non-trailing-slash paths to avoid POST redirects
+behind Toolforge ingress and Vite development proxies.
 """
 
-from django.urls import path, re_path
+from django.urls import path
 
 from . import views
 
@@ -20,18 +20,19 @@ urlpatterns = [
     path("rangeblock", views.rangeblock_lookup, name="rangeblock_lookup"),
     path("rangeblock/", views.rangeblock_lookup),
     path("auth/user/", views.get_current_user, name="auth_user"),
-    re_path(r"^auth/user$", views.get_current_user),
+    path("auth/user", views.get_current_user),
     path("auth/login/", views.oauth_login, name="auth_login"),
-    re_path(r"^auth/login$", views.oauth_login),
-    re_path(r"^auth/callback/?$", views.oauth_callback, name="auth_callback"),
+    path("auth/login", views.oauth_login),
+    path("auth/callback/", views.oauth_callback, name="auth_callback"),
+    path("auth/callback", views.oauth_callback),
     path("auth/logout/", views.oauth_logout, name="auth_logout"),
-    re_path(r"^auth/logout$", views.oauth_logout),
+    path("auth/logout", views.oauth_logout),
     path("auth/gadget-token/", views.exchange_gadget_token, name="auth_gadget_token"),
-    re_path(r"^auth/gadget-token$", views.exchange_gadget_token),
+    path("auth/gadget-token", views.exchange_gadget_token),
     path("auth/switch-role/", views.switch_test_role, name="switch_test_role"),
-    re_path(r"^auth/switch-role$", views.switch_test_role),
+    path("auth/switch-role", views.switch_test_role),
     path("admin/provider-dashboard/", views.admin_provider_dashboard, name="admin_provider_dashboard"),
-    re_path(r"^admin/provider-dashboard$", views.admin_provider_dashboard),
+    path("admin/provider-dashboard", views.admin_provider_dashboard),
     path("status/", views.system_status, name="system_status"),
-    re_path(r"^status$", views.system_status),
+    path("status", views.system_status),
 ]

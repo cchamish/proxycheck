@@ -60,6 +60,27 @@
           <code>{{ REQUIRED_USER_RIGHTS[0] }}(-no-preference)</code>
           right on any Wikimedia project.
         </p>
+        <cdx-message type="notice" :inline="false" class="barrier__message">
+          <p>
+            Entered IPs are checked against local offline databases and configured
+            third-party proxy/RDAP providers without being access-logged by Proxycheck.
+            Lookups remain subject to the policies below.
+          </p>
+          <ul>
+            <li>
+              <a href="https://foundation.wikimedia.org/wiki/Special:MyLanguage/Policy:Privacy_policy" target="_blank" rel="noopener">Foundation Privacy Policy</a>
+            </li>
+            <li>
+              <a href="https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Foundation_Access_to_Nonpublic_Personal_Data_Policy" target="_blank" rel="noopener">Foundation Access to Nonpublic Personal Data Policy</a>
+            </li>
+            <li>
+              <a href="https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Access_to_Temporary_Account_IP_Addresses_Policy" target="_blank" rel="noopener">Foundation Access to Temporary Account IP Addresses Policy</a>
+            </li>
+            <li>
+              <a href="https://wikitech.wikimedia.org/wiki/Wikitech:Cloud_Services_Terms_of_use" target="_blank" rel="noopener">Cloud Services Terms of use</a>
+            </li>
+          </ul>
+        </cdx-message>
       </div>
 
       <div v-else-if="!user.hasAccess" class="barrier">

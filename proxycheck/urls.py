@@ -37,22 +37,6 @@ async def serve_robots_txt(_request):
     return HttpResponse("User-agent: *\nDisallow: /\n", content_type="text/plain; charset=utf-8")
 
 
-async def serve_favicon(_request):
-    """Serves the site SVG icon asynchronously without blocking the ASGI event loop."""
-    base_dir = Path(settings.BASE_DIR)
-
-    def read_svg() -> Optional[bytes]:
-        for candidate in (base_dir / "dist" / "Proxycheck.svg", base_dir / "src" / "assets" / "Proxycheck.svg"):
-            if candidate.is_file():
-                return candidate.read_bytes()
-        return None
-
-    svg_bytes = await asyncio.to_thread(read_svg)
-    if svg_bytes is None:
-        return HttpResponseNotFound()
-    return HttpResponse(svg_bytes, content_type="image/svg+xml")
-
-
 async def serve_debug_asset(_request, asset_path: str):
     """Serves built Vite assets asynchronously in DEBUG mode when WhiteNoise staticfiles are inactive."""
     assets_root = Path(settings.BASE_DIR) / "dist" / "assets"
@@ -85,11 +69,8 @@ if settings.DEBUG:
 
 urlpatterns += [
     path("robots.txt", serve_robots_txt, name="robots_txt"),
-    path("Proxycheck.svg", serve_favicon),
-    path("favicon.svg", serve_favicon),
-    path("favicon.ico", serve_favicon),
     re_path(
-        r"^(?!api/|oauth/|assets/|Proxycheck\.svg|favicon\.svg|favicon\.ico).*$",
+        r"^(?!api/|oauth/|assets/).*$",
         spa_index,
         name="spa_index",
     ),

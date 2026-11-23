@@ -2,12 +2,6 @@
   <div class="app-layout">
     <header class="app-header">
       <div class="app-header__brand">
-        <img
-          :src="proxycheckLogo"
-          alt=""
-          class="app-logo"
-          aria-hidden="true"
-        />
         <h1 class="app-title">Proxycheck</h1>
       </div>
       <div class="app-header__actions">
@@ -201,7 +195,6 @@
 
 <script setup lang="ts">
 import { reactive, toRefs, ref, computed, watch, onMounted, onUnmounted } from 'vue';
-import proxycheckLogo from './assets/Proxycheck.svg';
 import toolforgeLogo from './assets/Toolforge.svg';
 import wmcsLogo from './assets/WMCS.svg';
 import wmcsDarkLogo from './assets/WMCS-dark.svg';

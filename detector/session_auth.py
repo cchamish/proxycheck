@@ -31,6 +31,7 @@ from .oauth import (
     is_session_rights_expired,
     normalize_and_validate_wikimedia_domain,
 )
+from .rangeblock_service import normalize_wiki_dbname
 
 logger = logging.getLogger("detector.views")
 auth_mode_logger = logging.getLogger("detector.auth_mode")
@@ -287,12 +288,26 @@ def get_session_user(request, *, context: str = "session_rights_check") -> Any:
     return session_user
 
 
+def normalize_post_login_route(params) -> Dict[str, str]:
+    """Keeps only validated SPA deep-link parameters."""
+    route = {}
+    ip = canonicalize_ip(params.get("ip", ""))
+    if ip:
+        route["ip"] = ip
+    if str(params.get("tab", "")).strip().lower() in ("rb", "rangeblock"):
+        route["tab"] = "rb"
+        wiki = normalize_wiki_dbname(params.get("wiki"))
+        if wiki:
+            route["wiki"] = wiki
+    return route
+
+
 @sync_to_async(thread_sensitive=True)
-def pop_oauth_login_context(request) -> Tuple[Any, Optional[str], bool]:
-    """Pops the OAuth state token and optional post-login IP target from the session in one write."""
+def pop_oauth_login_context(request) -> Tuple[Any, Dict[str, str], bool]:
+    """Pops the OAuth state token and post-login route from the session in one write."""
     try:
         state = request.session.pop("oauth_state", None)
-        post_login_ip = request.session.pop("oauth_post_login_ip", None)
+        post_login_route = request.session.pop("oauth_post_login_route", {})
     except Exception as exc:
         if not is_session_backend_error(exc):
             raise
@@ -301,30 +316,30 @@ def pop_oauth_login_context(request) -> Tuple[Any, Optional[str], bool]:
             "OAuth login context load failed due to cache backend unavailability (%s)",
             type(exc).__name__,
         )
-        return None, None, False
+        return None, {}, False
     request.session.modified = True
     saved = _safe_save_session(request, context="oauth_callback_state_pop")
-    cleaned_ip = canonicalize_ip(str(post_login_ip)) if isinstance(post_login_ip, str) else None
-    return state, cleaned_ip, saved
+    route = normalize_post_login_route(post_login_route) if isinstance(post_login_route, dict) else {}
+    return state, route, saved
 
 
 @sync_to_async(thread_sensitive=True)
-def persist_oauth_login_context(request, state: str, post_login_ip: Optional[str]) -> bool:
-    """Persists OAuth state and an optional validated IP deep-link target with rollback on failure."""
-    had_prev_ip = "oauth_post_login_ip" in request.session
-    prev_ip = request.session.get("oauth_post_login_ip")
+def persist_oauth_login_context(request, state: str, post_login_route: Dict[str, str]) -> bool:
+    """Persists OAuth state and a validated deep-link route with rollback on failure."""
+    had_prev_route = "oauth_post_login_route" in request.session
+    prev_route = request.session.get("oauth_post_login_route")
     request.session["oauth_state"] = state
-    if post_login_ip:
-        request.session["oauth_post_login_ip"] = post_login_ip
+    if post_login_route:
+        request.session["oauth_post_login_route"] = normalize_post_login_route(post_login_route)
     else:
-        request.session.pop("oauth_post_login_ip", None)
+        request.session.pop("oauth_post_login_route", None)
     request.session.modified = True
     if not _safe_save_session(request, context="oauth_login"):
         request.session.pop("oauth_state", None)
-        if had_prev_ip:
-            request.session["oauth_post_login_ip"] = prev_ip
+        if had_prev_route:
+            request.session["oauth_post_login_route"] = prev_route
         else:
-            request.session.pop("oauth_post_login_ip", None)
+            request.session.pop("oauth_post_login_route", None)
         request.session.modified = False
         return False
     return True

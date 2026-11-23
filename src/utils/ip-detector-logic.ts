@@ -368,6 +368,21 @@ export function canonicalizeIpAddress(rawIp: string): string | null {
   return zoneId ? `${compressed}%${zoneId}` : compressed;
 }
 
+export function buildOAuthLoginUrl(search?: string | null, fallbackIp?: string | null): string {
+  const params = new URLSearchParams(search || '');
+  const ip = canonicalizeIpAddress((params.get('ip') || '').trim()) ?? canonicalizeIpAddress(fallbackIp || '');
+  const tab = (params.get('tab') || '').trim().toLowerCase();
+  const wiki = (params.get('wiki') || '').trim().toLowerCase();
+  const route = new URLSearchParams();
+  if (ip) route.set('ip', ip);
+  if (tab === 'rb' || tab === 'rangeblock') {
+    route.set('tab', 'rb');
+    if (/^[a-z0-9_]{2,64}$/.test(wiki)) route.set('wiki', wiki);
+  }
+  const query = route.toString();
+  return query ? `/api/v1/auth/login/?${query}` : '/api/v1/auth/login/';
+}
+
 const ENGLISH_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 export function normalizeUtcCommitTimestamp(timestamp?: string | null): string {

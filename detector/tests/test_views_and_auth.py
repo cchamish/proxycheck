@@ -150,11 +150,14 @@ class DetectorViewsAndAuthTests(TestCase):
     )
     def test_oauth_login_and_callback_state_and_session_cycle_key(self):
         """Rotates session keys via cycle_key on login and prevents OAuth state replay."""
-        login_resp = self.client.get("/api/v1/auth/login/?ip=2001:0db8:0:0::0001")
+        login_resp = self.client.get("/api/v1/auth/login/?ip=2001:0db8:0:0::0001&tab=rb&wiki=enwiki")
         self.assertEqual(login_resp.status_code, 302)
         state = parse_qs(urlparse(login_resp["Location"]).query)["state"][0]
         session_key_before = self.client.session.session_key
-        self.assertEqual(self.client.session.get("oauth_post_login_ip"), "2001:db8::1")
+        self.assertEqual(
+            self.client.session.get("oauth_post_login_route"),
+            {"ip": "2001:db8::1", "tab": "rb", "wiki": "enwiki"},
+        )
 
         mock_client = AsyncMock()
         mock_client.post.return_value = _mock_response(200, {"access_token": "tok-1"})
@@ -172,7 +175,8 @@ class DetectorViewsAndAuthTests(TestCase):
         ):
             cb_resp = self.client.get(f"/api/v1/auth/callback/?code=auth-code&state={state}")
         self.assertEqual(cb_resp.status_code, 302)
-        self.assertEqual(cb_resp["Location"], "/?ip=2001%3Adb8%3A%3A1")
+        self.assertEqual(cb_resp["Location"], "/?ip=2001%3Adb8%3A%3A1&tab=rb&wiki=enwiki")
+        self.assertNotIn("oauth_post_login_route", self.client.session)
         self.assertNotEqual(self.client.session.session_key, session_key_before)
         self.assertTrue(self.client.session["wikimedia_user"]["hasAccess"])
 
@@ -196,6 +200,21 @@ class DetectorViewsAndAuthTests(TestCase):
         ):
             fail_client.get(f"/api/v1/auth/callback/?code=auth-code&state={next_state}")
         self.assertNotIn("wikimedia_user", fail_client.session)
+
+    @override_settings(DEBUG=True, ENABLE_TEST_AUTH=True, WIKIMEDIA_CLIENT_ID="", WIKIMEDIA_REDIRECT_URI="")
+    def test_test_auth_preserves_only_validated_route_params(self):
+        cases = [
+            ({"ip": "2001:0db8::1", "tab": "rb", "wiki": "enwiki"}, "/?ip=2001%3Adb8%3A%3A1&tab=rb&wiki=enwiki"),
+            ({"tab": " RangeBlock ", "wiki": " ENWIKI "}, "/?tab=rb&wiki=enwiki"),
+            ({"tab": "rb", "wiki": "https://evil.test", "next": "//evil.test"}, "/?tab=rb"),
+            ({"tab": "evil", "wiki": "x", "ip": "bad"}, "/"),
+            ({}, "/"),
+        ]
+        for params, target in cases:
+            with self.subTest(params=params):
+                response = self.client.get("/api/v1/auth/login/", params)
+                self.assertEqual(response.status_code, 302)
+                self.assertEqual(response["Location"], target)
 
     def test_logout_requires_post_with_csrf_and_always_deletes_cookie(self):
         """Enforces POST+CSRF logout, no-store headers, CSRF seeding, and auth-gated memoryMb."""

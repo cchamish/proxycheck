@@ -214,6 +214,7 @@ import RangeblockFinderView from './components/RangeblockFinderView.vue';
 import {
   REQUIRED_USER_RIGHTS,
   buildDiagnosticMetrics,
+  buildOAuthLoginUrl,
   canonicalizeIpAddress,
   createDetectionCoordinator,
   createLoggedOutUserState,
@@ -585,12 +586,7 @@ async function fetchUserStatus(): Promise<void> {
 }
 
 function handleLogin(): void {
-  const params = new URLSearchParams(window.location.search || '');
-  const targetIp =
-    canonicalizeIpAddress((params.get('ip') || '').trim()) ?? canonicalizeIpAddress(inputIp.value);
-  window.location.href = targetIp
-    ? `/api/v1/auth/login/?ip=${encodeURIComponent(targetIp)}`
-    : '/api/v1/auth/login/';
+  window.location.href = buildOAuthLoginUrl(window.location.search, inputIp.value);
 }
 
 async function handleLogout(): Promise<void> {

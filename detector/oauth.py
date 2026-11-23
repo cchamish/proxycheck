@@ -1,6 +1,4 @@
-"""
-Wikimedia OAuth 2.0 group inspection, CentralAuth verification, and role-based access control.
-"""
+"""Wikimedia OAuth 2.0 group inspection, CentralAuth verification, and role-based access control."""
 
 import logging
 import os
@@ -27,15 +25,6 @@ WIKIMEDIA_BETA_SUFFIXES = (
 WIKIMEDIA_HOST_SUFFIXES = rf"{WIKIMEDIA_BETA_SUFFIXES}|wikimediafoundation"
 WIKIMEDIA_HOST_RE = re.compile(rf"^(?:[a-z0-9-]+\.)*(?:{WIKIMEDIA_HOST_SUFFIXES})\.org$")
 WIKIMEDIA_BETA_HOST_RE = re.compile(rf"^(?:[a-z0-9-]+\.)*(?:{WIKIMEDIA_BETA_SUFFIXES})\.beta\.wm(?:cloud|flabs)\.org$")
-
-
-def is_wikimedia_beta_origins_allowed() -> bool:
-    """Returns True only when Wikimedia Beta Cluster origins and domains are explicitly enabled."""
-    configured = getattr(settings, "ALLOW_WIKIMEDIA_BETA_ORIGINS", None)
-    if isinstance(configured, bool):
-        return configured
-    return os.environ.get("ALLOW_WIKIMEDIA_BETA_ORIGINS", "").strip() == "1"
-
 
 REQUIRED_WIKIMEDIA_RIGHTS: Tuple[str, ...] = (
     "checkuser-temporary-account-no-preference",
@@ -66,10 +55,16 @@ class InvalidCentralAuthTokenError(RuntimeError):
         self.mw_error = mw_error
 
 
+def is_wikimedia_beta_origins_allowed() -> bool:
+    """Returns True only when Wikimedia Beta Cluster origins and domains are explicitly enabled."""
+    configured = getattr(settings, "ALLOW_WIKIMEDIA_BETA_ORIGINS", None)
+    if isinstance(configured, bool):
+        return configured
+    return os.environ.get("ALLOW_WIKIMEDIA_BETA_ORIGINS", "").strip() == "1"
+
+
 def normalize_and_validate_wikimedia_domain(raw_domain: Any) -> Optional[str]:
-    """
-    Validates and normalises a Wikimedia project hostname without scheme, port, or path.
-    """
+    """Validates and normalises a Wikimedia project hostname without scheme, port, or path."""
     if not isinstance(raw_domain, str):
         return None
     candidate = raw_domain.strip().lower()
@@ -107,15 +102,13 @@ def get_allowed_wiki_users() -> Set[str]:
         raw_items = [str(item).strip() for item in configured if str(item).strip()]
     else:
         raw_items = []
-    return {normalize_wiki_username(item) for item in raw_items if normalize_wiki_username(item)}
+    return {normalised for item in raw_items if (normalised := normalize_wiki_username(item))}
 
 
 def is_allowlisted_wiki_user(username: Any) -> bool:
     """Returns True when the normalised username is present in ALLOWED_WIKI_USERS."""
-    normalized = normalize_wiki_username(username)
-    if not normalized:
-        return False
-    return normalized in get_allowed_wiki_users()
+    normalised = normalize_wiki_username(username)
+    return bool(normalised) and normalised in get_allowed_wiki_users()
 
 
 def is_session_rights_expired(
@@ -123,10 +116,7 @@ def is_session_rights_expired(
     ttl_seconds: int = DEFAULT_RIGHTS_TTL_SECONDS,
     now: Optional[float] = None,
 ) -> bool:
-    """
-    Returns True when the cached Wikimedia rights evaluation in the user session
-    has exceeded its refresh window.
-    """
+    """Returns True when the cached Wikimedia rights evaluation has exceeded its refresh window."""
     if not isinstance(user_data, dict):
         return True
     updated_at = user_data.get("rights_updated_at")
@@ -138,25 +128,24 @@ def is_session_rights_expired(
     return (current_time - float(updated_at)) > float(ttl_seconds)
 
 
-def _normalize_str_list(values: Any, *, lowercase: bool = False) -> List[str]:
+def _normalise_str_list(values: Any, *, lowercase: bool = False) -> List[str]:
     if not isinstance(values, (list, tuple, set, frozenset)):
         return []
-    normalized: List[str] = []
+    normalised: List[str] = []
     for item in values:
         if not item:
             continue
         cleaned = str(item).strip()
         if not cleaned:
             continue
-        normalized.append(cleaned.lower() if lowercase else cleaned)
-    return normalized
+        normalised.append(cleaned.lower() if lowercase else cleaned)
+    return normalised
 
 
 def _find_required_right(rights: Any) -> Optional[str]:
-    """Returns the matching temporary-account IP reveal right when present."""
-    normalized = set(_normalize_str_list(rights, lowercase=True))
+    normalised = set(_normalise_str_list(rights, lowercase=True))
     for right in REQUIRED_WIKIMEDIA_RIGHTS:
-        if right in normalized:
+        if right in normalised:
             return right
     return None
 
@@ -184,11 +173,11 @@ def evaluate_wikimedia_rights(user_info: Dict[str, Any]) -> Tuple[bool, str, Lis
     or `checkuser-temporary-account-no-preference`) rather than user group names,
     alongside the configured operator username allowlist.
     """
-    global_groups = _normalize_str_list(user_info.get("global_groups") or [], lowercase=True)
-    local_groups = _normalize_str_list(user_info.get("local_groups") or [], lowercase=True)
+    global_groups = _normalise_str_list(user_info.get("global_groups") or [], lowercase=True)
+    local_groups = _normalise_str_list(user_info.get("local_groups") or [], lowercase=True)
     raw_local_rights = user_info.get("local_rights") if "local_rights" in user_info else user_info.get("rights")
-    local_rights = _normalize_str_list(raw_local_rights or [], lowercase=True)
-    global_rights = _normalize_str_list(user_info.get("global_rights") or [], lowercase=True)
+    local_rights = _normalise_str_list(raw_local_rights or [], lowercase=True)
+    global_rights = _normalise_str_list(user_info.get("global_rights") or [], lowercase=True)
     merged_projects = user_info.get("merged_projects") or []
     username = str(user_info.get("username") or "").strip()
 
@@ -228,6 +217,18 @@ def evaluate_wikimedia_rights(user_info: Dict[str, Any]) -> Tuple[bool, str, Lis
     return False, "Standard User (Unauthorised)", local_groups, global_groups
 
 
+async def _get_mediawiki_response(
+    client: httpx.AsyncClient,
+    api_url: str,
+    params: Dict[str, str],
+) -> httpx.Response:
+    clear_client_cookies(client)
+    try:
+        return await client.get(api_url, params=params, headers={"User-Agent": WIKIMEDIA_USER_AGENT}, timeout=10.0)
+    finally:
+        clear_client_cookies(client)
+
+
 async def verify_centralauth_userinfo(
     client: httpx.AsyncClient,
     centralauth_token: str,
@@ -252,21 +253,17 @@ async def verify_centralauth_userinfo(
         "format": "json",
         "centralauthtoken": centralauth_token,
     }
-    headers = {"User-Agent": WIKIMEDIA_USER_AGENT}
-    clear_client_cookies(client)
     try:
-        resp = await client.get(api_url, params=params, headers=headers, timeout=10.0)
-    except Exception as exc:
-        logger.warning(f"Error verifying CentralAuth token with {validated_domain}: {type(exc).__name__}")
+        resp = await _get_mediawiki_response(client, api_url, params)
+    except (httpx.HTTPError, TimeoutError, OSError) as exc:
+        logger.warning("Error verifying CentralAuth token with %s: %s", validated_domain, type(exc).__name__)
         raise CentralAuthVerificationError(
             f"Wikimedia CentralAuth verification request failed on {validated_domain}.",
             mw_error={"code": "upstream_network_error", "exception": type(exc).__name__},
         ) from exc
-    finally:
-        clear_client_cookies(client)
 
     if resp.status_code != 200:
-        logger.warning(f"{validated_domain} returned HTTP {resp.status_code} during CentralAuth verification")
+        logger.warning("%s returned HTTP %s during CentralAuth verification", validated_domain, resp.status_code)
         raise CentralAuthVerificationError(
             f"{validated_domain} returned HTTP {resp.status_code}.",
             mw_error={"code": "http_error", "status": resp.status_code, "domain": validated_domain},
@@ -275,7 +272,7 @@ async def verify_centralauth_userinfo(
     try:
         data = resp.json()
     except ValueError as exc:
-        logger.warning(f"{validated_domain} returned invalid JSON during CentralAuth verification")
+        logger.warning("%s returned invalid JSON during CentralAuth verification", validated_domain)
         raise CentralAuthVerificationError(
             f"{validated_domain} returned invalid JSON.",
             mw_error={"code": "invalid_json", "domain": validated_domain},
@@ -291,19 +288,17 @@ async def verify_centralauth_userinfo(
         err_obj = data.get("error")
         err_code = str(err_obj.get("code", "")).strip() if isinstance(err_obj, dict) else ""
         err_info = str(err_obj.get("info", "")).strip() if isinstance(err_obj, dict) else ""
-        error_detail = err_code or "unknown"
-        if err_info:
-            error_detail = f"{error_detail}: {err_info}"
-        normalized_code = err_code.lower()
-        if normalized_code.startswith("internal_api_error") or normalized_code in _TRANSIENT_MEDIAWIKI_ERROR_CODES:
+        error_detail = f"{err_code or 'unknown'}: {err_info}" if err_info else (err_code or "unknown")
+        normalised_code = err_code.lower()
+        if normalised_code.startswith("internal_api_error") or normalised_code in _TRANSIENT_MEDIAWIKI_ERROR_CODES:
             logger.warning(
-                f"Transient MediaWiki error on {validated_domain} during CentralAuth verification: {error_detail}"
+                "Transient MediaWiki error on %s during CentralAuth verification: %s", validated_domain, error_detail
             )
             raise CentralAuthVerificationError(
                 f"MediaWiki transient error on {validated_domain}: {error_detail}",
                 mw_error=err_obj,
             )
-        logger.warning(f"{validated_domain} rejected CentralAuth token: {error_detail}")
+        logger.warning("%s rejected CentralAuth token: %s", validated_domain, error_detail)
         raise InvalidCentralAuthTokenError(
             f"MediaWiki rejected CentralAuth token ({error_detail}).",
             mw_error=err_obj,
@@ -312,7 +307,7 @@ async def verify_centralauth_userinfo(
     query_obj = data.get("query")
     userinfo = query_obj.get("userinfo") if isinstance(query_obj, dict) else None
     if not isinstance(userinfo, dict):
-        logger.warning(f"{validated_domain} userinfo missing from CentralAuth verification response")
+        logger.warning("%s userinfo missing from CentralAuth verification response", validated_domain)
         raise CentralAuthVerificationError(
             f"{validated_domain} userinfo missing from response.",
             mw_error={"code": "missing_userinfo", "domain": validated_domain},
@@ -346,18 +341,12 @@ async def verify_centralauth_userinfo(
             },
         )
 
-    raw_groups = userinfo.get("groups")
-    local_groups = [str(g).strip().lower() for g in raw_groups if g] if isinstance(raw_groups, list) else []
-    raw_rights = userinfo.get("rights")
-    rights = [str(r).strip() for r in raw_rights if r] if isinstance(raw_rights, list) else []
     raw_centralids = userinfo.get("centralids")
-    centralids = raw_centralids if isinstance(raw_centralids, dict) else {}
-
     return {
         "username": cleaned_username,
-        "local_groups": local_groups,
-        "rights": rights,
-        "centralids": centralids,
+        "local_groups": _normalise_str_list(userinfo.get("groups"), lowercase=True),
+        "rights": _normalise_str_list(userinfo.get("rights")),
+        "centralids": raw_centralids if isinstance(raw_centralids, dict) else {},
         "domain": validated_domain,
     }
 
@@ -368,13 +357,10 @@ async def fetch_user_rights_from_meta(
     wiki_domain: str = "meta.wikimedia.org",
 ) -> Dict[str, Any]:
     """
-    Fetches global rights, global groups, and per-wiki SUL account memberships via Wikimedia's
-    `meta=globaluserinfo` Action API.
-    Raises MetaWikiRightsFetchError when the upstream request fails or returns a non-200
-    or malformed payload, distinguishing transient API failures from normal users without rights.
+    Fetches global rights, global groups, and per-wiki SUL account memberships via Meta-Wiki's
+    `meta=globaluserinfo` Action API. Raises MetaWikiRightsFetchError on upstream or payload failure.
     """
     # Always query canonical Meta-Wiki so caller-supplied domains cannot redirect global identity checks.
-    api_url = MEDIAWIKI_API_URL
     params = {
         "action": "query",
         "meta": "globaluserinfo",
@@ -382,26 +368,20 @@ async def fetch_user_rights_from_meta(
         "guiprop": "groups|rights|merged",
         "format": "json",
     }
-    headers = {
-        "User-Agent": WIKIMEDIA_USER_AGENT,
-    }
-    clear_client_cookies(client)
     try:
-        resp = await client.get(api_url, params=params, headers=headers, timeout=10.0)
-    except Exception as exc:
-        logger.warning(f"Error querying Meta-Wiki for user rights: {exc}")
+        resp = await _get_mediawiki_response(client, MEDIAWIKI_API_URL, params)
+    except (httpx.HTTPError, TimeoutError, OSError) as exc:
+        logger.warning("Error querying Meta-Wiki for user rights: %s", exc)
         raise MetaWikiRightsFetchError(f"Meta-Wiki request failed: {exc}") from exc
-    finally:
-        clear_client_cookies(client)
 
     if resp.status_code != 200:
-        logger.warning(f"Meta-Wiki returned HTTP {resp.status_code} for user rights query")
+        logger.warning("Meta-Wiki returned HTTP %s for user rights query", resp.status_code)
         raise MetaWikiRightsFetchError(f"Meta-Wiki returned HTTP {resp.status_code}")
 
     try:
         data = resp.json()
     except ValueError as exc:
-        logger.warning(f"Meta-Wiki returned invalid JSON for user rights query: {exc}")
+        logger.warning("Meta-Wiki returned invalid JSON for user rights query: %s", exc)
         raise MetaWikiRightsFetchError("Meta-Wiki returned invalid JSON") from exc
 
     if not isinstance(data, dict) or "error" in data:
@@ -417,11 +397,10 @@ async def fetch_user_rights_from_meta(
     global_groups = gui.get("groups")
     if not isinstance(global_groups, list):
         global_groups = gui.get("globalgroups")
-    global_rights = gui.get("rights")
     merged = gui.get("merged")
     return {
         "global_groups": global_groups if isinstance(global_groups, list) else [],
-        "global_rights": _normalize_str_list(global_rights, lowercase=True),
+        "global_rights": _normalise_str_list(gui.get("rights"), lowercase=True),
         "merged_projects": merged if isinstance(merged, list) else [],
     }
 
@@ -432,10 +411,8 @@ async def fetch_project_user_rights(
     wiki_domain: str,
 ) -> List[str]:
     """
-    Fetches effective local user rights for an account on a specific Wikimedia project
-    using `action=query&list=users&usprop=rights`.
-    Degrades to an empty list when an individual project endpoint fails so other merged
-    wikis can still be evaluated.
+    Fetches effective local user rights on a specific Wikimedia project via `list=users&usprop=rights`.
+    Degrades to an empty list on failure so other merged wikis can still be evaluated.
     """
     validated_domain = normalize_and_validate_wikimedia_domain(wiki_domain)
     if not validated_domain:
@@ -449,24 +426,20 @@ async def fetch_project_user_rights(
         "usprop": "rights",
         "format": "json",
     }
-    headers = {"User-Agent": WIKIMEDIA_USER_AGENT}
-    clear_client_cookies(client)
     try:
-        resp = await client.get(api_url, params=params, headers=headers, timeout=10.0)
-    except httpx.HTTPError as exc:
-        logger.warning(f"Error querying {validated_domain} for user rights: {type(exc).__name__}")
+        resp = await _get_mediawiki_response(client, api_url, params)
+    except (httpx.HTTPError, TimeoutError, OSError) as exc:
+        logger.warning("Error querying %s for user rights: %s", validated_domain, type(exc).__name__)
         return []
-    finally:
-        clear_client_cookies(client)
 
     if resp.status_code != 200:
-        logger.warning(f"{validated_domain} returned HTTP {resp.status_code} for user rights query")
+        logger.warning("%s returned HTTP %s for user rights query", validated_domain, resp.status_code)
         return []
 
     try:
         data = resp.json()
     except ValueError:
-        logger.warning(f"{validated_domain} returned invalid JSON for user rights query")
+        logger.warning("%s returned invalid JSON for user rights query", validated_domain)
         return []
 
     if not isinstance(data, dict) or "error" in data:
@@ -481,4 +454,4 @@ async def fetch_project_user_rights(
     if not isinstance(first_user, dict) or "missing" in first_user or "invalid" in first_user:
         return []
 
-    return _normalize_str_list(first_user.get("rights"), lowercase=True)
+    return _normalise_str_list(first_user.get("rights"), lowercase=True)

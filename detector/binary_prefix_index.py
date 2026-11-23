@@ -58,62 +58,39 @@ def parse_cidr_to_int_prefix(raw_cidr: str) -> Optional[Tuple[int, int, int]]:
     if not cleaned:
         return None
 
+    prefix_len: Optional[int]
     if "/" in cleaned:
         addr_part, prefix_part = cleaned.split("/", 1)
         addr_part = addr_part.strip()
         prefix_part = prefix_part.strip()
-        if not prefix_part.isdigit():
-            return _parse_cidr_fallback(cleaned)
-        prefix_len = int(prefix_part)
+        prefix_len = int(prefix_part) if prefix_part.isdigit() else None
     else:
         addr_part = cleaned
         prefix_len = 128 if ":" in addr_part else 32
 
-    if ":" not in addr_part:
-        if prefix_len < 0 or prefix_len > 32:
-            return None
-        try:
-            packed = socket.inet_pton(socket.AF_INET, addr_part)
-        except OSError:
-            return _parse_cidr_fallback(cleaned)
-        mask = ((_MAX_V4_INT << (32 - prefix_len)) & _MAX_V4_INT) if prefix_len > 0 else 0
-        return 4, int.from_bytes(packed, "big") & mask, prefix_len
+    if prefix_len is not None:
+        if ":" not in addr_part:
+            if not (0 <= prefix_len <= 32):
+                return None
+            with contextlib.suppress(OSError):
+                packed = socket.inet_pton(socket.AF_INET, addr_part)
+                mask = ((_MAX_V4_INT << (32 - prefix_len)) & _MAX_V4_INT) if prefix_len > 0 else 0
+                return 4, int.from_bytes(packed, "big") & mask, prefix_len
+        else:
+            if "%" in addr_part:
+                addr_part = addr_part.split("%", 1)[0]
+            if not (0 <= prefix_len <= 128):
+                return None
+            with contextlib.suppress(OSError):
+                packed6 = socket.inet_pton(socket.AF_INET6, addr_part)
+                mask6 = (_MAX_V6_INT ^ ((1 << (128 - prefix_len)) - 1)) if prefix_len > 0 else 0
+                return 6, int.from_bytes(packed6, "big") & mask6, prefix_len
 
-    if "%" in addr_part:
-        addr_part = addr_part.split("%", 1)[0]
-    if prefix_len < 0 or prefix_len > 128:
-        return None
-    try:
-        packed6 = socket.inet_pton(socket.AF_INET6, addr_part)
-    except OSError:
-        return _parse_cidr_fallback(cleaned)
-    mask6 = (_MAX_V6_INT ^ ((1 << (128 - prefix_len)) - 1)) if prefix_len > 0 else 0
-    return 6, int.from_bytes(packed6, "big") & mask6, prefix_len
-
-
-def _parse_cidr_fallback(cleaned: str) -> Optional[Tuple[int, int, int]]:
     try:
         net = ipaddress.ip_network(cleaned, strict=False)
     except ValueError:
         return None
     return net.version, int(net.network_address), net.prefixlen
-
-
-def _encode_payload(value: Any) -> Tuple[int, bytes]:
-    if value is None:
-        return _KIND_NONE, b""
-    if isinstance(value, int) and not isinstance(value, bool):
-        return _KIND_INT, str(value).encode("ascii")
-    if isinstance(value, str):
-        return _KIND_STR, value.encode("utf-8")
-    serialised = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    return _KIND_JSON, serialised
-
-
-def _append_segment(segments: List[Tuple[int, int]], seg_start: int, rule_id: int) -> None:
-    if segments and segments[-1][1] == rule_id:
-        return
-    segments.append((seg_start, rule_id))
 
 
 def _flatten_dyadic_rules(
@@ -129,6 +106,10 @@ def _flatten_dyadic_rules(
     stack: List[Tuple[int, int]] = []
     cursor = 0
 
+    def append_segment(seg_start: int, rule_id: int) -> None:
+        if not segments or segments[-1][1] != rule_id:
+            segments.append((seg_start, rule_id))
+
     for rule_idx, (net_start, prefix_len, _payload_idx) in enumerate(sorted_rules, start=1):
         host_bits = width - prefix_len
         net_end = net_start + ((1 << host_bits) - 1)
@@ -136,12 +117,11 @@ def _flatten_dyadic_rules(
         while stack and stack[-1][0] < net_start:
             top_end, top_rule = stack.pop()
             if cursor <= top_end:
-                _append_segment(segments, cursor, top_rule)
+                append_segment(cursor, top_rule)
                 cursor = top_end + 1
 
         if cursor < net_start:
-            active_rule = stack[-1][1] if stack else 0
-            _append_segment(segments, cursor, active_rule)
+            append_segment(cursor, stack[-1][1] if stack else 0)
             cursor = net_start
 
         stack.append((net_end, rule_idx))
@@ -149,22 +129,53 @@ def _flatten_dyadic_rules(
     while stack:
         top_end, top_rule = stack.pop()
         if cursor <= top_end:
-            _append_segment(segments, cursor, top_rule)
+            append_segment(cursor, top_rule)
             cursor = top_end + 1
 
     if cursor <= max_addr:
-        _append_segment(segments, cursor, 0)
+        append_segment(cursor, 0)
 
     return segments
 
 
-def _collect_normalised_rules(
+def _intern_rule_payloads(
+    rule_map: Dict[Tuple[int, int], Any],
+    payload_pool: Dict[Tuple[int, bytes], int],
+    payload_entries: List[Tuple[int, bytes]],
+) -> List[Tuple[int, int, int]]:
+    rules: List[Tuple[int, int, int]] = []
+    for key in sorted(rule_map.keys()):
+        value = rule_map[key]
+        if value is None:
+            encoded = (_KIND_NONE, b"")
+        elif isinstance(value, int) and not isinstance(value, bool):
+            encoded = (_KIND_INT, str(value).encode("ascii"))
+        elif isinstance(value, str):
+            encoded = (_KIND_STR, value.encode("utf-8"))
+        else:
+            encoded = (_KIND_JSON, json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+
+        payload_idx = payload_pool.get(encoded)
+        if payload_idx is None:
+            payload_idx = len(payload_entries)
+            payload_pool[encoded] = payload_idx
+            payload_entries.append(encoded)
+        rules.append((key[0], key[1], payload_idx))
+    return rules
+
+
+def compile_binary_prefix_index(
     entries: Iterable[Tuple[str, Any]],
-    merge_payloads: Optional[Callable[[Any, Any], Any]],
-) -> Tuple[Dict[Tuple[int, int], Any], Dict[Tuple[int, int], Any]]:
+    target_path: Path | str,
+    *,
+    merge_payloads: Optional[Callable[[Any, Any], Any]] = None,
+) -> int:
+    """Compiles IPv4 and IPv6 CIDRs with tagged metadata into an atomic memory-mappable binary file."""
+    dst = Path(target_path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
     v4_map: Dict[Tuple[int, int], Any] = {}
     v6_map: Dict[Tuple[int, int], Any] = {}
-
     for raw_cidr, payload in entries:
         parsed = parse_cidr_to_int_prefix(raw_cidr)
         if parsed is None:
@@ -177,51 +188,19 @@ def _collect_normalised_rules(
         else:
             target[key] = payload
 
-    return v4_map, v6_map
+    payload_pool: Dict[Tuple[int, bytes], int] = {}
+    payload_entries: List[Tuple[int, bytes]] = []
+    v4_rules = _intern_rule_payloads(v4_map, payload_pool, payload_entries)
+    v6_rules = _intern_rule_payloads(v6_map, payload_pool, payload_entries)
+    v4_segments = _flatten_dyadic_rules(v4_rules, 32)
+    v6_segments = _flatten_dyadic_rules(v6_rules, 128)
 
-
-def _intern_rule_payloads(
-    rule_map: Dict[Tuple[int, int], Any],
-    payload_pool: Dict[Tuple[int, bytes], int],
-    payload_entries: List[Tuple[int, bytes]],
-) -> List[Tuple[int, int, int]]:
-    sorted_keys = sorted(rule_map.keys())
-    rules: List[Tuple[int, int, int]] = []
-    for key in sorted_keys:
-        encoded = _encode_payload(rule_map[key])
-        payload_idx = payload_pool.get(encoded)
-        if payload_idx is None:
-            payload_idx = len(payload_entries)
-            payload_pool[encoded] = payload_idx
-            payload_entries.append(encoded)
-        rules.append((key[0], key[1], payload_idx))
-    return rules
-
-
-def _write_compiled_sections(
-    out_path: Path,
-    v4_segments: List[Tuple[int, int]],
-    v4_rules: List[Tuple[int, int, int]],
-    v6_segments: List[Tuple[int, int]],
-    v6_rules: List[Tuple[int, int, int]],
-    payload_entries: List[Tuple[int, bytes]],
-) -> None:
     v4_seg_offset = _HEADER_STRUCT.size
-    v4_seg_bytes = len(v4_segments) * _V4_SEG_STRUCT.size
-
-    v4_rule_offset = v4_seg_offset + v4_seg_bytes
-    v4_rule_bytes = len(v4_rules) * _V4_RULE_STRUCT.size
-
-    v6_seg_offset = v4_rule_offset + v4_rule_bytes
-    v6_seg_bytes = len(v6_segments) * _V6_SEG_STRUCT.size
-
-    v6_rule_offset = v6_seg_offset + v6_seg_bytes
-    v6_rule_bytes = len(v6_rules) * _V6_RULE_STRUCT.size
-
-    payload_index_offset = v6_rule_offset + v6_rule_bytes
-    payload_index_bytes = len(payload_entries) * _PAYLOAD_INDEX_STRUCT.size
-
-    payload_blob_offset = payload_index_offset + payload_index_bytes
+    v4_rule_offset = v4_seg_offset + len(v4_segments) * _V4_SEG_STRUCT.size
+    v6_seg_offset = v4_rule_offset + len(v4_rules) * _V4_RULE_STRUCT.size
+    v6_rule_offset = v6_seg_offset + len(v6_segments) * _V6_SEG_STRUCT.size
+    payload_index_offset = v6_rule_offset + len(v6_rules) * _V6_RULE_STRUCT.size
+    payload_blob_offset = payload_index_offset + len(payload_entries) * _PAYLOAD_INDEX_STRUCT.size
     payload_blob_size = sum(len(data) for _kind, data in payload_entries)
     total_file_size = payload_blob_offset + payload_blob_size
 
@@ -242,50 +221,29 @@ def _write_compiled_sections(
         total_file_size,
     )
 
-    with out_path.open("wb") as handle:
-        handle.write(header_bytes)
-        for seg_start, rule_id in v4_segments:
-            handle.write(_V4_SEG_STRUCT.pack(seg_start, rule_id))
-        for net_int, prefix_len, payload_idx in v4_rules:
-            handle.write(_V4_RULE_STRUCT.pack(net_int, prefix_len, payload_idx))
-        for seg_start6, rule_id6 in v6_segments:
-            handle.write(_V6_SEG_STRUCT.pack(seg_start6.to_bytes(16, "big"), rule_id6))
-        for net_int6, prefix_len6, payload_idx6 in v6_rules:
-            handle.write(_V6_RULE_STRUCT.pack(net_int6.to_bytes(16, "big"), prefix_len6, payload_idx6))
-
-        running_offset = 0
-        for kind, raw_blob in payload_entries:
-            handle.write(_PAYLOAD_INDEX_STRUCT.pack(running_offset, len(raw_blob), kind))
-            running_offset += len(raw_blob)
-        for _kind, raw_blob in payload_entries:
-            if raw_blob:
-                handle.write(raw_blob)
-
-
-def compile_binary_prefix_index(
-    entries: Iterable[Tuple[str, Any]],
-    target_path: Path | str,
-    *,
-    merge_payloads: Optional[Callable[[Any, Any], Any]] = None,
-) -> int:
-    """Compiles IPv4 and IPv6 CIDRs with tagged metadata into an atomic memory-mappable binary file."""
-    dst = Path(target_path)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-
-    v4_map, v6_map = _collect_normalised_rules(entries, merge_payloads)
-    payload_pool: Dict[Tuple[int, bytes], int] = {}
-    payload_entries: List[Tuple[int, bytes]] = []
-
-    v4_rules = _intern_rule_payloads(v4_map, payload_pool, payload_entries)
-    v6_rules = _intern_rule_payloads(v6_map, payload_pool, payload_entries)
-    v4_segments = _flatten_dyadic_rules(v4_rules, 32)
-    v6_segments = _flatten_dyadic_rules(v6_rules, 128)
-
     fd, tmp_name = tempfile.mkstemp(prefix=f".{dst.name}.tmp.", dir=str(dst.parent))
     os.close(fd)
     tmp_path = Path(tmp_name)
     try:
-        _write_compiled_sections(tmp_path, v4_segments, v4_rules, v6_segments, v6_rules, payload_entries)
+        with tmp_path.open("wb") as handle:
+            handle.write(header_bytes)
+            for seg_start, rule_id in v4_segments:
+                handle.write(_V4_SEG_STRUCT.pack(seg_start, rule_id))
+            for net_int, prefix_len, payload_idx in v4_rules:
+                handle.write(_V4_RULE_STRUCT.pack(net_int, prefix_len, payload_idx))
+            for seg_start6, rule_id6 in v6_segments:
+                handle.write(_V6_SEG_STRUCT.pack(seg_start6.to_bytes(16, "big"), rule_id6))
+            for net_int6, prefix_len6, payload_idx6 in v6_rules:
+                handle.write(_V6_RULE_STRUCT.pack(net_int6.to_bytes(16, "big"), prefix_len6, payload_idx6))
+
+            running_offset = 0
+            for kind, raw_blob in payload_entries:
+                handle.write(_PAYLOAD_INDEX_STRUCT.pack(running_offset, len(raw_blob), kind))
+                running_offset += len(raw_blob)
+            for _kind, raw_blob in payload_entries:
+                if raw_blob:
+                    handle.write(raw_blob)
+
         with contextlib.suppress(OSError):
             os.chmod(tmp_path, 0o644)
         _atomic_replace_retry(tmp_path, dst)
@@ -308,11 +266,9 @@ def sync_file_to_ephemeral_cache(
         st = os.stat(source_path)
         stat_sig = (st.st_mtime_ns, st.st_size)
 
-    try:
+    with contextlib.suppress(OSError):
         if source_path.parent.resolve() == ephemeral_dir.resolve():
             return source_path
-    except OSError:
-        pass
 
     sig_token = f"{source_path}:{stat_sig[0]}:{stat_sig[1]}".encode("utf-8")
     digest = hashlib.sha256(sig_token).hexdigest()[:12]
@@ -369,7 +325,39 @@ class BinaryPrefixIndexReader:
         self._mmap: Optional[mmap.mmap] = mm
         self._scalar_cache: Dict[int, Any] = {}
         try:
-            self._parse_and_validate_header(mm, file_size)
+            (
+                magic,
+                self._v4_seg_offset,
+                self._v4_seg_count,
+                self._v4_rule_offset,
+                self._v4_rule_count,
+                self._v6_seg_offset,
+                self._v6_seg_count,
+                self._v6_rule_offset,
+                self._v6_rule_count,
+                self._payload_index_offset,
+                self._payload_count,
+                self._payload_blob_offset,
+                self._payload_blob_size,
+                recorded_total_size,
+            ) = _HEADER_STRUCT.unpack_from(mm, 0)
+
+            if magic != MAGIC_HEADER:
+                raise BinaryPrefixFormatError(f"Invalid magic header in binary prefix index: {self.file_path}")
+            if recorded_total_size != file_size:
+                raise BinaryPrefixFormatError(f"Binary prefix index size mismatch in {self.file_path}")
+
+            sections = (
+                (self._v4_seg_offset, self._v4_seg_count * _V4_SEG_STRUCT.size),
+                (self._v4_rule_offset, self._v4_rule_count * _V4_RULE_STRUCT.size),
+                (self._v6_seg_offset, self._v6_seg_count * _V6_SEG_STRUCT.size),
+                (self._v6_rule_offset, self._v6_rule_count * _V6_RULE_STRUCT.size),
+                (self._payload_index_offset, self._payload_count * _PAYLOAD_INDEX_STRUCT.size),
+                (self._payload_blob_offset, self._payload_blob_size),
+            )
+            for offset, length in sections:
+                if offset < _HEADER_STRUCT.size or offset + length > file_size:
+                    raise BinaryPrefixFormatError(f"Corrupt section bounds in binary prefix index: {self.file_path}")
         except Exception:
             self.close()
             raise
@@ -384,41 +372,6 @@ class BinaryPrefixIndexReader:
     ) -> BinaryPrefixIndexReader:
         local_path = sync_file_to_ephemeral_cache(source_path, ephemeral_dir, stat_sig=stat_sig)
         return cls(local_path)
-
-    def _parse_and_validate_header(self, mm: mmap.mmap, file_size: int) -> None:
-        (
-            magic,
-            self._v4_seg_offset,
-            self._v4_seg_count,
-            self._v4_rule_offset,
-            self._v4_rule_count,
-            self._v6_seg_offset,
-            self._v6_seg_count,
-            self._v6_rule_offset,
-            self._v6_rule_count,
-            self._payload_index_offset,
-            self._payload_count,
-            self._payload_blob_offset,
-            self._payload_blob_size,
-            recorded_total_size,
-        ) = _HEADER_STRUCT.unpack_from(mm, 0)
-
-        if magic != MAGIC_HEADER:
-            raise BinaryPrefixFormatError(f"Invalid magic header in binary prefix index: {self.file_path}")
-        if recorded_total_size != file_size:
-            raise BinaryPrefixFormatError(f"Binary prefix index size mismatch in {self.file_path}")
-
-        sections = (
-            (self._v4_seg_offset, self._v4_seg_count * _V4_SEG_STRUCT.size),
-            (self._v4_rule_offset, self._v4_rule_count * _V4_RULE_STRUCT.size),
-            (self._v6_seg_offset, self._v6_seg_count * _V6_SEG_STRUCT.size),
-            (self._v6_rule_offset, self._v6_rule_count * _V6_RULE_STRUCT.size),
-            (self._payload_index_offset, self._payload_count * _PAYLOAD_INDEX_STRUCT.size),
-            (self._payload_blob_offset, self._payload_blob_size),
-        )
-        for offset, length in sections:
-            if offset < _HEADER_STRUCT.size or offset + length > file_size:
-                raise BinaryPrefixFormatError(f"Corrupt section bounds in binary prefix index: {self.file_path}")
 
     @property
     def closed(self) -> bool:
@@ -494,33 +447,6 @@ class BinaryPrefixIndexReader:
         cidr_str = f"{socket.inet_ntop(socket.AF_INET, net_u32.to_bytes(4, 'big'))}/{prefix_len}"
         return cidr_str, prefix_len, self._decode_payload_at(mm, payload_idx)
 
-    def _lookup_v6_packed(self, mm: mmap.mmap, packed16: bytes) -> Optional[Tuple[str, int, Any]]:
-        count = self._v6_seg_count
-        if count > 0:
-            base = self._v6_seg_offset
-            lo = 0
-            hi = count - 1
-            while lo <= hi:
-                mid = (lo + hi) >> 1
-                pos = base + mid * _V6_SEG_STRUCT.size
-                if mm[pos : pos + 16] <= packed16:
-                    lo = mid + 1
-                else:
-                    hi = mid - 1
-
-            if hi >= 0:
-                rule_id = _U32_STRUCT.unpack_from(mm, base + hi * _V6_SEG_STRUCT.size + 16)[0]
-                if 0 < rule_id <= self._v6_rule_count:
-                    rule_pos = self._v6_rule_offset + (rule_id - 1) * _V6_RULE_STRUCT.size
-                    net_bytes, prefix_len, payload_idx = _V6_RULE_STRUCT.unpack_from(mm, rule_pos)
-                    cidr_str = f"{ipaddress.IPv6Address(net_bytes).compressed}/{prefix_len}"
-                    return cidr_str, prefix_len, self._decode_payload_at(mm, payload_idx)
-
-        if packed16[:12] == _IPV4_MAPPED_PREFIX:
-            v4_u32 = _U32_STRUCT.unpack_from(packed16, 12)[0]
-            return self._lookup_v4_u32(mm, v4_u32)
-        return None
-
     def lookup_with_prefix_len(self, ip: Optional[str]) -> Optional[Tuple[str, int, Any]]:
         """Matches an IPv4 or IPv6 address against the longest prefix and returns CIDR, prefix length, and payload."""
         mm = self._mmap
@@ -549,7 +475,30 @@ class BinaryPrefixIndexReader:
             if addr.version == 4:
                 return self._lookup_v4_u32(mm, int(addr))
             packed6 = addr.packed
-        return self._lookup_v6_packed(mm, packed6)
+
+        if self._v6_seg_count > 0:
+            base = self._v6_seg_offset
+            lo = 0
+            hi = self._v6_seg_count - 1
+            while lo <= hi:
+                mid = (lo + hi) >> 1
+                pos = base + mid * _V6_SEG_STRUCT.size
+                if mm[pos : pos + 16] <= packed6:
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+
+            if hi >= 0:
+                rule_id = _U32_STRUCT.unpack_from(mm, base + hi * _V6_SEG_STRUCT.size + 16)[0]
+                if 0 < rule_id <= self._v6_rule_count:
+                    rule_pos = self._v6_rule_offset + (rule_id - 1) * _V6_RULE_STRUCT.size
+                    net_bytes, prefix_len, payload_idx = _V6_RULE_STRUCT.unpack_from(mm, rule_pos)
+                    cidr_str = f"{ipaddress.IPv6Address(net_bytes).compressed}/{prefix_len}"
+                    return cidr_str, prefix_len, self._decode_payload_at(mm, payload_idx)
+
+        if packed6[:12] == _IPV4_MAPPED_PREFIX:
+            return self._lookup_v4_u32(mm, _U32_STRUCT.unpack_from(packed6, 12)[0])
+        return None
 
     def lookup(self, ip: Optional[str]) -> Optional[Tuple[str, Any]]:
         """Matches an IPv4 or IPv6 address against the longest prefix and returns matched CIDR and payload."""

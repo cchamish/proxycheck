@@ -1,9 +1,9 @@
 """
-Asynchronous HTTP views and public API exports for IP intelligence
-aggregation and Wikimedia OAuth 2.0 session handling.
+Asynchronous HTTP views for IP intelligence aggregation and Wikimedia OAuth 2.0 sessions.
 """
 
 import asyncio
+import functools
 import json
 import logging
 import secrets
@@ -18,13 +18,13 @@ from django.middleware.csrf import get_token
 from django.views.decorators.csrf import csrf_exempt
 
 from . import http_client, oauth, rangeblock_service
+from .dashboard import build_dashboard_snapshot
 from .detection_service import (
     detect_canonical_ip_batch,
     detect_single_canonical_ip,
     is_compact_request,
     refresh_single_canonical_ip,
     resolve_query_mode,
-    stream_single_canonical_ip_sse,
 )
 from .intelligence import (
     MAX_BATCH_IPS,
@@ -37,14 +37,13 @@ from .oauth import (
     CentralAuthVerificationError,
     InvalidCentralAuthTokenError,
     MetaWikiRightsFetchError,
+    normalize_and_validate_wikimedia_domain,
 )
 from .offline_dbs import collect_offline_databases_status
 from .provider_registry import USER_AGENT_HEADER
 from .quota_telemetry import (
     RefreshRateLimitResult,
-    build_dashboard_snapshot,
     check_and_consume_endpoint_rate_limit,
-    is_admin_user,
 )
 from .sanitization import (
     sanitize_error_message,
@@ -54,20 +53,21 @@ from .session_auth import (
     GADGET_TOKEN_SALT,
     SESSION_UNAVAILABLE_ERROR,
     TEST_ROLE_PROFILES,
-    _verify_gadget_bearer_token,
     apply_detect_cors_headers,
     authenticate_detect_request,
-    authorize_admin_session_request,
+    authorise_admin_session_request,
     flush_session_async,
     get_gadget_token_ttl_seconds,
     get_session_user,
+    is_admin_user,
     issue_gadget_token,
-    parse_gadget_token_payload,
     persist_authenticated_session,
     persist_oauth_login_context,
     pop_oauth_login_context,
     resolve_wikimedia_access,
+    verify_gadget_bearer_token,
 )
+from .stream_service import stream_single_canonical_ip_sse
 
 __all__ = [
     "GADGET_TOKEN_SALT",
@@ -93,6 +93,8 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+_MAX_GADGET_TOKEN_BODY_BYTES = 8192
+
 _OAUTH_CALLBACK_ERROR_CODES = {
     code: code
     for code in (
@@ -110,7 +112,7 @@ _OAUTH_CALLBACK_ERROR_CODES = {
 }
 
 
-def _build_unauthenticated_user_payload() -> Dict[str, Any]:
+def _unauthenticated_user_payload() -> Dict[str, Any]:
     return {
         "isLoggedIn": False,
         "username": "",
@@ -122,22 +124,26 @@ def _build_unauthenticated_user_payload() -> Dict[str, Any]:
     }
 
 
-async def _dispatch_cors_endpoint(
-    request,
-    expected_method: str,
-    handler: Callable[[Any], Awaitable[HttpResponse]],
-) -> HttpResponse:
+def _cors_endpoint(expected_method: str) -> Callable[[Callable[..., Awaitable[HttpResponse]]], Any]:
     allowed_methods = f"{expected_method}, OPTIONS"
-    if request.method == "OPTIONS":
-        return apply_detect_cors_headers(request, HttpResponse(status=204), methods=allowed_methods)
-    if request.method != expected_method:
-        return apply_detect_cors_headers(
-            request,
-            JsonResponse({"error": "Method not allowed"}, status=405),
-            methods=allowed_methods,
-        )
-    response = await handler(request)
-    return apply_detect_cors_headers(request, response, methods=allowed_methods)
+
+    def decorator(view_fn: Callable[..., Awaitable[HttpResponse]]):
+        @functools.wraps(view_fn)
+        async def wrapped(request, *args, **kwargs) -> HttpResponse:
+            if request.method == "OPTIONS":
+                return apply_detect_cors_headers(request, HttpResponse(status=204), methods=allowed_methods)
+            if request.method != expected_method:
+                return apply_detect_cors_headers(
+                    request,
+                    JsonResponse({"error": "Method not allowed"}, status=405),
+                    methods=allowed_methods,
+                )
+            response = await view_fn(request, *args, **kwargs)
+            return apply_detect_cors_headers(request, response, methods=allowed_methods)
+
+        return wrapped
+
+    return decorator
 
 
 def _build_rate_limit_response(rl_res: RefreshRateLimitResult, message: str) -> JsonResponse:
@@ -155,26 +161,97 @@ def _build_rate_limit_response(rl_res: RefreshRateLimitResult, message: str) -> 
     return response
 
 
+async def _resolve_authenticated_identity(request, auth_mode: str) -> tuple[str, bool]:
+    if auth_mode == "gadget":
+        token_user, _ = verify_gadget_bearer_token(str(request.headers.get("Authorization") or ""))
+        return str(token_user or "").strip(), False
+    session_user = await get_session_user(request)
+    if not isinstance(session_user, dict):
+        return "", False
+    return str(session_user.get("username") or "").strip(), is_admin_user(session_user)
+
+
+def _parse_query_ip(request) -> tuple[str | None, JsonResponse | None]:
+    raw_ip = request.GET.get("ip")
+    if raw_ip is None or not str(raw_ip).strip():
+        return None, JsonResponse(
+            {
+                "error": "invalid_ip",
+                "message": "Missing required ip query parameter. Please provide a valid IPv4 or IPv6 address.",
+            },
+            status=400,
+        )
+    ip = canonicalize_ip(str(raw_ip))
+    if not ip:
+        return None, JsonResponse(
+            {
+                "error": "invalid_ip",
+                "message": "Invalid IP address format. Please provide a valid IPv4 or IPv6 address.",
+            },
+            status=400,
+        )
+    return ip, None
+
+
 @csrf_exempt
+@_cors_endpoint("POST")
 async def exchange_gadget_token(request):
-    """
-    Exchanges a one-time MediaWiki CentralAuth token for a signed gadget Bearer token
-    after verifying identity and unified RBAC permissions with Meta-Wiki.
-    """
-    return await _dispatch_cors_endpoint(request, "POST", _exchange_gadget_token_post)
+    """Exchanges a one-time MediaWiki CentralAuth token for a signed gadget Bearer token."""
+    raw_bytes = request.body or b""
+    if len(raw_bytes) > _MAX_GADGET_TOKEN_BODY_BYTES:
+        resp = JsonResponse(
+            {"error": f"Request body exceeds maximum allowed size of {_MAX_GADGET_TOKEN_BODY_BYTES} bytes."},
+            status=413,
+        )
+        resp["Cache-Control"] = "no-store"
+        return resp
 
+    try:
+        raw_body = raw_bytes.decode("utf-8-sig") if raw_bytes else ""
+        body = json.loads(raw_body) if raw_body.strip() else None
+    except UnicodeDecodeError, ValueError:
+        logger.warning("Invalid JSON request body received in exchange_gadget_token.")
+        resp = JsonResponse({"error": "Invalid JSON request body."}, status=400)
+        resp["Cache-Control"] = "no-store"
+        return resp
 
-async def _exchange_gadget_token_post(request):
-    response = await _handle_gadget_token_post(request)
-    response["Cache-Control"] = "no-store"
-    return response
+    if not isinstance(body, dict):
+        resp = JsonResponse({"error": "Request body must be a JSON object."}, status=400)
+        resp["Cache-Control"] = "no-store"
+        return resp
 
+    raw_token = body.get("centralauthtoken")
+    validation_error: str | None = None
+    centralauth_token = ""
+    if raw_token is None:
+        validation_error = "Missing centralauthtoken parameter."
+    elif not isinstance(raw_token, str):
+        validation_error = "centralauthtoken must be a string."
+    else:
+        centralauth_token = raw_token.strip()
+        if not centralauth_token:
+            validation_error = "centralauthtoken must not be empty."
+        elif len(centralauth_token) > 4096:
+            validation_error = "centralauthtoken exceeds maximum allowed length of 4096 characters."
+        elif any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in centralauth_token):
+            validation_error = "centralauthtoken contains invalid whitespace or control characters."
 
-async def _handle_gadget_token_post(request):
-    parsed, error_response = parse_gadget_token_payload(request)
-    if error_response is not None or parsed is None:
-        return error_response
-    centralauth_token, wiki_domain = parsed
+    wiki_domain = ""
+    if validation_error is None:
+        raw_domain = body.get("domain")
+        if raw_domain is None:
+            raw_domain = body.get("wiki_domain")
+        if raw_domain is None or (isinstance(raw_domain, str) and not raw_domain.strip()):
+            validation_error = "Missing Wikimedia domain parameter."
+        else:
+            wiki_domain = normalize_and_validate_wikimedia_domain(raw_domain) or ""
+            if not wiki_domain:
+                validation_error = "Invalid or unsupported Wikimedia domain."
+
+    if validation_error is not None:
+        resp = JsonResponse({"error": validation_error}, status=400)
+        resp["Cache-Control"] = "no-store"
+        return resp
 
     global_rl = await check_and_consume_endpoint_rate_limit("gadget_token", scope="global")
     if not global_rl.allowed:
@@ -190,7 +267,9 @@ async def _handle_gadget_token_post(request):
             sanitize_error_message(str(exc)),
             sanitize_payload(exc.mw_error) if exc.mw_error is not None else None,
         )
-        return JsonResponse({"error": "Invalid CentralAuth token."}, status=401)
+        resp = JsonResponse({"error": "Invalid CentralAuth token."}, status=401)
+        resp["Cache-Control"] = "no-store"
+        return resp
     except CentralAuthVerificationError as exc:
         logger.warning(
             "CentralAuth verification failed for domain '%s': %s (mw_error=%s)",
@@ -198,7 +277,9 @@ async def _handle_gadget_token_post(request):
             sanitize_error_message(str(exc)),
             sanitize_payload(exc.mw_error) if exc.mw_error is not None else None,
         )
-        return JsonResponse({"error": "Unable to verify CentralAuth credentials at this time."}, status=503)
+        resp = JsonResponse({"error": "Unable to verify CentralAuth credentials at this time."}, status=503)
+        resp["Cache-Control"] = "no-store"
+        return resp
 
     username = wiki_userinfo["username"]
     user_rl = await check_and_consume_endpoint_rate_limit("gadget_token", username, scope="user")
@@ -223,30 +304,31 @@ async def _handle_gadget_token_post(request):
         )
     except MetaWikiRightsFetchError as exc:
         if "missing" in str(exc).lower():
-            return JsonResponse({"error": "Access denied. Unrecognised Wikimedia user."}, status=403)
-        return JsonResponse({"error": "Unable to verify Wikimedia user rights at this time."}, status=503)
+            resp = JsonResponse({"error": "Access denied. Unrecognised Wikimedia user."}, status=403)
+        else:
+            resp = JsonResponse({"error": "Unable to verify Wikimedia user rights at this time."}, status=503)
+        resp["Cache-Control"] = "no-store"
+        return resp
 
     if not has_access:
-        return JsonResponse({"error": "Access denied. Insufficient Wikimedia user rights."}, status=403)
+        resp = JsonResponse({"error": "Access denied. Insufficient Wikimedia user rights."}, status=403)
+        resp["Cache-Control"] = "no-store"
+        return resp
 
-    return JsonResponse(
+    resp = JsonResponse(
         {
             "token": issue_gadget_token(username),
             "username": username,
             "expires_in": get_gadget_token_ttl_seconds(),
         }
     )
+    resp["Cache-Control"] = "no-store"
+    return resp
 
 
+@_cors_endpoint("GET")
 async def detect_ip(request):
-    """
-    Aggregates IP intelligence across upstream providers with non-public IP interception,
-    singleflight coalescing, tiered per-provider Redis caching, and cooldown circuit breaking.
-    """
-    return await _dispatch_cors_endpoint(request, "GET", _detect_ip_get)
-
-
-async def _detect_ip_get(request):
+    """Aggregates IP intelligence across upstream providers with L1/L2 caching and singleflight coalescing."""
     start_time = time.perf_counter()
 
     auth_mode, auth_error_response = await authenticate_detect_request(request)
@@ -258,25 +340,9 @@ async def _detect_ip_get(request):
     if not rl_res.allowed:
         return _build_rate_limit_response(rl_res, "Detection rate limit exceeded. Please wait before retrying.")
 
-    raw_ip = request.GET.get("ip")
-    if raw_ip is None or not str(raw_ip).strip():
-        return JsonResponse(
-            {
-                "error": "invalid_ip",
-                "message": "Missing required ip query parameter. Please provide a valid IPv4 or IPv6 address.",
-            },
-            status=400,
-        )
-
-    ip = canonicalize_ip(str(raw_ip))
-    if not ip:
-        return JsonResponse(
-            {
-                "error": "invalid_ip",
-                "message": "Invalid IP address format. Please provide a valid IPv4 or IPv6 address.",
-            },
-            status=400,
-        )
+    ip, ip_error = _parse_query_ip(request)
+    if ip_error is not None or ip is None:
+        return ip_error
 
     payload = await detect_single_canonical_ip(
         ip,
@@ -291,12 +357,9 @@ async def _detect_ip_get(request):
     return response
 
 
+@_cors_endpoint("GET")
 async def detect_ip_stream(request):
     """Streams progressive IP detection results over Server-Sent Events."""
-    return await _dispatch_cors_endpoint(request, "GET", _detect_ip_stream_get)
-
-
-async def _detect_ip_stream_get(request):
     start_time = time.perf_counter()
 
     auth_mode, auth_error_response = await authenticate_detect_request(request)
@@ -308,25 +371,9 @@ async def _detect_ip_stream_get(request):
     if not rl_res.allowed:
         return _build_rate_limit_response(rl_res, "Detection rate limit exceeded. Please wait before retrying.")
 
-    raw_ip = request.GET.get("ip")
-    if raw_ip is None or not str(raw_ip).strip():
-        return JsonResponse(
-            {
-                "error": "invalid_ip",
-                "message": "Missing required ip query parameter. Please provide a valid IPv4 or IPv6 address.",
-            },
-            status=400,
-        )
-
-    ip = canonicalize_ip(str(raw_ip))
-    if not ip:
-        return JsonResponse(
-            {
-                "error": "invalid_ip",
-                "message": "Invalid IP address format. Please provide a valid IPv4 or IPv6 address.",
-            },
-            status=400,
-        )
+    ip, ip_error = _parse_query_ip(request)
+    if ip_error is not None or ip is None:
+        return ip_error
 
     stream_iter = stream_single_canonical_ip_sse(
         ip,
@@ -342,12 +389,9 @@ async def _detect_ip_stream_get(request):
     return response
 
 
+@_cors_endpoint("GET")
 async def rangeblock_lookup(request):
     """Queries cross-wiki rangeblock aggregates and real-time Wiki Replicas status for an IP."""
-    return await _dispatch_cors_endpoint(request, "GET", _rangeblock_lookup_get)
-
-
-async def _rangeblock_lookup_get(request):
     start_time = time.perf_counter()
 
     auth_mode, auth_error_response = await authenticate_detect_request(request)
@@ -359,25 +403,9 @@ async def _rangeblock_lookup_get(request):
     if not rl_res.allowed:
         return _build_rate_limit_response(rl_res, "Rangeblock lookup rate limit exceeded. Please wait before retrying.")
 
-    raw_ip = request.GET.get("ip")
-    if raw_ip is None or not str(raw_ip).strip():
-        return JsonResponse(
-            {
-                "error": "invalid_ip",
-                "message": "Missing required ip query parameter. Please provide a valid IPv4 or IPv6 address.",
-            },
-            status=400,
-        )
-
-    ip = canonicalize_ip(str(raw_ip))
-    if not ip:
-        return JsonResponse(
-            {
-                "error": "invalid_ip",
-                "message": "Invalid IP address format. Please provide a valid IPv4 or IPv6 address.",
-            },
-            status=400,
-        )
+    ip, ip_error = _parse_query_ip(request)
+    if ip_error is not None or ip is None:
+        return ip_error
 
     wiki = rangeblock_service.normalize_wiki_dbname(request.GET.get("wiki"))
     payload = await rangeblock_service.query_rangeblocks_for_ip(ip, wiki=wiki)
@@ -387,28 +415,9 @@ async def _rangeblock_lookup_get(request):
 
 
 @csrf_exempt
+@_cors_endpoint("POST")
 async def refresh_ip_detection(request):
-    """
-    Executes an authenticated manual or stale-while-revalidate IP intelligence refresh
-    with per-user and global rate guards and non-degrading ToolsDB L2 merge protection.
-    """
-    return await _dispatch_cors_endpoint(request, "POST", _refresh_ip_detection_post)
-
-
-async def _resolve_authenticated_identity(request, auth_mode: str) -> tuple[str, bool]:
-    if auth_mode == "gadget":
-        token_user, _ = _verify_gadget_bearer_token(str(request.headers.get("Authorization") or ""))
-        cleaned = str(token_user or "").strip()
-        # Gadget Bearer tokens never bypass refresh rate limits regardless of username allowlist status.
-        return cleaned, False
-    session_user = await get_session_user(request)
-    if not isinstance(session_user, dict):
-        return "", False
-    cleaned = str(session_user.get("username") or "").strip()
-    return cleaned, is_admin_user(session_user)
-
-
-async def _refresh_ip_detection_post(request):
+    """Executes an authenticated manual IP intelligence refresh with rate guards and L2 merge protection."""
     start_time = time.perf_counter()
 
     auth_mode, auth_error_response = await authenticate_detect_request(request, require_csrf_for_session=True)
@@ -469,15 +478,9 @@ async def _refresh_ip_detection_post(request):
 
 
 @csrf_exempt
+@_cors_endpoint("POST")
 async def detect_ip_batch(request):
-    """
-    Executes bounded-concurrency batch IP intelligence detection for up to MAX_BATCH_IPS
-    addresses in a single POST request.
-    """
-    return await _dispatch_cors_endpoint(request, "POST", _detect_ip_batch_post)
-
-
-async def _detect_ip_batch_post(request):
+    """Executes bounded-concurrency batch IP intelligence detection for up to MAX_BATCH_IPS addresses."""
     start_time = time.perf_counter()
 
     auth_mode, auth_error_response = await authenticate_detect_request(request, require_csrf_for_session=True)
@@ -537,7 +540,7 @@ async def get_current_user(request):
     session_user = await get_session_user(request, context="get_current_user")
 
     if not isinstance(session_user, dict) or not session_user:
-        payload = _build_unauthenticated_user_payload()
+        payload = _unauthenticated_user_payload()
         include_memory = False
     else:
         payload = dict(session_user)
@@ -550,12 +553,9 @@ async def get_current_user(request):
 
 
 async def admin_provider_dashboard(request):
-    """
-    Returns anonymised API quota usage, reactive cooldown states, and daily telemetry
-    for allowlisted administrators.
-    """
+    """Returns anonymised API quota usage, reactive cooldown states, and daily telemetry for allowlisted admins."""
     start_time = time.perf_counter()
-    denied_response = await authorize_admin_session_request(request, context="admin_provider_dashboard")
+    denied_response = await authorise_admin_session_request(request, context="admin_provider_dashboard")
     if denied_response is not None:
         return denied_response
 
@@ -566,10 +566,7 @@ async def admin_provider_dashboard(request):
 
 
 async def oauth_login(request):
-    """
-    Redirects to Meta-Wiki OAuth 2.0 authorisation when credentials are set,
-    falling back to a local sysop session for staging or preview environments without OAuth keys.
-    """
+    """Redirects to Meta-Wiki OAuth 2.0 authorisation, or creates a local sysop session when test auth is enabled."""
     client_id = getattr(settings, "WIKIMEDIA_CLIENT_ID", "")
     redirect_uri = getattr(settings, "WIKIMEDIA_REDIRECT_URI", "")
     auth_base = getattr(settings, "WIKIMEDIA_OAUTH_URL", "https://meta.wikimedia.org/w/rest.php/oauth2")
@@ -610,22 +607,18 @@ async def oauth_login(request):
 
 
 async def oauth_callback(request):
-    """
-    Exchanges the OAuth 2.0 authorisation code for an access token, inspects Wikimedia
-    temporary-account IP reveal rights, and persists the evaluated role in the session.
-    """
+    """Exchanges the OAuth 2.0 authorisation code for a token, evaluates Wikimedia rights, and saves the session."""
     expected_state, post_login_ip, state_saved = await pop_oauth_login_context(request)
     if not state_saved:
         return JsonResponse({"error": SESSION_UNAVAILABLE_ERROR}, status=503)
 
-    # Map query errors to fixed identifiers so raw request values never reach logs.
     callback_error_raw = request.GET.get("error", "").strip().lower()
     if callback_error_raw:
         known_error_code = _OAUTH_CALLBACK_ERROR_CODES.get(callback_error_raw)
         if known_error_code is not None:
             logger.warning("OAuth callback returned error: %s", known_error_code)
         else:
-            logger.warning("OAuth callback returned an unrecognized error code")
+            logger.warning("OAuth callback returned an unrecognised error code")
         return HttpResponseRedirect("/")
 
     provided_state = request.GET.get("state", "").strip()
@@ -665,7 +658,7 @@ async def oauth_callback(request):
                 },
             )
             if token_resp.status_code != 200:
-                logger.error(f"Wikimedia OAuth token exchange failed: HTTP {token_resp.status_code}")
+                logger.error("Wikimedia OAuth token exchange failed: HTTP %s", token_resp.status_code)
                 return HttpResponseRedirect("/")
 
             access_token = token_resp.json().get("access_token", "")
@@ -678,7 +671,7 @@ async def oauth_callback(request):
                 headers={"Authorization": f"Bearer {access_token}"},
             )
             if profile_resp.status_code != 200:
-                logger.error(f"Wikimedia OAuth profile fetch failed: HTTP {profile_resp.status_code}")
+                logger.error("Wikimedia OAuth profile fetch failed: HTTP %s", profile_resp.status_code)
                 return HttpResponseRedirect("/")
 
             profile = profile_resp.json()
@@ -724,10 +717,10 @@ async def oauth_callback(request):
                 return JsonResponse({"error": SESSION_UNAVAILABLE_ERROR}, status=503)
             if has_access and post_login_ip:
                 redirect_target = f"/?{urlencode({'ip': post_login_ip})}"
-            logger.info(f"User {username} successfully authenticated with role: {role_label}")
-    # Top-level OAuth callback boundary prevents upstream or runtime failures from leaking tokens in error pages.
+            logger.info("User %s successfully authenticated with role: %s", username, role_label)
+    # Top-level OAuth boundary prevents upstream failures from leaking tokens in error pages.
     except Exception as exc:  # noqa: BLE001
-        logger.error(f"OAuth callback processing error ({type(exc).__name__})")
+        logger.error("OAuth callback processing error (%s)", type(exc).__name__)
 
     return HttpResponseRedirect(redirect_target)
 
@@ -775,7 +768,7 @@ async def switch_test_role(request):
 
     if target == "unauthenticated":
         await flush_session_async(request, context="switch_test_role")
-        return JsonResponse(_build_unauthenticated_user_payload())
+        return JsonResponse(_unauthenticated_user_payload())
 
     user_data = dict(TEST_ROLE_PROFILES.get(target, TEST_ROLE_PROFILES["sysop"]))
     user_data["rights_updated_at"] = time.time()
@@ -787,7 +780,7 @@ async def switch_test_role(request):
 async def system_status(request):
     """Returns live file mtime metadata for all offline databases to allowlisted administrators."""
     start_time = time.perf_counter()
-    denied_response = await authorize_admin_session_request(request, context="system_status")
+    denied_response = await authorise_admin_session_request(request, context="system_status")
     if denied_response is not None:
         return denied_response
 

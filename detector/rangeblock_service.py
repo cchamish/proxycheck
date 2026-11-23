@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -76,6 +77,26 @@ def normalize_wiki_dbname(raw_wiki: Any) -> Optional[str]:
     if not cleaned or not _WIKI_DBNAME_RE.fullmatch(cleaned):
         return None
     return cleaned
+
+
+def _get_replica_timeouts() -> Tuple[int, int, int]:
+    """Returns (connect_timeout, read_timeout, write_timeout) in seconds for real-time Wiki Replicas queries."""
+
+    def _parse_pos(name: str, default: int) -> int:
+        raw = getattr(settings, name, None)
+        if raw is None:
+            raw = os.environ.get(name, "")
+        try:
+            val = int(str(raw).strip())
+            return val if val > 0 else default
+        except TypeError, ValueError:
+            return default
+
+    return (
+        _parse_pos("RANGEBLOCK_REPLICA_CONNECT_TIMEOUT", 3),
+        _parse_pos("RANGEBLOCK_REPLICA_READ_TIMEOUT", 10),
+        _parse_pos("RANGEBLOCK_REPLICA_WRITE_TIMEOUT", 5),
+    )
 
 
 def get_configured_realtime_wikis() -> Tuple[str, ...]:
@@ -286,31 +307,6 @@ def _query_toolsdb_aggregates_sync(
     return rows, domain_map
 
 
-def _mediawiki_target_spelling(target: str) -> str:
-    """Spells an IPv6 target as MediaWiki stores it (IPUtils::sanitizeIP): eight uppercase words, no leading zeros."""
-    address, separator, prefix = target.partition("/")
-    try:
-        addr = ipaddress.ip_address(address)
-    except ValueError:
-        return target
-    if addr.version == 4:
-        return target
-    words = ":".join(f"{int(word, 16):X}" for word in addr.exploded.split(":"))
-    return f"{words}{separator}{prefix}"
-
-
-def expand_db_lookup_targets(targets: Sequence[str]) -> List[str]:
-    """Returns each target alongside its MediaWiki spelling for exact-match replica lookups."""
-    expanded: List[str] = []
-    seen: Set[str] = set()
-    for target in targets:
-        for variant in (target, _mediawiki_target_spelling(target)):
-            if variant not in seen:
-                seen.add(variant)
-                expanded.append(variant)
-    return expanded
-
-
 def _empty_target_entry() -> Dict[str, Any]:
     return {
         "block_count": 0,
@@ -371,85 +367,6 @@ def _apply_log_count_row(
         entry["last_blocked_at"] = last_dt
 
 
-def _query_local_wiki_tables(
-    cursor: Any,
-    targets: Sequence[str],
-    now_mw: str,
-) -> Dict[str, Dict[str, Any]]:
-    bucket: Dict[str, Dict[str, Any]] = {}
-    placeholders = ", ".join(["%s"] * len(targets))
-    active_sql = (
-        "SELECT bt.bt_address, b.bl_expiry FROM block b "  # noqa: S608
-        "JOIN block_target bt ON b.bl_target = bt.bt_id "
-        f"WHERE bt.bt_user IS NULL AND bt.bt_address IN ({placeholders}) "
-        "AND (b.bl_expiry = 'infinity' OR b.bl_expiry > %s)"
-    )
-    cursor.execute(active_sql, [*targets, now_mw])
-    for raw_target, raw_expiry in cursor.fetchall():
-        _apply_active_block_row(bucket, raw_target, raw_expiry)
-
-    log_sql = (
-        "SELECT log_title, COUNT(*), MAX(log_timestamp) FROM logging_logindex "  # noqa: S608
-        "WHERE log_type = 'block' AND log_action = 'block' AND log_namespace = 2 "
-        f"AND log_title IN ({placeholders}) GROUP BY log_title"
-    )
-    cursor.execute(log_sql, list(targets))
-    for raw_target, raw_count, raw_ts in cursor.fetchall():
-        _apply_log_count_row(bucket, raw_target, raw_count, raw_ts)
-    return bucket
-
-
-def _query_global_wiki_tables(
-    cursor: Any,
-    targets: Sequence[str],
-    now_mw: str,
-) -> Dict[str, Dict[str, Any]]:
-    bucket: Dict[str, Dict[str, Any]] = {}
-    placeholders = ", ".join(["%s"] * len(targets))
-    gbl_log_sql = (
-        "SELECT log_title, COUNT(*), MAX(log_timestamp) FROM logging_logindex "  # noqa: S608
-        "WHERE log_type = 'gblblock' AND log_action IN ('gblock', 'gblock2') AND log_namespace = 2 "
-        f"AND log_title IN ({placeholders}) GROUP BY log_title"
-    )
-    cursor.execute(gbl_log_sql, list(targets))
-    for raw_target, raw_count, raw_ts in cursor.fetchall():
-        _apply_log_count_row(bucket, raw_target, raw_count, raw_ts)
-    return bucket
-
-
-def _query_active_global_blocks(
-    bucket: Dict[str, Dict[str, Any]],
-    targets: Sequence[str],
-    now_mw: str,
-    creds: Tuple[str, str],
-) -> None:
-    user, password = creds
-    placeholders = ", ".join(["%s"] * len(targets))
-    conn = pymysql.connect(
-        host="centralauth.web.db.svc.wikimedia.cloud",
-        user=user,
-        password=password,
-        database="centralauth_p",
-        port=3306,
-        connect_timeout=2,
-        read_timeout=3,
-        write_timeout=3,
-        charset="utf8mb4",
-        autocommit=True,
-    )
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                "SELECT gb_address, gb_expiry FROM globalblocks "  # noqa: S608
-                f"WHERE gb_address IN ({placeholders}) AND (gb_expiry = 'infinity' OR gb_expiry > %s)",
-                [*targets, now_mw],
-            )
-            for raw_target, raw_expiry in cursor.fetchall():
-                _apply_active_block_row(bucket, raw_target, raw_expiry)
-    finally:
-        conn.close()
-
-
 def _query_single_replica_wiki_sync(
     wiki_dbname: str,
     db_targets: Sequence[str],
@@ -460,29 +377,104 @@ def _query_single_replica_wiki_sync(
         return {}
     user, password = creds
     now_mw = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    connect_timeout, read_timeout, write_timeout = _get_replica_timeouts()
+    placeholders = ", ".join(["%s"] * len(db_targets))
+
     conn = pymysql.connect(
         host=f"{wiki_dbname}.web.db.svc.wikimedia.cloud",
         user=user,
         password=password,
         database=f"{wiki_dbname}_p",
         port=3306,
-        connect_timeout=2,
-        read_timeout=3,
-        write_timeout=3,
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+        write_timeout=write_timeout,
         charset="utf8mb4",
         autocommit=True,
     )
     try:
         out: Dict[str, Dict[str, Dict[str, Any]]] = {}
         with conn.cursor() as cursor:
-            out[wiki_dbname] = _query_local_wiki_tables(cursor, db_targets, now_mw)
+            local_bucket: Dict[str, Dict[str, Any]] = {}
+            cursor.execute(
+                "SELECT bt.bt_address, b.bl_expiry FROM block b "  # noqa: S608
+                "JOIN block_target bt ON b.bl_target = bt.bt_id "
+                f"WHERE bt.bt_user IS NULL AND bt.bt_address IN ({placeholders}) "
+                "AND (b.bl_expiry = 'infinity' OR b.bl_expiry > %s)",
+                [*db_targets, now_mw],
+            )
+            for raw_target, raw_expiry in cursor.fetchall():
+                _apply_active_block_row(local_bucket, raw_target, raw_expiry)
+
+            cursor.execute(
+                "SELECT log_title, COUNT(*), MAX(log_timestamp) FROM logging_logindex "  # noqa: S608
+                "WHERE log_type = 'block' AND log_action = 'block' AND log_namespace = 2 "
+                f"AND log_title IN ({placeholders}) GROUP BY log_title",
+                list(db_targets),
+            )
+            for raw_target, raw_count, raw_ts in cursor.fetchall():
+                _apply_log_count_row(local_bucket, raw_target, raw_count, raw_ts)
+            out[wiki_dbname] = local_bucket
+
             if wiki_dbname == "metawiki":
-                out["global"] = _query_global_wiki_tables(cursor, db_targets, now_mw)
+                global_bucket: Dict[str, Dict[str, Any]] = {}
+                cursor.execute(
+                    "SELECT log_title, COUNT(*), MAX(log_timestamp) FROM logging_logindex "  # noqa: S608
+                    "WHERE log_type = 'gblblock' AND log_action IN ('gblock', 'gblock2') AND log_namespace = 2 "
+                    f"AND log_title IN ({placeholders}) GROUP BY log_title",
+                    list(db_targets),
+                )
+                for raw_target, raw_count, raw_ts in cursor.fetchall():
+                    _apply_log_count_row(global_bucket, raw_target, raw_count, raw_ts)
+                out["global"] = global_bucket
+
         if wiki_dbname == "metawiki":
-            _query_active_global_blocks(out["global"], db_targets, now_mw, creds)
+            ca_conn = pymysql.connect(
+                host="centralauth.web.db.svc.wikimedia.cloud",
+                user=user,
+                password=password,
+                database="centralauth_p",
+                port=3306,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+                write_timeout=write_timeout,
+                charset="utf8mb4",
+                autocommit=True,
+            )
+            try:
+                with ca_conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT gb_address, gb_expiry FROM globalblocks "  # noqa: S608
+                        f"WHERE gb_address IN ({placeholders}) AND (gb_expiry = 'infinity' OR gb_expiry > %s)",
+                        [*db_targets, now_mw],
+                    )
+                    for raw_target, raw_expiry in cursor.fetchall():
+                        _apply_active_block_row(out["global"], raw_target, raw_expiry)
+            finally:
+                ca_conn.close()
         return out
     finally:
         conn.close()
+
+
+def _mediawiki_target_spelling(target: str) -> str:
+    """Spells an IPv6 target as MediaWiki stores it (IPUtils::sanitizeIP): eight uppercase words, no leading zeros."""
+    address, separator, prefix = target.partition("/")
+    try:
+        addr = ipaddress.ip_address(address)
+    except ValueError:
+        return target
+    if addr.version == 4:
+        return target
+    words = ":".join(f"{int(word, 16):X}" for word in addr.exploded.split(":"))
+    return f"{words}{separator}{prefix}"
+
+
+def expand_db_lookup_targets(targets: Sequence[str]) -> List[str]:
+    """Returns each target alongside its MediaWiki spelling for exact-match replica lookups."""
+    return list(
+        dict.fromkeys(variant for target in targets for variant in (target, _mediawiki_target_spelling(target)))
+    )
 
 
 async def _fetch_realtime_wiki_blocks(
@@ -523,32 +515,6 @@ async def _fetch_realtime_wiki_blocks(
             for k, v in res.items():
                 realtime_by_wiki[k] = v
     return realtime_by_wiki, succeeded_wikis, degraded
-
-
-def _row_from_record(
-    wiki_dbname: str,
-    domain: str,
-    candidate: RangeblockCandidate,
-    rec: Mapping[str, Any],
-) -> Dict[str, Any]:
-    has_active = bool(rec.get("has_active"))
-    count = compute_effective_block_count(int(rec.get("block_count") or 0), has_active)
-    expiry_dt = rec.get("active_expiry")
-    is_indef = bool(rec.get("active_indefinite"))
-    last_dt = rec.get("last_blocked_at")
-    log_url, block_list_url = build_rangeblock_links(wiki_dbname, domain, candidate.target)
-    return {
-        "target": candidate.target,
-        "cidr": candidate.cidr,
-        "upperBound": candidate.upper_bound,
-        "count": count,
-        "isActive": has_active,
-        "expiry": expiry_dt.isoformat() if isinstance(expiry_dt, datetime) else None,
-        "indefinite": is_indef,
-        "lastBlockedAt": last_dt.isoformat() if isinstance(last_dt, datetime) else None,
-        "logUrl": log_url,
-        "blockListUrl": block_list_url,
-    }
 
 
 def merge_rangeblock_records(
@@ -598,12 +564,32 @@ def merge_rangeblock_records(
         if not target_map:
             continue
         domain = resolve_wiki_domain(wiki_dbname, domain_map)
-        rows_out = [
-            _row_from_record(wiki_dbname, domain, candidate_by_target[target], rec)
-            for target, rec in sorted(target_map.items(), key=lambda item: candidate_order.get(item[0], 999))
-            if target in candidate_by_target
-        ]
-        rows_out = [r for r in rows_out if r["count"] > 0 or r["isActive"]]
+        rows_out: List[Dict[str, Any]] = []
+        for target, rec in sorted(target_map.items(), key=lambda item: candidate_order.get(item[0], 999)):
+            candidate = candidate_by_target.get(target)
+            if candidate is None:
+                continue
+            has_active = bool(rec.get("has_active"))
+            count = compute_effective_block_count(int(rec.get("block_count") or 0), has_active)
+            if count <= 0 and not has_active:
+                continue
+            expiry_dt = rec.get("active_expiry")
+            last_dt = rec.get("last_blocked_at")
+            log_url, block_list_url = build_rangeblock_links(wiki_dbname, domain, candidate.target)
+            rows_out.append(
+                {
+                    "target": candidate.target,
+                    "cidr": candidate.cidr,
+                    "upperBound": candidate.upper_bound,
+                    "count": count,
+                    "isActive": has_active,
+                    "expiry": expiry_dt.isoformat() if isinstance(expiry_dt, datetime) else None,
+                    "indefinite": bool(rec.get("active_indefinite")),
+                    "lastBlockedAt": last_dt.isoformat() if isinstance(last_dt, datetime) else None,
+                    "logUrl": log_url,
+                    "blockListUrl": block_list_url,
+                }
+            )
         if not rows_out:
             continue
 

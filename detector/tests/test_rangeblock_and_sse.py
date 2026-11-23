@@ -134,11 +134,30 @@ class _ReplicaCursor:
     def __init__(self, conn):
         self._cursor = conn.cursor()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self._cursor.close()
+
     def execute(self, sql, params):
         self._cursor.execute(sql.replace("%s", "?"), list(params))
 
     def fetchall(self):
         return self._cursor.fetchall()
+
+
+class _ReplicaConnection:
+    """Stands in for a PyMySQL replica connection backed by SQLite."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self):
+        return _ReplicaCursor(self._conn)
+
+    def close(self):
+        pass
 
 
 def _seed_replica(stored_targets):
@@ -166,13 +185,10 @@ class RangeblockReplicaTargetSpellingTests(TestCase):
         conn = _seed_replica(stored_targets)
         self.addCleanup(conn.close)
 
-        def _sqlite_replica(wiki_dbname, db_targets, _creds):
-            return {wiki_dbname: rangeblock_service._query_local_wiki_tables(_ReplicaCursor(conn), db_targets, "0")}
-
         with (
             patch("detector.rangeblock_service.discover_wiki_replica_credentials", return_value=("u", "p")),
             patch("detector.rangeblock_service._resolve_realtime_wiki_list", return_value=("enwiki",)),
-            patch("detector.rangeblock_service._query_single_replica_wiki_sync", side_effect=_sqlite_replica),
+            patch("detector.rangeblock_service.pymysql.connect", return_value=_ReplicaConnection(conn)),
         ):
             summary = await rangeblock_service.query_rangeblocks_for_ip(ip)
         return [(row["target"], row["count"], row["isActive"]) for wiki in summary["wikis"] for row in wiki["rows"]]

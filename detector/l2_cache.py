@@ -269,26 +269,6 @@ def is_provider_allowed_in_l2(provider_key: Optional[str]) -> bool:
     return provider_key not in OFFLINE_REHYDRATE_PROVIDERS and provider_key not in L1_ONLY_PROVIDERS
 
 
-def _sanitize_shodan_row(row: Mapping[str, Any]) -> Dict[str, Any]:
-    cleaned: Dict[str, Any] = {}
-    for key, val in row.items():
-        if key not in _SHODAN_ALLOWED_ROW_KEYS or key in ("rawJson", "vulns", "cpes"):
-            continue
-        if key == "tags" and isinstance(val, list):
-            cleaned[key] = [
-                str(tag).strip()
-                for tag in val
-                if isinstance(tag, str) and tag.strip() and not tag.strip().lower().startswith("cve-")
-            ]
-        elif key == "openProxyPorts" and isinstance(val, list):
-            cleaned[key] = [int(port) for port in val if isinstance(port, int) and not isinstance(port, bool)]
-        elif key == "hostnames" and isinstance(val, list):
-            cleaned[key] = [str(host).strip() for host in val if isinstance(host, str) and host.strip()]
-        else:
-            cleaned[key] = val
-    return sanitization.sanitize_payload(cleaned)
-
-
 def sanitize_provider_row_for_l2(
     row: Mapping[str, Any], provider_key: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
@@ -297,7 +277,23 @@ def sanitize_provider_row_for_l2(
     if not is_provider_allowed_in_l2(resolved_key):
         return None
     if resolved_key == "shodan_internetdb":
-        return scrub_legacy_coordinates_from_row(_sanitize_shodan_row(row))
+        cleaned: Dict[str, Any] = {}
+        for key, val in row.items():
+            if key not in _SHODAN_ALLOWED_ROW_KEYS or key in ("rawJson", "vulns", "cpes"):
+                continue
+            if key == "tags" and isinstance(val, list):
+                cleaned[key] = [
+                    str(tag).strip()
+                    for tag in val
+                    if isinstance(tag, str) and tag.strip() and not tag.strip().lower().startswith("cve-")
+                ]
+            elif key == "openProxyPorts" and isinstance(val, list):
+                cleaned[key] = [int(port) for port in val if isinstance(port, int) and not isinstance(port, bool)]
+            elif key == "hostnames" and isinstance(val, list):
+                cleaned[key] = [str(host).strip() for host in val if isinstance(host, str) and host.strip()]
+            else:
+                cleaned[key] = val
+        return scrub_legacy_coordinates_from_row(sanitization.sanitize_payload(cleaned))
     stripped = scrub_legacy_coordinates_from_row({key: val for key, val in row.items() if key != "rawJson"})
     return sanitization.sanitize_payload(stripped)
 
@@ -559,117 +555,7 @@ async def aget_ip_snapshots_bulk(
         )
 
 
-def _evaluate_incoming_rows(raw_results: Any) -> Tuple[int, int, bool]:
-    if not isinstance(raw_results, list):
-        return 0, 0, False
-    new_valid_comm = 0
-    failed_comm = 0
-    any_degraded = False
-    for item in raw_results:
-        if not isinstance(item, Mapping):
-            continue
-        pkey = resolve_provider_key(item)
-        if (
-            pkey in _L2_COMMERCIAL_KEYS
-            and _is_valid_l2_provider_row(item, pkey)
-            and not item.get("isHistoricalFallback")
-        ):
-            new_valid_comm += 1
-        elif _is_failed_online_row(item, pkey):
-            any_degraded = True
-            if pkey is not None and pkey in PROVIDER_BY_KEY and PROVIDER_BY_KEY[pkey].is_commercial_arbitration:
-                failed_comm += 1
-    return new_valid_comm, failed_comm, any_degraded
-
-
-def _should_abort_degraded_overwrite(
-    existing_row: Optional[IpIntelligenceCache],
-    new_valid_comm: int,
-    failed_comm: int,
-) -> bool:
-    if existing_row is None:
-        return new_valid_comm == 0 and failed_comm > 0
-    existing_comm = int(existing_row.valid_commercial_count)
-    if new_valid_comm == 0 and (existing_comm > 0 or failed_comm > 0):
-        return True
-    return existing_comm > 0 and new_valid_comm < max(1.0, existing_comm * 0.5)
-
-
-def _build_merged_l2_rows(
-    raw_results: Any,
-    *,
-    existing_snapshot: Optional[Mapping[str, Any]],
-    explicit_fetched_map: Mapping[str, Any],
-    now_epoch: int,
-    existing_epoch: Optional[int],
-) -> Tuple[List[Dict[str, Any]], Dict[str, int], List[str], bool]:
-    existing_rows_by_key: Dict[str, Dict[str, Any]] = {}
-    existing_map: Mapping[str, Any] = {}
-    if existing_snapshot is not None:
-        existing_map = (
-            existing_snapshot.get("providerFetchedMap")
-            if isinstance(existing_snapshot.get("providerFetchedMap"), Mapping)
-            else {}
-        )
-        for prior_item in existing_snapshot.get("results") or ():
-            if isinstance(prior_item, Mapping):
-                prior_key = resolve_provider_key(prior_item)
-                if (
-                    prior_key
-                    and is_provider_allowed_in_l2(prior_key)
-                    and _is_valid_l2_provider_row(prior_item, prior_key)
-                ):
-                    existing_rows_by_key[prior_key] = dict(prior_item)
-
-    merged_rows: List[Dict[str, Any]] = []
-    merged_fetched_map: Dict[str, int] = {}
-    retained_keys: List[str] = []
-    seen_keys: set[str] = set()
-    had_fallback = False
-
-    for item in raw_results if isinstance(raw_results, list) else ():
-        if not isinstance(item, Mapping):
-            continue
-        pkey = resolve_provider_key(item)
-        if not is_provider_allowed_in_l2(pkey) or pkey is None:
-            continue
-        seen_keys.add(pkey)
-        if _is_valid_l2_provider_row(item, pkey) and not item.get("isHistoricalFallback"):
-            cleaned = sanitize_provider_row_for_l2(item, pkey)
-            if cleaned is not None:
-                cleaned.pop("isHistoricalFallback", None)
-                merged_rows.append(cleaned)
-                explicit_ts = _parse_timestamp_epoch(explicit_fetched_map.get(pkey))
-                merged_fetched_map[pkey] = int(explicit_ts if explicit_ts is not None else now_epoch)
-        elif pkey in existing_rows_by_key and _is_failed_online_row(item, pkey):
-            fallback_row = sanitize_provider_row_for_l2(existing_rows_by_key[pkey], pkey)
-            if fallback_row is not None:
-                fallback_row["isHistoricalFallback"] = True
-                merged_rows.append(fallback_row)
-                prior_ts = _parse_timestamp_epoch(existing_map.get(pkey))
-                merged_fetched_map[pkey] = int(
-                    prior_ts if prior_ts is not None else (existing_epoch if existing_epoch is not None else now_epoch)
-                )
-                retained_keys.append(pkey)
-                had_fallback = True
-
-    for prior_key, prior_row in existing_rows_by_key.items():
-        if prior_key in seen_keys:
-            continue
-        fallback_row = sanitize_provider_row_for_l2(prior_row, prior_key)
-        if fallback_row is not None:
-            fallback_row["isHistoricalFallback"] = True
-            merged_rows.append(fallback_row)
-            prior_ts = _parse_timestamp_epoch(existing_map.get(prior_key))
-            merged_fetched_map[prior_key] = int(
-                prior_ts if prior_ts is not None else (existing_epoch if existing_epoch is not None else now_epoch)
-            )
-            retained_keys.append(prior_key)
-
-    return merged_rows, merged_fetched_map, retained_keys, had_fallback
-
-
-def merge_and_upsert_l2_snapshot(
+def merge_and_upsert_l2_snapshot(  # noqa: C901
     canonical_ip: str,
     snapshot: Mapping[str, Any],
     *,
@@ -706,9 +592,23 @@ def merge_and_upsert_l2_snapshot(
     effective_mode = normalize_query_mode(query_mode or snapshot.get("queryMode"), default="full")
 
     raw_results = snapshot.get("results")
-    new_valid_comm, failed_comm, any_degraded = _evaluate_incoming_rows(raw_results)
-    if snapshot.get("hasDegradedSources") is True:
-        any_degraded = True
+    new_valid_comm = 0
+    failed_comm = 0
+    any_degraded = snapshot.get("hasDegradedSources") is True
+    for item in raw_results if isinstance(raw_results, list) else ():
+        if not isinstance(item, Mapping):
+            continue
+        pkey = resolve_provider_key(item)
+        if (
+            pkey in _L2_COMMERCIAL_KEYS
+            and _is_valid_l2_provider_row(item, pkey)
+            and not item.get("isHistoricalFallback")
+        ):
+            new_valid_comm += 1
+        elif _is_failed_online_row(item, pkey):
+            any_degraded = True
+            if pkey in PROVIDER_BY_KEY and PROVIDER_BY_KEY[pkey].is_commercial_arbitration:
+                failed_comm += 1
 
     try:
         close_old_connections()
@@ -719,17 +619,23 @@ def merge_and_upsert_l2_snapshot(
             else None
         )
 
-        if _should_abort_degraded_overwrite(existing_row, new_valid_comm, failed_comm):
-            preserved_fetched_at = (
-                _ensure_utc(existing_row.fetched_at).isoformat() if existing_row is not None else None
+        # Refuse to overwrite healthy cached data with a degraded upstream sweep.
+        existing_comm = int(existing_row.valid_commercial_count) if existing_row is not None else 0
+        should_abort = (
+            (new_valid_comm == 0 and failed_comm > 0)
+            if existing_row is None
+            else (
+                (new_valid_comm == 0 and (existing_comm > 0 or failed_comm > 0))
+                or (existing_comm > 0 and new_valid_comm < max(1.0, existing_comm * 0.5))
             )
-            preserved_comm = int(existing_row.valid_commercial_count) if existing_row is not None else 0
+        )
+        if should_abort:
             return L2MergeResult(
                 saved=False,
                 degraded_fallback=True,
-                fetched_at=preserved_fetched_at,
+                fetched_at=_ensure_utc(existing_row.fetched_at).isoformat() if existing_row is not None else None,
                 snapshot=existing_snapshot,
-                valid_commercial_count=preserved_comm,
+                valid_commercial_count=existing_comm,
                 has_degraded_sources=True,
             )
 
@@ -737,13 +643,71 @@ def merge_and_upsert_l2_snapshot(
         explicit_map = raw_explicit_map if isinstance(raw_explicit_map, Mapping) else {}
         existing_epoch = int(_ensure_utc(existing_row.fetched_at).timestamp()) if existing_row is not None else None
 
-        merged_rows, merged_fetched_map, retained_keys, had_fallback = _build_merged_l2_rows(
-            raw_results,
-            existing_snapshot=existing_snapshot,
-            explicit_fetched_map=explicit_map,
-            now_epoch=now_epoch,
-            existing_epoch=existing_epoch,
-        )
+        existing_rows_by_key: Dict[str, Dict[str, Any]] = {}
+        existing_map: Mapping[str, Any] = {}
+        if existing_snapshot is not None:
+            existing_map = (
+                existing_snapshot.get("providerFetchedMap")
+                if isinstance(existing_snapshot.get("providerFetchedMap"), Mapping)
+                else {}
+            )
+            for prior_item in existing_snapshot.get("results") or ():
+                if isinstance(prior_item, Mapping):
+                    prior_key = resolve_provider_key(prior_item)
+                    if (
+                        prior_key
+                        and is_provider_allowed_in_l2(prior_key)
+                        and _is_valid_l2_provider_row(prior_item, prior_key)
+                    ):
+                        existing_rows_by_key[prior_key] = dict(prior_item)
+
+        merged_rows: List[Dict[str, Any]] = []
+        merged_fetched_map: Dict[str, int] = {}
+        retained_keys: List[str] = []
+        seen_keys: set[str] = set()
+        had_fallback = False
+
+        for item in raw_results if isinstance(raw_results, list) else ():
+            if not isinstance(item, Mapping):
+                continue
+            pkey = resolve_provider_key(item)
+            if not is_provider_allowed_in_l2(pkey) or pkey is None:
+                continue
+            seen_keys.add(pkey)
+            if _is_valid_l2_provider_row(item, pkey) and not item.get("isHistoricalFallback"):
+                cleaned = sanitize_provider_row_for_l2(item, pkey)
+                if cleaned is not None:
+                    cleaned.pop("isHistoricalFallback", None)
+                    merged_rows.append(cleaned)
+                    explicit_ts = _parse_timestamp_epoch(explicit_map.get(pkey))
+                    merged_fetched_map[pkey] = int(explicit_ts if explicit_ts is not None else now_epoch)
+            elif pkey in existing_rows_by_key and _is_failed_online_row(item, pkey):
+                fallback_row = sanitize_provider_row_for_l2(existing_rows_by_key[pkey], pkey)
+                if fallback_row is not None:
+                    fallback_row["isHistoricalFallback"] = True
+                    merged_rows.append(fallback_row)
+                    prior_ts = _parse_timestamp_epoch(existing_map.get(pkey))
+                    merged_fetched_map[pkey] = int(
+                        prior_ts
+                        if prior_ts is not None
+                        else (existing_epoch if existing_epoch is not None else now_epoch)
+                    )
+                    retained_keys.append(pkey)
+                    had_fallback = True
+
+        for prior_key, prior_row in existing_rows_by_key.items():
+            if prior_key in seen_keys:
+                continue
+            fallback_row = sanitize_provider_row_for_l2(prior_row, prior_key)
+            if fallback_row is not None:
+                fallback_row["isHistoricalFallback"] = True
+                merged_rows.append(fallback_row)
+                prior_ts = _parse_timestamp_epoch(existing_map.get(prior_key))
+                merged_fetched_map[prior_key] = int(
+                    prior_ts if prior_ts is not None else (existing_epoch if existing_epoch is not None else now_epoch)
+                )
+                retained_keys.append(prior_key)
+
         final_degraded = any_degraded or had_fallback
         final_mode = (
             "full"
@@ -797,7 +761,7 @@ def merge_and_upsert_l2_snapshot(
         )
     except DjangoDbError as db_err:
         safe_err = sanitization.sanitize_error_message(str(db_err))
-        logger.warning(f"ToolsDB L2 upsert bypassed due to database error: {safe_err}")
+        logger.warning("ToolsDB L2 upsert bypassed due to database error: %s", safe_err)
         return L2MergeResult(
             saved=False,
             degraded_fallback=False,
@@ -836,53 +800,6 @@ async def amerge_and_upsert_l2_snapshot(
         )
 
 
-def _clean_expired_providers_on_row(
-    db_row: IpIntelligenceCache,
-    *,
-    now_epoch: float,
-    retention_map: Mapping[str, int],
-    dry_run: bool,
-) -> Tuple[bool, int]:
-    payload = decompress_l2_payload(db_row.payload_compressed)
-    raw_map = dict(db_row.provider_fetched_map) if isinstance(db_row.provider_fetched_map, Mapping) else {}
-    row_fetched_epoch = _ensure_utc(db_row.fetched_at).timestamp()
-
-    removed_count = 0
-    updated_results: List[Any] = []
-    if isinstance(payload, dict) and isinstance(payload.get("results"), list):
-        for item in payload["results"]:
-            if not isinstance(item, Mapping):
-                continue
-            pkey = resolve_provider_key(item)
-            if pkey and _is_provider_expired(pkey, raw_map, row_fetched_epoch, now_epoch, retention_map):
-                removed_count += 1
-                raw_map.pop(pkey, None)
-                continue
-            updated_results.append(item)
-
-    for map_key in list(raw_map.keys()):
-        resolved_key = resolve_provider_key(map_key) or map_key
-        if _is_provider_expired(resolved_key, raw_map, row_fetched_epoch, now_epoch, retention_map):
-            raw_map.pop(map_key, None)
-            if removed_count == 0:
-                removed_count += 1
-
-    if removed_count == 0 or payload is None:
-        return False, 0
-
-    if not dry_run:
-        updated_payload = {**payload, "results": updated_results}
-        db_row.payload_compressed = compress_l2_payload(updated_payload)
-        db_row.provider_fetched_map = raw_map
-        db_row.valid_commercial_count = _count_valid_commercial_rows(
-            [item for item in updated_results if isinstance(item, Mapping)]
-        )
-        db_row.save(
-            update_fields=["payload_compressed", "provider_fetched_map", "valid_commercial_count", "updated_at"]
-        )
-    return True, removed_count
-
-
 def _scan_purge_queryset(
     base_qs: Any,
     *,
@@ -911,15 +828,41 @@ def _scan_purge_queryset(
                 continue
             seen_bins.add(raw_bin)
             scanned += 1
-            changed, removed = _clean_expired_providers_on_row(
-                db_row,
-                now_epoch=now_epoch,
-                retention_map=retention_map,
-                dry_run=dry_run,
-            )
-            if changed:
-                updated += 1
-                purged_providers += removed
+
+            payload = decompress_l2_payload(db_row.payload_compressed)
+            raw_map = dict(db_row.provider_fetched_map) if isinstance(db_row.provider_fetched_map, Mapping) else {}
+            row_fetched_epoch = _ensure_utc(db_row.fetched_at).timestamp()
+            removed_count = 0
+            updated_results: List[Any] = []
+            if isinstance(payload, dict) and isinstance(payload.get("results"), list):
+                for item in payload["results"]:
+                    if not isinstance(item, Mapping):
+                        continue
+                    pkey = resolve_provider_key(item)
+                    if pkey and _is_provider_expired(pkey, raw_map, row_fetched_epoch, now_epoch, retention_map):
+                        removed_count += 1
+                        raw_map.pop(pkey, None)
+                        continue
+                    updated_results.append(item)
+            for map_key in list(raw_map.keys()):
+                resolved_key = resolve_provider_key(map_key) or map_key
+                if _is_provider_expired(resolved_key, raw_map, row_fetched_epoch, now_epoch, retention_map):
+                    raw_map.pop(map_key, None)
+                    if removed_count == 0:
+                        removed_count += 1
+            if removed_count == 0 or payload is None:
+                continue
+            if not dry_run:
+                db_row.payload_compressed = compress_l2_payload({**payload, "results": updated_results})
+                db_row.provider_fetched_map = raw_map
+                db_row.valid_commercial_count = _count_valid_commercial_rows(
+                    [item for item in updated_results if isinstance(item, Mapping)]
+                )
+                db_row.save(
+                    update_fields=["payload_compressed", "provider_fetched_map", "valid_commercial_count", "updated_at"]
+                )
+            updated += 1
+            purged_providers += removed_count
         if len(batch) < batch_size:
             break
 

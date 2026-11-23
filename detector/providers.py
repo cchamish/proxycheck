@@ -1,6 +1,4 @@
-"""
-Upstream HTTP IP intelligence provider queries and shared provider specification registry.
-"""
+"""Upstream HTTP IP intelligence provider queries and shared provider specification registry."""
 
 import asyncio
 import logging
@@ -9,12 +7,12 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import httpx
 from django.conf import settings
 
-from . import adapters, dns_providers, offline_dbs, sanitization
+from . import dns_providers, offline_dbs
 from .adapters import (
     adapt_abuseipdb,
     adapt_cloudflare_radar,
@@ -30,33 +28,12 @@ from .adapters import (
     adapt_tor_onionoo,
 )
 from .cache_backends import get_cooldown_bounds
-from .dns_providers import (
-    provider_upstream_events,
-    record_upstream_event,
-)
+from .dns_providers import provider_upstream_events, record_upstream_event
 from .provider_registry import PROVIDER_REGISTRY, USER_AGENT_HEADER
 from .quota_telemetry import extract_upstream_rate_limit
-from .sanitization import (
-    extract_response_log_details,
-    parse_upstream_json_with_error,
-    sanitize_error_message,
-)
+from .sanitization import sanitize_error_message, sanitize_payload
 
 logger = logging.getLogger("detector.views")
-
-
-def _extract_retry_after_header(resp: Any) -> Optional[str]:
-    headers = getattr(resp, "headers", None)
-    if headers is None:
-        return None
-    getter = getattr(headers, "get", None)
-    if not callable(getter):
-        return None
-    for header_name in ("Retry-After", "retry-after"):
-        val = getter(header_name)
-        if isinstance(val, str):
-            return val
-    return None
 
 
 def parse_retry_after_seconds(raw_header: Optional[str]) -> int:
@@ -68,62 +45,6 @@ def parse_retry_after_seconds(raw_header: Optional[str]) -> int:
     if not re.fullmatch(r"\d+", cleaned):
         return default_s
     return max(low, min(high, int(cleaned)))
-
-
-_parse_retry_after_seconds = parse_retry_after_seconds
-
-
-def _record_http_status_event(
-    resp: Any,
-    provider_key: str,
-    raw_status: Any,
-    parsed_status: int,
-    payload: Any,
-    default_cooldown: int,
-) -> None:
-    upstream_remaining, upstream_limit, upstream_used = extract_upstream_rate_limit(
-        resp,
-        payload if raw_status == 200 and parsed_status == 200 else None,
-        provider_key,
-    )
-    if raw_status == 429:
-        cooldown_secs = parse_retry_after_seconds(_extract_retry_after_header(resp))
-        record_upstream_event(
-            provider_key,
-            trigger_cooldown=True,
-            status_code=429,
-            reason="429 Rate Limited",
-            cooldown_seconds=cooldown_secs,
-            upstream_remaining=upstream_remaining,
-            upstream_limit=upstream_limit,
-        )
-    elif isinstance(raw_status, int) and raw_status >= 500:
-        record_upstream_event(
-            provider_key,
-            trigger_cooldown=True,
-            status_code=raw_status,
-            reason=f"HTTP {raw_status}",
-            cooldown_seconds=default_cooldown,
-            upstream_remaining=upstream_remaining,
-            upstream_limit=upstream_limit,
-        )
-    elif parsed_status >= 500 and raw_status == 200:
-        record_upstream_event(
-            provider_key,
-            trigger_cooldown=True,
-            status_code=parsed_status,
-            reason="Malformed Gateway Body",
-            cooldown_seconds=default_cooldown,
-        )
-    else:
-        record_upstream_event(
-            provider_key,
-            trigger_cooldown=False,
-            status_code=parsed_status,
-            upstream_remaining=upstream_remaining,
-            upstream_limit=upstream_limit,
-            upstream_used=upstream_used,
-        )
 
 
 async def _fetch_upstream_json(
@@ -159,7 +80,7 @@ async def _fetch_upstream_json(
             safe_message = f"{type(exc).__name__}: upstream request timed out"
         else:
             safe_message = type(exc).__name__
-        logger.error(f"{provider_label} request exception: {safe_message}")
+        logger.error("%s request exception: %s", provider_label, safe_message)
         record_upstream_event(
             provider_key,
             trigger_cooldown=True,
@@ -172,26 +93,122 @@ async def _fetch_upstream_json(
         return {"status": "error", "message": safe_message}, 502
 
     raw_status = getattr(resp, "status_code", 502)
-    payload, parsed_status, parse_error = parse_upstream_json_with_error(resp)
+    try:
+        payload: Any = resp.json()
+        parsed_status = raw_status
+        parse_error: Optional[str] = None
+    except ValueError as exc:
+        parsed_status = 502 if raw_status == 200 else raw_status
+        payload = {"status": "error", "message": sanitize_error_message(getattr(resp, "text", "") or "")}
+        parse_error = type(exc).__name__
+
     if treat_404_as_ok and raw_status == 404:
         clean_404_payload = (
             payload if parse_error is None and isinstance(payload, dict) else {"detail": "No information available"}
         )
-        _record_http_status_event(resp, provider_key, 200, 200, clean_404_payload, default_cooldown)
+        upstream_remaining, upstream_limit, upstream_used = extract_upstream_rate_limit(
+            resp, clean_404_payload, provider_key
+        )
+        record_upstream_event(
+            provider_key,
+            trigger_cooldown=False,
+            status_code=200,
+            upstream_remaining=upstream_remaining,
+            upstream_limit=upstream_limit,
+            upstream_used=upstream_used,
+        )
         return clean_404_payload, 404
 
-    if isinstance(raw_status, int) and raw_status != 200:
-        content_type, body_preview = extract_response_log_details(resp)
-        logger.warning(
-            f"{provider_label} returned HTTP {raw_status} (Content-Type: {content_type}; body: {body_preview})"
+    if (isinstance(raw_status, int) and raw_status != 200) or parse_error is not None:
+        content_type = "unknown"
+        resp_headers = getattr(resp, "headers", None)
+        getter = getattr(resp_headers, "get", None) if resp_headers is not None else None
+        if callable(getter):
+            for header_name in ("Content-Type", "content-type"):
+                candidate = getter(header_name)
+                if isinstance(candidate, str) and candidate.strip():
+                    cleaned_ct = " ".join(sanitize_error_message(candidate).split())
+                    content_type = cleaned_ct[:64] or "unknown"
+                    break
+
+        raw_text = getattr(resp, "text", "")
+        if not isinstance(raw_text, str) or not raw_text.strip():
+            body_preview = "<empty>"
+        else:
+            sanitised_text = " ".join(sanitize_error_message(raw_text).split())
+            body_preview = f"{sanitised_text[:117]}..." if len(sanitised_text) > 120 else sanitised_text
+
+        if isinstance(raw_status, int) and raw_status != 200:
+            logger.warning(
+                "%s returned HTTP %s (Content-Type: %s; body: %s)",
+                provider_label,
+                raw_status,
+                content_type,
+                body_preview,
+            )
+        else:
+            logger.warning(
+                "%s returned non-JSON HTTP %s body (%s -> %s; Content-Type: %s; body: %s)",
+                provider_label,
+                raw_status,
+                parse_error,
+                parsed_status,
+                content_type,
+                body_preview,
+            )
+
+    upstream_remaining, upstream_limit, upstream_used = extract_upstream_rate_limit(
+        resp,
+        payload if raw_status == 200 and parsed_status == 200 else None,
+        provider_key,
+    )
+    if raw_status == 429:
+        retry_after: Optional[str] = None
+        resp_headers = getattr(resp, "headers", None)
+        getter = getattr(resp_headers, "get", None) if resp_headers is not None else None
+        if callable(getter):
+            for header_name in ("Retry-After", "retry-after"):
+                val = getter(header_name)
+                if isinstance(val, str):
+                    retry_after = val
+                    break
+        record_upstream_event(
+            provider_key,
+            trigger_cooldown=True,
+            status_code=429,
+            reason="429 Rate Limited",
+            cooldown_seconds=parse_retry_after_seconds(retry_after),
+            upstream_remaining=upstream_remaining,
+            upstream_limit=upstream_limit,
         )
-    elif parse_error is not None:
-        content_type, body_preview = extract_response_log_details(resp)
-        logger.warning(
-            f"{provider_label} returned non-JSON HTTP {raw_status} body ({parse_error} -> {parsed_status}; "
-            f"Content-Type: {content_type}; body: {body_preview})"
+    elif isinstance(raw_status, int) and raw_status >= 500:
+        record_upstream_event(
+            provider_key,
+            trigger_cooldown=True,
+            status_code=raw_status,
+            reason=f"HTTP {raw_status}",
+            cooldown_seconds=default_cooldown,
+            upstream_remaining=upstream_remaining,
+            upstream_limit=upstream_limit,
         )
-    _record_http_status_event(resp, provider_key, raw_status, parsed_status, payload, default_cooldown)
+    elif parsed_status >= 500 and raw_status == 200:
+        record_upstream_event(
+            provider_key,
+            trigger_cooldown=True,
+            status_code=parsed_status,
+            reason="Malformed Gateway Body",
+            cooldown_seconds=default_cooldown,
+        )
+    else:
+        record_upstream_event(
+            provider_key,
+            trigger_cooldown=False,
+            status_code=parsed_status,
+            upstream_remaining=upstream_remaining,
+            upstream_limit=upstream_limit,
+            upstream_used=upstream_used,
+        )
+
     return payload, parsed_status
 
 
@@ -268,7 +285,7 @@ async def query_getipintel(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]
 
     url = f"https://check.getipintel.net/check.php?ip={ip}&contact={contact_email}&flags=f&oflags=r&format=json"
     payload, status_code = await _fetch_upstream_json(client, "getipintel", "GetIPIntel", url, timeout=5.0)
-    return adapters.adapt_getipintel(payload, True, status_code)
+    return adapt_getipintel(payload, True, status_code)
 
 
 async def query_proxycheck(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
@@ -362,7 +379,7 @@ async def query_dshield(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
             is_timeout = bool((events.get("dshield") or {}).get("isTimeout"))
             if is_timeout or elapsed > 5.0 or status_code not in (502, 503, 504) or idx == len(endpoints) - 1:
                 break
-            logger.warning(f"DShield primary endpoint {host} returned {status_code}; retrying fallback endpoint")
+            logger.warning("DShield primary endpoint %s returned %s; retrying fallback endpoint", host, status_code)
     finally:
         if owned_events_token is not None:
             provider_upstream_events.reset(owned_events_token)
@@ -404,7 +421,6 @@ def build_cooldown_provider_row(provider_name: str, cooldown_info: Dict[str, Any
         raw_payload["used"] = cooldown_info.get("used")
         raw_payload["limit"] = cooldown_info.get("limit")
 
-    sanitize_fn = sanitization.sanitize_payload
     row: Dict[str, Any] = {
         "provider": provider_name,
         "status": status_label,
@@ -416,15 +432,12 @@ def build_cooldown_provider_row(provider_name: str, cooldown_info: Dict[str, Any
         "usageType": "-",
         "securityFlags": [{"label": flag_label, "isHighRisk": False}],
         "isCooldown": True,
-        "rawJson": sanitize_fn(raw_payload),
+        "rawJson": sanitize_payload(raw_payload),
     }
     if is_quota_guard:
         row["isQuotaGuarded"] = True
         row["isQuotaGuard"] = True
     return row
-
-
-_build_cooldown_provider_row = build_cooldown_provider_row
 
 
 def build_unhandled_provider_error_row(provider_name: str, safe_message: str) -> Dict[str, Any]:
@@ -477,16 +490,6 @@ class ProviderSpec:
             return await query_fn(client, ip)
         return await query_fn(ip)
 
-    def __iter__(self) -> Iterator[Any]:
-        yield self.key
-        yield self.label
-        yield self.uses_http_client
-        yield self.supports_cooldown
-        yield self.invoke
-
-    def __getitem__(self, index: int) -> Any:
-        return (self.key, self.label, self.uses_http_client, self.supports_cooldown, self.invoke)[index]
-
 
 _CURRENT_MODULE = sys.modules[__name__]
 _IP_ONLY_DNS_PROVIDER_KEYS = frozenset({"maxmind", "spamhaus_zen", "spamcop"})
@@ -503,4 +506,3 @@ PROVIDER_SPECS: Tuple[ProviderSpec, ...] = tuple(
     )
     for meta in PROVIDER_REGISTRY
 )
-_PROVIDER_SPECS = PROVIDER_SPECS

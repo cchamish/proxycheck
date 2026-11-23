@@ -369,64 +369,6 @@ def _ingest_hosting_rule_entry(
         asn_map[parsed_asn] = f"AS{parsed_asn}"
 
 
-def _parse_hosting_rules_payload(payload: Any) -> Tuple[Dict[int, str], List[str]]:
-    """Extracts hosting ASN labels and organisation keywords from rule JSON."""
-    asn_map: Dict[int, str] = {}
-    keywords: List[str] = []
-
-    if isinstance(payload, list):
-        for item in payload:
-            _ingest_hosting_rule_entry(item, asn_map, keywords)
-        return asn_map, keywords
-
-    if not isinstance(payload, dict):
-        return asn_map, keywords
-
-    raw_asns = payload.get("asns")
-    if isinstance(raw_asns, dict):
-        for k, v in raw_asns.items():
-            parsed_asn = _normalize_asn_number(k)
-            if parsed_asn is not None:
-                asn_map[parsed_asn] = v.strip() if isinstance(v, str) and v.strip() else f"AS{parsed_asn}"
-    elif isinstance(raw_asns, list):
-        for item in raw_asns:
-            _ingest_hosting_rule_entry(item, asn_map, keywords)
-
-    for hosts_key in ("hosts", "providers", "rules"):
-        raw_hosts = payload.get(hosts_key)
-        entries = (
-            raw_hosts if isinstance(raw_hosts, list) else (raw_hosts.values() if isinstance(raw_hosts, dict) else ())
-        )
-        for entry in entries:
-            _ingest_hosting_rule_entry(entry, asn_map, keywords)
-
-    for kw_key in ("keywords", "orgKeywords", "searchterms"):
-        raw_kws = payload.get(kw_key)
-        if isinstance(raw_kws, list):
-            keywords.extend(kw.strip().lower() for kw in raw_kws if isinstance(kw, str) and kw.strip())
-    return asn_map, keywords
-
-
-def _build_hosting_keyword_pattern(keywords: Iterable[str]) -> Optional[re.Pattern[str]]:
-    unique_keywords = sorted(
-        {kw.strip().lower() for kw in keywords if isinstance(kw, str) and kw.strip()},
-        key=len,
-        reverse=True,
-    )
-    if not unique_keywords:
-        return None
-    escaped = "|".join(re.escape(kw) for kw in unique_keywords)
-    return re.compile(rf"(?<![a-z0-9])(?:{escaped})(?![a-z0-9])", re.IGNORECASE)
-
-
-def _normalize_setting_sequence(raw_val: Any) -> Tuple[str, ...]:
-    if isinstance(raw_val, str):
-        return tuple(part.strip() for part in raw_val.split(",") if part.strip())
-    if isinstance(raw_val, (list, tuple, set, frozenset)):
-        return tuple(str(part).strip() for part in raw_val if str(part).strip())
-    return ()
-
-
 def _get_hosting_rules() -> Tuple[Dict[int, str], Optional[re.Pattern[str]]]:
     path, _ = resolve_hosting_rules_path()
     mtime_ns = 0
@@ -439,8 +381,16 @@ def _get_hosting_rules() -> Tuple[Dict[int, str], Optional[re.Pattern[str]]]:
         else:
             path = None
 
-    configured_asns = _normalize_setting_sequence(get_setting("HOSTING_ASNS", ()))
-    configured_keywords = _normalize_setting_sequence(get_setting("HOSTING_ORG_KEYWORDS", ()))
+    def _setting_tuple(name: str) -> Tuple[str, ...]:
+        raw_val = get_setting(name, ())
+        if isinstance(raw_val, str):
+            return tuple(part.strip() for part in raw_val.split(",") if part.strip())
+        if isinstance(raw_val, (list, tuple, set, frozenset)):
+            return tuple(str(part).strip() for part in raw_val if str(part).strip())
+        return ()
+
+    configured_asns = _setting_tuple("HOSTING_ASNS")
+    configured_keywords = _setting_tuple("HOSTING_ORG_KEYWORDS")
     cache_key = (path_str, mtime_ns, configured_asns, configured_keywords)
 
     def _load() -> Tuple[Dict[int, str], Optional[re.Pattern[str]]]:
@@ -449,10 +399,35 @@ def _get_hosting_rules() -> Tuple[Dict[int, str], Optional[re.Pattern[str]]]:
 
         if path is not None:
             try:
-                raw_payload = json.loads(path.read_text(encoding="utf-8"))
-                file_asns, file_keywords = _parse_hosting_rules_payload(raw_payload)
-                asn_map.update(file_asns)
-                keywords.extend(file_keywords)
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(payload, list):
+                    for item in payload:
+                        _ingest_hosting_rule_entry(item, asn_map, keywords)
+                elif isinstance(payload, dict):
+                    raw_asns = payload.get("asns")
+                    if isinstance(raw_asns, dict):
+                        for k, v in raw_asns.items():
+                            parsed_asn = _normalize_asn_number(k)
+                            if parsed_asn is not None:
+                                asn_map[parsed_asn] = (
+                                    v.strip() if isinstance(v, str) and v.strip() else f"AS{parsed_asn}"
+                                )
+                    elif isinstance(raw_asns, list):
+                        for item in raw_asns:
+                            _ingest_hosting_rule_entry(item, asn_map, keywords)
+                    for hosts_key in ("hosts", "providers", "rules"):
+                        raw_hosts = payload.get(hosts_key)
+                        entries = (
+                            raw_hosts
+                            if isinstance(raw_hosts, list)
+                            else (raw_hosts.values() if isinstance(raw_hosts, dict) else ())
+                        )
+                        for entry in entries:
+                            _ingest_hosting_rule_entry(entry, asn_map, keywords)
+                    for kw_key in ("keywords", "orgKeywords", "searchterms"):
+                        raw_kws = payload.get(kw_key)
+                        if isinstance(raw_kws, list):
+                            keywords.extend(kw.strip().lower() for kw in raw_kws if isinstance(kw, str) and kw.strip())
             except (OSError, ValueError) as exc:
                 logger.warning("Failed to load hosting ASN rules from %s: %s", path, exc)
 
@@ -461,7 +436,20 @@ def _get_hosting_rules() -> Tuple[Dict[int, str], Optional[re.Pattern[str]]]:
             if parsed_asn is not None and parsed_asn not in asn_map:
                 asn_map[parsed_asn] = f"AS{parsed_asn}"
         keywords.extend(raw_kw.lower() for raw_kw in configured_keywords)
-        return asn_map, _build_hosting_keyword_pattern(keywords)
+
+        unique_keywords = sorted(
+            {kw.strip().lower() for kw in keywords if isinstance(kw, str) and kw.strip()},
+            key=len,
+            reverse=True,
+        )
+        pattern = (
+            re.compile(
+                rf"(?<![a-z0-9])(?:{'|'.join(re.escape(kw) for kw in unique_keywords)})(?![a-z0-9])", re.IGNORECASE
+            )
+            if unique_keywords
+            else None
+        )
+        return asn_map, pattern
 
     return _hosting_rules_cache.get_or_load(cache_key, _load)
 
@@ -528,47 +516,6 @@ def _format_clamped_cidr(addr: ipaddress.IPv4Address | ipaddress.IPv6Address, pr
     return str(ipaddress.ip_network(f"{addr.compressed}/{clamped}", strict=False))
 
 
-def _is_meaningful_label(raw_val: Any) -> bool:
-    if not isinstance(raw_val, str):
-        return False
-    cleaned = raw_val.strip()
-    return bool(cleaned and cleaned != "-")
-
-
-def _provider_rows_indicate_mobile(provider_rows: Optional[Iterable[Mapping[str, Any]]]) -> bool:
-    if provider_rows is None:
-        return False
-    for row in provider_rows:
-        if not isinstance(row, Mapping):
-            continue
-        status = row.get("status")
-        if isinstance(status, str) and status and status != "200 OK":
-            continue
-        if row.get("isMobile") is True or row.get("coreVerdict") == "mobile":
-            return True
-        if _is_meaningful_label(row.get("carrier")) or _is_meaningful_label(row.get("mobileBrand")):
-            return True
-        usage = str(row.get("usageType") or "").strip().lower()
-        if usage in ("mobile", "cellular"):
-            return True
-    return False
-
-
-def _provider_rows_indicate_hosting(provider_rows: Optional[Iterable[Mapping[str, Any]]]) -> bool:
-    if provider_rows is None:
-        return False
-    for row in provider_rows:
-        if not isinstance(row, Mapping):
-            continue
-        status = row.get("status")
-        if isinstance(status, str) and status and status != "200 OK":
-            continue
-        usage = str(row.get("usageType") or "").strip().lower()
-        if any(kw in usage for kw in ("hosting", "datacenter", "data center", "cloud")):
-            return True
-    return False
-
-
 def _extract_asn_from_rows(provider_rows: Optional[Iterable[Mapping[str, Any]]]) -> Optional[int]:
     if provider_rows is None:
         return None
@@ -604,226 +551,26 @@ def detect_mobile_or_cgnat(
     if any(str(tag).strip().lower() in MOBILE_BGP_TAG_TOKENS for tag in bgp_tags):
         return True
 
-    if _provider_rows_indicate_mobile(provider_rows):
-        return True
+    if provider_rows is not None:
+        for row in provider_rows:
+            if not isinstance(row, Mapping):
+                continue
+            status = row.get("status")
+            if isinstance(status, str) and status and status != "200 OK":
+                continue
+            if row.get("isMobile") is True or row.get("coreVerdict") == "mobile":
+                return True
+            for field_name in ("carrier", "mobileBrand"):
+                raw_label = row.get(field_name)
+                if isinstance(raw_label, str) and raw_label.strip() and raw_label.strip() != "-":
+                    return True
+            if str(row.get("usageType") or "").strip().lower() in ("mobile", "cellular"):
+                return True
 
     return bool(ip_compressed and query_openasn_offline(ip_compressed).get("coreVerdict") == "mobile")
 
 
-def _resolve_bgp_prefix_attribution(
-    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
-    explicit_bgp_prefix: Optional[str],
-    bgp_lookup: Optional[Dict[str, Any]],
-) -> Tuple[Optional[str], Optional[int]]:
-    candidates: List[str] = []
-    if isinstance(explicit_bgp_prefix, str) and explicit_bgp_prefix.strip():
-        candidates.append(explicit_bgp_prefix.strip())
-    if isinstance(bgp_lookup, dict):
-        offline_prefix = bgp_lookup.get("bgpPrefix")
-        if isinstance(offline_prefix, str) and offline_prefix.strip():
-            candidates.append(offline_prefix.strip())
-
-    for raw_prefix in candidates:
-        try:
-            net = ipaddress.ip_network(raw_prefix, strict=False)
-        except ValueError:
-            continue
-        if net.version == addr.version and addr in net:
-            return str(net), net.prefixlen
-    return None, None
-
-
-def _extract_openasn_shared_fallback(
-    ip_compressed: str,
-    provider_rows: Optional[Iterable[Mapping[str, Any]]],
-) -> Tuple[Optional[str], Optional[str]]:
-    openasn_row: Optional[Mapping[str, Any]] = None
-    if provider_rows is not None:
-        for row in provider_rows:
-            if isinstance(row, Mapping) and row.get("provider") == "OpenASN" and row.get("status") == "200 OK":
-                openasn_row = row
-                break
-
-    if openasn_row is not None:
-        verdict = openasn_row.get("coreVerdict")
-        is_cdn = bool(openasn_row.get("isCdn") or (openasn_row.get("rawJson") or {}).get("cdn"))
-        is_dc = bool(openasn_row.get("isDatacenter") or (openasn_row.get("rawJson") or {}).get("datacenterRange"))
-        raw_org = (
-            openasn_row.get("isp") or openasn_row.get("organisation") or (openasn_row.get("rawJson") or {}).get("asOrg")
-        )
-    else:
-        lookup = query_openasn_offline(ip_compressed)
-        if not lookup.get("has_db"):
-            return None, None
-        verdict = lookup.get("coreVerdict")
-        is_cdn = bool(lookup.get("cdn"))
-        is_dc = bool(lookup.get("datacenterRange"))
-        raw_org = lookup.get("asOrg")
-
-    org = raw_org.strip() if isinstance(raw_org, str) and raw_org.strip() and raw_org.strip() != "-" else None
-    if verdict == "enterprise_gateway":
-        return org or "Enterprise Gateway", "enterprise_gateway"
-    if verdict == "hosting" and is_cdn and not is_dc:
-        return org or "CDN", "cdn"
-    return None, None
-
-
-def _resolve_shared_attribution(
-    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
-    *,
-    shared_cidr: Optional[str],
-    shared_provider: Optional[str],
-    shared_category: Optional[str],
-    shared_privacy_egress: Optional[str],
-    provider_rows: Optional[Iterable[Mapping[str, Any]]],
-) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
-    if shared_privacy_egress == "icloud_private_relay":
-        return None, "iCloud Relay", "relay", None
-    if shared_privacy_egress == "cloudflare_warp":
-        return None, "Cloudflare WARP", "relay", None
-
-    resolved_provider = (
-        shared_provider.strip() if isinstance(shared_provider, str) and shared_provider.strip() else None
-    )
-    resolved_category = (
-        shared_category.strip().lower() if isinstance(shared_category, str) and shared_category.strip() else None
-    )
-    raw_cidr = shared_cidr
-    if raw_cidr is None and resolved_provider is None:
-        shared_hit = lookup_shared_cidr_offline(addr.compressed)
-        if shared_hit is not None:
-            raw_cidr = shared_hit["cidr"]
-            resolved_provider = shared_hit.get("provider")
-            resolved_category = shared_hit.get("category")
-
-    if isinstance(raw_cidr, str) and raw_cidr.strip():
-        try:
-            shared_net = ipaddress.ip_network(raw_cidr.strip(), strict=False)
-            if shared_net.version == addr.version and shared_net.prefixlen > 0 and addr in shared_net:
-                return (
-                    str(shared_net),
-                    resolved_provider,
-                    resolved_category or "cloud",
-                    shared_net.prefixlen,
-                )
-        except ValueError:
-            pass
-
-    if resolved_provider is not None:
-        return None, resolved_provider, resolved_category or "cloud", None
-
-    fallback_provider, fallback_category = _extract_openasn_shared_fallback(addr.compressed, provider_rows)
-    if fallback_provider is not None:
-        return None, fallback_provider, fallback_category, None
-    return None, None, None, None
-
-
-def _select_cidr_recommendation(
-    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
-    default_cidr: str,
-    default_prefix: int,
-    valid_mmdb_prefix: Optional[int],
-    resolved_cloud_provider: Optional[str],
-    valid_cloud_prefix: Optional[int],
-) -> Tuple[str, str]:
-    narrow_mmdb = valid_mmdb_prefix is not None and valid_mmdb_prefix > default_prefix
-    narrow_cloud = valid_cloud_prefix is not None and valid_cloud_prefix > default_prefix
-    provider_label = f"{resolved_cloud_provider} " if resolved_cloud_provider else ""
-
-    if narrow_mmdb and (not narrow_cloud or (valid_mmdb_prefix or 0) >= (valid_cloud_prefix or 0)):
-        clamped_mmdb = _clamp_mediawiki_prefix_len(addr.version, valid_mmdb_prefix or default_prefix)
-        return _format_clamped_cidr(addr, clamped_mmdb), (
-            f"Narrower MMDB prefix /{clamped_mmdb} selected over default /{default_prefix} to avoid collateral blocking"
-        )
-    if narrow_cloud:
-        clamped_cloud = _clamp_mediawiki_prefix_len(addr.version, valid_cloud_prefix or default_prefix)
-        return _format_clamped_cidr(addr, clamped_cloud), (
-            f"Narrower {provider_label}cloud prefix /{clamped_cloud} selected over default "
-            f"/{default_prefix} to avoid collateral blocking"
-        )
-    if valid_mmdb_prefix is not None and valid_mmdb_prefix < default_prefix:
-        note = (
-            f"Default /{default_prefix} retained because MMDB prefix "
-            f"/{valid_mmdb_prefix} is wider than standard block granularity"
-        )
-    elif valid_mmdb_prefix == default_prefix:
-        note = f"MMDB prefix matches default /{default_prefix} block granularity"
-    elif valid_cloud_prefix is not None and valid_cloud_prefix < default_prefix:
-        note = (
-            f"Default /{default_prefix} retained because {provider_label}cloud prefix "
-            f"/{valid_cloud_prefix} is wider than standard block granularity"
-        )
-    elif valid_cloud_prefix == default_prefix:
-        note = f"{provider_label}Cloud prefix matches default /{default_prefix} block granularity"
-    else:
-        note = f"Default /{default_prefix} range selected"
-    return default_cidr, note
-
-
-def _openasn_indicates_hosting(lookup: Mapping[str, Any]) -> bool:
-    verdict = lookup.get("coreVerdict")
-    if verdict == "vpn":
-        return True
-    return verdict == "hosting" and not (lookup.get("cdn") and not lookup.get("datacenterRange"))
-
-
-def _is_hosting_network(
-    *,
-    explicit_is_hosting: Optional[bool],
-    ip_compressed: str,
-    resolved_cloud_cidr: Optional[str],
-    resolved_cloud_provider: Optional[str],
-    resolved_ptr_category: str,
-    asn_num: Optional[int],
-    org_name: Optional[str],
-    bgp_tags: Iterable[str],
-    provider_rows: Optional[Iterable[Mapping[str, Any]]],
-) -> bool:
-    if explicit_is_hosting is not None:
-        return bool(explicit_is_hosting)
-    if resolved_cloud_cidr is not None or resolved_cloud_provider is not None:
-        return True
-    if resolved_ptr_category == "hosting_or_gateway":
-        return True
-    if match_hosting_asn_or_org(asn_num, org_name) is not None:
-        return True
-    if any(str(tag).strip().lower() in ("vpn", "hosting", "datacenter", "cloud") for tag in bgp_tags):
-        return True
-    if _openasn_indicates_hosting(query_openasn_offline(ip_compressed)):
-        return True
-    return _provider_rows_indicate_hosting(provider_rows)
-
-
-def _compute_ipv6_escalation(
-    addr: ipaddress.IPv6Address,
-    *,
-    is_hosting: bool,
-    valid_cloud_prefix: Optional[int],
-    valid_bgp_prefix: Optional[int],
-    valid_mmdb_prefix: Optional[int],
-    base_note: str,
-) -> Tuple[Optional[str], str]:
-    if is_hosting:
-        raw_candidates = [p for p in (valid_cloud_prefix, valid_bgp_prefix, valid_mmdb_prefix) if p is not None]
-        raw_esc = raw_candidates[0] if raw_candidates else _HOSTING_IPV6_MIN_ESCALATION_PREFIX
-        clamped_esc = max(
-            _HOSTING_IPV6_MIN_ESCALATION_PREFIX,
-            min(_HOSTING_IPV6_MAX_ESCALATION_PREFIX, raw_esc),
-        )
-        esc_cidr = _format_clamped_cidr(addr, clamped_esc)
-        return esc_cidr, f"{base_note}; hosting escalation range clamped to /{clamped_esc}"
-
-    if valid_bgp_prefix is not None and valid_bgp_prefix <= _RESIDENTIAL_IPV6_MAX_BGP_FOR_ESCALATION:
-        esc_cidr = _format_clamped_cidr(addr, _RESIDENTIAL_IPV6_ESCALATION_PREFIX)
-        return (
-            esc_cidr,
-            f"{base_note}; residential /{_RESIDENTIAL_IPV6_ESCALATION_PREFIX} escalation available within BGP /{valid_bgp_prefix}",
-        )
-
-    return None, base_note
-
-
-def compute_cidr_attribution(
+def compute_cidr_attribution(  # noqa: C901
     ip: str,
     mmdb_prefix_len: Optional[int] = None,
     shared_cidr: Optional[str] = None,
@@ -870,22 +617,114 @@ def compute_cidr_attribution(
 
     bgp_lookup = lookup_bgp_tools_offline(addr.compressed)
     shared_privacy_egress = lookup_privacy_relay_offline(addr.compressed)
-    resolved_shared_cidr, resolved_shared_provider, resolved_shared_category, valid_shared_prefix = (
-        _resolve_shared_attribution(
-            addr,
-            shared_cidr=shared_cidr,
-            shared_provider=shared_provider,
-            shared_category=shared_category,
-            shared_privacy_egress=shared_privacy_egress,
-            provider_rows=provider_rows,
+
+    # Resolve shared-infrastructure attribution (privacy relays, cloud/VPN CIDRs, or OpenASN fallback).
+    resolved_shared_cidr: Optional[str] = None
+    resolved_shared_provider: Optional[str] = None
+    resolved_shared_category: Optional[str] = None
+    valid_shared_prefix: Optional[int] = None
+    if shared_privacy_egress == "icloud_private_relay":
+        resolved_shared_provider, resolved_shared_category = "iCloud Relay", "relay"
+    elif shared_privacy_egress == "cloudflare_warp":
+        resolved_shared_provider, resolved_shared_category = "Cloudflare WARP", "relay"
+    else:
+        cand_provider = (
+            shared_provider.strip() if isinstance(shared_provider, str) and shared_provider.strip() else None
         )
-    )
+        cand_category = (
+            shared_category.strip().lower() if isinstance(shared_category, str) and shared_category.strip() else None
+        )
+        raw_cidr = shared_cidr
+        if raw_cidr is None and cand_provider is None:
+            shared_hit = lookup_shared_cidr_offline(addr.compressed)
+            if shared_hit is not None:
+                raw_cidr = shared_hit["cidr"]
+                cand_provider = shared_hit.get("provider")
+                cand_category = shared_hit.get("category")
+
+        if isinstance(raw_cidr, str) and raw_cidr.strip():
+            try:
+                shared_net = ipaddress.ip_network(raw_cidr.strip(), strict=False)
+                if shared_net.version == addr.version and shared_net.prefixlen > 0 and addr in shared_net:
+                    resolved_shared_cidr = str(shared_net)
+                    resolved_shared_provider = cand_provider
+                    resolved_shared_category = cand_category or "cloud"
+                    valid_shared_prefix = shared_net.prefixlen
+            except ValueError:
+                pass
+
+        if resolved_shared_cidr is None and cand_provider is not None:
+            resolved_shared_provider = cand_provider
+            resolved_shared_category = cand_category or "cloud"
+        elif resolved_shared_cidr is None:
+            openasn_row = next(
+                (
+                    row
+                    for row in (provider_rows or ())
+                    if isinstance(row, Mapping) and row.get("provider") == "OpenASN" and row.get("status") == "200 OK"
+                ),
+                None,
+            )
+            if openasn_row is not None:
+                oa_verdict = openasn_row.get("coreVerdict")
+                oa_cdn = bool(openasn_row.get("isCdn") or (openasn_row.get("rawJson") or {}).get("cdn"))
+                oa_dc = bool(
+                    openasn_row.get("isDatacenter") or (openasn_row.get("rawJson") or {}).get("datacenterRange")
+                )
+                oa_org_raw = (
+                    openasn_row.get("isp")
+                    or openasn_row.get("organisation")
+                    or (openasn_row.get("rawJson") or {}).get("asOrg")
+                )
+            else:
+                oa_lookup = query_openasn_offline(addr.compressed)
+                if oa_lookup.get("has_db"):
+                    oa_verdict = oa_lookup.get("coreVerdict")
+                    oa_cdn = bool(oa_lookup.get("cdn"))
+                    oa_dc = bool(oa_lookup.get("datacenterRange"))
+                    oa_org_raw = oa_lookup.get("asOrg")
+                else:
+                    oa_verdict, oa_cdn, oa_dc, oa_org_raw = None, False, False, None
+
+            oa_org = (
+                oa_org_raw.strip()
+                if isinstance(oa_org_raw, str) and oa_org_raw.strip() and oa_org_raw.strip() != "-"
+                else None
+            )
+            if oa_verdict == "enterprise_gateway":
+                resolved_shared_provider, resolved_shared_category = (
+                    oa_org or "Enterprise Gateway",
+                    "enterprise_gateway",
+                )
+            elif oa_verdict == "hosting" and oa_cdn and not oa_dc:
+                resolved_shared_provider, resolved_shared_category = oa_org or "CDN", "cdn"
+
     is_narrowing_shared = resolved_shared_category in ("cloud", "vpn")
     narrowing_provider = resolved_shared_provider if is_narrowing_shared else None
     narrowing_cidr = resolved_shared_cidr if is_narrowing_shared else None
     narrowing_prefix = valid_shared_prefix if is_narrowing_shared else None
 
-    resolved_bgp_prefix, valid_bgp_prefix = _resolve_bgp_prefix_attribution(addr, bgp_prefix, bgp_lookup)
+    # Resolve BGP prefix containing addr.
+    resolved_bgp_prefix: Optional[str] = None
+    valid_bgp_prefix: Optional[int] = None
+    bgp_candidates: List[str] = []
+    if isinstance(bgp_prefix, str) and bgp_prefix.strip():
+        bgp_candidates.append(bgp_prefix.strip())
+    if (
+        isinstance(bgp_lookup, dict)
+        and isinstance(bgp_lookup.get("bgpPrefix"), str)
+        and bgp_lookup["bgpPrefix"].strip()
+    ):
+        bgp_candidates.append(bgp_lookup["bgpPrefix"].strip())
+    for raw_bgp in bgp_candidates:
+        try:
+            net = ipaddress.ip_network(raw_bgp, strict=False)
+        except ValueError:
+            continue
+        if net.version == addr.version and addr in net:
+            resolved_bgp_prefix, valid_bgp_prefix = str(net), net.prefixlen
+            break
+
     bgp_tags = bgp_lookup.get("tags", ()) if isinstance(bgp_lookup, dict) else ()
     asn_num = (
         _normalize_asn_number(asn)
@@ -920,37 +759,88 @@ def compute_cidr_attribution(
         )
         cidr_rationale = cidr_note
     else:
-        recommended_cidr, cidr_note = _select_cidr_recommendation(
-            addr,
-            default_cidr,
-            default_prefix,
-            valid_mmdb_prefix,
-            narrowing_provider,
-            narrowing_prefix,
-        )
-        if addr.version == 6:
-            hosting_flag = _is_hosting_network(
-                explicit_is_hosting=is_hosting,
-                ip_compressed=addr.compressed,
-                resolved_cloud_cidr=narrowing_cidr,
-                resolved_cloud_provider=narrowing_provider,
-                resolved_ptr_category=resolved_ptr_category,
-                asn_num=asn_num,
-                org_name=org_name,
-                bgp_tags=bgp_tags,
-                provider_rows=provider_rows,
+        narrow_mmdb = valid_mmdb_prefix is not None and valid_mmdb_prefix > default_prefix
+        narrow_cloud = narrowing_prefix is not None and narrowing_prefix > default_prefix
+        provider_label = f"{narrowing_provider} " if narrowing_provider else ""
+
+        if narrow_mmdb and (not narrow_cloud or (valid_mmdb_prefix or 0) >= (narrowing_prefix or 0)):
+            clamped_mmdb = _clamp_mediawiki_prefix_len(addr.version, valid_mmdb_prefix or default_prefix)
+            recommended_cidr = _format_clamped_cidr(addr, clamped_mmdb)
+            cidr_note = f"Narrower MMDB prefix /{clamped_mmdb} selected over default /{default_prefix} to avoid collateral blocking"
+        elif narrow_cloud:
+            clamped_cloud = _clamp_mediawiki_prefix_len(addr.version, narrowing_prefix or default_prefix)
+            recommended_cidr = _format_clamped_cidr(addr, clamped_cloud)
+            cidr_note = (
+                f"Narrower {provider_label}cloud prefix /{clamped_cloud} selected over default "
+                f"/{default_prefix} to avoid collateral blocking"
             )
-            escalation_cidr, cidr_rationale = _compute_ipv6_escalation(
-                addr,
-                is_hosting=hosting_flag,
-                valid_cloud_prefix=narrowing_prefix,
-                valid_bgp_prefix=valid_bgp_prefix,
-                valid_mmdb_prefix=valid_mmdb_prefix,
-                base_note=cidr_note,
+        elif valid_mmdb_prefix is not None and valid_mmdb_prefix < default_prefix:
+            recommended_cidr = default_cidr
+            cidr_note = (
+                f"Default /{default_prefix} retained because MMDB prefix "
+                f"/{valid_mmdb_prefix} is wider than standard block granularity"
             )
+        elif valid_mmdb_prefix == default_prefix:
+            recommended_cidr = default_cidr
+            cidr_note = f"MMDB prefix matches default /{default_prefix} block granularity"
+        elif narrowing_prefix is not None and narrowing_prefix < default_prefix:
+            recommended_cidr = default_cidr
+            cidr_note = (
+                f"Default /{default_prefix} retained because {provider_label}cloud prefix "
+                f"/{narrowing_prefix} is wider than standard block granularity"
+            )
+        elif narrowing_prefix == default_prefix:
+            recommended_cidr = default_cidr
+            cidr_note = f"{provider_label}Cloud prefix matches default /{default_prefix} block granularity"
         else:
-            escalation_cidr = None
-            cidr_rationale = cidr_note
+            recommended_cidr = default_cidr
+            cidr_note = f"Default /{default_prefix} range selected"
+
+        escalation_cidr = None
+        cidr_rationale = cidr_note
+        if addr.version == 6:
+            if is_hosting is not None:
+                hosting_flag = bool(is_hosting)
+            elif (
+                narrowing_cidr is not None
+                or narrowing_provider is not None
+                or resolved_ptr_category == "hosting_or_gateway"
+                or match_hosting_asn_or_org(asn_num, org_name) is not None
+                or any(str(tag).strip().lower() in ("vpn", "hosting", "datacenter", "cloud") for tag in bgp_tags)
+            ):
+                hosting_flag = True
+            else:
+                oa_host = query_openasn_offline(addr.compressed)
+                oa_v = oa_host.get("coreVerdict")
+                hosting_flag = (
+                    oa_v == "vpn"
+                    or (oa_v == "hosting" and not (oa_host.get("cdn") and not oa_host.get("datacenterRange")))
+                    or any(
+                        isinstance(row, Mapping)
+                        and (
+                            not isinstance(row.get("status"), str)
+                            or not row.get("status")
+                            or row.get("status") == "200 OK"
+                        )
+                        and any(
+                            kw in str(row.get("usageType") or "").strip().lower()
+                            for kw in ("hosting", "datacenter", "data center", "cloud")
+                        )
+                        for row in (provider_rows or ())
+                    )
+                )
+
+            if hosting_flag:
+                raw_candidates = [p for p in (narrowing_prefix, valid_bgp_prefix, valid_mmdb_prefix) if p is not None]
+                raw_esc = raw_candidates[0] if raw_candidates else _HOSTING_IPV6_MIN_ESCALATION_PREFIX
+                clamped_esc = max(
+                    _HOSTING_IPV6_MIN_ESCALATION_PREFIX, min(_HOSTING_IPV6_MAX_ESCALATION_PREFIX, raw_esc)
+                )
+                escalation_cidr = _format_clamped_cidr(addr, clamped_esc)
+                cidr_rationale = f"{cidr_note}; hosting escalation range clamped to /{clamped_esc}"
+            elif valid_bgp_prefix is not None and valid_bgp_prefix <= _RESIDENTIAL_IPV6_MAX_BGP_FOR_ESCALATION:
+                escalation_cidr = _format_clamped_cidr(addr, _RESIDENTIAL_IPV6_ESCALATION_PREFIX)
+                cidr_rationale = f"{cidr_note}; residential /{_RESIDENTIAL_IPV6_ESCALATION_PREFIX} escalation available within BGP /{valid_bgp_prefix}"
 
     if shared_privacy_egress is not None:
         cidr_rationale = f"{cidr_rationale}; shared privacy egress ({shared_privacy_egress})"

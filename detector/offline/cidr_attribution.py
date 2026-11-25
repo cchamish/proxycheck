@@ -12,7 +12,7 @@ import math
 import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
-from .offline_dbs import (
+from . import (
     MOBILE_BGP_TAG_TOKENS,
     FileStatCache,
     are_stopforumspam_caches_warm,

@@ -12,8 +12,14 @@ from typing import Any, Dict, Optional, Tuple, Union
 import httpx
 from django.conf import settings
 
-from . import dns_providers, offline_dbs
-from .adapters import (
+from .. import offline as offline_dbs
+from ..cache.quota_telemetry import extract_upstream_rate_limit
+from ..cache.redis_backend import get_cooldown_bounds
+from ..core.context import provider_upstream_events, record_upstream_event
+from ..core.sanitization import sanitize_error_message, sanitize_payload
+from ..provider_registry import PROVIDER_REGISTRY, USER_AGENT_HEADER
+from . import dns_local as dns_providers
+from .adapters_http import (
     adapt_abuseipdb,
     adapt_cloudflare_radar,
     adapt_dshield,
@@ -27,11 +33,6 @@ from .adapters import (
     adapt_shodan_internetdb,
     adapt_tor_onionoo,
 )
-from .cache_backends import get_cooldown_bounds
-from .dns_providers import provider_upstream_events, record_upstream_event
-from .provider_registry import PROVIDER_REGISTRY, USER_AGENT_HEADER
-from .quota_telemetry import extract_upstream_rate_limit
-from .sanitization import sanitize_error_message, sanitize_payload
 
 logger = logging.getLogger("detector.views")
 

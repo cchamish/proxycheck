@@ -12,9 +12,9 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import httpx
 
-from . import dns_providers, http_client, offline_dbs, quota_telemetry, rangeblock_service
-from .adapters import adapt_tor_onionoo
-from .cache_backends import (
+from .. import offline as offline_dbs
+from ..cache import quota_telemetry
+from ..cache.redis_backend import (
     acquire_ip_updating_lock,
     get_cooldown_bounds,
     get_redis_client,
@@ -22,7 +22,25 @@ from .cache_backends import (
     safe_redis_set_many,
     set_cached_ip_snapshot,
 )
-from .detection_service import (
+from ..core import http_client
+from ..core.context import provider_upstream_events, rdns_context_state
+from ..core.ip_utils import classify_non_public_ip, normalize_query_mode
+from ..offline import lookup_bgp_tools_offline
+from ..providers import (
+    adapt_tor_onionoo,
+    build_cooldown_provider_row,
+    build_deferred_provider_row,
+    is_unconfigured_provider_row,
+)
+from ..providers import dns_local as dns_providers
+from ..providers.dns_local import reverse_ipv4_octets
+from ..rangeblock import service as rangeblock_service
+from .arbitration import (
+    attach_request_diagnostics,
+    build_non_public_response_payload,
+    strip_raw_json_from_payload,
+)
+from .pipeline import (
     NO_REDIS_CACHE_PROVIDER_KEYS,
     OFFLINE_PROVIDER_KEYS,
     PROVIDER_SPECS,
@@ -45,20 +63,6 @@ from .detection_service import (
     _safe_l2_amerge_snapshot,
     _stamp_offline_signatures,
     _try_read_l1_snapshot,
-)
-from .dns_providers import provider_upstream_events, rdns_context_state, reverse_ipv4_octets
-from .intelligence import (
-    attach_request_diagnostics,
-    build_non_public_response_payload,
-    classify_non_public_ip,
-    normalize_query_mode,
-    strip_raw_json_from_payload,
-)
-from .offline_dbs import lookup_bgp_tools_offline
-from .providers import (
-    build_cooldown_provider_row,
-    build_deferred_provider_row,
-    is_unconfigured_provider_row,
 )
 
 _SSE_OVERVIEW_KEYS = (

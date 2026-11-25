@@ -18,17 +18,17 @@ from django.conf import settings
 from django.db import Error as DjangoDbError
 from django.db import close_old_connections, connection
 
-from . import sanitization
-from .cache_backends import scrub_legacy_coordinates_from_row
-from .intelligence import MAX_BATCH_IPS, canonicalize_ip, normalize_query_mode
-from .models import IpIntelligenceCache
-from .provider_registry import (
+from ..core import sanitization
+from ..core.ip_utils import MAX_BATCH_IPS, canonicalize_ip, normalize_query_mode
+from ..models import IpIntelligenceCache
+from ..provider_registry import (
     DEFAULT_PROVIDER_L2_MAX_RETENTION_DAYS,
     L1_ONLY_PROVIDERS,
     OFFLINE_REHYDRATE_PROVIDERS,
     PROVIDER_BY_KEY,
     PROVIDER_BY_LABEL,
 )
+from .redis_backend import scrub_legacy_coordinates_from_row
 
 logger = logging.getLogger("detector.views")
 

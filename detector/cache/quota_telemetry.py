@@ -19,17 +19,17 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from django.conf import settings
 from django.core.signals import setting_changed
 
-from .cache_backends import (
-    get_redis_client,
-    get_redis_namespace,
-    mark_redis_failure,
-    safe_redis_mget,
-)
-from .provider_registry import (
+from ..provider_registry import (
     DEFAULT_QUOTA_LIMITS,
     PROVIDER_CREDENTIAL_SETTINGS,
     PROVIDER_REGISTRY,
     REDIS_TRANSPORT_ERRORS,
+)
+from .redis_backend import (
+    get_redis_client,
+    get_redis_namespace,
+    mark_redis_failure,
+    safe_redis_mget,
 )
 
 logger = logging.getLogger(__name__)
@@ -128,7 +128,7 @@ def _on_quota_setting_changed(*, setting: str, enter: bool, **kwargs: Any) -> No
             _OVERRIDDEN_SETTING_KEYS.discard(setting)
 
 
-setting_changed.connect(_on_quota_setting_changed, dispatch_uid="detector.quota_telemetry.setting_changed")
+setting_changed.connect(_on_quota_setting_changed, dispatch_uid="detector.cache.quota_telemetry.setting_changed")
 
 
 def _parse_non_negative_int(value: Any) -> Optional[int]:

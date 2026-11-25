@@ -6,8 +6,9 @@ from unittest.mock import AsyncMock, patch
 import dns.exception
 from django.test import SimpleTestCase, TestCase, override_settings
 
-from detector import dns_providers, sanitization
-from detector.intelligence import aggregate_intelligence_metrics
+from detector.core import sanitization
+from detector.detection.arbitration import aggregate_intelligence_metrics
+from detector.providers import dns_local as dns_providers
 
 from .helpers import ALL_ADAPTERS, MAXMIND_STUB, TEST_UPSTREAM_SECRETS
 
@@ -33,8 +34,8 @@ class AdaptersAndArbitrationTests(TestCase):
             self.assertNotIn(TEST_UPSTREAM_SECRETS["ABUSEIPDB_API_KEY"], str(nested))
 
         with (
-            patch("detector.dns_providers._create_async_resolver") as mock_resolver_cls,
-            patch("detector.dns_providers.record_upstream_event"),
+            patch("detector.providers.dns_local._create_async_resolver") as mock_resolver_cls,
+            patch("detector.providers.dns_local.record_upstream_event"),
             self.assertLogs("detector.views", level="WARNING") as captured,
         ):
             mock_resolver = AsyncMock()

@@ -20,9 +20,9 @@ from django.db import close_old_connections
 
 from proxycheck.settings import discover_wiki_replica_credentials
 
-from . import sanitization
-from .intelligence import canonicalize_ip, classify_non_public_ip
-from .models import RangeblockAggregate, RangeblockSyncState
+from ..core import sanitization
+from ..core.ip_utils import canonicalize_ip, classify_non_public_ip
+from ..models import RangeblockAggregate, RangeblockSyncState
 
 logger = logging.getLogger("detector.views")
 

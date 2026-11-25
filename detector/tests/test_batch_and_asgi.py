@@ -10,7 +10,10 @@ import dns.resolver
 from django.http import HttpResponse
 from django.test import AsyncRequestFactory, Client, SimpleTestCase, TestCase, override_settings
 
-from detector import cache_backends, detection_service, quota_telemetry, views
+from detector import views
+from detector.cache import quota_telemetry
+from detector.cache import redis_backend as cache_backends
+from detector.detection import service as detection_service
 from detector.middleware import ResilientSessionMiddleware
 from detector.provider_registry import PROVIDER_REGISTRY
 
@@ -88,7 +91,7 @@ class BatchDetectTests(TestCase):
             "results": [],
             "cacheMeta": shared_meta,
         }
-        with patch("detector.detection_service.detect_single_canonical_ip", AsyncMock(return_value=shared_payload)):
+        with patch("detector.detection.service.detect_single_canonical_ip", AsyncMock(return_value=shared_payload)):
             ok_resp = csrf_client.post(
                 "/api/v1/detect/batch",
                 data=json.dumps({"ips": ["8.8.8.8"]}),
@@ -113,7 +116,7 @@ class BatchDetectTests(TestCase):
                 "results": [],
             }
         )
-        with patch("detector.cache_backends.redis_client", fake_redis):
+        with patch("detector.cache.redis_backend.redis_client", fake_redis):
             l1_batch = csrf_client.post(
                 "/api/v1/detect/batch",
                 data=json.dumps({"ips": ["8.8.8.8"]}),
@@ -151,9 +154,9 @@ class BatchDetectTests(TestCase):
         mock_client.is_closed = False
         with (
             override_settings(**TEST_UPSTREAM_SECRETS),
-            patch("detector.cache_backends.redis_client", fake_redis),
-            patch("detector.dns_providers.query_rdns_ptr", AsyncMock(return_value="dns.google")),
-            patch("detector.http_client.get_shared_http_client", AsyncMock(return_value=mock_client)),
+            patch("detector.cache.redis_backend.redis_client", fake_redis),
+            patch("detector.providers.dns_local.query_rdns_ptr", AsyncMock(return_value="dns.google")),
+            patch("detector.core.http_client.get_shared_http_client", AsyncMock(return_value=mock_client)),
             patch_non_dnsbl_providers(_make_stub, overrides={"maxmind": AsyncMock(return_value=dict(MAXMIND_STUB))}),
             patch.object(
                 quota_telemetry, "check_and_consume_quota", wraps=quota_telemetry.check_and_consume_quota

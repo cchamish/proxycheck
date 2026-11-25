@@ -4,7 +4,8 @@ import contextlib
 from typing import Any, Callable, Dict, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from detector.adapters import (
+from detector.provider_registry import PROVIDER_REGISTRY
+from detector.providers import (
     adapt_abuseipdb,
     adapt_cloudflare_radar,
     adapt_dshield,
@@ -22,7 +23,6 @@ from detector.adapters import (
     adapt_stopforumspam,
     adapt_tor_onionoo,
 )
-from detector.provider_registry import PROVIDER_REGISTRY
 
 TEST_UPSTREAM_SECRETS = {
     "CLOUDFLARE_RADAR_TOKEN": "cf-radar-token-7a1c",
@@ -237,9 +237,9 @@ _DNS_PROVIDER_KEYS = frozenset({"maxmind", "spamhaus_zen", "spamcop", "stopforum
 
 CANONICAL_PROVIDER_PATCH_TARGETS: Dict[str, str] = {
     meta.key: (
-        f"detector.dns_providers.query_{meta.key}"
+        f"detector.providers.dns_local.query_{meta.key}"
         if meta.key in _DNS_PROVIDER_KEYS
-        else f"detector.providers.query_{meta.key}"
+        else f"detector.providers.http.query_{meta.key}"
     )
     for meta in PROVIDER_REGISTRY
 }

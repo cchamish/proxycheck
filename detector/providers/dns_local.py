@@ -3,7 +3,6 @@ Local MaxMind MMDB, StopForumSpam SQLite, and asynchronous DNS and DNSBL provide
 """
 
 import asyncio
-import contextvars
 import ipaddress
 import logging
 import math
@@ -18,18 +17,16 @@ import dns.resolver
 import dns.reversename
 from django.conf import settings
 
-from . import cidr_attribution, offline_dbs
-from .adapters import (
-    adapt_ipsum_drop,
-    adapt_maxmind,
-    adapt_openasn,
-    adapt_spamcop,
-    adapt_spamhaus_zen,
-    adapt_stopforumspam,
+from .. import offline as offline_dbs
+from ..cache.redis_backend import get_cooldown_bounds
+from ..core.context import (
+    rdns_context_state,
+    record_upstream_event,
 )
-from .cache_backends import get_cooldown_bounds
-from .offline_dbs import (
+from ..core.sanitization import sanitize_error_message
+from ..offline import (
     MAXMIND_DB_SPECS,
+    cidr_attribution,
     evict_maxmind_reader,
     evict_missing_maxmind_readers,
     get_maxmind_newest_mtime_iso,
@@ -40,16 +37,16 @@ from .offline_dbs import (
     query_stopforumspam_offline,
     record_city_db_presence,
 )
-from .sanitization import sanitize_error_message
+from .adapters_local import (
+    adapt_ipsum_drop,
+    adapt_maxmind,
+    adapt_openasn,
+    adapt_spamcop,
+    adapt_spamhaus_zen,
+    adapt_stopforumspam,
+)
 
 logger = logging.getLogger("detector.views")
-
-provider_upstream_events: contextvars.ContextVar[Optional[Dict[str, Dict[str, Any]]]] = contextvars.ContextVar(
-    "provider_upstream_events", default=None
-)
-rdns_context_state: contextvars.ContextVar[Optional[Dict[str, str]]] = contextvars.ContextVar(
-    "rdns_context_state", default=None
-)
 
 DEFAULT_DNS_TIMEOUT_SECONDS = 2.0
 _DEFAULT_ASYNC_RESOLVER_CLS = dns.asyncresolver.Resolver
@@ -64,34 +61,6 @@ def clear_dns_resolver_cache() -> None:
     with _async_resolver_lock:
         _cached_base_nameservers = None
         _cached_async_resolvers.clear()
-
-
-def record_upstream_event(
-    provider_key: str,
-    *,
-    trigger_cooldown: bool,
-    status_code: int,
-    reason: str = "",
-    cooldown_seconds: Optional[int] = None,
-    is_timeout: bool = False,
-    is_transport_error: bool = False,
-    upstream_remaining: Optional[int] = None,
-    upstream_limit: Optional[int] = None,
-    upstream_used: Optional[int] = None,
-) -> None:
-    events = provider_upstream_events.get()
-    if isinstance(events, dict):
-        events[provider_key] = {
-            "trigger": trigger_cooldown,
-            "statusCode": status_code,
-            "reason": reason,
-            "cooldownSeconds": cooldown_seconds,
-            "isTimeout": is_timeout,
-            "isTransportError": is_transport_error,
-            "upstreamRemaining": upstream_remaining,
-            "upstreamLimit": upstream_limit,
-            "upstreamUsed": upstream_used,
-        }
 
 
 async def query_maxmind(ip: str) -> Dict[str, Any]:

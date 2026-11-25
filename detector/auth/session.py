@@ -16,9 +16,10 @@ from django.core import signing
 from django.http import JsonResponse
 from django.middleware.csrf import CsrfViewMiddleware
 
+from ..core.ip_utils import canonicalize_ip
+from ..middleware import is_session_backend_error
+from ..rangeblock.service import normalize_wiki_dbname
 from . import oauth
-from .intelligence import canonicalize_ip
-from .middleware import is_session_backend_error
 from .oauth import (
     DEFAULT_RIGHTS_TTL_SECONDS,
     REQUIRED_WIKIMEDIA_RIGHTS_SET,
@@ -31,7 +32,6 @@ from .oauth import (
     is_session_rights_expired,
     normalize_and_validate_wikimedia_domain,
 )
-from .rangeblock_service import normalize_wiki_dbname
 
 logger = logging.getLogger("detector.views")
 auth_mode_logger = logging.getLogger("detector.auth_mode")

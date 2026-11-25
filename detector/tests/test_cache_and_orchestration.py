@@ -8,7 +8,10 @@ import dns.resolver
 import httpx
 from django.test import AsyncRequestFactory, TestCase, override_settings
 
-from detector import cache_backends, detection_service, providers, views
+from detector import views
+from detector.cache import redis_backend as cache_backends
+from detector.detection import service as detection_service
+from detector.providers import http as providers
 
 from .helpers import MAXMIND_STUB, _BatchingFakeRedis, _mock_response, patch_non_dnsbl_providers
 
@@ -34,9 +37,9 @@ class CacheAndOrchestrationTests(TestCase):
         token = views.issue_gadget_token("SysopUser")
         with (
             patch(
-                "detector.cache_backends.get_redis_client", side_effect=AssertionError("Redis called")
+                "detector.cache.redis_backend.get_redis_client", side_effect=AssertionError("Redis called")
             ) as _mock_redis,
-            patch("detector.http_client.get_shared_http_client", side_effect=AssertionError("HTTP called")),
+            patch("detector.core.http_client.get_shared_http_client", side_effect=AssertionError("HTTP called")),
         ):
             for ip in ("127.0.0.1", "10.0.0.1", "192.168.1.5", "::1", "fc00::1"):
                 with self.subTest(ip=ip):
@@ -78,9 +81,9 @@ class CacheAndOrchestrationTests(TestCase):
         mock_client.is_closed = False
 
         with (
-            patch("detector.cache_backends.redis_client", fake_redis),
-            patch("detector.dns_providers.query_rdns_ptr", AsyncMock(return_value="dns.google")),
-            patch("detector.http_client.get_shared_http_client", AsyncMock(return_value=mock_client)),
+            patch("detector.cache.redis_backend.redis_client", fake_redis),
+            patch("detector.providers.dns_local.query_rdns_ptr", AsyncMock(return_value="dns.google")),
+            patch("detector.core.http_client.get_shared_http_client", AsyncMock(return_value=mock_client)),
             patch_non_dnsbl_providers(
                 _make_provider, overrides={"maxmind": AsyncMock(return_value=dict(MAXMIND_STUB))}
             ),
@@ -105,9 +108,9 @@ class CacheAndOrchestrationTests(TestCase):
 
         with (
             override_settings(PROXYCHECK_API_KEY="test-proxycheck-key"),
-            patch("detector.cache_backends.redis_client", fake_redis),
-            patch("detector.dns_providers.query_rdns_ptr", AsyncMock(return_value=None)),
-            patch("detector.http_client.get_shared_http_client", AsyncMock(return_value=mock_client)),
+            patch("detector.cache.redis_backend.redis_client", fake_redis),
+            patch("detector.providers.dns_local.query_rdns_ptr", AsyncMock(return_value=None)),
+            patch("detector.core.http_client.get_shared_http_client", AsyncMock(return_value=mock_client)),
             patch_non_dnsbl_providers(
                 lambda name: AsyncMock(return_value=dict(MAXMIND_STUB, provider=name)),
                 overrides={

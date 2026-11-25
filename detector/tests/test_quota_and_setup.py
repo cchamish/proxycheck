@@ -6,7 +6,8 @@ from unittest.mock import patch
 
 from django.test import TestCase, override_settings
 
-from detector import cache_backends, quota_telemetry
+from detector.cache import quota_telemetry
+from detector.cache import redis_backend as cache_backends
 
 from .helpers import FakeAsyncRedis
 
@@ -22,7 +23,7 @@ class QuotaAndRateLimitTests(TestCase):
         """Blocks calls past configured provider RPM limit and fails open on Redis transport errors."""
         fake_redis = FakeAsyncRedis()
         with (
-            patch("detector.cache_backends.redis_client", fake_redis),
+            patch("detector.cache.redis_backend.redis_client", fake_redis),
             override_settings(ABUSEIPDB_RPM_LIMIT=1, ABUSEIPDB_DAILY_LIMIT=100),
         ):
             first = asyncio.run(quota_telemetry.check_and_consume_quota("abuseipdb"))
@@ -38,7 +39,7 @@ class QuotaAndRateLimitTests(TestCase):
 
         broken_redis.pipeline = lambda *a, **kw: (_ for _ in ()).throw(ConnectionError("redis unreachable"))
         broken_redis.eval = _raise_conn
-        with patch("detector.cache_backends.redis_client", broken_redis):
+        with patch("detector.cache.redis_backend.redis_client", broken_redis):
             degraded = asyncio.run(quota_telemetry.check_and_consume_quota("abuseipdb"))
         self.assertTrue(degraded.allowed)
 
@@ -47,7 +48,7 @@ class QuotaAndRateLimitTests(TestCase):
         fake_redis = FakeAsyncRedis()
         fixed_dt = datetime(2026, 11, 20, 12, 0, 10, tzinfo=timezone.utc)
         with (
-            patch("detector.cache_backends.redis_client", fake_redis),
+            patch("detector.cache.redis_backend.redis_client", fake_redis),
             override_settings(
                 DETECT_USER_RPM_LIMIT=1,
                 DETECT_GLOBAL_RPM_LIMIT=600,
@@ -82,7 +83,7 @@ class QuotaAndRateLimitTests(TestCase):
         """Stores aggregated daily counters in Redis without recording plaintext IPs or usernames."""
         fake_redis = FakeAsyncRedis()
         fixed_dt = datetime(2026, 11, 20, 12, 0, 0, tzinfo=timezone.utc)
-        with patch("detector.cache_backends.redis_client", fake_redis):
+        with patch("detector.cache.redis_backend.redis_client", fake_redis):
             asyncio.run(
                 quota_telemetry.record_global_request_telemetry(
                     "hit", "gadget", cache_layer_event="l1_hit", now_dt=fixed_dt

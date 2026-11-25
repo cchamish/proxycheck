@@ -7,7 +7,7 @@ from urllib.parse import quote
 
 from django.conf import settings
 
-from .provider_registry import SECRET_SETTING_NAMES
+from ..provider_registry import SECRET_SETTING_NAMES
 
 REDACTED_PLACEHOLDER = "***REDACTED***"
 

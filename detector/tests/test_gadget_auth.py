@@ -8,13 +8,15 @@ import dns.resolver
 from django.core import signing
 from django.test import TestCase, override_settings
 
-from detector import cache_backends, oauth, views
-from detector.oauth import (
+from detector import views
+from detector.auth import oauth
+from detector.auth.oauth import (
     evaluate_wikimedia_rights,
     fetch_user_rights_from_meta,
     normalize_and_validate_wikimedia_domain,
 )
-from detector.session_auth import GADGET_TOKEN_SALT, get_gadget_token_ttl_seconds
+from detector.auth.session import GADGET_TOKEN_SALT, get_gadget_token_ttl_seconds
+from detector.cache import redis_backend as cache_backends
 
 from .helpers import _mock_response, start_non_dnsbl_provider_stubs
 
@@ -97,7 +99,7 @@ class GadgetAuthSecurityTests(TestCase):
                     _mock_response(200, userinfo_payload),
                     _mock_response(200, {"query": {"globaluserinfo": {"groups": [], "rights": [], "merged": []}}}),
                 ]
-                with patch("detector.http_client.get_shared_http_client", AsyncMock(return_value=mock_client)):
+                with patch("detector.core.http_client.get_shared_http_client", AsyncMock(return_value=mock_client)):
                     resp = self.client.post(
                         "/api/v1/auth/gadget-token",
                         data=json.dumps({"centralauthtoken": "cat-secret", "domain": "en.wikipedia.org"}),

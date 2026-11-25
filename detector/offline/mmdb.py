@@ -162,14 +162,6 @@ def resolve_maxmind_db_paths() -> Dict[str, str]:
     return {key: resolve_mmdb_file(configured_dir, filename, base_dir) for key, filename in MAXMIND_DB_SPECS}
 
 
-def clear_maxmind_probe_cache() -> None:
-    """Clears short-TTL MaxMind file existence probe caches."""
-    global _maxmind_city_db_cache, _maxmind_any_db_cache
-    with _maxmind_probe_lock:
-        _maxmind_city_db_cache = None
-        _maxmind_any_db_cache = None
-
-
 def has_local_maxmind_city_db() -> bool:
     """Returns True when GeoLite2-City.mmdb is present on disk at its resolved location."""
     global _maxmind_city_db_cache

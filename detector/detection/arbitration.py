@@ -19,13 +19,6 @@ _proc_rss_lock = threading.Lock()
 _proc_rss_cache: Optional[Tuple[float, float]] = None
 
 
-def clear_proc_rss_cache() -> None:
-    """Clears the short-lived process RSS diagnostic cache."""
-    global _proc_rss_cache
-    with _proc_rss_lock:
-        _proc_rss_cache = None
-
-
 def get_process_memory_mb() -> Optional[float]:
     """Returns current worker RSS in megabytes, falling back to peak RSS when procfs is unavailable."""
     global _proc_rss_cache

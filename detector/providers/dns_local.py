@@ -55,14 +55,6 @@ _cached_base_nameservers: Optional[List[Any]] = None
 _cached_async_resolvers: Dict[Tuple[float, float], dns.asyncresolver.Resolver] = {}
 
 
-def clear_dns_resolver_cache() -> None:
-    """Clears cached async DNS resolvers and base nameserver discovery state."""
-    global _cached_base_nameservers
-    with _async_resolver_lock:
-        _cached_base_nameservers = None
-        _cached_async_resolvers.clear()
-
-
 async def query_maxmind(ip: str) -> Dict[str, Any]:
     """Reads local GeoLite2/GeoIP2 Country, City, and ASN MMDB files off the ASGI event loop."""
 

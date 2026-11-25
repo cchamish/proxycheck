@@ -93,12 +93,3 @@ async def get_shared_http_client() -> httpx.AsyncClient:
         await close_http_client_safely(stale_client)
 
     return selected_client
-
-
-async def clear_shared_http_clients() -> None:
-    """Removes and safely closes all cached HTTP clients across event loops."""
-    with http_client_lock:
-        clients = list(http_clients_by_loop.values())
-        http_clients_by_loop.clear()
-    for client in clients:
-        await close_http_client_safely(client)

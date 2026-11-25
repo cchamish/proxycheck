@@ -25,6 +25,7 @@ from detector.provider_registry import REDIS_TRANSPORT_ERRORS
 from proxycheck.settings import discover_wiki_replica_credentials
 
 from .service import (
+    expand_db_lookup_targets,
     get_configured_realtime_wikis,
     normalize_block_target,
     parse_mw_expiry,
@@ -864,13 +865,7 @@ def _stream_incremental_logs(
             if collect_touched and chunk_touched:
                 stage_ctx.stage = "active_read"
                 read_start = time.monotonic()
-                expanded_targets: List[str] = []
-                seen_targets: Set[str] = set()
-                for target in sorted(chunk_touched):
-                    for variant in (target, target.upper()):
-                        if variant not in seen_targets:
-                            seen_targets.add(variant)
-                            expanded_targets.append(variant)
+                expanded_targets = expand_db_lookup_targets(sorted(chunk_touched))
                 if spec.is_global:
                     if global_session is None:
                         raise RuntimeError("Global Replica session is required for targeted global active lookups.")

@@ -8,6 +8,7 @@ from django.test import SimpleTestCase, TestCase, override_settings
 
 from detector.core import sanitization
 from detector.detection.arbitration import aggregate_intelligence_metrics
+from detector.providers import adapt_proxycheck
 from detector.providers import dns_local as dns_providers
 
 from .helpers import ALL_ADAPTERS, MAXMIND_STUB, TEST_UPSTREAM_SECRETS
@@ -76,6 +77,97 @@ class AdaptersAndArbitrationTests(TestCase):
         self.assertEqual(proxy_row, snapshot_copy)
         self.assertIn("arbitrationVerdict", metrics)
         self.assertEqual(metrics["primaryAsn"], "AS14061")
+
+    def test_adapt_proxycheck_parses_flat_v3_payload(self):
+        """Preserves detections, risk score, location, and network metadata for flat v3 payloads."""
+        flat_payload = {
+            "status": "ok",
+            "network": {"asn": "AS15169", "provider": "Google LLC", "type": "ISP"},
+            "location": {"city": "Mountain View", "country_name": "United States", "country_code": "US"},
+            "detections": {
+                "proxy": True,
+                "vpn": True,
+                "tor": False,
+                "hosting": False,
+                "risk": 99,
+                "port": 443,
+                "last_seen": "2026-11-20T12:00:00Z",
+            },
+        }
+        for ip_arg in ("8.8.8.8", ""):
+            with self.subTest(ip=ip_arg):
+                row = adapt_proxycheck(flat_payload, has_api_key=True, status_code=200, ip=ip_arg)
+                self.assertEqual(row["status"], "200 OK")
+                self.assertEqual(row["asn"], "AS15169")
+                self.assertEqual(row["isp"], "Google LLC")
+                self.assertEqual(row["location"], "Mountain View, United States")
+                self.assertEqual(row["countryCode"], "US")
+                self.assertEqual(row["usageType"], "isp")
+                self.assertEqual(row["riskScore"], 99)
+                self.assertEqual(row["port"], 443)
+                self.assertEqual(row["lastSeen"], "2026-11-20T12:00:00Z")
+                self.assertEqual(
+                    row["securityFlags"],
+                    [
+                        {"label": "Proxy", "isHighRisk": True},
+                        {"label": "VPN", "isHighRisk": True},
+                    ],
+                )
+
+    def test_adapt_proxycheck_parses_ip_keyed_v2_and_v3_payloads(self):
+        """Still extracts records keyed by IP for v2, v3, omitted ip, and non-canonical IPv6 keys."""
+        v3_ip_keyed = {
+            "status": "ok",
+            "2001:0db8::1": {
+                "network": {"asn": "AS64496", "provider": "Example Hosting", "type": "Hosting"},
+                "location": {"city": "London", "country_name": "United Kingdom", "country_code": "GB"},
+                "detections": {"proxy": False, "vpn": False, "tor": True, "hosting": True, "risk": 88},
+            },
+            "query_time": "5ms",
+        }
+        for ip_arg in ("2001:0db8::1", "2001:db8::1", ""):
+            with self.subTest(case="v3_ip_keyed", ip=ip_arg):
+                row = adapt_proxycheck(v3_ip_keyed, has_api_key=True, status_code=200, ip=ip_arg)
+                self.assertEqual(row["asn"], "AS64496")
+                self.assertEqual(row["isp"], "Example Hosting")
+                self.assertEqual(row["location"], "London, United Kingdom")
+                self.assertEqual(row["countryCode"], "GB")
+                self.assertEqual(row["usageType"], "hosting")
+                self.assertEqual(row["riskScore"], 88)
+                self.assertEqual(
+                    row["securityFlags"],
+                    [
+                        {"label": "Tor", "isHighRisk": True},
+                        {"label": "Hosting", "isHighRisk": True},
+                    ],
+                )
+
+        v2_ip_keyed = {
+            "status": "ok",
+            "198.51.100.1": {
+                "asn": "AS14061",
+                "provider": "DigitalOcean",
+                "country": "United States",
+                "isocode": "US",
+                "city": "New York",
+                "proxy": "yes",
+                "type": "VPN",
+                "risk": 66,
+            },
+        }
+        row = adapt_proxycheck(v2_ip_keyed, has_api_key=True, status_code=200, ip="198.51.100.1")
+        self.assertEqual(row["asn"], "AS14061")
+        self.assertEqual(row["isp"], "DigitalOcean")
+        self.assertEqual(row["location"], "New York, United States")
+        self.assertEqual(row["countryCode"], "US")
+        self.assertEqual(row["riskScore"], 66)
+        self.assertEqual(
+            row["securityFlags"],
+            [
+                {"label": "Proxy", "isHighRisk": True},
+                {"label": "VPN", "isHighRisk": True},
+            ],
+        )
 
 
 class NonMutationSanityTests(SimpleTestCase):

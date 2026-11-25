@@ -329,6 +329,16 @@ def _first_parsed(candidates: Iterable[Any], parser: Any) -> Any:
     return None
 
 
+def _is_ip_address_key(key: Any) -> bool:
+    if not isinstance(key, str):
+        return False
+    try:
+        ipaddress.ip_address(key.strip())
+    except ValueError:
+        return False
+    return True
+
+
 def adapt_proxycheck(
     raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_code: int = 200, ip: str = ""
 ) -> Dict[str, Any]:
@@ -341,12 +351,12 @@ def adapt_proxycheck(
     if status_code != 200 or not raw_data or str(raw_data.get("status", "")).lower() in ("error", "denied"):
         return _build_error_row("Proxycheck", status_code, raw_data, extra=extra)
 
-    # v2 payloads key the record by IP; v3 and flat payloads expose it directly.
+    # v2 and IP-keyed v3 payloads nest the record under an IP key; flat v3 payloads expose sections directly.
     if ip and isinstance(raw_data.get(ip), dict):
         ip_obj = raw_data[ip]
     else:
         ip_obj = next(
-            (v for k, v in raw_data.items() if k not in ("status", "message", "query_time") and isinstance(v, dict)),
+            (v for k, v in raw_data.items() if isinstance(v, dict) and _is_ip_address_key(k)),
             raw_data,
         )
     detections = ip_obj.get("detections") if isinstance(ip_obj.get("detections"), dict) else {}

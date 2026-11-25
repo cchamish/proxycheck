@@ -149,12 +149,6 @@ def get_l2_db_semaphore() -> asyncio.Semaphore:
         return sem
 
 
-def clear_l2_db_semaphores() -> None:
-    """Clears cached per-loop semaphores for deterministic tests."""
-    with _l2_semaphore_lock:
-        _l2_semaphores_by_loop.clear()
-
-
 def pack_ip_binary(raw_ip: str) -> Tuple[bytes, int, str]:
     """Converts an IPv4 or IPv6 address into a 16-byte binary key, version, and canonical text."""
     canonical = canonicalize_ip(raw_ip)

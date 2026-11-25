@@ -62,13 +62,6 @@ def _sync_circuit_client_ref_locked() -> None:
         _redis_circuit_client_ref = redis_client
 
 
-def clear_redis_clients() -> None:
-    """Clears per-loop Redis client references and resets the Redis circuit breaker."""
-    with _redis_client_lock:
-        _redis_clients_by_loop.clear()
-    reset_redis_circuit_breaker()
-
-
 def is_redis_circuit_open() -> bool:
     """Returns True while the default Redis client circuit breaker is within its cooldown window."""
     global _redis_circuit_open_until

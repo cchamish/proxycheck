@@ -62,7 +62,7 @@ def adapt_abuseipdb(raw_data: Optional[Dict[str, Any]], has_api_key: bool, statu
 
     flags = _build_risk_flags(
         ("Tor Exit Node", data.get("isTor")),
-        ("Datacenter / Hosting", is_datacenter),
+        ("Datacentre / Hosting", is_datacenter),
     )
     location = _format_location((data.get("countryName"), data.get("countryCode")))
 
@@ -99,7 +99,7 @@ def adapt_ipdata(raw_data: Optional[Dict[str, Any]], has_api_key: bool, status_c
     company = raw_data.get("company") if isinstance(raw_data.get("company"), dict) else {}
     flags = _build_risk_flags(
         ("Proxy", threat.get("is_proxy")),
-        ("Datacenter", threat.get("is_datacenter")),
+        ("Datacentre", threat.get("is_datacenter")),
         ("Tor", threat.get("is_tor")),
         ("VPN", threat.get("is_vpn")),
         ("iCloud Private Relay", threat.get("is_icloud_relay")),
@@ -206,7 +206,7 @@ def adapt_ip2location(raw_data: Optional[Dict[str, Any]], has_api_key: bool, sta
         ("Proxy", raw_data.get("is_proxy") or proxy_obj.get("is_proxy")),
         ("VPN", proxy_obj.get("is_vpn")),
         ("Tor", proxy_obj.get("is_tor")),
-        ("Datacenter", proxy_obj.get("is_data_center")),
+        ("Datacentre", proxy_obj.get("is_data_center")),
         ("Threat Detected", proxy_obj.get("is_spammer") or proxy_obj.get("is_scanner") or proxy_obj.get("is_botnet")),
     )
 

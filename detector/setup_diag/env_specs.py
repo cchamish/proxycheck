@@ -226,7 +226,7 @@ def _build_env_specs() -> Tuple[EnvVarSpec, ...]:
             "Production / Toolforge Recommended",
             True,
             "(unset)",
-            "MaxMind license key paired with MAXMIND_ACCOUNT_ID",
+            "MaxMind licence key paired with MAXMIND_ACCOUNT_ID",
         ),
         EnvVarSpec(
             "ALLOWED_WIKI_USERS",

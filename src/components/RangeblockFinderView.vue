@@ -13,7 +13,8 @@
         <div class="rb-header__title">
           <h2 class="card-heading">{{ t('rb-title') }}</h2>
           <cdx-info-chip :status="rangeblock.hasActive ? 'error' : 'notice'">
-            {{ t('rb-chip-summary', { local: rangeblock.localTotal, global: rangeblock.globalTotal }) }}
+            <template v-if="rangeblock.blockDataDegraded">{{ t('rb-chip-unavailable') }}</template>
+            <template v-else>{{ t('rb-chip-summary', { local: rangeblock.localTotal, global: rangeblock.globalTotal }) }}</template>
           </cdx-info-chip>
         </div>
         <span class="text-subtle">
@@ -21,7 +22,10 @@
         </span>
       </div>
 
-      <cdx-message v-if="rangeblock.realtimeDegraded" type="warning" :inline="false">
+      <cdx-message v-if="rangeblock.blockDataDegraded" type="warning" :inline="false">
+        {{ t('rb-block-data-degraded') }}
+      </cdx-message>
+      <cdx-message v-if="rangeblock.realtimeDegraded && !rangeblock.blockDataDegraded" type="warning" :inline="false">
         {{ t('rb-realtime-degraded') }}
       </cdx-message>
 
@@ -68,7 +72,8 @@
           </div>
         </template>
         <template #empty-state>
-          {{ t('rb-empty-state', { ip: rangeblock.ip }) }}
+          <template v-if="rangeblock.blockDataDegraded">{{ t('rb-empty-unavailable', { ip: rangeblock.ip }) }}</template>
+          <template v-else>{{ t('rb-empty-state', { ip: rangeblock.ip }) }}</template>
         </template>
       </cdx-table>
     </template>

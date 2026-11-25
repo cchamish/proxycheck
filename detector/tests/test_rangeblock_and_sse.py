@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 import dns.resolver
 from asgiref.sync import sync_to_async
+from django.db import OperationalError
 from django.test import AsyncClient, TestCase, override_settings
 
 from detector.cache import redis_backend as cache_backends
@@ -29,6 +30,32 @@ async def _add_agg(wiki: str, count: int, *, active: bool = False) -> None:
 
 
 class RangeblockAndSseTests(TestCase):
+    async def _lookup_blocks(self):
+        _login_authorised(self)
+        client = AsyncClient()
+        client.cookies.load(self.client.cookies.output(header=""))
+        response = await client.get("/api/v1/rangeblock?ip=8.8.8.8")
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    async def test_block_data_query_failure_is_degraded(self):
+        with (
+            patch(
+                "detector.rangeblock.service.RangeblockAggregate.objects.filter",
+                side_effect=OperationalError("missing table"),
+            ),
+            patch("detector.rangeblock.service._fetch_realtime_wiki_blocks", return_value=({}, set(), False)),
+        ):
+            result = await self._lookup_blocks()
+        self.assertTrue(result.get("blockDataDegraded", False))
+        self.assertEqual(result["wikis"], [])
+
+    async def test_empty_block_data_query_is_not_degraded(self):
+        with patch("detector.rangeblock.service._fetch_realtime_wiki_blocks", return_value=({}, set(), False)):
+            result = await self._lookup_blocks()
+        self.assertFalse(result.get("blockDataDegraded", False))
+        self.assertEqual((result["localTotal"], result["globalTotal"], result["wikis"]), (0, 0, []))
+
     def setUp(self):
         cache_backends.reset_redis_circuit_breaker()
         dns_patcher = patch(

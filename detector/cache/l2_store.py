@@ -166,22 +166,6 @@ def pack_ip_binary(raw_ip: str) -> Tuple[bytes, int, str]:
     return addr.packed, 6, addr.compressed
 
 
-def ip_to_bin(raw_ip: str) -> bytes:
-    """Returns the 16-byte packed IPv6 or RFC 4291 IPv4-mapped binary representation."""
-    ip_bin, _, _ = pack_ip_binary(raw_ip)
-    return ip_bin
-
-
-def unpack_ip_binary(ip_bin: bytes | memoryview) -> str:
-    """Restores the canonical IPv4 or IPv6 string from a 16-byte binary key."""
-    raw = bytes(ip_bin)
-    if len(raw) != 16:
-        raise ValueError(f"Expected 16-byte packed IP key, got {len(raw)} bytes.")
-    if raw[:12] == _IPV4_MAPPED_PREFIX:
-        return ipaddress.IPv4Address(raw[12:]).compressed
-    return ipaddress.IPv6Address(raw).compressed
-
-
 def _ensure_utc(dt_value: Optional[datetime] = None) -> datetime:
     if dt_value is None:
         return datetime.now(timezone.utc)

@@ -1,6 +1,7 @@
 """Core P0 tests for rangeblock invariants, real-time overrides, auth guards, and SSE streaming."""
 
 import json
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import dns.resolver
@@ -14,7 +15,9 @@ from detector.rangeblock import service as rangeblock_service
 from .helpers import _login_authorised, start_non_dnsbl_provider_stubs
 
 
-async def _add_agg(wiki: str, count: int, *, active: bool = False) -> None:
+async def _add_agg(
+    wiki: str, count: int, *, active: bool = False, expiry: datetime | None = None, indefinite: bool = False
+) -> None:
     target, ver, prefix, start_bin, end_bin = rangeblock_service.normalize_block_target("8.8.8.0/24")
     await sync_to_async(RangeblockAggregate.objects.create, thread_sensitive=True)(
         wiki_dbname=wiki,
@@ -25,6 +28,8 @@ async def _add_agg(wiki: str, count: int, *, active: bool = False) -> None:
         range_end_bin=end_bin,
         block_count=count,
         has_active=active,
+        active_expiry=expiry,
+        active_indefinite=indefinite,
     )
 
 
@@ -72,6 +77,34 @@ class RangeblockAndSseTests(TestCase):
             degraded = await rangeblock_service.query_rangeblocks_for_ip("8.8.8.8")
         self.assertTrue(degraded["realtimeDegraded"])
         self.assertEqual(degraded["localTotal"], 6)
+
+    async def test_cached_rangeblock_activity_respects_expiry(self):
+        now = datetime.now(timezone.utc)
+        past = now - timedelta(days=1)
+        future = now + timedelta(days=1)
+        await _add_agg("enwiki", 3, active=True, expiry=past)
+        await _add_agg("dewiki", 2, active=True, expiry=future)
+        await _add_agg("frwiki", 1, active=True, indefinite=True)
+
+        with patch("detector.rangeblock.service.discover_wiki_replica_credentials", return_value=None):
+            summary = await rangeblock_service.query_rangeblocks_for_ip("8.8.8.8")
+
+        self.assertEqual(summary["localTotal"], 6)
+        wikis = {wiki["wiki"]: wiki for wiki in summary["wikis"]}
+        for name, count, active, expiry, indefinite in (
+            ("enwiki", 3, False, past.isoformat(), False),
+            ("dewiki", 2, True, future.isoformat(), False),
+            ("frwiki", 1, True, None, True),
+        ):
+            with self.subTest(wiki=name):
+                wiki = wikis[name]
+                (row,) = wiki["rows"]
+                self.assertEqual(row["isActive"], active)
+                self.assertEqual(wiki["hasActive"], active)
+                self.assertEqual(row["count"], count)
+                self.assertEqual(wiki["count"], count)
+                self.assertEqual(row["expiry"], expiry)
+                self.assertEqual(row["indefinite"], indefinite)
 
     async def test_rangeblock_and_stream_auth_guards(self):
         """P0: Both new endpoints enforce 401/403."""

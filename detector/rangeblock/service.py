@@ -539,6 +539,7 @@ def merge_rangeblock_records(
     local_total = 0
     global_total = 0
     any_active = False
+    now_utc = datetime.now(timezone.utc)
 
     for wiki_dbname, target_map in merged_by_wiki.items():
         if not target_map:
@@ -549,11 +550,14 @@ def merge_rangeblock_records(
             candidate = candidate_by_target.get(target)
             if candidate is None:
                 continue
-            has_active = bool(rec.get("has_active"))
+            expiry_dt = rec.get("active_expiry")
+            is_indef = bool(rec.get("active_indefinite"))
+            has_active = bool(rec.get("has_active")) and (
+                is_indef or not isinstance(expiry_dt, datetime) or expiry_dt > now_utc
+            )
             count = compute_effective_block_count(int(rec.get("block_count") or 0), has_active)
             if count <= 0 and not has_active:
                 continue
-            expiry_dt = rec.get("active_expiry")
             last_dt = rec.get("last_blocked_at")
             log_url, block_list_url = build_rangeblock_links(wiki_dbname, domain, candidate.target)
             rows_out.append(
@@ -564,7 +568,7 @@ def merge_rangeblock_records(
                     "count": count,
                     "isActive": has_active,
                     "expiry": expiry_dt.isoformat() if isinstance(expiry_dt, datetime) else None,
-                    "indefinite": bool(rec.get("active_indefinite")),
+                    "indefinite": is_indef,
                     "lastBlockedAt": last_dt.isoformat() if isinstance(last_dt, datetime) else None,
                     "logUrl": log_url,
                     "blockListUrl": block_list_url,

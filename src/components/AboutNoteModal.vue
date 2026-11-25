@@ -3,7 +3,7 @@
     v-model:open="dialogOpen"
     :title="aboutTitle"
     :use-close-button="true"
-    :default-action="{ label: 'Close' }"
+    :default-action="{ label: t('common-close') }"
     class="about-note-dialog"
     @default="dialogOpen = false"
   >
@@ -15,6 +15,9 @@
 import { computed } from 'vue';
 import { CdxDialog } from '@wikimedia/codex';
 import aboutMarkdown from '../../docs/about.md?raw';
+import { useI18n } from '../utils/i18n';
+
+const { t } = useI18n();
 
 const props = defineProps<{
   open: boolean;

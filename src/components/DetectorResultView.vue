@@ -1,12 +1,12 @@
 <template>
   <div class="tab-panel">
-    <section class="overview-section" aria-label="Detection overview">
+    <section class="overview-section" :aria-label="t('detector-overview-aria')">
       <div class="overview-header">
         <div class="overview-header__main">
           <div
             class="prediction__ring"
             :class="predictionScoreTierClass"
-            :aria-label="`Prediction ${formatChance(detectionData.prediction_score)}%`"
+            :aria-label="t('detector-prediction-aria', { score: formatChance(detectionData.prediction_score) })"
           >
             <span
               class="prediction__score"
@@ -42,7 +42,7 @@
               class="inline-group"
             >
               <cdx-info-chip v-if="detectionData.is_broadcast_ip" status="warning">
-                Broadcast IP?
+                {{ t('detector-broadcast-ip') }}
               </cdx-info-chip>
               <cdx-info-chip
                 v-if="detectionData.isTor"
@@ -69,29 +69,29 @@
                 {{ sharedPrivacyInfo.pillText }}
               </cdx-info-chip>
               <cdx-info-chip v-if="detectionData.suspectedResidentialProxy" status="warning">
-                Suspected Residential Proxy / Compromised Host
+                {{ t('detector-suspected-residential') }}
               </cdx-info-chip>
               <cdx-info-chip
                 v-if="detectionData.highlySuspectedResidentialProxy"
                 status="error"
                 :title="detectionData.residentialProxy != null ? `GetIPIntel ResidentialProxy: ${formatChance(detectionData.residentialProxy * 100)}%` : 'GetIPIntel ResidentialProxy'"
               >
-                Highly Suspected Residential Proxy
+                {{ t('detector-highly-suspected-residential') }}
               </cdx-info-chip>
               <cdx-info-chip
                 v-for="proxyPort in openProxyPorts"
                 :key="`proxy-port-${proxyPort}`"
                 status="error"
-                title="Open proxy port detected via Shodan InternetDB"
+                :title="t('detector-open-proxy-port-title')"
               >
-                Open Proxy Port: {{ proxyPort }}
+                {{ t('detector-open-proxy-port', { port: proxyPort }) }}
               </cdx-info-chip>
               <cdx-info-chip
                 v-for="shodanTag in shodanTags"
                 :key="`shodan-tag-${shodanTag}`"
                 status="warning"
               >
-                Shodan: {{ shodanTag }}
+                {{ t('detector-shodan-tag', { tag: shodanTag }) }}
               </cdx-info-chip>
             </div>
 
@@ -125,7 +125,7 @@
         {{ refreshWarningMessage }}
       </cdx-message>
       <cdx-message v-if="showFreshRecheckPrompt" type="warning" :inline="false">
-        Cached residential proxy evidence is older than 7 days. Click
+        {{ t('detector-fresh-recheck-prefix') }}
         <cdx-button
           type="button"
           action="progressive"
@@ -134,27 +134,27 @@
           :disabled="refetchButtonState.disabled"
           @click="emit('refetch')"
         >
-          Refetch
+          {{ t('detector-refetch') }}
         </cdx-button>
-        to verify the current dynamic DHCP assignment before applying a long-term block.
+        {{ t('detector-fresh-recheck-suffix') }}
       </cdx-message>
 
       <dl class="overview-grid">
         <div class="overview-grid__item">
-          <dt class="overview-grid__label">Country</dt>
+          <dt class="overview-grid__label">{{ t('detector-label-country') }}</dt>
           <dd class="overview-grid__value">{{ detectionData.primaryCountry || '-' }}</dd>
         </div>
 
         <div class="overview-grid__item">
-          <dt class="overview-grid__label">ASN</dt>
+          <dt class="overview-grid__label">{{ t('detector-label-asn') }}</dt>
           <dd class="overview-grid__value"><code>{{ detectionData.primaryAsn || '-' }}</code></dd>
         </div>
 
         <div class="overview-grid__item">
-          <dt class="overview-grid__label">Reverse DNS (PTR)</dt>
+          <dt class="overview-grid__label">{{ t('detector-label-ptr') }}</dt>
           <dd class="overview-grid__value">
             <div class="inline-group">
-              <code>{{ detectionData.ptrHostname || 'No PTR Record' }}</code>
+              <code>{{ detectionData.ptrHostname || t('detector-no-ptr') }}</code>
               <cdx-info-chip
                 v-if="detectionData.ptrLabel && detectionData.ptrCategory && detectionData.ptrCategory !== 'none'"
                 :status="ptrChipStatus"
@@ -166,7 +166,7 @@
         </div>
 
         <div class="overview-grid__item">
-          <dt class="overview-grid__label">Recommended CIDR</dt>
+          <dt class="overview-grid__label">{{ t('detector-label-recommended-cidr') }}</dt>
           <dd class="overview-grid__value">
             <div class="stack">
               <div class="inline-group">
@@ -175,17 +175,17 @@
                   v-if="!detectionData.highlySuspectedResidentialProxy && (detectionData.bgpPrefix || (detectionData.mmdbCidr && detectionData.mmdbCidr !== detectionData.recommendedCidr))"
                   class="text-subtle"
                 >
-                  (BGP: {{ detectionData.bgpPrefix || detectionData.mmdbCidr }})
+                  {{ t('detector-bgp-prefix', { prefix: detectionData.bgpPrefix || detectionData.mmdbCidr || '' }) }}
                 </span>
                 <span v-if="!detectionData.highlySuspectedResidentialProxy && detectionData.escalationCidr" class="text-subtle">
-                  Escalation CIDR: <code>{{ detectionData.escalationCidr }}</code>
+                  {{ t('detector-escalation-cidr') }} <code>{{ detectionData.escalationCidr }}</code>
                 </span>
               </div>
               <cdx-message v-if="isMobileOrCgnat" type="warning" :inline="true">
-                <strong>Mobile Cellular / CGNAT Shared Gateway</strong>
+                <strong>{{ t('detector-mobile-cgnat') }}</strong>
               </cdx-message>
               <cdx-message v-if="detectionData.highlySuspectedResidentialProxy" type="error" :inline="true">
-                <strong>Highly Suspected Residential Proxy</strong>
+                <strong>{{ t('detector-highly-suspected-residential') }}</strong>
               </cdx-message>
               <span
                 v-if="!detectionData.highlySuspectedResidentialProxy && detectionData.cidrRationale"
@@ -198,20 +198,20 @@
         </div>
 
         <div v-if="detectionData.rangeblock" class="overview-grid__item">
-          <dt class="overview-grid__label">Rangeblock</dt>
+          <dt class="overview-grid__label">{{ t('detector-label-rangeblock') }}</dt>
           <dd class="overview-grid__value">
             <span v-if="detectionData.rangeblock.wikis.length === 0" class="text-subtle">
-              No hits (0/0)
+              {{ t('detector-rangeblock-no-hits') }}
             </span>
             <span v-else>
               <template v-for="(item, idx) in detectionData.rangeblock.wikis" :key="item.wiki">
                 <span v-if="Number(idx) > 0">, </span>
-                <span>{{ item.count }} on </span>
+                <span>{{ t('detector-rangeblock-on-wiki', { count: item.count }) }}</span>
                 <a
                   :href="buildRangeblockWikiHref(detectionData.ip, item.wiki)"
                   @click.prevent="emit('open-rangeblock', item.wiki)"
                 >{{ item.wiki }}</a>
-                <span v-if="item.hasActive" class="text-destructive"> (active)</span>
+                <span v-if="item.hasActive" class="text-destructive">{{ t('detector-rangeblock-active-suffix') }}</span>
               </template>
             </span>
           </dd>
@@ -230,14 +230,14 @@
           :href="verificationLinks.rangeblockFinderUrl"
           @click.prevent="emit('open-rangeblock', null)"
         >
-          Rangeblock Finder
+          {{ t('detector-link-rangeblock-finder') }}
         </a>
         <a
           :href="verificationLinks.whoisGatewayUrl"
           target="_blank"
           rel="noopener noreferrer"
         >
-          WHOIS Gateway
+          {{ t('detector-link-whois-gateway') }}
         </a>
         <a
           :href="verificationLinks.singleIpBlockUrl"
@@ -252,16 +252,16 @@
           target="_blank"
           rel="noopener noreferrer"
         >
-          Special:Block (range)
+          {{ t('detector-link-special-block-range') }}
         </a>
         <cdx-button type="button" size="small" @click="handleCopyWikitext">
-          {{ wikitextCopied ? 'Copied Wikitext!' : 'Copy Wikitext Summary' }}
+          {{ wikitextCopied ? t('detector-copied-wikitext') : t('detector-copy-wikitext') }}
         </cdx-button>
       </div>
     </section>
 
     <cdx-table
-      caption="Sources"
+      :caption="t('detector-sources-caption')"
       :columns="groundTruthColumns"
       :data="comparisonRows"
     >
@@ -278,7 +278,7 @@
           <cdx-info-chip
             :status="getStatusChipStatus(row.status)"
             :class="{ 'is-pending': row.status === 'Querying...' }"
-            :title="row.status === 'Offline DB Missing' ? 'Local offline database file not yet downloaded' : undefined"
+            :title="row.status === 'Offline DB Missing' ? t('detector-offline-db-missing-title') : undefined"
           >
             {{ row.status }}
           </cdx-info-chip>
@@ -339,19 +339,22 @@ import {
   type DetectionResponse,
   type ProviderRawResult,
 } from '../utils/ip-detector-logic';
+import { useI18n } from '../utils/i18n';
+
+const { t } = useI18n();
 
 const DEFAULT_STALE_THRESHOLD_SECONDS = 7_776_000;
 const FRESH_RECHECK_THRESHOLD_SECONDS = 7 * 86_400;
 const META_WIKI_BASE = 'https://meta.wikimedia.org';
 
-const groundTruthColumns: TableColumn[] = [
-  { id: 'provider', label: 'Provider' },
-  { id: 'asn', label: 'ASN', width: '120px' },
-  { id: 'isp', label: 'ISP / Organisation' },
-  { id: 'location', label: 'Location' },
-  { id: 'usageType', label: 'Usage type' },
-  { id: 'securityFlags', label: 'Security flags' },
-];
+const groundTruthColumns = computed<TableColumn[]>(() => [
+  { id: 'provider', label: t('detector-col-provider') },
+  { id: 'asn', label: t('detector-col-asn'), width: '120px' },
+  { id: 'isp', label: t('detector-col-isp') },
+  { id: 'location', label: t('detector-col-location') },
+  { id: 'usageType', label: t('detector-col-usage-type') },
+  { id: 'securityFlags', label: t('detector-col-security-flags') },
+]);
 
 const props = defineProps<{
   detectionData: DetectionResponse;
@@ -451,15 +454,15 @@ const sharedPrivacyInfo = computed(() => {
   if (egress === 'icloud_private_relay') {
     return {
       label: 'Apple iCloud Private Relay',
-      pillText: 'Apple iCloud Private Relay · Shared egress',
-      guidance: 'Shared Apple iCloud Private Relay client egress. Many unrelated users may share this address.',
+      pillText: t('detector-shared-icloud-pill'),
+      guidance: t('detector-shared-icloud-guidance'),
     };
   }
   if (egress === 'cloudflare_warp') {
     return {
       label: 'Cloudflare WARP',
-      pillText: 'Cloudflare WARP Egress · Shared egress',
-      guidance: 'Shared Cloudflare WARP client egress. Many unrelated users may share this address.',
+      pillText: t('detector-shared-warp-pill'),
+      guidance: t('detector-shared-warp-guidance'),
     };
   }
   return null;
@@ -505,7 +508,7 @@ const refetchButtonState = computed(() => {
   const isBusy = Boolean(props.isRefreshing || data.cacheMeta?.refreshInProgress);
   return {
     visible,
-    label: isBusy ? 'Updating...' : 'Refetch',
+    label: isBusy ? t('detector-refetch-updating') : t('detector-refetch'),
     disabled: Boolean(isBusy || props.isLoading),
     isBusy,
   };
@@ -527,7 +530,7 @@ const cacheAgeBadgeLabel = computed(() => {
   if (props.lastRefreshedAt && !data.cacheMeta?.degradedRefreshFallback) {
     const refreshedMs = Date.parse(props.lastRefreshedAt);
     if (Number.isFinite(refreshedMs) && Math.max(0, Math.floor((safeNowMs - refreshedMs) / 1000)) < 60) {
-      return 'Just updated';
+      return t('detector-cache-just-updated');
     }
   }
 
@@ -550,24 +553,24 @@ const cacheAgeBadgeLabel = computed(() => {
 
   if (!isCachedPayload) {
     const age = timestampAgeSec ?? metaAgeSec ?? 0;
-    if (age < 60) return 'Just updated';
-    if (age < 3600) return `Updated ${Math.floor(age / 60)}m ago`;
-    if (age < 86_400) return `Updated ${Math.floor(age / 3600)}h ago`;
-    return `Updated ${Math.floor(age / 86_400)}d ago`;
+    if (age < 60) return t('detector-cache-just-updated');
+    if (age < 3600) return t('detector-cache-updated-minutes', { count: Math.floor(age / 60) });
+    if (age < 86_400) return t('detector-cache-updated-hours', { count: Math.floor(age / 3600) });
+    return t('detector-cache-updated-days', { count: Math.floor(age / 86_400) });
   }
 
   const age = Math.max(timestampAgeSec ?? 0, metaAgeSec ?? 0);
-  if (age < 60) return 'Cached just now';
-  if (age < 3600) return `Cached ${Math.floor(age / 60)}m ago`;
-  if (age < 86_400) return `Cached ${Math.floor(age / 3600)}h ago`;
-  return `Cached ${Math.floor(age / 86_400)}d ago`;
+  if (age < 60) return t('detector-cache-just-now');
+  if (age < 3600) return t('detector-cache-minutes', { count: Math.floor(age / 60) });
+  if (age < 86_400) return t('detector-cache-hours', { count: Math.floor(age / 3600) });
+  return t('detector-cache-days', { count: Math.floor(age / 86_400) });
 });
 
 const cacheExactUtcTooltip = computed(() => {
   const data = props.detectionData;
   const rawStamp = data.cacheMeta?.fetchedAt || data.fetchedAt || data.cacheMeta?.cachedAt || null;
   const formatted = formatExactUtcTimestamp(rawStamp);
-  return formatted ? `Fetched ${formatted}` : null;
+  return formatted ? t('detector-fetched-at', { timestamp: formatted }) : null;
 });
 
 const showFreshRecheckPrompt = computed(() => {
@@ -663,8 +666,8 @@ function getProviderUpdatedLabel(row: ProviderRawResult): string | null {
   if (!Number.isFinite(cachedMs)) return null;
   const nowMs = Number.isFinite(props.nowTimestampMs) ? props.nowTimestampMs : Date.now();
   const diffMs = nowMs - cachedMs;
-  if (diffMs < 60_000) return 'Updated just now';
-  return `Updated ${formatCompactDuration(Math.floor(diffMs / 60_000))} ago`;
+  if (diffMs < 60_000) return t('detector-updated-just-now');
+  return t('detector-updated-ago', { duration: formatCompactDuration(Math.floor(diffMs / 60_000)) });
 }
 
 function getStatusChipStatus(status?: string | null): ChipStatus {
@@ -696,24 +699,32 @@ function getVisibleSecurityFlags(
 
 function getProviderMetaItems(row: ProviderRawResult): string[] {
   const items: string[] = [];
-  if (row.port !== undefined && row.port !== null) items.push(`Port: ${row.port}`);
+  if (row.port !== undefined && row.port !== null) items.push(t('detector-meta-port', { value: row.port }));
   if (Array.isArray(row.openProxyPorts) && row.openProxyPorts.length > 0) {
-    items.push(`Proxy ports: ${row.openProxyPorts.join(', ')}`);
+    items.push(t('detector-meta-proxy-ports', { value: row.openProxyPorts.join(', ') }));
   } else if (Array.isArray(row.ports) && row.ports.length > 0) {
     const preview = row.ports.slice(0, 8).join(', ');
-    items.push(`Open ports: ${row.ports.length > 8 ? `${preview}…` : preview}`);
+    items.push(t('detector-meta-open-ports', { value: row.ports.length > 8 ? `${preview}…` : preview }));
   }
-  if (Array.isArray(row.tags) && row.tags.length > 0) items.push(`Tags: ${row.tags.join(', ')}`);
+  if (Array.isArray(row.tags) && row.tags.length > 0) {
+    items.push(t('detector-meta-tags', { value: row.tags.join(', ') }));
+  }
   if (Array.isArray(row.hostnames) && row.hostnames.length > 0) {
     const preview = row.hostnames.slice(0, 3).join(', ');
-    items.push(`Hostnames: ${row.hostnames.length > 3 ? `${preview}…` : preview}`);
+    items.push(t('detector-meta-hostnames', { value: row.hostnames.length > 3 ? `${preview}…` : preview }));
   }
-  if (typeof row.ipsumScore === 'number' && row.ipsumScore > 0) items.push(`IPsum lists: ${row.ipsumScore}`);
+  if (typeof row.ipsumScore === 'number' && row.ipsumScore > 0) {
+    items.push(t('detector-meta-ipsum-lists', { value: row.ipsumScore }));
+  }
   if (row.inSpamhausDrop) {
     const dropParts = [row.dropSblId, row.dropCidr].filter(
       (part): part is string => typeof part === 'string' && part.trim().length > 0
     );
-    items.push(dropParts.length > 0 ? `Spamhaus DROP: ${dropParts.join(' · ')}` : 'Spamhaus DROP: Listed');
+    items.push(
+      dropParts.length > 0
+        ? t('detector-meta-spamhaus-drop', { value: dropParts.join(' · ') })
+        : t('detector-meta-spamhaus-drop-listed')
+    );
   }
   if (row.category) {
     const normalisedCategory =
@@ -724,46 +735,67 @@ function getProviderMetaItems(row: ProviderRawResult): string[] {
           : row.category === 'hosting'
             ? 'Hosting'
             : row.category;
-    items.push(`Category: ${normalisedCategory}`);
+    items.push(t('detector-meta-category', { value: normalisedCategory }));
   }
-  if (row.matchedCidr && !row.dropCidr) items.push(`Prefix: ${row.matchedCidr}`);
-  if (Array.isArray(row.sources) && row.sources.length > 0) items.push(`Sources: ${row.sources.join(', ')}`);
+  if (row.matchedCidr && !row.dropCidr) items.push(t('detector-meta-prefix', { value: row.matchedCidr }));
+  if (Array.isArray(row.sources) && row.sources.length > 0) {
+    items.push(t('detector-meta-sources', { value: row.sources.join(', ') }));
+  }
   if (row.provider === 'StopForumSpam' || row.frequency !== undefined || row.confidence !== undefined) {
-    if (row.frequency !== undefined && row.frequency !== null) items.push(`Frequency: ${row.frequency}`);
-    if (row.confidence !== undefined && row.confidence !== null) items.push(`Confidence: ${row.confidence}%`);
-  }
-  if (row.provider === 'DShield' || row.attacks !== undefined || row.count !== undefined) {
-    if (row.attacks !== undefined && row.attacks !== null) items.push(`Attacks: ${row.attacks}`);
-    if (row.count !== undefined && row.count !== null) items.push(`Targets: ${row.count}`);
-    if (Array.isArray(row.threatfeeds) && row.threatfeeds.length > 0) {
-      items.push(`Feeds: ${row.threatfeeds.join(', ')}`);
+    if (row.frequency !== undefined && row.frequency !== null) {
+      items.push(t('detector-meta-frequency', { value: row.frequency }));
+    }
+    if (row.confidence !== undefined && row.confidence !== null) {
+      items.push(t('detector-meta-confidence', { value: row.confidence }));
     }
   }
-  if (row.carrier) items.push(`Carrier: ${row.carrier}`);
-  if (row.mobileBrand) items.push(`Mobile brand: ${row.mobileBrand}`);
-  if (row.coreVerdict) items.push(`Core verdict: ${row.coreVerdict}`);
-  if (Array.isArray(row.coreSources) && row.coreSources.length > 0) {
-    items.push(`Core sources: ${row.coreSources.join(', ')}`);
+  if (row.provider === 'DShield' || row.attacks !== undefined || row.count !== undefined) {
+    if (row.attacks !== undefined && row.attacks !== null) {
+      items.push(t('detector-meta-attacks', { value: row.attacks }));
+    }
+    if (row.count !== undefined && row.count !== null) {
+      items.push(t('detector-meta-targets', { value: row.count }));
+    }
+    if (Array.isArray(row.threatfeeds) && row.threatfeeds.length > 0) {
+      items.push(t('detector-meta-feeds', { value: row.threatfeeds.join(', ') }));
+    }
   }
-  if (row.networkRole) items.push(`Network role: ${row.networkRole}`);
+  if (row.carrier) items.push(t('detector-meta-carrier', { value: row.carrier }));
+  if (row.mobileBrand) items.push(t('detector-meta-mobile-brand', { value: row.mobileBrand }));
+  if (row.coreVerdict) items.push(t('detector-meta-core-verdict', { value: row.coreVerdict }));
+  if (Array.isArray(row.coreSources) && row.coreSources.length > 0) {
+    items.push(t('detector-meta-core-sources', { value: row.coreSources.join(', ') }));
+  }
+  if (row.networkRole) items.push(t('detector-meta-network-role', { value: row.networkRole }));
   const rowSharedProvider = row.sharedProvider || row.cloudProvider;
   if (rowSharedProvider) {
     items.push(
       row.sharedCategory
-        ? `Shared egress: ${rowSharedProvider} (${row.sharedCategory})`
-        : `Shared egress: ${rowSharedProvider}`
+        ? t('detector-meta-shared-egress-category', {
+            provider: rowSharedProvider,
+            category: row.sharedCategory,
+          })
+        : t('detector-meta-shared-egress', { value: rowSharedProvider })
     );
   }
   if (row.provider === 'AbuseIPDB' || row.totalReports !== undefined || row.numDistinctUsers !== undefined) {
-    if (row.totalReports !== undefined && row.totalReports !== null) items.push(`Reports: ${row.totalReports}`);
+    if (row.totalReports !== undefined && row.totalReports !== null) {
+      items.push(t('detector-meta-reports', { value: row.totalReports }));
+    }
     if (row.numDistinctUsers !== undefined && row.numDistinctUsers !== null) {
-      items.push(`Distinct users: ${row.numDistinctUsers}`);
+      items.push(t('detector-meta-distinct-users', { value: row.numDistinctUsers }));
     }
   }
   const lastSeenValue = row.lastSeen || row.maxDate;
-  if (lastSeenValue) items.push(`Last seen: ${lastSeenValue}`);
-  if (row.offlineDbUpdatedAt) items.push(`Offline DB: ${formatOfflineDbTimestamp(row.offlineDbUpdatedAt, props.nowTimestampMs)}`);
-  if (row.isHistoricalFallback) items.push('Historical L2 fallback');
+  if (lastSeenValue) items.push(t('detector-meta-last-seen', { value: lastSeenValue }));
+  if (row.offlineDbUpdatedAt) {
+    items.push(
+      t('detector-meta-offline-db', {
+        value: formatOfflineDbTimestamp(row.offlineDbUpdatedAt, props.nowTimestampMs),
+      })
+    );
+  }
+  if (row.isHistoricalFallback) items.push(t('detector-meta-historical-fallback'));
   return items;
 }
 

@@ -1,32 +1,28 @@
 <template>
-  <section class="rb-finder" aria-label="Cross-Wiki Rangeblock Finder">
+  <section class="rb-finder" :aria-label="t('rb-title')">
     <cdx-message v-if="errorMessage" type="error" :inline="false">
       {{ errorMessage }}
     </cdx-message>
 
     <cdx-message v-else-if="isLoading" type="notice" :inline="false">
-      Querying cross-wiki rangeblock aggregates and Wiki Replicas...
+      {{ t('rb-loading') }}
     </cdx-message>
 
     <template v-else-if="rangeblock">
       <div class="rb-header">
         <div class="rb-header__title">
-          <h2 class="card-heading">Cross-Wiki Rangeblock Finder</h2>
+          <h2 class="card-heading">{{ t('rb-title') }}</h2>
           <cdx-info-chip :status="rangeblock.hasActive ? 'error' : 'notice'">
-            rangeblock: {{ rangeblock.localTotal }}/{{ rangeblock.globalTotal }}
+            {{ t('rb-chip-summary', { local: rangeblock.localTotal, global: rangeblock.globalTotal }) }}
           </cdx-info-chip>
         </div>
         <span class="text-subtle">
-          {{
-            rangeblock.ipVersion === 6
-              ? 'IPv6 scope: single IP and /64–/19 (47 targets; /127–/65 excluded)'
-              : 'IPv4 scope: single IP and /32–/16 (18 targets)'
-          }}
+          {{ rangeblock.ipVersion === 6 ? t('rb-scope-v6') : t('rb-scope-v4') }}
         </span>
       </div>
 
       <cdx-message v-if="rangeblock.realtimeDegraded" type="warning" :inline="false">
-        Real-time Wiki Replicas lookup was temporarily unavailable; displaying cached ToolsDB aggregate records.
+        {{ t('rb-realtime-degraded') }}
       </cdx-message>
 
       <div class="rb-filters">
@@ -35,12 +31,12 @@
           :buttons="wikiButtons"
         />
         <cdx-toggle-switch v-if="selectedWikiSummary" v-model="showFullLadder">
-          Show full CIDR ladder
+          {{ t('rb-show-full-ladder') }}
         </cdx-toggle-switch>
       </div>
 
       <cdx-table
-        caption="Rangeblock records"
+        :caption="t('rb-table-caption')"
         :hide-caption="true"
         :columns="rbColumns"
         :data="tableRows"
@@ -53,10 +49,10 @@
         </template>
         <template #item-status="{ row }">
           <cdx-info-chip v-if="row.hit.isActive" status="error">
-            Active · {{ row.hit.indefinite ? 'Indefinite' : (formatExactUtcTimestamp(row.hit.expiry) || 'Active') }}
+            {{ t('rb-status-active') }} · {{ row.hit.indefinite ? t('rb-status-indefinite') : (formatExactUtcTimestamp(row.hit.expiry) || t('rb-status-active')) }}
           </cdx-info-chip>
           <cdx-info-chip v-else-if="row.hit.count > 0" status="notice">
-            Historical
+            {{ t('rb-status-historical') }}
           </cdx-info-chip>
           <span v-else class="text-subtle">-</span>
         </template>
@@ -72,13 +68,13 @@
           </div>
         </template>
         <template #empty-state>
-          No rangeblock or single-IP block records found for {{ rangeblock.ip }}.
+          {{ t('rb-empty-state', { ip: rangeblock.ip }) }}
         </template>
       </cdx-table>
     </template>
 
     <p v-else class="text-subtle">
-      Enter an IPv4 or IPv6 address above to inspect cross-wiki blocks without consuming commercial API quota.
+      {{ t('rb-idle-prompt') }}
     </p>
   </section>
 </template>
@@ -101,6 +97,9 @@ import {
   type RangeblockSummary,
   type RangeblockWikiSummary,
 } from '../utils/ip-detector-logic';
+import { useI18n } from '../utils/i18n';
+
+const { t } = useI18n();
 
 const props = defineProps<{
   rangeblock: RangeblockSummary | null;
@@ -115,15 +114,15 @@ const emit = defineEmits<{
 
 const ALL_WIKIS_VALUE = '__all__';
 
-const rbColumns: TableColumn[] = [
-  { id: 'wiki', label: 'Wiki' },
-  { id: 'target', label: 'Target' },
-  { id: 'cidr', label: 'CIDR' },
-  { id: 'upperBound', label: 'Upper bound' },
-  { id: 'status', label: 'Status' },
-  { id: 'count', label: 'Blocks' },
-  { id: 'links', label: 'Links' },
-];
+const rbColumns = computed<TableColumn[]>(() => [
+  { id: 'wiki', label: t('rb-col-wiki') },
+  { id: 'target', label: t('rb-col-target') },
+  { id: 'cidr', label: t('rb-col-cidr') },
+  { id: 'upperBound', label: t('rb-col-upper-bound') },
+  { id: 'status', label: t('rb-col-status') },
+  { id: 'count', label: t('rb-col-blocks') },
+  { id: 'links', label: t('rb-col-links') },
+]);
 
 const showFullLadder = ref(false);
 
@@ -133,10 +132,10 @@ const selectedWikiValue = computed<string>({
 });
 
 const wikiButtons = computed<ButtonGroupItem[]>(() => [
-  { value: ALL_WIKIS_VALUE, label: `All Hits (${props.rangeblock?.wikis.length ?? 0})` },
+  { value: ALL_WIKIS_VALUE, label: t('rb-filter-all-hits', { count: props.rangeblock?.wikis.length ?? 0 }) },
   ...(props.rangeblock?.wikis ?? []).map((item) => ({
     value: item.wiki,
-    label: `${item.wiki}${item.hasActive ? ' (active)' : ''} · ${item.count}`,
+    label: `${item.wiki}${item.hasActive ? t('detector-rangeblock-active-suffix') : ''} · ${item.count}`,
   })),
 ]);
 
@@ -236,7 +235,7 @@ const tableRows = computed(() => {
   const toTableRow = (wiki: string, hit: RangeblockHitRow) => ({
     wiki,
     hit,
-    cidr: hit.cidr === null ? 'Single IP' : `/${hit.cidr}`,
+    cidr: hit.cidr === null ? t('rb-single-ip') : `/${hit.cidr}`,
   });
 
   if (selectedWikiSummary.value) {

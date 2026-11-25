@@ -158,7 +158,7 @@ def build_non_public_response_payload(
     return attach_request_diagnostics(payload, start_time)
 
 
-_HOSTING_KEYWORDS = ("datacenter", "data center", "hosting", "cloud", "transit", "cdn")
+_HOSTING_KEYWORDS = ("datacenter", "data center", "datacentre", "data centre", "hosting", "cloud", "transit", "cdn")
 _RESIDENTIAL_KEYWORDS = ("isp", "residential", "fixed line", "mobile", "commercial", "education")
 _ANONYMISER_KEYWORDS = ("proxy", "vpn", "tor", "relay", "abuser", "attacker", "threat", "block 1", "spam", "botnet")
 _SHODAN_PARADOX_TAGS = frozenset({"proxy", "vpn", "compromised"})
@@ -499,7 +499,7 @@ def aggregate_intelligence_metrics(  # noqa: C901
             verdict, tier, is_majority = "Direct Connection (No Commercial Threats)", "neutral", False
         elif votes > (total / 2.0):
             prefix = (
-                "Confirmed Datacenter / Hosting"
+                "Confirmed Datacentre / Hosting"
                 if sig.has_hosting and not sig.has_anonymiser_flag
                 else "Confirmed Proxy / VPN"
             )
@@ -511,7 +511,7 @@ def aggregate_intelligence_metrics(  # noqa: C901
             if sig.has_anonymiser_flag:
                 prefix = "Disputed Proxy / VPN"
             elif sig.has_hosting and sig.residential_source_count == 0:
-                prefix = "Disputed Datacenter / Hosting"
+                prefix = "Disputed Datacentre / Hosting"
             else:
                 prefix = "Disputed Residential / VPN"
             verdict, tier, is_majority = f"{prefix} ({votes_str}/{total} Sources)", "warning", False

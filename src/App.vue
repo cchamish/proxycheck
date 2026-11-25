@@ -7,13 +7,24 @@
       <div class="app-header__actions">
         <template v-if="user.isLoggedIn">
           <cdx-button v-if="isAdminUser" weight="quiet" @click="isDashboardOpen = true">
-            Status
+            {{ t('header-status') }}
           </cdx-button>
           <span class="app-username">{{ user.username }}</span>
           <cdx-button weight="quiet" @click="handleLogout">
-            Log out
+            {{ t('header-logout') }}
           </cdx-button>
         </template>
+        <cdx-menu-button
+          :selected="locale"
+          :menu-items="localeMenuItems"
+          weight="quiet"
+          :aria-label="t('header-language-aria')"
+          :title="t('header-language-aria')"
+          @update:selected="handleLocaleSelect"
+        >
+          <cdx-icon :icon="LANGUAGE_ICON" />
+          {{ currentLocaleLabel }}
+        </cdx-menu-button>
         <cdx-button
           weight="quiet"
           :aria-label="themeToggleAriaLabel"
@@ -47,31 +58,27 @@
           size="large"
           @click="handleLogin"
         >
-          Log in with Wikimedia
+          {{ t('auth-login-button') }}
         </cdx-button>
         <p class="barrier__note">
-          This tool is designed for users with the
+          {{ t('auth-required-right-prefix') }}
           <code>{{ REQUIRED_USER_RIGHTS[0] }}(-no-preference)</code>
-          right on any Wikimedia project.
+          {{ t('auth-required-right-suffix') }}
         </p>
         <cdx-message type="notice" :inline="false" class="barrier__message">
-          <p>
-            Entered IPs are checked against local offline databases and configured
-            third-party proxy/RDAP providers without being access-logged by Proxycheck.
-            Lookups remain subject to the policies below.
-          </p>
+          <p>{{ t('auth-privacy-notice') }}</p>
           <ul>
             <li>
-              <a href="https://foundation.wikimedia.org/wiki/Special:MyLanguage/Policy:Privacy_policy" target="_blank" rel="noopener">Foundation Privacy Policy</a>
+              <a href="https://foundation.wikimedia.org/wiki/Special:MyLanguage/Policy:Privacy_policy" target="_blank" rel="noopener">{{ t('auth-policy-privacy') }}</a>
             </li>
             <li>
-              <a href="https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Foundation_Access_to_Nonpublic_Personal_Data_Policy" target="_blank" rel="noopener">Foundation Access to Nonpublic Personal Data Policy</a>
+              <a href="https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Foundation_Access_to_Nonpublic_Personal_Data_Policy" target="_blank" rel="noopener">{{ t('auth-policy-nonpublic') }}</a>
             </li>
             <li>
-              <a href="https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Access_to_Temporary_Account_IP_Addresses_Policy" target="_blank" rel="noopener">Foundation Access to Temporary Account IP Addresses Policy</a>
+              <a href="https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Access_to_Temporary_Account_IP_Addresses_Policy" target="_blank" rel="noopener">{{ t('auth-policy-temp-ip') }}</a>
             </li>
             <li>
-              <a href="https://wikitech.wikimedia.org/wiki/Wikitech:Cloud_Services_Terms_of_use" target="_blank" rel="noopener">Cloud Services Terms of use</a>
+              <a href="https://wikitech.wikimedia.org/wiki/Wikitech:Cloud_Services_Terms_of_use" target="_blank" rel="noopener">{{ t('auth-policy-wmcs') }}</a>
             </li>
           </ul>
         </cdx-message>
@@ -79,7 +86,7 @@
 
       <div v-else-if="!user.hasAccess" class="barrier">
         <cdx-message type="error" :inline="false" class="barrier__message">
-          Access Denied: You must hold either the <code>{{ REQUIRED_USER_RIGHTS[0] }}</code> or <code>{{ REQUIRED_USER_RIGHTS[1] }}</code> user right on any Wikimedia project to use this tool.
+          {{ t('auth-access-denied-prefix') }} <code>{{ REQUIRED_USER_RIGHTS[0] }}</code> {{ t('auth-access-denied-or') }} <code>{{ REQUIRED_USER_RIGHTS[1] }}</code> {{ t('auth-access-denied-suffix') }}
         </cdx-message>
       </div>
 
@@ -88,11 +95,11 @@
           <form class="search-form" @submit.prevent="handleSearch">
             <cdx-text-input
               v-model="inputIp"
-              placeholder="Enter IPv4 or IPv6 address..."
+              :placeholder="t('search-placeholder')"
               size="large"
               class="search-form__input"
               :disabled="isActiveSearchBusy"
-              aria-label="IP Address Input"
+              :aria-label="t('search-input-aria')"
             />
             <cdx-button
               type="submit"
@@ -101,7 +108,7 @@
               size="large"
               :disabled="isActiveSearchBusy || !inputIp.trim()"
             >
-              {{ isActiveSearchBusy ? 'Analysing...' : (activeTab === 'rb' ? 'Lookup' : 'Detect') }}
+              {{ isActiveSearchBusy ? t('search-button-analysing') : (activeTab === 'rb' ? t('search-button-lookup') : t('search-button-detect')) }}
             </cdx-button>
           </form>
 
@@ -110,7 +117,7 @@
           </cdx-message>
 
           <div v-if="ipHistory.length > 0" class="history">
-            <span class="text-subtle">Recent queries:</span>
+            <span class="text-subtle">{{ t('search-recent-queries') }}</span>
             <cdx-button
               v-for="historyIp in ipHistory"
               :key="historyIp"
@@ -124,7 +131,7 @@
         </section>
 
         <cdx-tabs v-model:active="activeTab">
-          <cdx-tab name="detector" label="Detector">
+          <cdx-tab name="detector" :label="t('tab-detector')">
             <detector-result-view
               v-if="detectionData"
               :detection-data="detectionData"
@@ -138,7 +145,7 @@
             />
           </cdx-tab>
 
-          <cdx-tab name="rb" label="RB Finder">
+          <cdx-tab name="rb" :label="t('tab-rb-finder')">
             <rangeblock-finder-view
               v-if="activeTab === 'rb'"
               :rangeblock="activeRangeblockData"
@@ -155,7 +162,7 @@
     <footer class="app-footer">
       <span class="app-footer__meta">
         &copy; 2026 &middot;
-        <a href="#" @click.prevent="isAboutOpen = true">About</a>
+        <a href="#" @click.prevent="isAboutOpen = true">{{ t('footer-about') }}</a>
         &middot;
         <a
           v-if="repoBaseUrl"
@@ -167,14 +174,14 @@
         </a>
         <span v-else>{{ commitVersionLabel }}</span>
         &middot; {{ formatDiagnosticSummary(footerDiagnostic) }}
-        <cdx-info-chip v-if="footerDiagnostic.isCached">Cached</cdx-info-chip>
+        <cdx-info-chip v-if="footerDiagnostic.isCached">{{ t('footer-cached') }}</cdx-info-chip>
       </span>
       <div class="app-footer__logos">
         <a
           href="https://wikitech.wikimedia.org/wiki/Portal:Toolforge"
           target="_blank"
           rel="noopener noreferrer"
-          title="Hosted on Wikimedia Toolforge"
+          :title="t('footer-toolforge-title')"
         >
           <img :src="toolforgeLogo" alt="Toolforge" class="footer-logo" />
         </a>
@@ -182,9 +189,9 @@
           href="https://wikitech.wikimedia.org/wiki/Help:Cloud_Services_introduction"
           target="_blank"
           rel="noopener noreferrer"
-          title="Powered by Wikimedia Cloud Services"
+          :title="t('footer-wmcs-title')"
         >
-          <img :src="activeWmcsLogo" alt="Powered by Wikimedia Cloud Services" class="footer-logo" />
+          <img :src="activeWmcsLogo" :alt="t('footer-wmcs-title')" class="footer-logo" />
         </a>
       </div>
     </footer>
@@ -203,9 +210,11 @@ import {
   CdxButton,
   CdxIcon,
   CdxInfoChip,
+  CdxMenuButton,
   CdxMessage,
   CdxTab,
   CdxTabs,
+  type MenuItemValue,
 } from '@wikimedia/codex';
 import AboutNoteModal from './components/AboutNoteModal.vue';
 import DetectorResultView from './components/DetectorResultView.vue';
@@ -227,6 +236,9 @@ import {
   type DiagnosticMetrics,
   type RangeblockSummary,
 } from './utils/ip-detector-logic';
+import { handleLocaleStorageSync, normaliseLocale, useI18n } from './utils/i18n';
+
+const { locale, currentLocaleLabel, localeMenuItems, t } = useI18n();
 
 type ThemeMode = 'dark' | 'light';
 
@@ -235,12 +247,21 @@ const HISTORY_STORAGE_KEY = 'proxy_detector_ip_history';
 const DARK_THEME_COLOUR = '#101418';
 const LIGHT_THEME_COLOUR = '#f6f7f8';
 
+const LANGUAGE_ICON = {
+  path: 'M20 18h-1.44a.61.61 0 0 1-.4-.12.81.81 0 0 1-.23-.31L17 15h-5l-1 2.54a.77.77 0 0 1-.22.3.59.59 0 0 1-.4.14H9l4.55-11.47h1.89zm-3.53-4.31L14.89 9.5a11.62 11.62 0 0 1-.39-1.24q-.09.37-.19.69l-.19.56-1.58 4.19zm-6.3-1.58a13.43 13.43 0 0 1-2.91-1.41 11.46 11.46 0 0 0 2.81-5.37H12V4H7.31a4 4 0 0 0-.2-.56C6.87 2.79 6.6 2 6.6 2l-1.47.5s.4.89.6 1.5H0v1.33h2.15A11.23 11.23 0 0 0 5 10.7a17.19 17.19 0 0 1-5 2.1q.56.82.87 1.38a23.28 23.28 0 0 0 5.22-2.51 15.64 15.64 0 0 0 3.56 1.77zM3.63 5.33h4.91a8.11 8.11 0 0 1-2.45 4.45 9.11 9.11 0 0 1-2.46-4.45',
+};
 const BRIGHT_ICON = {
   path: 'm7.866 15.696-2 3.464-1.732-1 2-3.464zm8 2.464-1.732 1-2-3.464 1.732-1zM10 6a4 4 0 1 1 0 8 4 4 0 0 1 0-8m0 2a2 2 0 1 0 0 4 2 2 0 0 0 0-4m-6 3H0V9h4zm16 0h-4V9h4zM7.866 4.304l-1.732 1-2-3.464 1.732-1zm8-2.464-2 3.464-1.732-1 2-3.464z',
 };
 const MOON_ICON = {
   path: 'M11.426 2.525c-1.287 2.085-1.379 4.72 0 6.948 1.385 2.239 3.924 3.522 6.575 3.525l.85 1.525a9.27 9.27 0 0 1-3.515 3.285c-4.54 2.445-10.375 1.018-13.037-3.283C-.39 10.18 1.24 4.657 5.814 2.191A10 10 0 0 1 10.577 1zm-2.511.644a8 8 0 0 0-2.153.783C3.137 5.905 1.954 10.166 4 13.472c2.073 3.352 6.726 4.547 10.387 2.575a7.5 7.5 0 0 0 1.687-1.236c-2.562-.496-4.916-1.97-6.35-4.286a8.5 8.5 0 0 1-.81-7.356Z',
 };
+
+function handleLocaleSelect(selected: MenuItemValue | MenuItemValue[] | null): void {
+  if (typeof selected !== 'string') return;
+  const nextLocale = normaliseLocale(selected);
+  if (nextLocale) locale.value = nextLocale;
+}
 
 function applyTheme(nextTheme: ThemeMode): void {
   if (typeof document === 'undefined') return;
@@ -265,7 +286,7 @@ applyTheme(theme.value);
 
 const themeToggleIcon = computed(() => (theme.value === 'dark' ? BRIGHT_ICON : MOON_ICON));
 const themeToggleAriaLabel = computed(() =>
-  theme.value === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'
+  theme.value === 'dark' ? t('header-theme-to-light') : t('header-theme-to-dark')
 );
 const activeWmcsLogo = computed(() => (theme.value === 'dark' ? wmcsDarkLogo : wmcsLogo));
 
@@ -443,7 +464,7 @@ async function executeRangeblockLookup(ipToQuery: string, wikiOverride?: string 
   rbError.value = '';
   const canonical = canonicalizeIpAddress(ipToQuery.trim());
   if (!canonical) {
-    validationError.value = 'Please provide a valid IPv4 or IPv6 address.';
+    validationError.value = t('error-invalid-ip');
     return;
   }
 
@@ -464,7 +485,7 @@ async function executeRangeblockLookup(ipToQuery: string, wikiOverride?: string 
     if (seq !== rbRequestSeq) return;
     if (res.status === 401) {
       user.value = createLoggedOutUserState();
-      sessionExpiredMessage.value = 'Your session has expired. Please log in again with Wikimedia.';
+      sessionExpiredMessage.value = t('error-session-expired');
       return;
     }
     const payload = (await res.json().catch(() => ({}))) as RangeblockSummary & {
@@ -475,7 +496,7 @@ async function executeRangeblockLookup(ipToQuery: string, wikiOverride?: string 
       isCached?: boolean | null;
     };
     if (!res.ok) {
-      throw new Error(payload.message || payload.error || `Server returned HTTP ${res.status}`);
+      throw new Error(payload.message || payload.error || t('error-server-http', { status: res.status }));
     }
     rbData.value = payload;
     diagnostic.value = buildDiagnosticMetrics(payload);
@@ -483,7 +504,7 @@ async function executeRangeblockLookup(ipToQuery: string, wikiOverride?: string 
   } catch (err: unknown) {
     if (seq !== rbRequestSeq || (err instanceof Error && err.name === 'AbortError')) return;
     rbError.value =
-      (err instanceof Error && err.message) || 'Unable to query rangeblock records at this time.';
+      (err instanceof Error && err.message) || t('error-rangeblock-unavailable');
   } finally {
     if (seq === rbRequestSeq) {
       rbLoading.value = false;
@@ -641,6 +662,7 @@ let relativeTimeTimer: ReturnType<typeof setInterval> | null = null;
 
 onMounted(async () => {
   window.addEventListener('storage', handleThemeStorageSync);
+  window.addEventListener('storage', handleLocaleStorageSync);
   relativeTimeTimer = setInterval(() => {
     nowTimestampMs.value = Date.now();
   }, 30_000);
@@ -665,6 +687,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.removeEventListener('storage', handleThemeStorageSync);
+  window.removeEventListener('storage', handleLocaleStorageSync);
   coordinator.cancelPending();
   cancelPendingRangeblock();
   if (relativeTimeTimer !== null) {

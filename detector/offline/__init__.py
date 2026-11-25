@@ -15,7 +15,6 @@ from .feeds import (
 )
 from .mmdb import (
     MAXMIND_DB_SPECS,
-    clear_maxmind_probe_cache,
     clear_maxmind_readers,
     evict_maxmind_reader,
     evict_missing_maxmind_readers,
@@ -130,7 +129,6 @@ __all__ = [
     "build_offline_database_entries",
     "build_stopforumspam_sqlite_index",
     "classify_rezmoss_provider",
-    "clear_maxmind_probe_cache",
     "clear_maxmind_readers",
     "clear_stat_throttle_cache",
     "clear_stopforumspam_caches",

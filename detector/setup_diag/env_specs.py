@@ -72,8 +72,8 @@ _OFFLINE_SOURCE_ALIASES = {
     "bgp-tools": "bgp_tools",
     "openasn": "openasn",
     "open-asn": "openasn",
-    "peeringdb_mobile": "peeringdb_mobile",
-    "peeringdb-mobile": "peeringdb_mobile",
+    "mobile_carriers": "mobile_carriers",
+    "mobile-carriers": "mobile_carriers",
 }
 _ALL_OFFLINE_SOURCES = frozenset(_OFFLINE_SOURCE_ALIASES.values())
 
@@ -411,7 +411,7 @@ DEFAULT_JOB_SPECS: Tuple[JobSpec, ...] = (
     ),
     JobSpec(
         name="update-shared-cidrs-db",
-        command="python manage.py update_offline_dbs --sources shared_cidrs privacy_relays",
+        command="python manage.py update_offline_dbs --sources shared_cidrs",
         image="tool-proxycheck/tool-proxycheck:latest",
         schedule="@daily",
         mount="all",

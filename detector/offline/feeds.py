@@ -332,30 +332,30 @@ def lookup_bgp_tools_offline(ip: str) -> Optional[Dict[str, Any]]:
 
 
 def is_mobile_asn_offline(asn: Optional[int]) -> bool:
-    """Returns True when an ASN is tagged as mobile in PeeringDB mobile_asns.json or bgp_tags.json."""
+    """Returns True when an ASN is tagged as mobile in mobile_asns.json or bgp_tags.json."""
     asn_num = _parse_asn_int(asn)
     if asn_num is None:
         return False
 
     path = resolve_feed_data_path(MOBILE_ASNS_JSON_FILENAME, override_setting="MOBILE_ASNS_JSON_PATH")
-    peeringdb_asns: FrozenSet[int]
+    carrier_asns: FrozenSet[int]
     if path is None:
-        peeringdb_asns = _mobile_asns_cache.set_constant(("__missing__", -1, -1), frozenset())
+        carrier_asns = _mobile_asns_cache.set_constant(("__missing__", -1, -1), frozenset())
     else:
         sig = get_file_stat_signature(path)
         if sig is None:
-            peeringdb_asns = _mobile_asns_cache.set_constant(("__missing__", -1, -1), frozenset())
+            carrier_asns = _mobile_asns_cache.set_constant(("__missing__", -1, -1), frozenset())
         else:
             target_key = (str(path), sig[0], sig[1])
             hit = _mobile_asns_cache.peek_matching(lambda key, _val: key == target_key)
             if hit is not None:
-                peeringdb_asns = hit
+                carrier_asns = hit
             else:
                 try:
                     payload = json.loads(path.read_text(encoding="utf-8"))
                 except (OSError, ValueError) as exc:
                     logger.warning("Failed to parse mobile ASNs file %s: %s", path, exc)
-                    peeringdb_asns = frozenset()
+                    carrier_asns = frozenset()
                 else:
                     raw_items: Iterable[Any] = ()
                     if isinstance(payload, list):
@@ -372,9 +372,9 @@ def is_mobile_asn_offline(asn: Optional[int]) -> bool:
                         if parsed_num is not None:
                             parsed_asns.add(parsed_num)
                     frozen_asns = frozenset(parsed_asns)
-                    peeringdb_asns = _mobile_asns_cache.get_or_load(target_key, lambda: frozen_asns)
+                    carrier_asns = _mobile_asns_cache.get_or_load(target_key, lambda: frozen_asns)
 
-    if asn_num in peeringdb_asns:
+    if asn_num in carrier_asns:
         return True
     _tags_map, bgp_mobile_asns = _get_bgp_tags_data()
     return asn_num in bgp_mobile_asns
@@ -670,9 +670,9 @@ def collect_offline_databases_status(
             None,
         ),
         (
-            "peeringdb_mobile",
-            "PeeringDB",
-            "PeeringDB Mobile ASNs",
+            "mobile_carriers",
+            "Mobile Carriers",
+            "Mobile Carrier ASNs",
             resolve_feed_data_path(
                 MOBILE_ASNS_JSON_FILENAME,
                 override_setting="MOBILE_ASNS_JSON_PATH",

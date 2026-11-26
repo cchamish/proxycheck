@@ -1,3 +1,5 @@
+import { t } from './i18n.ts';
+
 export const REQUIRED_USER_RIGHTS = [
   'checkuser-temporary-account',
   'checkuser-temporary-account-no-preference',
@@ -151,6 +153,7 @@ export interface RangeblockSummary {
   globalTotal: number;
   hasActive: boolean;
   realtimeDegraded?: boolean;
+  blockDataDegraded?: boolean;
   wikis: RangeblockWikiSummary[];
 }
 
@@ -415,7 +418,7 @@ export function formatOfflineDbTimestamp(
   now: Date | number = Date.now(),
   ageSeconds?: number | null
 ): string {
-  if (!lastModifiedIso || typeof lastModifiedIso !== 'string') return 'Not downloaded';
+  if (!lastModifiedIso || typeof lastModifiedIso !== 'string') return t('offline-db-not-downloaded');
   const parsedMs = Date.parse(lastModifiedIso.trim());
   if (Number.isNaN(parsedMs)) return lastModifiedIso;
 
@@ -428,7 +431,8 @@ export function formatOfflineDbTimestamp(
 
   const utcStamp = `${new Date(parsedMs).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
   const totalMinutes = Math.floor(computedAge / 60);
-  const relativeText = totalMinutes < 1 ? 'just now' : `${formatCompactDuration(totalMinutes)} ago`;
+  const relativeText =
+    totalMinutes < 1 ? t('offline-db-just-now') : t('offline-db-ago', { duration: formatCompactDuration(totalMinutes) });
   return `${utcStamp} (${relativeText})`;
 }
 
@@ -459,11 +463,11 @@ export function formatDiagnosticSummary(diagnostic?: DiagnosticMetrics | null): 
   const rawDuration = diagnostic?.duration;
   const duration =
     typeof rawDuration === 'number' && Number.isFinite(rawDuration) && rawDuration >= 0 ? rawDuration : 0;
-  const parts = [`Executed in ${duration.toFixed(3)} seconds`];
+  const parts = [t('footer-executed-in', { duration: duration.toFixed(3) })];
 
   const rawMemory = diagnostic?.memory;
   if (typeof rawMemory === 'number' && Number.isFinite(rawMemory) && rawMemory >= 0) {
-    parts.push(`Worker RSS ${rawMemory.toFixed(2)} MB`);
+    parts.push(t('footer-worker-rss', { memory: rawMemory.toFixed(2) }));
   }
 
   return parts.join(' \u00b7 ');
@@ -571,7 +575,7 @@ export function createDetectionCoordinator(
   }
 
   function handleSessionExpired(): void {
-    const expiredMessage = 'Your session has expired. Please log in again with Wikimedia.';
+    const expiredMessage = t('error-session-expired');
     state.sessionExpiredMessage = expiredMessage;
     state.validationError = expiredMessage;
     state.refreshWarningMessage = '';
@@ -653,10 +657,9 @@ export function createDetectionCoordinator(
           clearRefreshFlags(state.detectionData);
           const retryHint =
             typeof rateData.retryAfterSeconds === 'number' && rateData.retryAfterSeconds > 0
-              ? ` Please wait ${rateData.retryAfterSeconds}s before retrying.`
+              ? ` ${t('error-refresh-retry-after', { seconds: rateData.retryAfterSeconds })}`
               : '';
-          state.refreshWarningMessage =
-            `Refresh rate limit is temporarily constrained; valid historical intelligence is preserved.${retryHint}`;
+          state.refreshWarningMessage = `${t('error-refresh-rate-limited')}${retryHint}`;
           return;
         }
 
@@ -665,11 +668,10 @@ export function createDetectionCoordinator(
           if (boundRequestId !== latestRequestId || refreshId !== latestRefreshId) return;
           clearRefreshFlags(state.detectionData);
           if (state.detectionData) {
-            state.refreshWarningMessage =
-              'Upstream providers are temporarily constrained; valid historical intelligence is preserved.';
+            state.refreshWarningMessage = t('error-refresh-upstream-constrained');
             return;
           }
-          throw new Error(errData.message || errData.error || `Server returned HTTP ${response.status}`);
+          throw new Error(errData.message || errData.error || t('error-server-http', { status: response.status }));
         }
 
         const data = (await response.json()) as DetectionResponse;
@@ -700,8 +702,7 @@ export function createDetectionCoordinator(
             };
             state.diagnostic = buildDiagnosticMetrics(data);
           }
-          state.refreshWarningMessage =
-            'Upstream providers or quota limits are temporarily constrained; valid historical intelligence is preserved.';
+          state.refreshWarningMessage = t('error-refresh-quota-constrained');
           return;
         }
 
@@ -724,12 +725,10 @@ export function createDetectionCoordinator(
         }
         clearRefreshFlags(state.detectionData);
         if (state.detectionData) {
-          state.refreshWarningMessage =
-            'Unable to complete upstream refresh at this time; valid historical intelligence is preserved.';
+          state.refreshWarningMessage = t('error-refresh-unable');
         } else {
           state.validationError =
-            (err instanceof Error && err.message) ||
-            'An error occurred whilst refreshing the requested IP address.';
+            (err instanceof Error && err.message) || t('error-refresh-generic');
         }
       } finally {
         if (boundRequestId === latestRequestId && refreshId === latestRefreshId) {
@@ -751,7 +750,7 @@ export function createDetectionCoordinator(
     }
     const canonicalIp = canonicalizeIpAddress(String(ipOverride ?? state.detectionData?.ip ?? ''));
     if (!canonicalIp) {
-      state.validationError = 'Please provide a valid IPv4 or IPv6 address.';
+      state.validationError = t('error-invalid-ip');
       return;
     }
     if (state.detectionData?.isNonPublic || state.detectionData?.cacheMeta?.refreshInProgress) {
@@ -773,7 +772,7 @@ export function createDetectionCoordinator(
     state.validationError = '';
     const targetIp = ipToQuery.trim();
     if (!isValidIpAddress(targetIp)) {
-      state.validationError = 'Please provide a valid IPv4 or IPv6 address.';
+      state.validationError = t('error-invalid-ip');
       return;
     }
 
@@ -894,7 +893,7 @@ export function createDetectionCoordinator(
       if (!fallbackResponse.ok) {
         const errData = (await fallbackResponse.json().catch(() => ({}))) as { message?: string; error?: string };
         if (requestId !== latestRequestId) return;
-        throw new Error(errData.message || errData.error || `Server returned HTTP ${fallbackResponse.status}`);
+        throw new Error(errData.message || errData.error || t('error-server-http', { status: fallbackResponse.status }));
       }
 
       const fallbackData = (await fallbackResponse.json()) as DetectionResponse;
@@ -904,8 +903,7 @@ export function createDetectionCoordinator(
         return;
       }
       state.validationError =
-        (err instanceof Error && err.message) ||
-        'An error occurred whilst analysing the requested IP address.';
+        (err instanceof Error && err.message) || t('error-analyse-generic');
     } finally {
       if (requestId === latestRequestId) {
         state.isLoading = false;

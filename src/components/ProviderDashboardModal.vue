@@ -1,10 +1,10 @@
 <template>
   <cdx-dialog
     v-model:open="dialogOpen"
-    title="API Quota &amp; Health"
-    subtitle="Anonymised backend quota usage, reactive cooldowns, and daily request telemetry"
+    :title="t('dashboard-title')"
+    :subtitle="t('dashboard-subtitle')"
     :use-close-button="true"
-    :default-action="{ label: 'Close' }"
+    :default-action="{ label: t('common-close') }"
     class="provider-dashboard-dialog"
     @default="dialogOpen = false"
   >
@@ -12,10 +12,10 @@
       <div class="dashboard__toolbar">
         <div class="inline-group">
           <cdx-info-chip :status="snapshot?.redisAvailable ? 'success' : 'warning'">
-            {{ snapshot?.redisAvailable ? 'Redis Connected' : 'Redis Unavailable (Fail-open)' }}
+            {{ snapshot?.redisAvailable ? t('dashboard-redis-connected') : t('dashboard-redis-unavailable') }}
           </cdx-info-chip>
           <span v-if="generatedTimestamp" class="text-subtle">
-            Updated {{ generatedTimestamp }}
+            {{ t('dashboard-updated', { timestamp: generatedTimestamp }) }}
           </span>
         </div>
         <cdx-button
@@ -24,7 +24,7 @@
           :disabled="isLoading"
           @click="loadDashboard"
         >
-          {{ isLoading ? 'Refreshing...' : 'Refresh' }}
+          {{ isLoading ? t('dashboard-refreshing') : t('dashboard-refresh') }}
         </cdx-button>
       </div>
 
@@ -34,26 +34,26 @@
 
       <div v-if="snapshot" class="kpi-grid">
         <div class="kpi">
-          <span class="kpi__label">Total Requests Today</span>
+          <span class="kpi__label">{{ t('dashboard-kpi-requests') }}</span>
           <strong class="kpi__value">{{ formatCount(snapshot.global.totalRequestsToday) }}</strong>
           <span class="text-subtle">
-            Session: {{ formatCount(snapshot.global.authSession) }} &middot;
-            Gadget: {{ formatCount(snapshot.global.authGadget) }}
+            {{ t('dashboard-kpi-session', { count: formatCount(snapshot.global.authSession) }) }} &middot;
+            {{ t('dashboard-kpi-gadget', { count: formatCount(snapshot.global.authGadget) }) }}
           </span>
         </div>
 
         <div class="kpi">
-          <span class="kpi__label">Full Cache Hit Rate</span>
+          <span class="kpi__label">{{ t('dashboard-kpi-cache-rate') }}</span>
           <strong class="kpi__value">{{ snapshot.global.fullCacheHitRatePercent.toFixed(1) }}%</strong>
           <span class="text-subtle">
-            Hit: {{ formatCount(snapshot.global.cacheHit) }} &middot;
-            Partial: {{ formatCount(snapshot.global.cachePartial) }} &middot;
-            Miss: {{ formatCount(snapshot.global.cacheMiss) }}
+            {{ t('dashboard-kpi-hit', { count: formatCount(snapshot.global.cacheHit) }) }} &middot;
+            {{ t('dashboard-kpi-partial', { count: formatCount(snapshot.global.cachePartial) }) }} &middot;
+            {{ t('dashboard-kpi-miss', { count: formatCount(snapshot.global.cacheMiss) }) }}
           </span>
         </div>
 
         <div class="kpi">
-          <span class="kpi__label">Proactive Quota Blocks Today</span>
+          <span class="kpi__label">{{ t('dashboard-kpi-quota-blocks') }}</span>
           <strong
             class="kpi__value"
             :class="{ 'text-warning': snapshot.global.totalQuotaBlocksToday > 0 }"
@@ -61,55 +61,55 @@
             {{ formatCount(snapshot.global.totalQuotaBlocksToday) }}
           </strong>
           <span class="text-subtle">
-            Active local guards: {{ formatCount(snapshot.global.activeQuotaGuardCount) }}
+            {{ t('dashboard-kpi-local-guards', { count: formatCount(snapshot.global.activeQuotaGuardCount) }) }}
           </span>
         </div>
 
         <div class="kpi">
-          <span class="kpi__label">Active Reactive Cooldowns</span>
+          <span class="kpi__label">{{ t('dashboard-kpi-cooldowns') }}</span>
           <strong
             class="kpi__value"
             :class="{ 'text-warning': snapshot.global.activeCooldownCount > 0 }"
           >
             {{ formatCount(snapshot.global.activeCooldownCount) }}
           </strong>
-          <span class="text-subtle">Upstream 429 or 5xx circuit breakers</span>
+          <span class="text-subtle">{{ t('dashboard-kpi-circuit-breakers') }}</span>
         </div>
       </div>
 
       <section v-if="snapshot" class="dashboard__section">
-        <h3 class="card-heading">Dual-Layer Cache &amp; SWR Telemetry</h3>
+        <h3 class="card-heading">{{ t('dashboard-section-cache') }}</h3>
         <div class="kpi-grid">
           <div class="kpi">
-            <span class="kpi__label">Dual-Layer Cache Hit Rate</span>
+            <span class="kpi__label">{{ t('dashboard-kpi-dual-layer-rate') }}</span>
             <strong class="kpi__value">{{ cacheTelemetry.dualLayerHitRatePercent.toFixed(1) }}%</strong>
             <span class="text-subtle">
-              L1 Hit: {{ formatCount(cacheTelemetry.l1Hit) }} &middot;
-              Upstream Miss: {{ formatCount(cacheTelemetry.upstreamMiss) }}
+              {{ t('dashboard-kpi-l1-hit', { count: formatCount(cacheTelemetry.l1Hit) }) }} &middot;
+              {{ t('dashboard-kpi-upstream-miss', { count: formatCount(cacheTelemetry.upstreamMiss) }) }}
             </span>
           </div>
 
           <div class="kpi">
-            <span class="kpi__label">ToolsDB L2 Hits (Fresh vs Stale)</span>
+            <span class="kpi__label">{{ t('dashboard-kpi-l2-hits') }}</span>
             <strong class="kpi__value">
               {{ formatCount(cacheTelemetry.l2HitFresh + cacheTelemetry.l2HitStaleSwr) }}
             </strong>
             <span class="text-subtle">
-              Fresh (&le;90d): {{ formatCount(cacheTelemetry.l2HitFresh) }} &middot;
-              Stale SWR (&gt;90d): {{ formatCount(cacheTelemetry.l2HitStaleSwr) }}
+              {{ t('dashboard-kpi-l2-fresh', { count: formatCount(cacheTelemetry.l2HitFresh) }) }} &middot;
+              {{ t('dashboard-kpi-l2-stale', { count: formatCount(cacheTelemetry.l2HitStaleSwr) }) }}
             </span>
           </div>
 
           <div class="kpi">
-            <span class="kpi__label">ToolsDB L2 Estimated Rows</span>
+            <span class="kpi__label">{{ t('dashboard-kpi-l2-rows') }}</span>
             <strong class="kpi__value">
-              {{ cacheTelemetry.l2EstimatedRows !== null ? formatCount(cacheTelemetry.l2EstimatedRows) : 'Unavailable' }}
+              {{ cacheTelemetry.l2EstimatedRows !== null ? formatCount(cacheTelemetry.l2EstimatedRows) : t('dashboard-kpi-unavailable') }}
             </strong>
-            <span class="text-subtle">Persistent MariaDB IP intelligence records</span>
+            <span class="text-subtle">{{ t('dashboard-kpi-l2-subtitle') }}</span>
           </div>
 
           <div class="kpi">
-            <span class="kpi__label">SWR &amp; Manual Refreshes</span>
+            <span class="kpi__label">{{ t('dashboard-kpi-refreshes') }}</span>
             <strong
               class="kpi__value"
               :class="{ 'text-warning': cacheTelemetry.refreshRateLimited > 0 }"
@@ -117,8 +117,8 @@
               {{ formatCount(cacheTelemetry.refreshOk) }}
             </strong>
             <span class="text-subtle">
-              OK: {{ formatCount(cacheTelemetry.refreshOk) }} &middot;
-              429 Rate-Limited: {{ formatCount(cacheTelemetry.refreshRateLimited) }}
+              {{ t('dashboard-kpi-refresh-ok', { count: formatCount(cacheTelemetry.refreshOk) }) }} &middot;
+              {{ t('dashboard-kpi-refresh-429', { count: formatCount(cacheTelemetry.refreshRateLimited) }) }}
             </span>
           </div>
         </div>
@@ -126,7 +126,7 @@
 
       <cdx-table
         v-if="snapshot"
-        caption="Provider quota and health"
+        :caption="t('dashboard-providers-caption')"
         :hide-caption="true"
         :columns="providerColumns"
         :data="snapshot.providers"
@@ -144,12 +144,12 @@
         </template>
         <template #item-minuteQuota="{ row }">
           <span class="table-cell-inline">
-            <span>{{ formatQuotaPair(row.minuteUsed, row.minuteLimit, 'req/min') }}</span>
+            <span>{{ formatQuotaPair(row.minuteUsed, row.minuteLimit, t('dashboard-quota-unit-min')) }}</span>
             <template v-if="row.minuteLimit > 0">
               <cdx-info-chip
                 v-if="getQuotaChipStatus(row.minuteUsed, row.minuteLimit)"
                 :status="getQuotaChipStatus(row.minuteUsed, row.minuteLimit)!"
-                :aria-label="`${row.name} minute quota usage`"
+                :aria-label="t('dashboard-quota-minute-aria', { provider: row.name })"
               >
                 {{ computeQuotaUsagePercent(row.minuteUsed, row.minuteLimit) }}%
               </cdx-info-chip>
@@ -159,12 +159,12 @@
         </template>
         <template #item-dailyQuota="{ row }">
           <span class="table-cell-inline">
-            <span>{{ formatQuotaPair(row.dailyUsed, row.dailyLimit, 'req/day') }}</span>
+            <span>{{ formatQuotaPair(row.dailyUsed, row.dailyLimit, t('dashboard-quota-unit-day')) }}</span>
             <template v-if="row.dailyLimit > 0">
               <cdx-info-chip
                 v-if="getQuotaChipStatus(row.dailyUsed, row.dailyLimit)"
                 :status="getQuotaChipStatus(row.dailyUsed, row.dailyLimit)!"
-                :aria-label="`${row.name} daily quota usage`"
+                :aria-label="t('dashboard-quota-daily-aria', { provider: row.name })"
               >
                 {{ computeQuotaUsagePercent(row.dailyUsed, row.dailyLimit) }}%
               </cdx-info-chip>
@@ -184,20 +184,20 @@
             <cdx-info-chip
               v-if="row.telemetry.rateLimited429 > 0"
               status="warning"
-              title="Upstream HTTP 429 responses today"
+              :title="t('dashboard-telemetry-429-title')"
             >
               429
             </cdx-info-chip>
             <cdx-info-chip
               v-if="row.telemetry.quotaBlocked > 0"
               status="warning"
-              title="Proactive local quota blocks today"
+              :title="t('dashboard-telemetry-blocked-title')"
             >
-              Blocked
+              {{ t('dashboard-telemetry-blocked') }}
             </cdx-info-chip>
             <span v-if="row.telemetry.error5xx > 0 || row.telemetry.timeout > 0" class="text-subtle">
-              5xx: {{ formatCount(row.telemetry.error5xx) }} &middot;
-              Timeouts: {{ formatCount(row.telemetry.timeout) }}
+              {{ t('dashboard-telemetry-5xx', { count: formatCount(row.telemetry.error5xx) }) }} &middot;
+              {{ t('dashboard-telemetry-timeouts', { count: formatCount(row.telemetry.timeout) }) }}
             </span>
           </span>
         </template>
@@ -205,7 +205,7 @@
 
       <section v-if="snapshot?.offlineDatabases?.length" class="dashboard__section">
         <cdx-table
-          caption="Offline Databases Status"
+          :caption="t('dashboard-offline-caption')"
           :columns="offlineDbColumns"
           :data="snapshot.offlineDatabases"
         >
@@ -240,6 +240,9 @@ import {
   type TableColumn,
 } from '@wikimedia/codex';
 import { formatOfflineDbTimestamp, type ChipStatus } from '../utils/ip-detector-logic';
+import { useI18n } from '../utils/i18n';
+
+const { t } = useI18n();
 
 interface OfflineDatabaseEntry {
   key: string;
@@ -327,22 +330,22 @@ interface ProviderDashboardResponse {
   memoryMb?: number | null;
 }
 
-const providerColumns: TableColumn[] = [
-  { id: 'name', label: 'Provider' },
-  { id: 'status', label: 'Status' },
-  { id: 'minuteQuota', label: 'Minute quota', minWidth: '150px' },
-  { id: 'dailyQuota', label: 'Daily quota', minWidth: '150px' },
-  { id: 'upstream', label: 'Upstream remaining' },
-  { id: 'telemetry', label: 'OK / cache hit / 429 / quota blocked', minWidth: '240px' },
-];
+const providerColumns = computed<TableColumn[]>(() => [
+  { id: 'name', label: t('dashboard-col-provider') },
+  { id: 'status', label: t('dashboard-col-status') },
+  { id: 'minuteQuota', label: t('dashboard-col-minute-quota'), minWidth: '150px' },
+  { id: 'dailyQuota', label: t('dashboard-col-daily-quota'), minWidth: '150px' },
+  { id: 'upstream', label: t('dashboard-col-upstream') },
+  { id: 'telemetry', label: t('dashboard-col-telemetry'), minWidth: '240px' },
+]);
 
-const offlineDbColumns: TableColumn[] = [
-  { id: 'name', label: 'Database' },
-  { id: 'filename', label: 'File' },
-  { id: 'status', label: 'Status' },
-  { id: 'size', label: 'Size' },
-  { id: 'mtime', label: 'Last updated (mtime)' },
-];
+const offlineDbColumns = computed<TableColumn[]>(() => [
+  { id: 'name', label: t('dashboard-col-database') },
+  { id: 'filename', label: t('dashboard-col-file') },
+  { id: 'status', label: t('dashboard-col-status') },
+  { id: 'size', label: t('dashboard-col-size') },
+  { id: 'mtime', label: t('dashboard-col-mtime') },
+]);
 
 const props = defineProps<{
   open: boolean;
@@ -401,7 +404,9 @@ function formatCount(value: number | null | undefined): string {
 }
 
 function formatQuotaPair(used: number, limit: number, unit: string): string {
-  return limit <= 0 ? `${formatCount(used)} (Unlimited)` : `${formatCount(used)} / ${formatCount(limit)} ${unit}`;
+  return limit <= 0
+    ? t('dashboard-quota-unlimited', { used: formatCount(used) })
+    : `${formatCount(used)} / ${formatCount(limit)} ${unit}`;
 }
 
 function computeQuotaUsagePercent(used: number, limit: number): number {
@@ -429,12 +434,15 @@ function getOfflineDbChipStatus(entry: OfflineDatabaseEntry): ChipStatus {
 function formatUpstreamQuotaLabel(row: ProviderDashboardRow): string {
   if (row.upstreamRemaining !== null && row.upstreamRemaining !== undefined) {
     if (row.upstreamLimit !== null && row.upstreamLimit !== undefined && row.upstreamLimit > 0) {
-      return `${row.upstreamRemaining.toLocaleString('en-GB')} / ${row.upstreamLimit.toLocaleString('en-GB')} left`;
+      return t('dashboard-upstream-left-of', {
+        remaining: row.upstreamRemaining.toLocaleString('en-GB'),
+        limit: row.upstreamLimit.toLocaleString('en-GB'),
+      });
     }
-    return `${row.upstreamRemaining.toLocaleString('en-GB')} left`;
+    return t('dashboard-upstream-left', { remaining: row.upstreamRemaining.toLocaleString('en-GB') });
   }
   if (row.upstreamUsed !== null && row.upstreamUsed !== undefined) {
-    return `${row.upstreamUsed.toLocaleString('en-GB')} used`;
+    return t('dashboard-upstream-used', { used: row.upstreamUsed.toLocaleString('en-GB') });
   }
   return '-';
 }
@@ -461,19 +469,19 @@ async function loadDashboard(): Promise<void> {
     });
     if (res.status === 401 || res.status === 403) {
       const errData = (await res.json().catch(() => ({}))) as { error?: string };
-      errorMessage.value = errData.error || 'You are not authorised to view this diagnostic dashboard.';
+      errorMessage.value = errData.error || t('dashboard-error-unauthorised');
       if (res.status === 401) emit('unauthorised');
       return;
     }
     if (!res.ok) {
       const errData = (await res.json().catch(() => ({}))) as { error?: string };
-      errorMessage.value = errData.error || `Failed to load quota telemetry (HTTP ${res.status}).`;
+      errorMessage.value = errData.error || t('dashboard-error-load-http', { status: res.status });
       return;
     }
     snapshot.value = (await res.json()) as ProviderDashboardResponse;
   } catch (err: unknown) {
     if (err instanceof Error && err.name === 'AbortError') return;
-    errorMessage.value = 'Unable to reach the backend quota telemetry endpoint.';
+    errorMessage.value = t('dashboard-error-unreachable');
   } finally {
     if (activeController === controller) {
       isLoading.value = false;

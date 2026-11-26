@@ -537,7 +537,7 @@ def detect_mobile_or_cgnat(
     provider_rows: Optional[Iterable[Mapping[str, Any]]] = None,
     ip_compressed: Optional[str] = None,
 ) -> bool:
-    """Determines whether rDNS, PeeringDB, BGP tags, OpenASN, or provider signals indicate mobile or CGNAT."""
+    """Determines whether rDNS, mobile carrier registry, BGP tags, OpenASN, or provider signals indicate mobile or CGNAT."""
     resolved_ptr = ptr_category
     if not resolved_ptr and ptr_hostname:
         resolved_ptr = classify_rdns_hostname(ptr_hostname)["ptrCategory"]

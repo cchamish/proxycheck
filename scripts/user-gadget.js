@@ -1238,6 +1238,7 @@
             'a.proxycheck-ip-badge.proxycheck-badge-stale, a.proxycheck-ip-badge.proxycheck-badge-stale:visited { border-style: dashed; }',
             'a.proxycheck-rb-badge, a.proxycheck-rb-badge:visited { margin-left: 4px; font-size: 0.85em; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; padding: 1px 5px; border-radius: 3px; text-decoration: none; white-space: nowrap; }',
             'a.proxycheck-rb-badge.proxycheck-rb-badge-active, a.proxycheck-rb-badge.proxycheck-rb-badge-active:visited { background-color: var(--proxycheck-high-bg); color: var(--proxycheck-high-color) !important; border: 1px solid var(--proxycheck-high-border); font-weight: bold; }',
+            'a.proxycheck-rb-badge.proxycheck-rb-badge-warning, a.proxycheck-rb-badge.proxycheck-rb-badge-warning:visited { background-color: var(--proxycheck-medium-bg); color: var(--proxycheck-medium-color) !important; border: 1px solid var(--proxycheck-medium-border); font-weight: normal; }',
             'a.proxycheck-rb-badge.proxycheck-rb-badge-neutral, a.proxycheck-rb-badge.proxycheck-rb-badge-neutral:visited { background-color: var(--proxycheck-low-bg); color: var(--proxycheck-low-color) !important; border: 1px solid var(--proxycheck-low-border); font-weight: normal; }',
             '.proxycheck-rb-active-label { color: var(--proxycheck-high-color); font-weight: bold; }',
             '#proxycheck-pageinfo { font-size: 92%; line-height: 1.5em; padding: 8px 12px; margin-bottom: 12px; background-color: var(--proxycheck-surface-bg); color: var(--proxycheck-surface-color); border: 1px solid var(--proxycheck-divider-color); border-left: 4px solid var(--proxycheck-border-color); border-radius: 2px; }',
@@ -1432,9 +1433,13 @@
         const rb = data && data.rangeblock && typeof data.rangeblock === 'object' ? data.rangeblock : null;
         if (rb && resolvedIp) {
             const rbWikis = Array.isArray(rb.wikis) ? rb.wikis : [];
+            const blockDataDegraded = Boolean(rb.blockDataDegraded);
             const $rbCell = $('<div>', { class: 'proxycheck-rb-distribution' });
             if (rbWikis.length === 0) {
-                $rbCell.append($('<span>', { class: 'proxycheck-details-empty', text: 'No hits (0/0)' }));
+                $rbCell.append($('<span>', {
+                    class: blockDataDegraded ? 'proxycheck-banner-warning-text' : 'proxycheck-details-empty',
+                    text: blockDataDegraded ? 'Block data unavailable' : 'No hits (0/0)'
+                }));
             } else {
                 rbWikis.forEach((entry, idx) => {
                     if (!entry || !entry.wiki) return;
@@ -1449,6 +1454,12 @@
                         $rbCell.append(document.createTextNode(' '), $('<span>', { class: 'proxycheck-rb-active-label', text: '(active)' }));
                     }
                 });
+                if (blockDataDegraded) {
+                    $rbCell.append($('<div>', {
+                        class: 'proxycheck-banner-warning-text',
+                        text: 'Stored block records unavailable; results shown are partial.'
+                    }));
+                }
             }
             appendRow('Rangeblock', $rbCell);
         }
@@ -1662,18 +1673,27 @@
         const rb = !risk.isNonPublic && data && data.rangeblock && typeof data.rangeblock === 'object' ? data.rangeblock : null;
         const localTotal = rb ? Math.max(0, Number(rb.localTotal) || 0) : 0;
         const globalTotal = rb ? Math.max(0, Number(rb.globalTotal) || 0) : 0;
+        const blockDataDegraded = Boolean(rb && rb.blockDataDegraded);
         const existingRbBadge = badge.nextElementSibling && badge.nextElementSibling.classList &&
             badge.nextElementSibling.classList.contains('proxycheck-rb-badge')
             ? badge.nextElementSibling : null;
 
-        if (localTotal > 0 || globalTotal > 0) {
+        if (localTotal > 0 || globalTotal > 0 || blockDataDegraded) {
             const rbBadge = existingRbBadge || createEl('a', 'proxycheck-rb-badge', '');
-            rbBadge.textContent = `rangeblock: ${localTotal}/${globalTotal}`;
-            rbBadge.className = `proxycheck-rb-badge ${rb.hasActive ? 'proxycheck-rb-badge-active' : 'proxycheck-rb-badge-neutral'}`;
+            const isUnavailable = blockDataDegraded && localTotal === 0 && globalTotal === 0;
+            const badgeVariant = rb.hasActive
+                ? 'proxycheck-rb-badge-active'
+                : (blockDataDegraded ? 'proxycheck-rb-badge-warning' : 'proxycheck-rb-badge-neutral');
+            rbBadge.textContent = isUnavailable ? 'rangeblock: unavailable' : `rangeblock: ${localTotal}/${globalTotal}`;
+            rbBadge.className = `proxycheck-rb-badge ${badgeVariant}`;
             rbBadge.href = `${TOOL_BASE_URL}/?ip=${encodeURIComponent(resolvedIp)}&tab=rb`;
             rbBadge.target = '_blank';
             rbBadge.rel = 'noopener noreferrer';
-            rbBadge.title = rb.hasActive ? 'Cross-wiki rangeblock (active)' : 'Cross-wiki rangeblock (historical)';
+            rbBadge.title = isUnavailable
+                ? 'Stored block data unavailable'
+                : (rb.hasActive
+                    ? (blockDataDegraded ? 'Cross-wiki rangeblock (active; stored block data unavailable, results may be incomplete)' : 'Cross-wiki rangeblock (active)')
+                    : (blockDataDegraded ? 'Cross-wiki rangeblock (historical; stored block data unavailable, results may be incomplete)' : 'Cross-wiki rangeblock (historical)'));
             if (!existingRbBadge && badge.parentNode) badge.parentNode.insertBefore(rbBadge, badge.nextSibling);
         } else if (existingRbBadge) {
             existingRbBadge.remove();

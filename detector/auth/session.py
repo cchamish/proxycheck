@@ -77,10 +77,10 @@ def verify_gadget_bearer_token(auth_header: str) -> Tuple[Optional[str], Optiona
     """Validates a Bearer header containing a signed gadget token."""
     parts = auth_header.strip().split(None, 1)
     if len(parts) != 2 or parts[0].lower() != "bearer":
-        return None, "Invalid authorization header."
+        return None, "Invalid authorisation header."
     token = parts[1].strip()
     if not token:
-        return None, "Invalid authorization header."
+        return None, "Invalid authorisation header."
 
     try:
         payload = signing.loads(

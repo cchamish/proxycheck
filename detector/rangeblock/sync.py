@@ -1327,7 +1327,7 @@ class WorldBlockSynchronizer:
                 )
         return section_synced, section_failed_wikis
 
-    def handle(self, *args: Any, **options: Any) -> None:
+    def run(self, **options: Any) -> None:
         creds = discover_wiki_replica_credentials()
         if creds is None:
             raise CommandError("Wiki Replicas credentials were not found in TOOL_REPLICA_* or replica.my.cnf.")

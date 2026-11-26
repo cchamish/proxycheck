@@ -149,12 +149,6 @@ def get_l2_db_semaphore() -> asyncio.Semaphore:
         return sem
 
 
-def clear_l2_db_semaphores() -> None:
-    """Clears cached per-loop semaphores for deterministic tests."""
-    with _l2_semaphore_lock:
-        _l2_semaphores_by_loop.clear()
-
-
 def pack_ip_binary(raw_ip: str) -> Tuple[bytes, int, str]:
     """Converts an IPv4 or IPv6 address into a 16-byte binary key, version, and canonical text."""
     canonical = canonicalize_ip(raw_ip)
@@ -164,22 +158,6 @@ def pack_ip_binary(raw_ip: str) -> Tuple[bytes, int, str]:
     if addr.version == 4:
         return _IPV4_MAPPED_PREFIX + addr.packed, 4, addr.compressed
     return addr.packed, 6, addr.compressed
-
-
-def ip_to_bin(raw_ip: str) -> bytes:
-    """Returns the 16-byte packed IPv6 or RFC 4291 IPv4-mapped binary representation."""
-    ip_bin, _, _ = pack_ip_binary(raw_ip)
-    return ip_bin
-
-
-def unpack_ip_binary(ip_bin: bytes | memoryview) -> str:
-    """Restores the canonical IPv4 or IPv6 string from a 16-byte binary key."""
-    raw = bytes(ip_bin)
-    if len(raw) != 16:
-        raise ValueError(f"Expected 16-byte packed IP key, got {len(raw)} bytes.")
-    if raw[:12] == _IPV4_MAPPED_PREFIX:
-        return ipaddress.IPv4Address(raw[12:]).compressed
-    return ipaddress.IPv6Address(raw).compressed
 
 
 def _ensure_utc(dt_value: Optional[datetime] = None) -> datetime:

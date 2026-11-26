@@ -68,6 +68,8 @@
   "detector-mobile-cgnat": "Mobile Cellular / CGNAT Shared Gateway",
   "detector-label-rangeblock": "Rangeblock",
   "detector-rangeblock-no-hits": "No hits (0/0)",
+  "detector-rangeblock-unavailable": "Block data unavailable.",
+  "detector-rangeblock-partial": "Stored block records unavailable; results shown are partial.",
   "detector-rangeblock-on-wiki": "{count} on ",
   "detector-rangeblock-active-suffix": " (active)",
   "detector-link-rangeblock-finder": "Rangeblock Finder",

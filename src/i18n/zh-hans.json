@@ -68,6 +68,8 @@
   "detector-mobile-cgnat": "移动蜂窝网络/CGNAT共享网关",
   "detector-label-rangeblock": "段封禁",
   "detector-rangeblock-no-hits": "无命中（0/0）",
+  "detector-rangeblock-unavailable": "封禁数据不可用。",
+  "detector-rangeblock-partial": "存储的封禁记录不可用，当前显示的结果可能不完整。",
   "detector-rangeblock-on-wiki": "{count}条于",
   "detector-rangeblock-active-suffix": "（生效中）",
   "detector-link-rangeblock-finder": "段封禁查找器",

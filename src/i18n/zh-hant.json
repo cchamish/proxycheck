@@ -68,6 +68,8 @@
   "detector-mobile-cgnat": "行動網路/CGNAT共用閘道",
   "detector-label-rangeblock": "段封鎖",
   "detector-rangeblock-no-hits": "無符合（0/0）",
+  "detector-rangeblock-unavailable": "封鎖資料無法使用。",
+  "detector-rangeblock-partial": "儲存的封鎖記錄無法使用，目前顯示的結果可能不完整。",
   "detector-rangeblock-on-wiki": "{count}筆於",
   "detector-rangeblock-active-suffix": "（生效中）",
   "detector-link-rangeblock-finder": "段封鎖尋找器",

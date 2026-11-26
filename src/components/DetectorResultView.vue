@@ -200,20 +200,36 @@
         <div v-if="detectionData.rangeblock" class="overview-grid__item">
           <dt class="overview-grid__label">{{ t('detector-label-rangeblock') }}</dt>
           <dd class="overview-grid__value">
-            <span v-if="detectionData.rangeblock.wikis.length === 0" class="text-subtle">
+            <cdx-message
+              v-if="detectionData.rangeblock.wikis.length === 0 && detectionData.rangeblock.blockDataDegraded"
+              type="warning"
+              :inline="true"
+            >
+              {{ t('detector-rangeblock-unavailable') }}
+            </cdx-message>
+            <span v-else-if="detectionData.rangeblock.wikis.length === 0" class="text-subtle">
               {{ t('detector-rangeblock-no-hits') }}
             </span>
-            <span v-else>
-              <template v-for="(item, idx) in detectionData.rangeblock.wikis" :key="item.wiki">
-                <span v-if="Number(idx) > 0">, </span>
-                <span>{{ t('detector-rangeblock-on-wiki', { count: item.count }) }}</span>
-                <a
-                  :href="buildRangeblockWikiHref(detectionData.ip, item.wiki)"
-                  @click.prevent="emit('open-rangeblock', item.wiki)"
-                >{{ item.wiki }}</a>
-                <span v-if="item.hasActive" class="text-destructive">{{ t('detector-rangeblock-active-suffix') }}</span>
-              </template>
-            </span>
+            <div v-else class="stack stack--tight">
+              <span>
+                <template v-for="(item, idx) in detectionData.rangeblock.wikis" :key="item.wiki">
+                  <span v-if="Number(idx) > 0">, </span>
+                  <span>{{ t('detector-rangeblock-on-wiki', { count: item.count }) }}</span>
+                  <a
+                    :href="buildRangeblockWikiHref(detectionData.ip, item.wiki)"
+                    @click.prevent="emit('open-rangeblock', item.wiki)"
+                  >{{ item.wiki }}</a>
+                  <span v-if="item.hasActive" class="text-destructive">{{ t('detector-rangeblock-active-suffix') }}</span>
+                </template>
+              </span>
+              <cdx-message
+                v-if="detectionData.rangeblock.blockDataDegraded"
+                type="warning"
+                :inline="true"
+              >
+                {{ t('detector-rangeblock-partial') }}
+              </cdx-message>
+            </div>
           </dd>
         </div>
       </dl>

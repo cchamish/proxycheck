@@ -12,8 +12,8 @@
       <div class="rb-header">
         <div class="rb-header__title">
           <h2 class="card-heading">{{ t('rb-title') }}</h2>
-          <cdx-info-chip :status="rangeblock.hasActive ? 'error' : 'notice'">
-            <template v-if="rangeblock.blockDataDegraded">{{ t('rb-chip-unavailable') }}</template>
+          <cdx-info-chip :status="rangeblock.hasActive ? 'error' : (rangeblock.blockDataDegraded ? 'warning' : 'notice')">
+            <template v-if="rangeblock.blockDataDegraded && rangeblock.localTotal === 0 && rangeblock.globalTotal === 0">{{ t('rb-chip-unavailable') }}</template>
             <template v-else>{{ t('rb-chip-summary', { local: rangeblock.localTotal, global: rangeblock.globalTotal }) }}</template>
           </cdx-info-chip>
         </div>

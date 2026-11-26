@@ -643,24 +643,24 @@ async def refresh_single_canonical_ip(
         return non_public_payload, 200, {}
 
     if await is_refresh_on_cooldown(ip):
+        rb_rl = await quota_telemetry.check_and_consume_endpoint_rate_limit("rangeblock", username)
+        if not rb_rl.allowed:
+            return (
+                {
+                    "error": "rate_limited",
+                    "reason": rb_rl.reason,
+                    "message": "Refresh rate limit exceeded. Please wait before retrying.",
+                    "retryAfterSeconds": rb_rl.retry_after_seconds,
+                },
+                429,
+                {"Retry-After": str(rb_rl.retry_after_seconds)},
+            )
         cooldown_cached = await _try_serve_existing_snapshot_for_refresh(
             ip,
             normalized_mode,
             refresh_in_progress=False,
         )
         if cooldown_cached is not None:
-            rb_rl = await quota_telemetry.check_and_consume_endpoint_rate_limit("rangeblock", username)
-            if not rb_rl.allowed:
-                return (
-                    {
-                        "error": "rate_limited",
-                        "reason": rb_rl.reason,
-                        "message": "Refresh rate limit exceeded. Please wait before retrying.",
-                        "retryAfterSeconds": rb_rl.retry_after_seconds,
-                    },
-                    429,
-                    {"Retry-After": str(rb_rl.retry_after_seconds)},
-                )
             cache_meta = cooldown_cached.get("cacheMeta") or {}
             await quota_telemetry.record_global_request_telemetry(
                 str(cache_meta.get("status") or "hit"),

@@ -1,0 +1,47 @@
+name: Deploy User Gadget to Meta-Wiki
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'scripts/user-gadget.js'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-gadget-meta
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Minify and Deploy User Gadget
+    runs-on: macos-latest
+    timeout-minutes: 10
+    if: ${{ github.repository == 'cchamish/proxycheck' }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: '.node-version'
+          cache: 'npm'
+          cache-dependency-path: 'package-lock.json'
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Verify gadget deployment script
+        run: node --test scripts/deploy-gadget.test.mjs
+
+      - name: Minify and deploy gadget to Meta-Wiki
+        env:
+          MW_API_URL: ${{ secrets.MW_API_URL }}
+          MW_USERNAME: ${{ secrets.MW_USERNAME }}
+          MW_PASSWORD: ${{ secrets.MW_PASSWORD }}
+        run: node scripts/deploy-gadget.mjs

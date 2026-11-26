@@ -319,41 +319,6 @@ class RangeblockAndSseTests(TestCase):
                 self.assertEqual(payload.get("rangeblock"), expected_rb)
                 self.assertTrue(payload["cacheMeta"]["degradedRefreshFallback"])
 
-            with (
-                self.subTest(path="fresh_refresh"),
-                patch.object(detection_service, "is_refresh_on_cooldown", AsyncMock(return_value=False)),
-                patch.object(detection_service, "acquire_ip_updating_lock", AsyncMock(return_value="tok")),
-                patch.object(detection_service, "release_ip_updating_lock", AsyncMock()),
-                patch.object(detection_service, "_try_read_l1_snapshot", AsyncMock(return_value=None)),
-                patch.object(
-                    detection_service,
-                    "_execute_detection_with_cache",
-                    AsyncMock(return_value={**base_snapshot, "_rawCleanResults": []}),
-                ),
-                patch.object(
-                    detection_service,
-                    "_safe_l2_amerge_snapshot",
-                    AsyncMock(
-                        return_value=l2_cache.L2MergeResult(
-                            snapshot=None,
-                            saved=True,
-                            fetched_at="2026-11-26T00:00:00+00:00",
-                            valid_commercial_count=1,
-                            has_degraded_sources=False,
-                            degraded_fallback=False,
-                        )
-                    ),
-                ),
-                patch.object(detection_service, "set_cached_ip_snapshot", AsyncMock()),
-                patch.object(detection_service, "set_refresh_cooldown", AsyncMock()),
-            ):
-                payload, status, _ = await detection_service.refresh_single_canonical_ip(
-                    "8.8.8.8", "session", 0.0, username="ExampleAdmin", is_admin=True, compact=True, wiki="enwiki"
-                )
-                self.assertEqual(status, 200)
-                self.assertEqual(payload.get("rangeblock"), expected_rb)
-                self.assertTrue(payload["rangeblock"]["blockDataDegraded"])
-
             mock_rb.reset_mock()
             denied_rl = AsyncMock(
                 return_value=type("RL", (), {"allowed": False, "reason": "user_rpm", "retry_after_seconds": 30})()

@@ -605,6 +605,19 @@ async def _try_serve_existing_snapshot_for_refresh(
     return None
 
 
+async def _finalize_refresh_payload(
+    payload: Dict[str, Any],
+    *,
+    ip: str,
+    wiki: Optional[str],
+    compact: bool,
+    start_time: float,
+) -> Tuple[Dict[str, Any], int, Dict[str, str]]:
+    out_payload = strip_raw_json_from_payload(payload) if compact else dict(payload)
+    out_payload["rangeblock"] = await rangeblock_service.query_rangeblocks_for_ip(ip, wiki=wiki)
+    return attach_request_diagnostics(out_payload, start_time), 200, {}
+
+
 async def refresh_single_canonical_ip(
     ip: str,
     auth_mode: str,
@@ -630,6 +643,18 @@ async def refresh_single_canonical_ip(
         return non_public_payload, 200, {}
 
     if await is_refresh_on_cooldown(ip):
+        rb_rl = await quota_telemetry.check_and_consume_endpoint_rate_limit("rangeblock", username)
+        if not rb_rl.allowed:
+            return (
+                {
+                    "error": "rate_limited",
+                    "reason": rb_rl.reason,
+                    "message": "Refresh rate limit exceeded. Please wait before retrying.",
+                    "retryAfterSeconds": rb_rl.retry_after_seconds,
+                },
+                429,
+                {"Retry-After": str(rb_rl.retry_after_seconds)},
+            )
         cooldown_cached = await _try_serve_existing_snapshot_for_refresh(
             ip,
             normalized_mode,
@@ -642,8 +667,9 @@ async def refresh_single_canonical_ip(
                 auth_mode,
                 cache_layer_event=_resolve_cache_layer_telemetry_event(cache_meta),
             )
-            out_payload = strip_raw_json_from_payload(cooldown_cached) if compact else cooldown_cached
-            return attach_request_diagnostics(out_payload, start_time), 200, {}
+            return await _finalize_refresh_payload(
+                cooldown_cached, ip=ip, wiki=wiki, compact=compact, start_time=start_time
+            )
 
     rl_res = await quota_telemetry.check_and_consume_refresh_rate_limit(username, is_admin=is_admin)
     if not rl_res.allowed:
@@ -666,12 +692,12 @@ async def refresh_single_canonical_ip(
             refresh_in_progress=True,
         )
         if in_progress_cached is not None:
-            out_payload = strip_raw_json_from_payload(in_progress_cached) if compact else in_progress_cached
-            return attach_request_diagnostics(out_payload, start_time), 200, {}
+            return await _finalize_refresh_payload(
+                in_progress_cached, ip=ip, wiki=wiki, compact=compact, start_time=start_time
+            )
         polled = await _poll_for_concurrent_snapshot(ip, normalized_mode)
         if polled is not None:
-            out_payload = strip_raw_json_from_payload(polled) if compact else polled
-            return attach_request_diagnostics(out_payload, start_time), 200, {}
+            return await _finalize_refresh_payload(polled, ip=ip, wiki=wiki, compact=compact, start_time=start_time)
 
     try:
         prior_l1 = await _try_read_l1_snapshot(ip, normalized_mode)
@@ -708,15 +734,17 @@ async def refresh_single_canonical_ip(
                     backfill_l1=merge_res.snapshot is not None,
                     record_provider_hits=False,
                 )
-                out_payload = strip_raw_json_from_payload(preserved_payload) if compact else preserved_payload
-                return attach_request_diagnostics(out_payload, start_time), 200, {}
+                return await _finalize_refresh_payload(
+                    preserved_payload, ip=ip, wiki=wiki, compact=compact, start_time=start_time
+                )
 
             fresh_meta = dict(fresh_assembled.get("cacheMeta") or {})
             fresh_meta["degradedRefreshFallback"] = True
             fresh_meta["shouldAutoRefresh"] = False
             degraded_payload = {**fresh_assembled, "cacheMeta": fresh_meta}
-            out_payload = strip_raw_json_from_payload(degraded_payload) if compact else degraded_payload
-            return attach_request_diagnostics(out_payload, start_time), 200, {}
+            return await _finalize_refresh_payload(
+                degraded_payload, ip=ip, wiki=wiki, compact=compact, start_time=start_time
+            )
 
         merged_rows = _merge_retained_historical_rows(
             raw_clean_results,
@@ -770,9 +798,7 @@ async def refresh_single_canonical_ip(
                 now_dt=now_dt,
             ),
         )
-        out_payload = strip_raw_json_from_payload(final_payload) if compact else dict(final_payload)
-        out_payload["rangeblock"] = await rangeblock_service.query_rangeblocks_for_ip(ip, wiki=wiki)
-        return attach_request_diagnostics(out_payload, start_time), 200, {}
+        return await _finalize_refresh_payload(final_payload, ip=ip, wiki=wiki, compact=compact, start_time=start_time)
     finally:
         if lock_token is not None:
             await release_ip_updating_lock(ip, lock_token)

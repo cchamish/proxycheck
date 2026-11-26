@@ -4,43 +4,87 @@
   image: tool-proxycheck/tool-proxycheck:latest
   schedule: "@hourly"
   mount: all
+  filelog: true
+  filelog-stdout: data/logs/cron/update-sfs-db.out
+  filelog-stderr: data/logs/cron/update-sfs-db.err
 - name: update-tor-onionoo
   command: python manage.py update_offline_dbs --sources tor_onionoo
   image: tool-proxycheck/tool-proxycheck:latest
   schedule: "@hourly"
   mount: all
+  filelog: true
+  filelog-stdout: data/logs/cron/update-tor-onionoo.out
+  filelog-stderr: data/logs/cron/update-tor-onionoo.err
 - name: update-maxmind-db
   command: python manage.py update_offline_dbs --sources maxmind
   image: tool-proxycheck/tool-proxycheck:latest
   schedule: "@daily"
   mount: all
+  filelog: true
+  filelog-stdout: data/logs/cron/update-maxmind-db.out
+  filelog-stderr: data/logs/cron/update-maxmind-db.err
 - name: update-shared-cidrs-db
-  command: python manage.py update_offline_dbs --sources shared_cidrs privacy_relays
+  command: python manage.py update_offline_dbs --sources shared_cidrs
   image: tool-proxycheck/tool-proxycheck:latest
   schedule: "@daily"
   mount: all
+  filelog: true
+  filelog-stdout: data/logs/cron/update-shared-cidrs-db.out
+  filelog-stderr: data/logs/cron/update-shared-cidrs-db.err
+- name: update-privacy-relays-db
+  command: python manage.py update_offline_dbs --sources privacy_relays
+  image: tool-proxycheck/tool-proxycheck:latest
+  schedule: "@daily"
+  mount: all
+  filelog: true
+  filelog-stdout: data/logs/cron/update-privacy-relays-db.out
+  filelog-stderr: data/logs/cron/update-privacy-relays-db.err
 - name: update-threat-feeds-db
   command: python manage.py update_offline_dbs --sources ipsum_drop
   image: tool-proxycheck/tool-proxycheck:latest
   schedule: "@daily"
   mount: all
+  filelog: true
+  filelog-stdout: data/logs/cron/update-threat-feeds-db.out
+  filelog-stderr: data/logs/cron/update-threat-feeds-db.err
 - name: update-openasn-db
   command: python manage.py update_offline_dbs --sources openasn
   image: tool-proxycheck/tool-proxycheck:latest
   schedule: "@daily"
   mount: all
-- name: update-routing-intel-db
-  command: python manage.py update_offline_dbs --sources bgp_tools peeringdb_mobile
+  filelog: true
+  filelog-stdout: data/logs/cron/update-openasn-db.out
+  filelog-stderr: data/logs/cron/update-openasn-db.err
+- name: update-bgp-tools-db
+  command: python manage.py update_offline_dbs --sources bgp_tools
+  image: tool-proxycheck/tool-proxycheck:latest
+  schedule: "@daily"
+  mem: 1Gi
+  mount: all
+  filelog: true
+  filelog-stdout: data/logs/cron/update-bgp-tools-db.out
+  filelog-stderr: data/logs/cron/update-bgp-tools-db.err
+- name: update-mobile-carriers-db
+  command: python manage.py update_offline_dbs --sources mobile_carriers
   image: tool-proxycheck/tool-proxycheck:latest
   schedule: "@daily"
   mount: all
+  filelog: true
+  filelog-stdout: data/logs/cron/update-mobile-carriers-db.out
+  filelog-stderr: data/logs/cron/update-mobile-carriers-db.err
 - name: purge-l2-restricted-cache
   command: python manage.py purge_l2_cache
   image: tool-proxycheck/tool-proxycheck:latest
   schedule: "@daily"
   mount: all
+  filelog: true
+  filelog-stdout: data/logs/cron/purge-l2-restricted-cache.out
+  filelog-stderr: data/logs/cron/purge-l2-restricted-cache.err
 - name: sync-world-block
   command: python manage.py sync_world_block
   image: tool-proxycheck/tool-proxycheck:latest
   schedule: "@hourly"
   mount: all
+  filelog: true
+  filelog-stdout: data/logs/cron/sync-world-block.out
+  filelog-stderr: data/logs/cron/sync-world-block.err

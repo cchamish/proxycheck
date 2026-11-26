@@ -118,7 +118,7 @@ _OPENASN_EXPORT_CONTRACT: Dict[str, Any] = {
     "lookup_policy_version": 1,
 }
 
-PEERINGDB_NET_URL = "https://www.peeringdb.com/api/net"
+MOBILE_CARRIERS_URL = "https://www.proxies.sx/carriers/dataset/json"
 
 _SOURCE_ALIASES: Dict[str, str] = {
     "stopforumspam": "stopforumspam",
@@ -137,8 +137,8 @@ _SOURCE_ALIASES: Dict[str, str] = {
     "bgp-tools": "bgp_tools",
     "openasn": "openasn",
     "open-asn": "openasn",
-    "peeringdb_mobile": "peeringdb_mobile",
-    "peeringdb-mobile": "peeringdb_mobile",
+    "mobile_carriers": "mobile_carriers",
+    "mobile-carriers": "mobile_carriers",
 }
 _ALL_CANONICAL_SOURCES: Tuple[str, ...] = (
     "stopforumspam",
@@ -149,7 +149,7 @@ _ALL_CANONICAL_SOURCES: Tuple[str, ...] = (
     "tor_onionoo",
     "bgp_tools",
     "openasn",
-    "peeringdb_mobile",
+    "mobile_carriers",
 )
 
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
@@ -213,6 +213,35 @@ def _write_json_atomically(payload: Any, target_path: Path) -> None:
         tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _touch_file_mtime(*paths: Path) -> None:
+    for path in paths:
+        if path.is_file():
+            with contextlib.suppress(OSError):
+                os.utime(path, None)
+
+
+def _extract_http_cache_meta(resp_headers: Any) -> Dict[str, str]:
+    entry: Dict[str, str] = {}
+    if resp_headers is None:
+        return entry
+    for meta_key, header_name in (("etag", "ETag"), ("last_modified", "Last-Modified")):
+        val = ""
+        getter = getattr(resp_headers, "get", None)
+        if callable(getter):
+            direct = getter(header_name) or getter(header_name.lower()) or getter(header_name.title())
+            if isinstance(direct, str) and direct.strip():
+                val = direct.strip()
+        if not val and isinstance(resp_headers, Mapping):
+            lowered = header_name.lower()
+            for k, v in resp_headers.items():
+                if str(k).lower() == lowered and isinstance(v, str) and v.strip():
+                    val = v.strip()
+                    break
+        if val:
+            entry[meta_key] = val
+    return entry
+
+
 def _parse_plaintext_cidrs(raw_text: str, label: str) -> List[str]:
     _reject_html_payload(raw_text, label)
     cidrs: List[str] = []
@@ -234,6 +263,30 @@ def _parse_asn_token(raw_val: str) -> Optional[int]:
         parsed = int(cleaned)
         return parsed if parsed > 0 else None
     return None
+
+
+def _iter_bgp_table_entries(table_resp: httpx.Response) -> Iterable[Tuple[str, int]]:
+    seen_non_empty = False
+    total_bytes = 0
+    for raw_line in table_resp.iter_lines():
+        total_bytes += len(raw_line.encode("utf-8", errors="replace")) + 1
+        if total_bytes > MAX_ARCHIVE_BYTES:
+            raise CommandError(f"Download exceeded size limit for {BGP_TOOLS_TABLE_URL}")
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        if not seen_non_empty:
+            seen_non_empty = True
+            if stripped.lower().startswith(("<!doctype", "<html")):
+                raise CommandError("bgp.tools table download returned HTML instead of feed data.")
+        if stripped.startswith(("#", ";")):
+            continue
+        parts = stripped.split()
+        if len(parts) < 2:
+            continue
+        asn_num = _parse_asn_token(parts[1])
+        if asn_num is not None:
+            yield parts[0], asn_num
 
 
 def _fetch_conditional_text(
@@ -280,24 +333,7 @@ def _fetch_conditional_text(
     if not text.strip():
         raise CommandError(f"Downloaded empty response from {url}")
 
-    resp_headers = getattr(resp, "headers", None)
-    entry: Dict[str, str] = {}
-    if resp_headers is not None:
-        for meta_key, header_name in (("etag", "ETag"), ("last_modified", "Last-Modified")):
-            val = ""
-            getter = getattr(resp_headers, "get", None)
-            if callable(getter):
-                direct = getter(header_name) or getter(header_name.lower()) or getter(header_name.title())
-                if isinstance(direct, str) and direct.strip():
-                    val = direct.strip()
-            if not val and isinstance(resp_headers, Mapping):
-                lowered = header_name.lower()
-                for k, v in resp_headers.items():
-                    if str(k).lower() == lowered and isinstance(v, str) and v.strip():
-                        val = v.strip()
-                        break
-            if val:
-                entry[meta_key] = val
+    entry = _extract_http_cache_meta(getattr(resp, "headers", None))
     if entry:
         meta_map[url] = entry
 
@@ -725,6 +761,7 @@ class OfflineDbUpdater:
                 entries.extend((cidr, payload) for cidr in cidrs)
 
         if not any_modified and target_exists:
+            _touch_file_mtime(target_path)
             self.stdout.write(f"Skipped Shared CIDRs ({target_path.name}): upstream returned 304 Not Modified.")
             return 0
         if not entries:
@@ -806,6 +843,7 @@ class OfflineDbUpdater:
                     entries.extend((cidr, tag) for cidr in _parse_plaintext_cidrs(body, label))
 
             if not any_modified and target_exists:
+                _touch_file_mtime(target_path)
                 self.stdout.write(f"Skipped Privacy Relays ({target_path.name}): upstream returned 304 Not Modified.")
                 return 0
             if not entries:
@@ -867,6 +905,7 @@ class OfflineDbUpdater:
                 cache_raw=True,
             )
             if not (mod_ipsum or mod_drop4 or mod_drop6) and target_exists:
+                _touch_file_mtime(target_path)
                 self.stdout.write(f"Skipped IPsum and DROP ({target_path.name}): upstream returned 304 Not Modified.")
                 return 0
 
@@ -1009,6 +1048,7 @@ class OfflineDbUpdater:
                 extra_headers={"Accept-Encoding": "gzip"},
             )
             if not modified or body is None:
+                _touch_file_mtime(target_path)
                 self.stdout.write(f"Skipped Tor Onionoo ({target_path.name}): upstream returned 304 Not Modified.")
                 return 0
 
@@ -1049,15 +1089,6 @@ class OfflineDbUpdater:
         both_exist = bin_target.is_file() and tags_target.is_file()
         bgp_headers = {"User-Agent": BGP_TOOLS_USER_AGENT}
         try:
-            table_body, mod_table = _fetch_conditional_text(
-                client,
-                BGP_TOOLS_TABLE_URL,
-                data_dir=data_dir,
-                meta_map=meta_map,
-                target_exists=both_exist,
-                cache_raw=True,
-                extra_headers=bgp_headers,
-            )
             tags_body, mod_tags = _fetch_conditional_text(
                 client,
                 BGP_TOOLS_TAGS_URL,
@@ -1152,26 +1183,39 @@ class OfflineDbUpdater:
                                     if category_name not in bucket:
                                         bucket.append(category_name)
 
+            table_headers = dict(bgp_headers)
+            if both_exist:
+                prior_table_meta = meta_map.get(BGP_TOOLS_TABLE_URL)
+                if isinstance(prior_table_meta, dict):
+                    if prior_table_meta.get("etag"):
+                        table_headers["If-None-Match"] = prior_table_meta["etag"]
+                    if prior_table_meta.get("last_modified"):
+                        table_headers["If-Modified-Since"] = prior_table_meta["last_modified"]
+
+            rule_count = 0
+            mod_table = False
+            with client.stream("GET", BGP_TOOLS_TABLE_URL, headers=table_headers) as table_resp:
+                if getattr(table_resp, "status_code", 200) == 304:
+                    mod_table = False
+                else:
+                    table_resp.raise_for_status()
+                    mod_table = True
+                    rule_count = compile_binary_prefix_index(
+                        _iter_bgp_table_entries(table_resp), bin_target, allow_empty=False
+                    )
+                    if rule_count == 0:
+                        raise CommandError("bgp.tools table feed contained no valid prefix announcements.")
+                    table_meta = _extract_http_cache_meta(getattr(table_resp, "headers", None))
+                    if table_meta:
+                        meta_map[BGP_TOOLS_TABLE_URL] = table_meta
+
             if not (mod_table or mod_tags or mod_extra) and both_exist:
+                _touch_file_mtime(bin_target, tags_target)
                 self.stdout.write(f"Skipped BGP Tools ({bin_target.name}): upstream returned 304 Not Modified.")
                 return 0
 
-            _reject_html_payload(table_body or "", "bgp.tools table")
-            table_entries: List[Tuple[str, int]] = []
-            for line in (table_body or "").splitlines():
-                stripped = line.strip()
-                if not stripped or stripped.startswith(("#", ";")):
-                    continue
-                parts = stripped.split()
-                if len(parts) < 2:
-                    continue
-                asn_num = _parse_asn_token(parts[1])
-                if asn_num is not None and parse_cidr_to_int_prefix(parts[0]) is not None:
-                    table_entries.append((parts[0], asn_num))
-            if not table_entries:
-                raise CommandError("bgp.tools table feed contained no valid prefix announcements.")
-
-            rule_count = compile_binary_prefix_index(table_entries, bin_target)
+            if not mod_table:
+                _touch_file_mtime(bin_target)
             mobile_asns = sorted(
                 asn_num for asn_num, tags in asn_tags.items() if any(tag in MOBILE_BGP_TAG_TOKENS for tag in tags)
             )
@@ -1182,7 +1226,10 @@ class OfflineDbUpdater:
             }
             _write_json_atomically(tags_payload, tags_target)
             clear_offline_intelligence_caches()
-            self.stdout.write(self.style.SUCCESS(f"Updated BGP Tools ({bin_target.name}, {rule_count} prefixes)."))
+            if mod_table:
+                self.stdout.write(self.style.SUCCESS(f"Updated BGP Tools ({bin_target.name}, {rule_count} prefixes)."))
+            else:
+                self.stdout.write(self.style.SUCCESS(f"Updated BGP Tools tags ({tags_target.name})."))
             return 0
         except _DOWNLOAD_UPDATE_ERRORS as exc:
             self.stderr.write(self.style.ERROR(_redact_update_error(f"Failed BGP Tools update: {exc}")))
@@ -1253,6 +1300,7 @@ class OfflineDbUpdater:
                 if not force and target_path.is_file():
                     with contextlib.suppress(OSError):
                         if _file_digest_hex(target_path, "sha256") == expected_sha:
+                            _touch_file_mtime(target_path)
                             self.stdout.write(
                                 f"Skipped OpenASN ({target_path.name}): local file already matches manifest."
                             )
@@ -1312,7 +1360,7 @@ class OfflineDbUpdater:
         self.stderr.write(self.style.ERROR(_redact_update_error(f"Failed OpenASN update: {last_error}")))
         return 1
 
-    def _update_peeringdb_mobile(
+    def _update_mobile_carriers(
         self,
         client: httpx.Client,
         *,
@@ -1324,45 +1372,38 @@ class OfflineDbUpdater:
         target_path = data_dir / MOBILE_ASNS_JSON_FILENAME
         wait_seconds = _check_mtime_cooldown(target_path, DAILY_FEED_MIN_INTERVAL_SECONDS, force=force)
         if wait_seconds is not None:
-            self.stdout.write(f"Skipped PeeringDB Mobile ({target_path.name}): wait {wait_seconds}s.")
+            self.stdout.write(f"Skipped Mobile Carriers ({target_path.name}): wait {wait_seconds}s.")
             return 0
         if dry_run:
-            self.stdout.write(f"[dry-run] Would fetch PeeringDB mobile ASNs into {target_path}")
+            self.stdout.write(f"[dry-run] Would fetch mobile carrier ASNs into {target_path}")
             return 0
 
         try:
             body, modified = _fetch_conditional_text(
                 client,
-                PEERINGDB_NET_URL,
+                MOBILE_CARRIERS_URL,
                 data_dir=data_dir,
                 meta_map=meta_map,
                 target_exists=target_path.is_file(),
                 cache_raw=False,
             )
             if not modified or body is None:
-                self.stdout.write(f"Skipped PeeringDB Mobile ({target_path.name}): upstream returned 304 Not Modified.")
+                _touch_file_mtime(target_path)
+                self.stdout.write(f"Skipped Mobile Carriers ({target_path.name}): upstream returned 304 Not Modified.")
                 return 0
 
-            _reject_html_payload(body, "PeeringDB")
+            _reject_html_payload(body, "Mobile Carriers")
             payload = json.loads(body)
-            if isinstance(payload, dict) and isinstance(payload.get("data"), list):
-                rows: Iterable[Any] = payload["data"]
-            elif isinstance(payload, list):
-                rows = payload
-            else:
-                raise CommandError("PeeringDB payload did not contain a network data list.")
+            rows = payload.get("rows") if isinstance(payload, dict) else None
+            if not isinstance(rows, list):
+                raise CommandError("Mobile carriers payload did not contain a rows list.")
 
             mobile_asns: Set[int] = set()
             networks: Dict[str, str] = {}
             for entry in rows:
                 if not isinstance(entry, Mapping):
                     continue
-                info_types = entry.get("info_types")
-                info_type = entry.get("info_type")
-                is_mobile = (
-                    isinstance(info_types, list) and any(str(item).strip().lower() == "mobile" for item in info_types)
-                ) or (isinstance(info_type, str) and info_type.strip().lower() == "mobile")
-                if not is_mobile:
+                if str(entry.get("asn_role") or "").strip().lower() != "mobile":
                     continue
                 raw_asn = entry.get("asn")
                 asn_num = (
@@ -1372,21 +1413,24 @@ class OfflineDbUpdater:
                     asn_num = _parse_asn_token(raw_asn)
                 if asn_num is not None:
                     mobile_asns.add(asn_num)
-                    name = str(entry.get("name") or "").strip()
+                    name = str(entry.get("carrier") or entry.get("asn_holder") or "").strip()
                     if name:
                         networks[str(asn_num)] = name
+
+            if not mobile_asns:
+                raise CommandError("Mobile carriers payload contained no valid mobile ASNs.")
 
             parsed = {"mobile_asns": sorted(mobile_asns), "networks": networks}
             _write_json_atomically(parsed, target_path)
             clear_offline_intelligence_caches()
             self.stdout.write(
                 self.style.SUCCESS(
-                    f"Updated PeeringDB Mobile ({target_path.name}, {len(parsed['mobile_asns'])} mobile ASNs)."
+                    f"Updated Mobile Carriers ({target_path.name}, {len(parsed['mobile_asns'])} mobile ASNs)."
                 )
             )
             return 0
         except _DOWNLOAD_UPDATE_ERRORS as exc:
-            self.stderr.write(self.style.ERROR(_redact_update_error(f"Failed PeeringDB Mobile update: {exc}")))
+            self.stderr.write(self.style.ERROR(_redact_update_error(f"Failed Mobile Carriers update: {exc}")))
             return 1
 
     def run(self, **options) -> None:
@@ -1469,8 +1513,8 @@ class OfflineDbUpdater:
                 )
             if "openasn" in selected:
                 total_errors += self._update_openasn(client, data_dir=data_dir, force=force, dry_run=dry_run)
-            if "peeringdb_mobile" in selected:
-                total_errors += self._update_peeringdb_mobile(
+            if "mobile_carriers" in selected:
+                total_errors += self._update_mobile_carriers(
                     client, data_dir=data_dir, meta_map=meta_map, force=force, dry_run=dry_run
                 )
 

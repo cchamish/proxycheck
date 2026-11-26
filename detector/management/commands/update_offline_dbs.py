@@ -17,7 +17,7 @@ class Command(BaseCommand):
             default=["all"],
             help=(
                 "Sources to update: all, stopforumspam, maxmind, shared_cidrs, privacy_relays, "
-                "ipsum_drop, tor_onionoo, bgp_tools, openasn, peeringdb_mobile (space or comma separated)."
+                "ipsum_drop, tor_onionoo, bgp_tools, openasn, mobile_carriers (space or comma separated)."
             ),
         )
         parser.add_argument(

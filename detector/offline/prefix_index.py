@@ -169,6 +169,7 @@ def compile_binary_prefix_index(
     target_path: Path | str,
     *,
     merge_payloads: Optional[Callable[[Any, Any], Any]] = None,
+    allow_empty: bool = True,
 ) -> int:
     """Compiles IPv4 and IPv6 CIDRs with tagged metadata into an atomic memory-mappable binary file."""
     dst = Path(target_path)
@@ -188,10 +189,16 @@ def compile_binary_prefix_index(
         else:
             target[key] = payload
 
+    if not allow_empty and not v4_map and not v6_map:
+        return 0
+
     payload_pool: Dict[Tuple[int, bytes], int] = {}
     payload_entries: List[Tuple[int, bytes]] = []
     v4_rules = _intern_rule_payloads(v4_map, payload_pool, payload_entries)
+    v4_map.clear()
     v6_rules = _intern_rule_payloads(v6_map, payload_pool, payload_entries)
+    v6_map.clear()
+    del v4_map, v6_map, payload_pool
     v4_segments = _flatten_dyadic_rules(v4_rules, 32)
     v6_segments = _flatten_dyadic_rules(v6_rules, 128)
 

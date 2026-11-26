@@ -9,15 +9,14 @@ export type MessageKey = keyof typeof enMessages;
 export interface LocaleOption {
   code: LocaleCode;
   label: string;
-  htmlLang: string;
 }
 
 export const LOCALE_STORAGE_KEY = 'proxy_detector_lang';
 
 export const SUPPORTED_LOCALES: readonly LocaleOption[] = [
-  { code: 'en', label: 'English', htmlLang: 'en-GB' },
-  { code: 'zh-hans', label: '中文（简体）', htmlLang: 'zh-Hans' },
-  { code: 'zh-hant', label: '中文（繁體）', htmlLang: 'zh-Hant' },
+  { code: 'en', label: 'English' },
+  { code: 'zh-hans', label: '中文（简体）' },
+  { code: 'zh-hant', label: '中文（繁體）' },
 ];
 
 const MESSAGES: Record<LocaleCode, Record<MessageKey, string>> = {
@@ -82,10 +81,6 @@ export function applyLocaleToDocument(code: LocaleCode): void {
 const initialSearch = typeof window !== 'undefined' ? window.location.search : '';
 const activeLocale = ref<LocaleCode>(resolveInitialLocale(initialSearch, readStoredLocale()));
 applyLocaleToDocument(activeLocale.value);
-
-export function getLocale(): LocaleCode {
-  return activeLocale.value;
-}
 
 export function setLocale(code: LocaleCode, options?: { persist?: boolean; clearUrlOverride?: boolean }): void {
   activeLocale.value = code;

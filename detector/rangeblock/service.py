@@ -278,7 +278,7 @@ def build_empty_rangeblock_summary(canonical_ip: str, *, realtime_degraded: bool
 def _query_toolsdb_aggregates_sync(
     v4_targets: Sequence[str],
     v6_targets: Sequence[str],
-) -> Tuple[List[RangeblockAggregate], Dict[str, str]]:
+) -> Tuple[List[RangeblockAggregate], Dict[str, str], bool]:
     rows: List[RangeblockAggregate] = []
     domain_map: Dict[str, str] = {}
     try:
@@ -297,14 +297,14 @@ def _query_toolsdb_aggregates_sync(
             "Rangeblock ToolsDB query bypassed due to database error: %s",
             sanitization.sanitize_error_message(str(db_err)),
         )
-        return [], {}
+        return [], {}, True
     except AssertionError as exc:
         if type(exc).__name__ == "DatabaseOperationForbidden":
-            return [], {}
+            return [], {}, True
         raise
     finally:
         close_old_connections()
-    return rows, domain_map
+    return rows, domain_map, False
 
 
 def _empty_target_entry() -> Dict[str, Any]:
@@ -658,7 +658,10 @@ async def query_rangeblocks_for_ips(
         sorted(v4_targets), sorted(v6_targets)
     )
     realtime_task = _fetch_realtime_wiki_blocks(all_targets, realtime_wikis)
-    (toolsdb_rows, domain_map), (realtime_by_wiki, succeeded_wikis, realtime_degraded) = await asyncio.gather(
+    (
+        (toolsdb_rows, domain_map, block_data_degraded),
+        (realtime_by_wiki, succeeded_wikis, realtime_degraded),
+    ) = await asyncio.gather(
         toolsdb_task,
         realtime_task,
     )
@@ -674,6 +677,7 @@ async def query_rangeblocks_for_ips(
             domain_map,
             realtime_degraded=realtime_degraded,
         )
+        out[canonical]["blockDataDegraded"] = block_data_degraded
     return out
 
 

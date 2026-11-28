@@ -37,12 +37,14 @@ from ..core.ip_utils import (
 from ..offline import (
     cidr_attribution,
     lookup_bgp_tools_offline,
+    lookup_tor_onionoo_offline,
 )
 from ..provider_registry import (
     NO_REDIS_CACHE_PROVIDER_KEYS,
 )
 from ..providers import (
     PROVIDER_SPECS,
+    adapt_tor_onionoo,
     build_cooldown_provider_row,
     build_deferred_provider_row,
     is_unconfigured_provider_row,
@@ -105,6 +107,19 @@ async def _execute_detection_with_cache(
     )
 
     active_redis = get_redis_client()
+    executed_provider_results: Dict[str, Any] = {}
+    if (
+        normalized_mode == "light"
+        and "tor_onionoo" not in cached_providers
+        and "tor_onionoo" not in deferred_provider_keys
+    ):
+        offline_tor = lookup_tor_onionoo_offline(ip)
+        if isinstance(offline_tor, dict):
+            executed_provider_results["tor_onionoo"] = adapt_tor_onionoo(offline_tor, status_code=200, ip=ip)
+        else:
+            deferred_provider_keys = deferred_provider_keys | {"tor_onionoo"}
+        missed_cooldown_keys = [k for k in missed_cooldown_keys if k != "tor_onionoo"]
+
     cooldown_entries = await _fetch_provider_cooldowns(active_redis, missed_cooldown_keys)
     candidate_specs = [
         spec
@@ -112,12 +127,13 @@ async def _execute_detection_with_cache(
         if spec.key not in cached_providers
         and spec.key not in deferred_provider_keys
         and spec.key not in cooldown_entries
+        and spec.key not in executed_provider_results
     ]
     quota_blocked_entries, quota_consumed_keys = await _evaluate_quota_candidates(
         active_redis, candidate_specs, is_ipv4
     )
     specs_to_execute = [spec for spec in candidate_specs if spec.key not in quota_blocked_entries]
-    needs_ptr = cached_ptr is None
+    needs_ptr = cached_ptr is None and normalized_mode != "light"
     needs_cymru_bgp = needs_ptr and lookup_bgp_tools_offline(ip) is None
     needs_http_client = any(spec.uses_http_client and spec.key in cache_expected_keys for spec in specs_to_execute)
 
@@ -125,7 +141,6 @@ async def _execute_detection_with_cache(
     events_token = provider_upstream_events.set(upstream_events)
     rdns_state: Dict[str, str] = {"status": "ok"}
     rdns_token = rdns_context_state.set(rdns_state)
-    executed_provider_results: Dict[str, Any] = {}
     ptr_raw: Any = None
     cymru_bgp_prefix: Optional[str] = None
     try:
@@ -214,15 +229,18 @@ async def _execute_detection_with_cache(
         if write_entry is not None:
             redis_set_entries.append(write_entry)
 
-    ptr_hostname, ptr_hit, ptr_miss, ptr_cached_at, ptr_write = _resolve_ptr_outcome(
-        ip, cached_ptr, ptr_raw, rdns_state, active_redis, now_iso
-    )
-    hit_count += ptr_hit
-    miss_count += ptr_miss
-    if ptr_cached_at:
-        cached_at_timestamps.append(ptr_cached_at)
-    if ptr_write is not None:
-        redis_set_entries.append(ptr_write)
+    if cached_ptr is not None or needs_ptr:
+        ptr_hostname, ptr_hit, ptr_miss, ptr_cached_at, ptr_write = _resolve_ptr_outcome(
+            ip, cached_ptr, ptr_raw, rdns_state, active_redis, now_iso
+        )
+        hit_count += ptr_hit
+        miss_count += ptr_miss
+        if ptr_cached_at:
+            cached_at_timestamps.append(ptr_cached_at)
+        if ptr_write is not None:
+            redis_set_entries.append(ptr_write)
+    else:
+        ptr_hostname = None
 
     redis_write_ops = []
     if redis_set_entries:
@@ -414,7 +432,7 @@ async def _execute_l1_l2_or_upstream(
             cached_providers, target_mode, reverse_ipv4_octets(target_ip) is not None
         )
         all_cached = (expected_keys - deferred_keys).issubset(cached_providers.keys())
-    if all_cached:
+    if all_cached or target_mode == "light":
         return await _execute_detection_with_cache(
             target_ip,
             initial_cache=(cached_providers, cached_ptr),
@@ -811,6 +829,7 @@ async def detect_canonical_ip_batch(
     compact: bool = False,
     query_mode: str = "light",
     wiki: Optional[str] = None,
+    skip_rangeblock: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Executes bounded-concurrency intelligence detection across up to 25 unique canonical IPs
@@ -831,10 +850,14 @@ async def detect_canonical_ip_batch(
         light_hits = await get_cached_ip_snapshots_bulk(remaining, mode="light")
         return {**light_hits, **full_hits}
 
-    l1_hits, rangeblock_by_ip = await asyncio.gather(
-        _prefetch_l1(),
-        rangeblock_service.query_rangeblocks_for_ips(public_ips, wiki=wiki),
-    )
+    if skip_rangeblock:
+        l1_hits = await _prefetch_l1()
+        rangeblock_by_ip: Dict[str, Dict[str, Any]] = {}
+    else:
+        l1_hits, rangeblock_by_ip = await asyncio.gather(
+            _prefetch_l1(),
+            rangeblock_service.query_rangeblocks_for_ips(public_ips, wiki=wiki),
+        )
     l1_miss_ips = [ip for ip in public_ips if ip not in l1_hits]
     l2_hits: Dict[str, Dict[str, Any]] = {}
     if l1_miss_ips:
@@ -895,10 +918,11 @@ async def detect_canonical_ip_batch(
                     skip_rangeblock=True,
                 )
 
-            rb_summary = rangeblock_by_ip.get(canonical_ip) or rangeblock_service.build_empty_rangeblock_summary(
-                canonical_ip
-            )
-            payload = {**payload, "rangeblock": rb_summary}
+            if not skip_rangeblock:
+                rb_summary = rangeblock_by_ip.get(canonical_ip) or rangeblock_service.build_empty_rangeblock_summary(
+                    canonical_ip
+                )
+                payload = {**payload, "rangeblock": rb_summary}
             if isinstance(payload.get("cacheMeta"), dict):
                 payload = {**payload, "cacheMeta": {**payload["cacheMeta"], "shouldAutoRefresh": False}}
             return canonical_ip, payload

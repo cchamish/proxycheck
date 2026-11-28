@@ -127,7 +127,7 @@ class BatchDetectTests(TestCase):
         self.assertFalse(l1_batch.json()["results"]["8.8.8.8"]["cacheMeta"]["shouldAutoRefresh"])
 
     def test_batch_light_mode_skips_commercial_providers_and_quota(self):
-        """Skips uncached commercial providers and quota in light mode while deduplicating variants."""
+        """Skips uncached online, DNSBL, PTR, commercial providers, and rangeblock when requested in light mode."""
         fake_redis = _BatchingFakeRedis()
         bearer = views.issue_gadget_token("SysopUser")
         called_providers = []
@@ -152,10 +152,14 @@ class BatchDetectTests(TestCase):
 
         mock_client = AsyncMock()
         mock_client.is_closed = False
+        ptr_spy = AsyncMock(return_value="dns.google")
+        rb_spy = AsyncMock(return_value={})
         with (
             override_settings(**TEST_UPSTREAM_SECRETS),
             patch("detector.cache.redis_backend.redis_client", fake_redis),
-            patch("detector.providers.dns_local.query_rdns_ptr", AsyncMock(return_value="dns.google")),
+            patch("detector.providers.dns_local.query_rdns_ptr", ptr_spy),
+            patch("detector.detection.service.lookup_tor_onionoo_offline", return_value=None),
+            patch("detector.rangeblock.service.query_rangeblocks_for_ips", rb_spy),
             patch("detector.core.http_client.get_shared_http_client", AsyncMock(return_value=mock_client)),
             patch_non_dnsbl_providers(_make_stub, overrides={"maxmind": AsyncMock(return_value=dict(MAXMIND_STUB))}),
             patch.object(
@@ -164,7 +168,9 @@ class BatchDetectTests(TestCase):
         ):
             resp = self.client.post(
                 "/api/v1/detect/batch",
-                data=json.dumps({"ips": ["127.0.0.1", "2001:0db8:0:0::1", "2001:db8::1"]}),
+                data=json.dumps(
+                    {"ips": ["127.0.0.1", "8.8.8.8", "2001:0db8:0:0::1", "2001:db8::1"], "skipRangeblock": True}
+                ),
                 content_type="application/json",
                 HTTP_AUTHORIZATION=f"Bearer {bearer}",
             )
@@ -172,13 +178,16 @@ class BatchDetectTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertEqual(body["queryMode"], "light")
-        self.assertEqual(body["count"], 2)
+        self.assertEqual(body["count"], 3)
         self.assertEqual(body["inputMap"]["2001:0db8:0:0::1"], "2001:db8::1")
-        commercial_labels = {m.label for m in PROVIDER_REGISTRY if m.is_commercial_arbitration}
-        self.assertFalse(commercial_labels & set(called_providers))
-        commercial_keys = {m.key for m in PROVIDER_REGISTRY if m.is_commercial_arbitration}
+        self.assertNotIn("rangeblock", body["results"]["8.8.8.8"])
+        rb_spy.assert_not_awaited()
+        ptr_spy.assert_not_awaited()
+        online_labels = {m.label for m in PROVIDER_REGISTRY if not m.is_offline}
+        self.assertFalse(online_labels & set(called_providers))
+        online_keys = {m.key for m in PROVIDER_REGISTRY if not m.is_offline}
         quota_called_keys = {call.args[0] for call in spy_quota.call_args_list if call.args}
-        self.assertFalse(commercial_keys & quota_called_keys)
+        self.assertFalse(online_keys & quota_called_keys)
 
 
 class AsgiStatelessMiddlewareTests(SimpleTestCase):

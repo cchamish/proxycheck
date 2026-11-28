@@ -48,7 +48,7 @@ from .cache.quota_telemetry import (
     check_and_consume_endpoint_rate_limit,
 )
 from .core import http_client
-from .core.ip_utils import MAX_BATCH_IPS, canonicalize_ip, parse_batch_ip_list
+from .core.ip_utils import MAX_BATCH_IPS, canonicalize_ip, parse_batch_ip_list, parse_compact_flag
 from .core.sanitization import sanitize_error_message, sanitize_payload
 from .detection.arbitration import (
     aggregate_intelligence_metrics,
@@ -85,6 +85,7 @@ __all__ = [
     "oauth_login",
     "oauth_logout",
     "rangeblock_lookup",
+    "rangeblock_lookup_batch",
     "refresh_ip_detection",
     "switch_test_role",
     "system_status",
@@ -168,6 +169,40 @@ async def _resolve_authenticated_identity(request, auth_mode: str) -> tuple[str,
     if not isinstance(session_user, dict):
         return "", False
     return str(session_user.get("username") or "").strip(), is_admin_user(session_user)
+
+
+def _is_skip_rangeblock_request(request, body: Dict[str, Any] | None = None) -> bool:
+    raw_query = request.GET.get("skipRangeblock")
+    if raw_query is not None and str(raw_query).strip():
+        return parse_compact_flag(str(raw_query))
+    if isinstance(body, dict) and "skipRangeblock" in body:
+        return parse_compact_flag(body.get("skipRangeblock"))
+    return False
+
+
+def _parse_json_batch_request(
+    request,
+) -> tuple[Dict[str, Any] | None, tuple[list[str], Dict[str, str]] | None, JsonResponse | None]:
+    try:
+        raw_body = request.body.decode("utf-8-sig") if request.body else ""
+        body = json.loads(raw_body) if raw_body.strip() else None
+    except UnicodeDecodeError, ValueError:
+        return None, None, JsonResponse({"error": "invalid_batch", "message": "Invalid JSON request body."}, status=400)
+
+    if not isinstance(body, dict):
+        return (
+            None,
+            None,
+            JsonResponse(
+                {"error": "invalid_batch", "message": "Request body must be a JSON object containing an ips array."},
+                status=400,
+            ),
+        )
+
+    parsed_batch, batch_error_message = parse_batch_ip_list(body.get("ips"))
+    if batch_error_message is not None or parsed_batch is None:
+        return None, None, JsonResponse({"error": "invalid_batch", "message": batch_error_message}, status=400)
+    return body, parsed_batch, None
 
 
 def _parse_query_ip(request) -> tuple[str | None, JsonResponse | None]:
@@ -350,6 +385,7 @@ async def detect_ip(request):
         compact=is_compact_request(request),
         query_mode=resolve_query_mode(request),
         wiki=rangeblock_service.normalize_wiki_dbname(request.GET.get("wiki")),
+        skip_rangeblock=_is_skip_rangeblock_request(request),
     )
     response = JsonResponse(payload)
     response["Cache-Control"] = "private, no-cache"
@@ -409,6 +445,42 @@ async def rangeblock_lookup(request):
     wiki = rangeblock_service.normalize_wiki_dbname(request.GET.get("wiki"))
     payload = await rangeblock_service.query_rangeblocks_for_ip(ip, wiki=wiki)
     response = JsonResponse(attach_request_diagnostics(payload, start_time))
+    response["Cache-Control"] = "private, no-cache"
+    return response
+
+
+@csrf_exempt
+@_cors_endpoint("POST")
+async def rangeblock_lookup_batch(request):
+    """Queries cross-wiki rangeblock aggregates and real-time Wiki Replicas status for up to MAX_BATCH_IPS addresses."""
+    start_time = time.perf_counter()
+
+    auth_mode, auth_error_response = await authenticate_detect_request(request, require_csrf_for_session=True)
+    if auth_error_response is not None or auth_mode is None:
+        return auth_error_response
+
+    username, _ = await _resolve_authenticated_identity(request, auth_mode)
+    rl_res = await check_and_consume_endpoint_rate_limit("rangeblock", username)
+    if not rl_res.allowed:
+        return _build_rate_limit_response(rl_res, "Rangeblock lookup rate limit exceeded. Please wait before retrying.")
+
+    body, parsed_batch, batch_error = _parse_json_batch_request(request)
+    if batch_error is not None or body is None or parsed_batch is None:
+        return batch_error
+    unique_canonical_ips, input_map = parsed_batch
+
+    wiki = rangeblock_service.normalize_wiki_dbname(body.get("wiki") or request.GET.get("wiki"))
+    results_by_ip = await rangeblock_service.query_rangeblocks_for_ips(unique_canonical_ips, wiki=wiki)
+    response = JsonResponse(
+        attach_request_diagnostics(
+            {
+                "results": results_by_ip,
+                "inputMap": input_map,
+                "count": len(results_by_ip),
+            },
+            start_time,
+        )
+    )
     response["Cache-Control"] = "private, no-cache"
     return response
 
@@ -491,21 +563,9 @@ async def detect_ip_batch(request):
     if not rl_res.allowed:
         return _build_rate_limit_response(rl_res, "Batch detection rate limit exceeded. Please wait before retrying.")
 
-    try:
-        raw_body = request.body.decode("utf-8-sig") if request.body else ""
-        body = json.loads(raw_body) if raw_body.strip() else None
-    except UnicodeDecodeError, ValueError:
-        return JsonResponse({"error": "invalid_batch", "message": "Invalid JSON request body."}, status=400)
-
-    if not isinstance(body, dict):
-        return JsonResponse(
-            {"error": "invalid_batch", "message": "Request body must be a JSON object containing an ips array."},
-            status=400,
-        )
-
-    parsed_batch, batch_error_message = parse_batch_ip_list(body.get("ips"))
-    if batch_error_message is not None or parsed_batch is None:
-        return JsonResponse({"error": "invalid_batch", "message": batch_error_message}, status=400)
+    body, parsed_batch, batch_error = _parse_json_batch_request(request)
+    if batch_error is not None or body is None or parsed_batch is None:
+        return batch_error
     unique_canonical_ips, input_map = parsed_batch
 
     query_mode = resolve_query_mode(request, body, default="light")
@@ -516,6 +576,7 @@ async def detect_ip_batch(request):
         compact=is_compact_request(request, body),
         query_mode=query_mode,
         wiki=wiki,
+        skip_rangeblock=_is_skip_rangeblock_request(request, body),
     )
 
     response = JsonResponse(

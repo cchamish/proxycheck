@@ -19,6 +19,8 @@ urlpatterns = [
     path("detect/batch/", views.detect_ip_batch),
     path("rangeblock", views.rangeblock_lookup, name="rangeblock_lookup"),
     path("rangeblock/", views.rangeblock_lookup),
+    path("rangeblock/batch", views.rangeblock_lookup_batch, name="rangeblock_lookup_batch"),
+    path("rangeblock/batch/", views.rangeblock_lookup_batch),
     path("auth/user/", views.get_current_user, name="auth_user"),
     path("auth/user", views.get_current_user),
     path("auth/login/", views.oauth_login, name="auth_login"),

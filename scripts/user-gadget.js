@@ -23,6 +23,7 @@
     const OBSERVER_THROTTLE_MS = 100;
     const IPINFO_FALLBACK_DELAY_MS = 400;
     const MAX_CONCURRENT_REQUESTS = 4;
+    const MAX_CONCURRENT_RANGEBLOCK_REQUESTS = 2;
     const BATCH_DEBOUNCE_MS = 40;
     const MAX_BATCH_IPS = 10;
     const CONSENT_KEY = 'proxycheck-ip-policy-consent';
@@ -78,6 +79,7 @@
     const autoSwrAttemptedKeys = new Set();
     const riskCache = new WeakMap();
     const requestQueue = [];
+    const rangeblockQueue = [];
     const pendingBatchQueue = [];
 
     let accessBlocked = false;
@@ -95,7 +97,9 @@
     let memoryTokenCooldownUntil = 0;
     let cancelTokenVisibilityWait = null;
     let activeRequestCount = 0;
+    let activeRangeblockRequestCount = 0;
     let batchEndpointSupported = true;
+    let rangeblockBatchSupported = true;
     let batchDebounceTimer = null;
     let infoDialoguePromise = null;
     let contributionsBanner = null;
@@ -223,6 +227,7 @@
         pendingSpurRefresh = false;
         pendingBatchQueue.splice(0).forEach((item) => item.resolve(null));
         requestQueue.splice(0).forEach((item) => item.resolve(null));
+        rangeblockQueue.splice(0);
         if (observer) observer.disconnect();
         for (const el of document.body.querySelectorAll(`.${BADGE_CLASS}.proxycheck-ip-badge-loading`)) {
             const prev = el.previousElementSibling;
@@ -341,7 +346,7 @@
 
     function getOrCreateIpState(key) {
         let entry = ipStateMap.get(key);
-        if (!entry) ipStateMap.set(key, (entry = { lightPromise: null, fullPromise: null, inflightFull: null, inflightRefresh: null, data: null, fullTs: 0, fullTtlMs: 0 }));
+        if (!entry) ipStateMap.set(key, (entry = { lightPromise: null, fullPromise: null, inflightFull: null, inflightRefresh: null, data: null, rangeblock: null, fullTs: 0, fullTtlMs: 0 }));
         return entry;
     }
 
@@ -371,13 +376,20 @@
         const isFull = !isPartialLightResult(data), now = Date.now();
         const resolvedKey = typeof data.ip === 'string' ? canonicaliseIpKey(data.ip) : '';
         const keys = resolvedKey && resolvedKey !== cacheKey ? [cacheKey, resolvedKey] : [cacheKey];
+        let effectiveData = data;
+        if (!effectiveData.rangeblock && !effectiveData.isNonPublic) {
+            const existingRb = keys.map((k) => ipStateMap.get(k) && ipStateMap.get(k).rangeblock).find(Boolean);
+            if (existingRb) effectiveData = Object.assign({}, effectiveData, { rangeblock: existingRb });
+        }
         for (const key of keys) {
             const st = getOrCreateIpState(key);
-            recordIpResult(key, data, now);
+            if (effectiveData.rangeblock) st.rangeblock = effectiveData.rangeblock;
+            recordIpResult(key, effectiveData, now);
             if (!st.lightPromise || isFull) st.lightPromise = promise;
             if (isFull && !st.fullPromise) st.fullPromise = promise;
-            writePersistedEntry(key, data);
+            writePersistedEntry(key, effectiveData);
         }
+        return effectiveData;
     }
 
     function peekCachedIpState(ip) {
@@ -643,6 +655,89 @@
         }));
     }
 
+    function matchBatchEntry(results, inputMap, rawIp) {
+        if (!results) return null;
+        const trimmed = String(rawIp || '').trim(), lower = trimmed.toLowerCase(), canonical = canonicaliseIpKey(trimmed);
+        for (const k of [trimmed, lower, canonical]) {
+            if (k && hasOwn(results, k) && results[k]) return results[k];
+        }
+        if (inputMap) {
+            const mapped = inputMap[rawIp] || inputMap[trimmed] || inputMap[lower] || (canonical ? inputMap[canonical] : '');
+            if (mapped && hasOwn(results, mapped) && results[mapped]) return results[mapped];
+        }
+        if (canonical) {
+            for (const [k, entry] of Object.entries(results)) {
+                if (canonicaliseIpKey(k) === canonical || (entry && typeof entry.ip === 'string' && canonicaliseIpKey(entry.ip) === canonical)) {
+                    return entry;
+                }
+            }
+        }
+        return null;
+    }
+
+    function applyRangeblockResult(rawIp, rb) {
+        if (!rb || typeof rb !== 'object') return;
+        const resolvedIp = typeof rb.ip === 'string' && rb.ip ? rb.ip : rawIp;
+        const keys = Array.from(new Set([canonicaliseIpKey(rawIp), canonicaliseIpKey(resolvedIp)].filter(Boolean)));
+        let updatedData = null;
+        for (const key of keys) {
+            const st = getOrCreateIpState(key);
+            st.rangeblock = rb;
+            if (!st.data || st.data.isNonPublic) continue;
+            if (!isPartialLightResult(st.data) && st.data.rangeblock) continue;
+            st.data = Object.assign({}, st.data, { rangeblock: rb });
+            writePersistedEntry(key, st.data);
+            updatedData = st.data;
+        }
+        if (updatedData && ((Number(rb.localTotal) || 0) > 0 || (Number(rb.globalTotal) || 0) > 0 || rb.blockDataDegraded)) {
+            refreshRenderedBadgesForIp(resolvedIp, updatedData);
+        }
+    }
+
+    function drainRangeblockQueue() {
+        while (!accessBlocked && rangeblockBatchSupported && activeRangeblockRequestCount < MAX_CONCURRENT_RANGEBLOCK_REQUESTS && rangeblockQueue.length > 0) {
+            const uniqueIps = rangeblockQueue.shift();
+            const body = { ips: uniqueIps };
+            if (WIKI_DBNAME) body.wiki = WIKI_DBNAME;
+            activeRangeblockRequestCount += 1;
+            const release = () => {
+                activeRangeblockRequestCount -= 1;
+                drainRangeblockQueue();
+            };
+            authorisedFetch('/api/v1/rangeblock/batch', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+            }).then((res) => {
+                if (!res) return null;
+                if (res.status === 404 || res.status === 405) {
+                    rangeblockBatchSupported = false;
+                    rangeblockQueue.splice(0);
+                    return null;
+                }
+                if (!res.ok) {
+                    warn(`Rangeblock batch API HTTP ${res.status}`);
+                    return null;
+                }
+                return res.json();
+            }).then((payload) => {
+                const results = payload && typeof payload === 'object' && payload.results && typeof payload.results === 'object' ? payload.results : null;
+                const inputMap = payload && typeof payload === 'object' && payload.inputMap && typeof payload.inputMap === 'object' ? payload.inputMap : null;
+                if (!results) return;
+                for (const ip of uniqueIps) applyRangeblockResult(ip, matchBatchEntry(results, inputMap, ip));
+            }).catch((err) => warn('Rangeblock batch lookup failed:', err)).then(release);
+        }
+    }
+
+    function enqueueRangeblockBatch(ips) {
+        if (accessBlocked || !rangeblockBatchSupported || !ips || ips.length === 0) return;
+        const needed = ips.filter((ip) => {
+            const st = ipStateMap.get(canonicaliseIpKey(ip));
+            return !(st && st.rangeblock);
+        });
+        if (needed.length === 0) return;
+        rangeblockQueue.push(needed);
+        drainRangeblockQueue();
+    }
+
     function flushPendingBatch() {
         window.clearTimeout(batchDebounceTimer);
         batchDebounceTimer = null;
@@ -659,8 +754,9 @@
                 const key = canonicaliseIpKey(item.ip) || item.ip.toLowerCase();
                 if (!seen[key]) { seen[key] = true; uniqueIps.push(item.ip); }
             }
-            const body = { ips: uniqueIps, mode: 'light' };
+            const body = { ips: uniqueIps, mode: 'light', skipRangeblock: true };
             if (WIKI_DBNAME) body.wiki = WIKI_DBNAME;
+            enqueueRangeblockBatch(uniqueIps);
 
             enqueueNetworkTask(() => {
                 if (!batchEndpointSupported) return { fallbackSingle: true };
@@ -687,27 +783,7 @@
                 }
                 const results = payload && typeof payload === 'object' && payload.results && typeof payload.results === 'object' ? payload.results : null;
                 const inputMap = payload && typeof payload === 'object' && payload.inputMap && typeof payload.inputMap === 'object' ? payload.inputMap : null;
-                items.forEach((item) => {
-                    if (!results) return item.resolve(null);
-                    const trimmed = String(item.ip || '').trim(), lower = trimmed.toLowerCase(), canonical = canonicaliseIpKey(trimmed);
-                    let match = null;
-                    for (const k of [trimmed, lower, canonical]) {
-                        if (k && hasOwn(results, k) && results[k]) { match = results[k]; break; }
-                    }
-                    if (!match && inputMap) {
-                        const mapped = inputMap[item.ip] || inputMap[trimmed] || inputMap[lower] || (canonical ? inputMap[canonical] : '');
-                        if (mapped && hasOwn(results, mapped) && results[mapped]) match = results[mapped];
-                    }
-                    if (!match && canonical) {
-                        for (const [k, entry] of Object.entries(results)) {
-                            if (canonicaliseIpKey(k) === canonical || (entry && typeof entry.ip === 'string' && canonicaliseIpKey(entry.ip) === canonical)) {
-                                match = entry;
-                                break;
-                            }
-                        }
-                    }
-                    item.resolve(match);
-                });
+                items.forEach((item) => item.resolve(matchBatchEntry(results, inputMap, item.ip)));
             }, (err) => items.forEach((item) => item.reject(err)));
         }
     }
@@ -769,8 +845,7 @@
                 return null;
             }
             if (!isPartialLightResult(data) && !st.fullPromise) st.fullPromise = lightPromise;
-            storeResolvedResult(cacheKey, data, lightPromise);
-            return data;
+            return storeResolvedResult(cacheKey, data, lightPromise);
         }).catch((err) => {
             warn(`Detection failed for ${ip}:`, err);
             if (st.lightPromise === lightPromise) st.lightPromise = null;

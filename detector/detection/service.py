@@ -317,6 +317,7 @@ async def _execute_l1_l2_or_upstream(
             query_mode=target_mode,
         )
 
+    use_initial_cache = True
     lock_token = await acquire_ip_updating_lock(target_ip)
     if lock_token is None and await is_ip_updating_locked(target_ip):
         polled = await _poll_for_concurrent_snapshot(
@@ -325,11 +326,12 @@ async def _execute_l1_l2_or_upstream(
         )
         if polled is not None:
             return polled
+        use_initial_cache = False
 
     try:
         return await _execute_detection_with_cache(
             target_ip,
-            initial_cache=(cached_providers, cached_ptr),
+            initial_cache=(cached_providers, cached_ptr) if use_initial_cache else None,
             query_mode=target_mode,
         )
     finally:

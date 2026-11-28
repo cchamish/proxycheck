@@ -636,33 +636,46 @@ const verificationLinks = computed(() => {
 });
 
 const comparisonRows = computed<ProviderRawResult[]>(() => {
-  const ordered: ProviderRawResult[] = [];
-  const seenProviders = new Set<string>();
+  const resolvedByName = new Map<string, ProviderRawResult>();
   for (const row of props.detectionData.results ?? []) {
-    if (row.provider === 'GetIPIntel' || row.provider === 'Tor Onionoo' || seenProviders.has(row.provider)) {
-      continue;
+    if (row.provider !== 'GetIPIntel' && row.provider !== 'Tor Onionoo' && !resolvedByName.has(row.provider)) {
+      resolvedByName.set(row.provider, row);
     }
-    seenProviders.add(row.provider);
-    ordered.push(row);
   }
-  for (const providerName of props.detectionData.pendingProviders ?? []) {
-    if (providerName === 'GetIPIntel' || providerName === 'Tor Onionoo' || seenProviders.has(providerName)) {
-      continue;
+  const pendingSet = new Set(
+    (props.detectionData.pendingProviders ?? []).filter(
+      (name) => name !== 'GetIPIntel' && name !== 'Tor Onionoo' && !resolvedByName.has(name)
+    )
+  );
+  const order = [
+    ...(props.detectionData.providerOrder ?? []),
+    ...resolvedByName.keys(),
+    ...pendingSet,
+  ];
+  const seen = new Set<string>();
+  const ordered: ProviderRawResult[] = [];
+  for (const name of order) {
+    if (name === 'GetIPIntel' || name === 'Tor Onionoo' || seen.has(name)) continue;
+    const resolved = resolvedByName.get(name);
+    if (resolved) {
+      seen.add(name);
+      ordered.push(resolved);
+    } else if (pendingSet.has(name)) {
+      seen.add(name);
+      ordered.push({
+        provider: name,
+        status: 'Querying...',
+        statusCode: null,
+        asn: '-',
+        isp: '-',
+        organisation: '-',
+        location: '-',
+        usageType: '-',
+        securityFlags: [],
+        isPending: true,
+        rawJson: {},
+      });
     }
-    seenProviders.add(providerName);
-    ordered.push({
-      provider: providerName,
-      status: 'Querying...',
-      statusCode: null,
-      asn: '-',
-      isp: '-',
-      organisation: '-',
-      location: '-',
-      usageType: '-',
-      securityFlags: [],
-      isPending: true,
-      rawJson: {},
-    });
   }
   return ordered;
 });

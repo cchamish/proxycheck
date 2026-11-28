@@ -241,6 +241,10 @@ async def stream_single_canonical_ip_sse(
                 ):
                     yield frame
                 return
+            cached_providers, cached_ptr = await _read_provider_caches(ip)
+            cache_expected_keys, deferred_provider_keys, missed_cooldown_keys = _plan_provider_execution(
+                cached_providers, normalised_mode, is_ipv4
+            )
 
     tasks: List[asyncio.Task[Any]] = []
     try:
@@ -338,6 +342,7 @@ async def stream_single_canonical_ip_sse(
         initial_payload = strip_raw_json_from_payload(initial_payload) if compact else initial_payload
         initial_payload["rangeblock"] = rb_summary
         initial_payload["pendingProviders"] = pending_labels
+        initial_payload["providerOrder"] = [spec.label for spec in PROVIDER_SPECS]
         yield _format_sse_event("snapshot", attach_request_diagnostics(initial_payload, start_time))
 
         needs_http = any(spec.uses_http_client and spec.key in cache_expected_keys for spec in specs_to_execute)
@@ -442,14 +447,14 @@ async def stream_single_canonical_ip_sse(
 
         await _record_global_cache_telemetry(final_payload.get("cacheMeta"), auth_mode)
         yield _build_done_event(ip, final_payload, start_time, include_overview=True)
-    except asyncio.CancelledError:
-        for t in tasks:
-            if not t.done():
-                t.cancel()
-        if tasks:
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.gather(*tasks, return_exceptions=True)
-        raise
     finally:
-        if lock_token is not None:
-            await release_ip_updating_lock(ip, lock_token)
+        pending = [t for t in tasks if not t.done()]
+        for t in pending:
+            t.cancel()
+        try:
+            if pending:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.gather(*pending, return_exceptions=True)
+        finally:
+            if lock_token is not None:
+                await release_ip_updating_lock(ip, lock_token)

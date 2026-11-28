@@ -213,6 +213,7 @@ export interface DetectionResponse {
   openProxyPorts?: number[];
   rangeblock?: RangeblockSummary | null;
   pendingProviders?: string[];
+  providerOrder?: string[];
   results: ProviderRawResult[];
 }
 
@@ -830,6 +831,13 @@ export function createDetectionCoordinator(
                     const idx = existingResults.findIndex((r) => r.provider === row.provider);
                     if (idx >= 0) existingResults[idx] = row;
                     else existingResults.push(row);
+                    const order = state.detectionData.providerOrder;
+                    if (Array.isArray(order) && order.length > 0) {
+                      const rank = new Map(order.map((name, i) => [name, i]));
+                      existingResults.sort(
+                        (a, b) => (rank.get(a.provider) ?? order.length) - (rank.get(b.provider) ?? order.length)
+                      );
+                    }
                   }
                   const { provider: _p, providerKey: _pk, row: _r, ...overviewPatch } = parsed;
                   state.detectionData = {

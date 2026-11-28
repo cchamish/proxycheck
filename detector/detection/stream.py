@@ -79,6 +79,8 @@ _SSE_OVERVIEW_KEYS = (
     "predictionTier",
     "getipintel_chance",
     "residentialProxy",
+    "confirmedResidentialProxy",
+    "confirmedResidentialProxyProvider",
     "highlySuspectedResidentialProxy",
     "arbitrationVerdict",
     "arbitrationTier",

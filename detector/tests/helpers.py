@@ -18,6 +18,7 @@ from detector.providers import (
     adapt_ipsum_drop,
     adapt_maxmind,
     adapt_openasn,
+    adapt_oxylabs,
     adapt_proxycheck,
     adapt_shodan_internetdb,
     adapt_stopforumspam,
@@ -65,6 +66,7 @@ ALL_ADAPTERS = (
     ("DShield", lambda raw, code: adapt_dshield(raw, code)),
     ("IPsum / DROP", lambda raw, code: adapt_ipsum_drop(raw, code)),
     ("OpenASN", lambda raw, code: adapt_openasn(raw, code)),
+    ("Oxylabs", lambda raw, code: adapt_oxylabs(raw, code)),
     ("Shodan InternetDB", lambda raw, code: adapt_shodan_internetdb(raw, code)),
 )
 
@@ -233,7 +235,9 @@ class _BatchingFakeRedis(FakeAsyncRedis):
         return super().pipeline(transaction=transaction)
 
 
-_DNS_PROVIDER_KEYS = frozenset({"maxmind", "spamhaus_zen", "spamcop", "stopforumspam", "ipsum_drop", "openasn"})
+_DNS_PROVIDER_KEYS = frozenset(
+    {"maxmind", "spamhaus_zen", "spamcop", "stopforumspam", "ipsum_drop", "openasn", "oxylabs"}
+)
 
 CANONICAL_PROVIDER_PATCH_TARGETS: Dict[str, str] = {
     meta.key: (

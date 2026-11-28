@@ -47,6 +47,7 @@
   "detector-broadcast-ip": "疑似广播IP？",
   "detector-suspected-residential": "疑似住宅代理/被入侵主机",
   "detector-highly-suspected-residential": "高度疑似住宅代理",
+  "detector-confirmed-residential-cidr-warning": "已确认住宅代理：{provider} — 请仅封禁单个IP，并谨慎使用IP段封禁。",
   "detector-open-proxy-port-title": "通过Shodan InternetDB检测到开放代理端口",
   "detector-open-proxy-port": "开放代理端口：{port}",
   "detector-shodan-tag": "Shodan：{tag}",

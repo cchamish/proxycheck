@@ -36,6 +36,7 @@ from ..offline import (
     cidr_attribution,
     get_maxmind_newest_mtime_iso,
     get_openasn_mtime_iso,
+    get_oxylabs_mtime_iso,
     get_positive_int_setting,
     get_stopforumspam_db_version,
     has_any_local_stopforumspam_db,
@@ -144,6 +145,8 @@ def _current_offline_provider_signature(provider_key: str) -> str:
         return offline_dbs._ipsum_drop_index.get_reader_and_mtime()[1] or "none"
     if provider_key == "openasn":
         return get_openasn_mtime_iso() or "none"
+    if provider_key == "oxylabs":
+        return get_oxylabs_mtime_iso() or "none"
     return "none"
 
 

@@ -57,7 +57,7 @@
         'Tor Onionoo': ['#f1ecf8', '#c9bce3', '#4e3475', '#29203d', '#574480', '#cbb8f2'], DShield: ['#e7f3f3', '#a7cfd1', '#1f5357', '#172e2f', '#316163', '#8cd4d6'],
         StopForumSpam: ['#e6f8f5', '#9fdcd2', '#125c51', '#13332e', '#286b60', '#7ee0d1'], 'Spamhaus ZEN': ['#eaedf7', '#b5c0de', '#2e3f6e', '#1e243b', '#404d7d', '#a8b8eb'],
         SpamCop: ['#eaf4fb', '#add2ec', '#1c537d', '#172c3d', '#315c80', '#91c6f2'], 'IPsum / DROP': ['#f4ecfb', '#ceb3ea', '#512b78', '#2a1d3b', '#5d4180', '#d4b8f8'],
-        'OpenASN': ['#e6f4f8', '#9fd0df', '#0e5266', '#132d36', '#285f70', '#82d2e8'], 'Shodan InternetDB': ['#fbeee8', '#e8bca8', '#783416', '#361f16', '#734330', '#f5bba3'],
+        'OpenASN': ['#e6f4f8', '#9fd0df', '#0e5266', '#132d36', '#285f70', '#82d2e8'], 'Oxylabs': ['#fdecef', '#f2b8c3', '#8c1d35', '#3b1820', '#873647', '#ffb5c4'], 'Shodan InternetDB': ['#fbeee8', '#e8bca8', '#783416', '#361f16', '#734330', '#f5bba3'],
         'Privacy Relay': ['#eef0ff', '#b5bff7', '#2b3a94', '#1c2247', '#3f4d96', '#a8b5ff'], 'Shared CIDR': ['#e8f6ff', '#a8d8f8', '#0e527d', '#152c3d', '#2c5c80', '#8ac7f5'],
         'Multi-Source': ['#eef2f6', '#b9c6d4', '#3b4f66', '#222830', '#475466', '#b3c2d4'], 'Reverse DNS': ['#e8f7f7', '#a6dada', '#185b5e', '#153030', '#2c6666', '#87dbdb'],
         Spur: ['#e3f1f8', '#95cce6', '#0f4c6e', '#152b38', '#2c5973', '#8bc8eb']
@@ -996,6 +996,7 @@
         const isSfsBlacklisted = Boolean(stopforumspamRow && (stopforumspamRow.blacklisted || stopforumspamRow.toxicCidr));
         const isSfsListed = Boolean(stopforumspamRow && (stopforumspamRow.appears || (stopforumspamRow.frequency && Number(stopforumspamRow.frequency) > 0) ||
             (Array.isArray(stopforumspamRow.securityFlags) && stopforumspamRow.securityFlags.some((f) => f && f.isHighRisk))));
+        const confirmedResidentialProxy = Boolean(data.confirmedResidentialProxy);
         const suspectedResidentialProxy = Boolean(data.suspectedResidentialProxy), highlySuspectedResidentialProxy = Boolean(data.highlySuspectedResidentialProxy);
         const sharedInfo = resolveSharedProvider(data, sig);
         const sharedProvider = sharedInfo.label, hasSharedProvider = Boolean(sharedProvider);
@@ -1010,7 +1011,7 @@
             shodanOpenPorts.length > 0 || hasOtherNonCommercialRiskFlag || (isLightScreeningMode && hasLightCommercialRiskFlag)
         );
         const hasHighOrMediumSignals = Boolean(
-            isTor || isMajorityProxyVpn || highlySuspectedResidentialProxy || suspectedResidentialProxy ||
+            isTor || isMajorityProxyVpn || confirmedResidentialProxy || highlySuspectedResidentialProxy || suspectedResidentialProxy ||
             openProxyPorts.length > 0 || hasSharedProvider || arbitrationTier === 'destructive' ||
             ptrIsHighRisk || arbitrationTier === 'warning' || broadcastIp ||
             isSfsBlacklisted || isSfsListed || hasProviderRiskSignal
@@ -1020,7 +1021,7 @@
             (validCommercialCount > 0 || (!hasQuotaGuardedProvider && !hasCooldownProvider && (validTotalSourceCount > 0 || arbitrationTier === 'success'))));
 
         const riskTier = isNonPublic ? 'nonpublic'
-            : ((hasPrediction && prediction > 80) || isTor || isMajorityProxyVpn || highlySuspectedResidentialProxy || arbitrationTier === 'destructive' || isSfsBlacklisted || hasSharedProvider || hasOpenAsnVpn) ? 'high'
+            : ((hasPrediction && prediction > 80) || isTor || isMajorityProxyVpn || confirmedResidentialProxy || highlySuspectedResidentialProxy || arbitrationTier === 'destructive' || isSfsBlacklisted || hasSharedProvider || hasOpenAsnVpn) ? 'high'
                 : ((hasPrediction && prediction >= 30) || broadcastIp || suspectedResidentialProxy || openProxyPorts.length > 0 || arbitrationTier === 'warning' || ptrIsHighRisk || isSfsListed || hasProviderRiskSignal) ? 'medium'
                     : 'low';
 
@@ -1036,7 +1037,7 @@
                                 : 'Unavailable' + (data.predictionLabel ? ` (${data.predictionLabel})` : '');
 
         const primaryRules = [
-            [highlySuspectedResidentialProxy || suspectedResidentialProxy, 'RES-PROXY'],
+            [confirmedResidentialProxy || highlySuspectedResidentialProxy || suspectedResidentialProxy, 'RES-PROXY'],
             [isMajorityProxyVpn || arbitrationTier === 'destructive', /datacenter|hosting/i.test(arbitrationVerdict) ? 'HOSTING' : 'PROXY'],
             [isSfsBlacklisted, 'BLACKLIST'],
             [openProxyPorts.length > 0, 'PROXY-PORT'],
@@ -1323,6 +1324,10 @@
         if (risk.broadcastIp) addRisk('Broadcast IP', 'Multi-Source');
         if (data.ptrIsHighRisk && typeof data.ptrLabel === 'string' && data.ptrLabel.trim()) addRisk(`PTR (${data.ptrLabel.trim()})`, 'Reverse DNS');
         if (data.suspectedResidentialProxy) addRisk('Suspected Residential Proxy / Compromised Host', 'Multi-Source');
+        if (data.confirmedResidentialProxy) {
+            const provider = (typeof data.confirmedResidentialProxyProvider === 'string' && data.confirmedResidentialProxyProvider.trim()) || 'Oxylabs';
+            addRisk(`Confirmed Residential Proxy: ${provider}`, provider);
+        }
         if (data.highlySuspectedResidentialProxy) addRisk('Highly Suspected Residential Proxy', 'GetIPIntel ResidentialProxy');
         if (sig.openProxyPorts.length > 0) addRisk(`Open Proxy Ports (${sig.openProxyPorts.join(', ')})`, 'Shodan InternetDB');
         else if (sig.shodanOpenPorts.length > 0) addRisk(`Open Ports (${sig.shodanOpenPorts.join(', ')})`, 'Shodan InternetDB');
@@ -1357,7 +1362,10 @@
         };
 
         const $panel = $('<div>', { class: 'proxycheck-details-panel' });
+        const confirmedResidentialProxy = Boolean(data && data.confirmedResidentialProxy);
+        const confirmedResidentialProxyProvider = (data && typeof data.confirmedResidentialProxyProvider === 'string' && data.confirmedResidentialProxyProvider.trim()) || 'Oxylabs';
         const highlySuspectedResidentialProxy = Boolean(data && data.highlySuspectedResidentialProxy);
+        const isSingleIpResidentialProxy = confirmedResidentialProxy || highlySuspectedResidentialProxy;
         const cacheMeta = getCacheMeta(data), cacheAge = getCacheAgeSeconds(data);
         const recommendFreshRecheck = Boolean((cacheMeta && cacheMeta.recommendFreshRecheck === true) ||
             (data && data.suspectedResidentialProxy && cacheAge !== null && cacheAge > RESIDENTIAL_RECHECK_THRESHOLD_SECONDS));
@@ -1365,7 +1373,8 @@
         if (risk.sharedProvider) bannerPills.push(['proxycheck-signal-privacy', `Shared Egress: ${risk.sharedProvider} \u2014 many unrelated users may share this address; check collateral damage before blocking.`]);
         if (isMobileOrCgnatPayload(data)) bannerPills.push(['proxycheck-signal-cgnat', 'Mobile / CGNAT Network: Collateral-damage warning \u2014 recommended block locked to /32 (IPv4) or /64 (IPv6).']);
         if (data && data.suspectedResidentialProxy) bannerPills.push(['proxycheck-signal-danger', 'Suspected Residential Proxy / Compromised Host' + (recommendFreshRecheck ? ' \u2014 Cached signal is older than 7 days; click Refetch to verify current DHCP assignment before issuing a long-term block.' : '')]);
-        if (highlySuspectedResidentialProxy) bannerPills.push(['proxycheck-signal-danger', 'Highly Suspected Residential Proxy']);
+        if (confirmedResidentialProxy) bannerPills.push(['proxycheck-signal-danger', `Confirmed Residential Proxy: ${confirmedResidentialProxyProvider}`]);
+        else if (highlySuspectedResidentialProxy) bannerPills.push(['proxycheck-signal-danger', 'Highly Suspected Residential Proxy']);
         if (sig.openProxyPorts.length > 0) bannerPills.push(['proxycheck-signal-danger', `Shodan Open Proxy Ports: ${sig.openProxyPorts.join(', ')}`]);
         if (bannerPills.length > 0) {
             const $banners = $('<div>', { class: 'proxycheck-signal-banners' });
@@ -1415,12 +1424,17 @@
         const cidrRationale = (data && typeof data.cidrRationale === 'string' && data.cidrRationale.trim()) || (data && typeof data.cidrNote === 'string' && data.cidrNote.trim()) || '';
 
         const $cidrLine = $('<div>').append($('<code>').text(recCidr));
-        if (!highlySuspectedResidentialProxy) {
+        if (!isSingleIpResidentialProxy) {
             if (escCidr) $cidrLine.append($('<span>', { class: 'proxycheck-inline-pill', text: 'Escalation: ' + escCidr }));
             if (bgpCidr) $cidrLine.append($('<span>', { class: 'proxycheck-inline-pill', text: 'BGP: ' + bgpCidr }));
         }
         const $cidrCell = $('<div>').append($cidrLine);
-        if (highlySuspectedResidentialProxy) {
+        if (confirmedResidentialProxy) {
+            $cidrCell.append($('<div>', {
+                class: 'proxycheck-cidr-rationale proxycheck-residential-proxy-warning',
+                text: `Confirmed Residential Proxy: ${confirmedResidentialProxyProvider} — restrict CIDR blocking to this single IP and proceed with discretion on CIDR.`
+            }));
+        } else if (highlySuspectedResidentialProxy) {
             $cidrCell.append($('<div>', {
                 class: 'proxycheck-cidr-rationale proxycheck-residential-proxy-warning',
                 text: 'Highly Suspected Residential Proxy: this IP is highly likely to use residential proxy infrastructure. Restrict CIDR blocking to this single IP and proceed with discretion on CIDR.'
@@ -1519,7 +1533,7 @@
             const sanitise = (value) => String(value || '').replace(/[\r\n]+/g, ' ').replace(/<!--|-->|\{\{|\}\}|\[\[|\]\]/g, '').trim();
             const targetIp = sanitise((data && data.ip) || resolvedIp);
             const cidr = sanitise((data && data.recommendedCidr) || targetIp);
-            const esc = !highlySuspectedResidentialProxy && escCidr ? sanitise(escCidr) : '';
+            const esc = !isSingleIpResidentialProxy && escCidr ? sanitise(escCidr) : '';
             const asn = sanitise((data && data.primaryAsn) || (asnEntries[0] && asnEntries[0].value) || '');
             const isp = sanitise((ispEntries[0] && ispEntries[0].value) || '');
             const signals = [];

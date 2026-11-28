@@ -62,6 +62,7 @@ TOR_ONIONOO_SUMMARY_FILENAME = "tor_onionoo_summary.json"
 BGP_TOOLS_BIN_FILENAME = "bgp_tools.bin"
 BGP_TAGS_JSON_FILENAME = "bgp_tags.json"
 OPENASN_MMDB_FILENAME = "openasn.mmdb"
+OXYLABS_DIR_NAME = "oxylabs"
 MOBILE_ASNS_JSON_FILENAME = "mobile_asns.json"
 HTTP_FEED_METADATA_FILENAME = "http_feed_metadata.json"
 
@@ -161,6 +162,7 @@ DEFAULT_STALE_SFS_90_SECONDS = 2 * 86400
 DEFAULT_STALE_SFS_1_SECONDS = 6 * 3600
 DEFAULT_STALE_SHARED_CIDRS_SECONDS = 7 * 86400
 DEFAULT_STALE_OPENASN_SECONDS = 14 * 86400
+DEFAULT_STALE_OXYLABS_SECONDS = 7 * 86400
 DEFAULT_STALE_TOR_ONIONOO_SECONDS = 6 * 3600
 DEFAULT_STALE_DAILY_FEED_SECONDS = 7 * 86400
 DEFAULT_STALE_RULES_SECONDS = 90 * 86400
@@ -477,6 +479,30 @@ def resolve_feed_data_path(
     for directory in _effective_standard_dirs(env_overrides=env_overrides, base_dir=resolved_base):
         candidate = directory / filename
         if _is_regular_file(candidate, bypass_throttle=bypass_throttle):
+            return candidate
+    return None
+
+
+def resolve_oxylabs_data_dir(
+    *,
+    env_overrides: Optional[Mapping[str, str]] = None,
+    base_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    """Resolves the Oxylabs JSONL directory across OXYLABS_DATA_DIR, TOOL_DATA_DIR, and standard directories."""
+    raw_override = expand_configured_path(_lookup_config_value("OXYLABS_DATA_DIR", env_overrides=env_overrides))
+    if raw_override:
+        explicit = Path(raw_override)
+        return explicit if explicit.is_dir() else None
+
+    configured_dir = resolve_configured_data_dir(env_overrides=env_overrides)
+    if configured_dir:
+        candidate = Path(expand_configured_path(configured_dir)) / OXYLABS_DIR_NAME
+        return candidate if candidate.is_dir() else None
+
+    resolved_base = _effective_base_dir(base_dir)
+    for directory in _effective_standard_dirs(env_overrides=env_overrides, base_dir=resolved_base):
+        candidate = directory / OXYLABS_DIR_NAME
+        if candidate.is_dir():
             return candidate
     return None
 

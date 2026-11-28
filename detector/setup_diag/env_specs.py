@@ -13,6 +13,7 @@ from django.db import Error as DjangoDbError
 from ..offline import (
     DEFAULT_STALE_MAXMIND_SECONDS,
     DEFAULT_STALE_OPENASN_SECONDS,
+    DEFAULT_STALE_OXYLABS_SECONDS,
     DEFAULT_STALE_RULES_SECONDS,
     DEFAULT_STALE_SFS_1_SECONDS,
     DEFAULT_STALE_SFS_90_SECONDS,
@@ -291,6 +292,7 @@ def _build_env_specs() -> Tuple[EnvVarSpec, ...]:
         ("STOPFORUMSPAM_LISTED_1_PATH", "(auto)", "Override path for StopForumSpam 1-day listed IP archive", False),
         ("STOPFORUMSPAM_SQLITE_PATH", "(auto)", "Override path for stopforumspam.sqlite3 index", False),
         ("OPENASN_MMDB_PATH", "(auto)", "Override path for openasn.mmdb", False),
+        ("OXYLABS_DATA_DIR", "(auto)", "Override directory path for Oxylabs JSONL datasets", False),
         ("SHARED_CIDRS_BIN_PATH", "(auto)", "Override path for shared_cidrs.bin", False),
         ("HOSTING_ASN_RULES_PATH", "(auto)", "Override path for hosting_asn_rules.json", False),
         ("HOSTING_ASNS", "(built-in)", "Extra comma-separated hosting ASNs", False),
@@ -348,6 +350,11 @@ def _build_env_specs() -> Tuple[EnvVarSpec, ...]:
             "OFFLINE_DB_OPENASN_STALE_SECONDS",
             str(DEFAULT_STALE_OPENASN_SECONDS),
             "OpenASN MMDB staleness threshold",
+        ),
+        (
+            "OFFLINE_DB_OXYLABS_STALE_SECONDS",
+            str(DEFAULT_STALE_OXYLABS_SECONDS),
+            "Oxylabs JSONL datasets staleness threshold",
         ),
         (
             "OFFLINE_DB_SHARED_CIDRS_STALE_SECONDS",

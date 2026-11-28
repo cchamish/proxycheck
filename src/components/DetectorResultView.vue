@@ -172,23 +172,30 @@
               <div class="inline-group">
                 <code>{{ detectionData.recommendedCidr || '-' }}</code>
                 <span
-                  v-if="!detectionData.highlySuspectedResidentialProxy && (detectionData.bgpPrefix || (detectionData.mmdbCidr && detectionData.mmdbCidr !== detectionData.recommendedCidr))"
+                  v-if="!isSingleIpResidentialProxy && (detectionData.bgpPrefix || (detectionData.mmdbCidr && detectionData.mmdbCidr !== detectionData.recommendedCidr))"
                   class="text-subtle"
                 >
                   {{ t('detector-bgp-prefix', { prefix: detectionData.bgpPrefix || detectionData.mmdbCidr || '' }) }}
                 </span>
-                <span v-if="!detectionData.highlySuspectedResidentialProxy && detectionData.escalationCidr" class="text-subtle">
+                <span v-if="!isSingleIpResidentialProxy && detectionData.escalationCidr" class="text-subtle">
                   {{ t('detector-escalation-cidr') }} <code>{{ detectionData.escalationCidr }}</code>
                 </span>
               </div>
               <cdx-message v-if="isMobileOrCgnat" type="warning" :inline="true">
                 <strong>{{ t('detector-mobile-cgnat') }}</strong>
               </cdx-message>
-              <cdx-message v-if="detectionData.highlySuspectedResidentialProxy" type="error" :inline="true">
+              <cdx-message v-if="detectionData.confirmedResidentialProxy" type="error" :inline="true">
+                <strong>{{
+                  t('detector-confirmed-residential-cidr-warning', {
+                    provider: detectionData.confirmedResidentialProxyProvider || 'Oxylabs',
+                  })
+                }}</strong>
+              </cdx-message>
+              <cdx-message v-else-if="detectionData.highlySuspectedResidentialProxy" type="error" :inline="true">
                 <strong>{{ t('detector-highly-suspected-residential') }}</strong>
               </cdx-message>
               <span
-                v-if="!detectionData.highlySuspectedResidentialProxy && detectionData.cidrRationale"
+                v-if="!isSingleIpResidentialProxy && detectionData.cidrRationale"
                 class="text-subtle"
               >
                 {{ detectionData.cidrRationale }}
@@ -417,6 +424,10 @@ function normaliseSafeCidrOrIp(rawTarget?: string | null, fallbackIp?: string | 
     null
   );
 }
+
+const isSingleIpResidentialProxy = computed(() =>
+  Boolean(props.detectionData.confirmedResidentialProxy || props.detectionData.highlySuspectedResidentialProxy)
+);
 
 const predictionScoreTierClass = computed(() => {
   const data = props.detectionData;
@@ -860,6 +871,9 @@ async function handleCopyWikitext(): Promise<void> {
     );
   }
   if (isMobileOrCgnat.value) signals.push('Mobile cellular or CGNAT shared gateway');
+  if (data.confirmedResidentialProxy) {
+    signals.push(`Confirmed Residential Proxy: ${data.confirmedResidentialProxyProvider || 'Oxylabs'}`);
+  }
   if (data.suspectedResidentialProxy) signals.push('Suspected Residential Proxy or Compromised Host');
   if (openProxyPorts.value.length > 0) signals.push(`Open proxy ports: ${openProxyPorts.value.join(', ')}`);
   const dropRow = data.results?.find((row) => row?.provider === 'IPsum / DROP' && row.inSpamhausDrop);

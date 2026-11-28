@@ -20,6 +20,7 @@ from .adapters_local import (
     adapt_ipsum_drop,
     adapt_maxmind,
     adapt_openasn,
+    adapt_oxylabs,
     adapt_stopforumspam,
 )
 from .http import (
@@ -47,6 +48,7 @@ __all__ = [
     "adapt_ipsum_drop",
     "adapt_maxmind",
     "adapt_openasn",
+    "adapt_oxylabs",
     "adapt_proxycheck",
     "adapt_shodan_internetdb",
     "adapt_stopforumspam",

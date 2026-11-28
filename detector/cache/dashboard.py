@@ -147,6 +147,7 @@ async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict
     )
     has_ipsum_db = any(entry.get("key") == "ipsum_drop" and entry.get("exists") for entry in offline_databases)
     has_openasn_db = any(entry.get("key") == "openasn" and entry.get("exists") for entry in offline_databases)
+    has_oxylabs_db = any(entry.get("key") == "oxylabs" and entry.get("exists") for entry in offline_databases)
 
     providers_out: List[Dict[str, Any]] = []
     for meta in PROVIDER_REGISTRY:
@@ -162,6 +163,7 @@ async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict
             (meta.key == "stopforumspam" and not has_sfs_db)
             or (meta.key == "ipsum_drop" and not has_ipsum_db)
             or (meta.key == "openasn" and not has_openasn_db)
+            or (meta.key == "oxylabs" and not has_oxylabs_db)
         ):
             status_key, status_label = "db_missing", "Offline DB Missing"
         elif not configured:

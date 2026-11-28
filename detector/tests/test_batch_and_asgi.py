@@ -133,7 +133,7 @@ class BatchDetectTests(TestCase):
         called_providers = []
 
         def _make_stub(label):
-            async def _impl(client, ip):
+            async def _impl(*_args):
                 called_providers.append(label)
                 return {
                     "provider": label,
@@ -157,8 +157,8 @@ class BatchDetectTests(TestCase):
         with (
             override_settings(**TEST_UPSTREAM_SECRETS),
             patch("detector.cache.redis_backend.redis_client", fake_redis),
-            patch("detector.providers.dns_local.query_rdns_ptr", ptr_spy),
-            patch("detector.detection.service.lookup_tor_onionoo_offline", return_value=None),
+            patch("detector.providers.dns.query_rdns_ptr", ptr_spy),
+            patch("detector.offline.feeds.lookup_tor_onionoo_offline", return_value=None),
             patch("detector.rangeblock.service.query_rangeblocks_for_ips", rb_spy),
             patch("detector.core.http_client.get_shared_http_client", AsyncMock(return_value=mock_client)),
             patch_non_dnsbl_providers(_make_stub, overrides={"maxmind": AsyncMock(return_value=dict(MAXMIND_STUB))}),

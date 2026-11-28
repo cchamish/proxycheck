@@ -6,7 +6,7 @@ import ipaddress
 import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .adapters_common import (
+from .common import (
     _build_error_row,
     _build_ok_row,
     _build_risk_flags,

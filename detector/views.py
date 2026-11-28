@@ -64,7 +64,7 @@ from .detection.service import (
     refresh_single_canonical_ip,
 )
 from .detection.stream import stream_single_canonical_ip_sse
-from .offline import collect_offline_databases_status
+from .offline.feeds import collect_offline_databases_status
 from .provider_registry import USER_AGENT_HEADER
 from .rangeblock import service as rangeblock_service
 

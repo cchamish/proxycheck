@@ -15,13 +15,13 @@ import httpx
 from django.core.management.color import no_style
 from django.test import SimpleTestCase
 
-from detector.offline import (
+from detector.offline.prefix_index import BinaryPrefixIndexReader
+from detector.offline.store import (
     BGP_TAGS_JSON_FILENAME,
     BGP_TOOLS_BIN_FILENAME,
     MOBILE_ASNS_JSON_FILENAME,
     OPENASN_MMDB_FILENAME,
 )
-from detector.offline.prefix_index import BinaryPrefixIndexReader
 from detector.offline.updaters import (
     BGP_TOOLS_TABLE_URL,
     BGP_TOOLS_TAGS_URL,

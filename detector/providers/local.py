@@ -1,13 +1,34 @@
-"""Response adapters for offline local databases and DNSBL lookups."""
+"""Local offline database provider queries and response adapters."""
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import math
-from typing import Any, Dict, List, Optional, Tuple
+import os
+import sqlite3
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from ..offline import lookup_shared_cidr_offline
+from ..core.sanitization import sanitize_error_message
+from ..offline import cidr_attribution
+from ..offline import mmdb as offline_mmdb
 from ..offline.cidr_attribution import match_hosting_asn_or_org
-from .adapters_common import (
+from ..offline.feeds import (
+    lookup_shared_cidr_offline,
+    query_ipsum_drop_offline,
+    query_oxylabs_offline,
+)
+from ..offline.mmdb import (
+    MAXMIND_DB_SPECS,
+    evict_maxmind_reader,
+    evict_missing_maxmind_readers,
+    get_maxmind_newest_mtime_iso,
+    get_maxmind_reader,
+    query_openasn_offline,
+    record_city_db_presence,
+)
+from ..offline.sfs import query_stopforumspam_offline
+from .common import (
     _build_error_row,
     _build_ok_row,
     _build_risk_flags,
@@ -18,6 +39,8 @@ from .adapters_common import (
     _normalize_timestamp_or_text,
     _safe_int,
 )
+
+logger = logging.getLogger("detector.views")
 
 
 def _extract_maxmind_name(node: Any) -> str:
@@ -144,178 +167,6 @@ def adapt_maxmind(
         usage_type=usage_type,
         security_flags=flags,
         extra=extra,
-    )
-
-
-_SPAMHAUS_CODE_MAP: Dict[str, Tuple[str, str, bool]] = {
-    "127.0.0.2": ("SBL", "Spamhaus SBL", True),
-    "127.0.0.3": ("CSS", "Spamhaus CSS", True),
-    "127.0.0.4": ("XBL/CBL", "Spamhaus XBL/CBL", True),
-    "127.0.0.5": ("XBL/CBL", "Spamhaus XBL/CBL", True),
-    "127.0.0.6": ("XBL/CBL", "Spamhaus XBL/CBL", True),
-    "127.0.0.7": ("XBL/CBL", "Spamhaus XBL/CBL", True),
-    "127.0.0.9": ("SBL DROP/EDROP", "Spamhaus DROP/EDROP", True),
-    "127.0.0.10": ("Policy/Dynamic ISP Range (PBL)", "Policy/Dynamic ISP Range (PBL)", False),
-    "127.0.0.11": ("Policy/Dynamic ISP Range (PBL)", "Policy/Dynamic ISP Range (PBL)", False),
-}
-
-
-def _extract_dnsbl_codes(raw_data: Dict[str, Any]) -> List[str]:
-    raw_codes = raw_data.get("codes")
-    if not isinstance(raw_codes, list):
-        return []
-    seen = set()
-    cleaned: List[str] = []
-    for item in raw_codes:
-        if isinstance(item, str):
-            val = item.strip()
-            if val and val not in seen:
-                seen.add(val)
-                cleaned.append(val)
-    return cleaned
-
-
-def _adapt_dnsbl_precheck(
-    provider_name: str,
-    raw_data: Optional[Dict[str, Any]],
-    status_code: int,
-) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-    guarded, effective_status = _guard_payload(raw_data, status_code)
-    payload = guarded if isinstance(guarded, dict) else {}
-    state = str(payload.get("status") or "").strip().lower()
-
-    if state == "skipped_ipv6":
-        return (
-            _build_error_row(
-                provider_name,
-                None,
-                payload,
-                status="Skipped (IPv6)",
-                usage_type="IPv4 Only (Skipped for IPv6)",
-                extra={"isListed": False, "isSkippedIpv6": True, "listedCodes": [], "listedCategories": []},
-            ),
-            payload,
-        )
-
-    if effective_status != 200 or state in ("timeout", "error") or not raw_data:
-        if state == "timeout" or effective_status == 504:
-            status_text, out_code = "504 Timeout", 504
-        elif effective_status == 429:
-            status_text, out_code = "429 Rate Limited", 429
-        else:
-            out_code = effective_status if effective_status != 200 else 502
-            status_text = f"{out_code} DNS Error"
-        return (
-            _build_error_row(
-                provider_name,
-                out_code,
-                payload or None,
-                status=status_text,
-                raw_message=status_text,
-                extra={"isListed": False, "listedCodes": [], "listedCategories": []},
-            ),
-            payload,
-        )
-
-    return None, payload
-
-
-def _build_clean_dnsbl_row(provider_name: str, raw_data: Dict[str, Any]) -> Dict[str, Any]:
-    return _build_ok_row(
-        provider_name,
-        raw_data,
-        usage_type="Clean (Not Listed)",
-        extra={"isListed": False, "listedCodes": [], "listedCategories": []},
-    )
-
-
-def adapt_spamhaus_zen(raw_data: Optional[Dict[str, Any]], status_code: int = 200) -> Dict[str, Any]:
-    """Normalises Spamhaus ZEN DNSBL A-record responses including SBL, CSS, XBL, PBL, and policy blocks."""
-    early_row, payload = _adapt_dnsbl_precheck("Spamhaus ZEN", raw_data, status_code)
-    if early_row is not None:
-        return early_row
-
-    codes = _extract_dnsbl_codes(payload)
-    blocked_codes = [code for code in codes if code.startswith("127.255.255.")]
-    if blocked_codes:
-        reason_detail = (
-            "Public DNS Refused or Rate Limited"
-            if any(c in ("127.255.255.254", "127.255.255.255") for c in blocked_codes)
-            else "Query Format Error"
-        )
-        return _build_error_row(
-            "Spamhaus ZEN",
-            429,
-            payload,
-            status="429 Query Blocked",
-            usage_type=f"Query Restricted ({', '.join(blocked_codes)}: {reason_detail})",
-            security_flags=[{"label": "Query Restricted (Unapplied)", "isHighRisk": False}],
-            extra={"isListed": False, "isQueryRestricted": True, "listedCodes": [], "listedCategories": []},
-        )
-
-    if not codes:
-        return _build_clean_dnsbl_row("Spamhaus ZEN", payload)
-
-    flags: List[Dict[str, Any]] = []
-    usage_parts: List[str] = []
-    categories: List[str] = []
-    seen_labels = set()
-
-    for code in codes:
-        category, flag_label, is_high_risk = _SPAMHAUS_CODE_MAP.get(
-            code,
-            (f"Spamhaus Code {code}", f"Spamhaus Listed ({code})", True),
-        )
-        if category not in categories:
-            categories.append(category)
-        if code in ("127.0.0.10", "127.0.0.11"):
-            usage_parts.append(f"Policy/Dynamic ISP Range (PBL: {code})")
-            full_label = flag_label
-        else:
-            usage_parts.append(f"{category} ({code})")
-            full_label = f"{flag_label} ({code})"
-
-        if full_label not in seen_labels:
-            seen_labels.add(full_label)
-            flags.append({"label": full_label, "isHighRisk": is_high_risk})
-
-    is_only_pbl = all(code in ("127.0.0.10", "127.0.0.11") for code in codes)
-    usage_text = ", ".join(usage_parts) if is_only_pbl else f"Listed: {', '.join(usage_parts)}"
-
-    return _build_ok_row(
-        "Spamhaus ZEN",
-        payload,
-        usage_type=usage_text,
-        security_flags=flags,
-        extra={
-            "isListed": True,
-            "isPolicyRange": is_only_pbl,
-            "listedCodes": codes,
-            "listedCategories": categories,
-        },
-    )
-
-
-def adapt_spamcop(raw_data: Optional[Dict[str, Any]], status_code: int = 200) -> Dict[str, Any]:
-    """Normalises SpamCop DNSBL A-record responses."""
-    early_row, payload = _adapt_dnsbl_precheck("SpamCop", raw_data, status_code)
-    if early_row is not None:
-        return early_row
-
-    codes = _extract_dnsbl_codes(payload)
-    if not codes:
-        return _build_clean_dnsbl_row("SpamCop", payload)
-
-    return _build_ok_row(
-        "SpamCop",
-        payload,
-        usage_type=f"Listed: Spam Source ({', '.join(codes)})",
-        security_flags=[{"label": f"SpamCop Listed ({code})", "isHighRisk": True} for code in codes],
-        extra={
-            "isListed": True,
-            "listedCodes": codes,
-            "listedCategories": ["Spam Source"],
-        },
     )
 
 
@@ -647,4 +498,199 @@ def adapt_oxylabs(
         usage_type="Clean (Not Listed)",
         security_flags=_default_no_flags(),
         extra=row_extra,
+    )
+
+
+async def query_maxmind(ip: str) -> Dict[str, Any]:
+    """Reads local GeoLite2 and GeoIP2 Country, City, and ASN MMDB files off the ASGI event loop."""
+
+    def _run() -> Dict[str, Any]:
+        if not cidr_attribution.are_offline_intelligence_caches_warm():
+            cidr_attribution.warm_offline_intelligence_caches()
+
+        db_paths = offline_mmdb.resolve_maxmind_db_paths()
+        available_paths = {key: path for key, path in db_paths.items() if os.path.exists(path)}
+
+        for key, filename in MAXMIND_DB_SPECS:
+            if key not in available_paths:
+                evict_missing_maxmind_readers(filename, db_paths[key])
+
+        if not available_paths:
+            return adapt_maxmind(None, has_db=False)
+
+        city_path = db_paths["city"]
+        if record_city_db_presence(city_path, is_present="city" in available_paths):
+            logger.warning("GeoLite2-City.mmdb was not found at %s; MaxMind lookups will omit city", city_path)
+
+        try:
+            import maxminddb
+        except ImportError:
+            logger.warning("maxminddb package not installed; returning Database Missing fallback")
+            return adapt_maxmind(None, has_db=False)
+
+        try:
+            records: Dict[str, Optional[Dict[str, Any]]] = {}
+            prefix_lens: Dict[str, Optional[int]] = {}
+            for key, path in available_paths.items():
+                reader = get_maxmind_reader(path, maxminddb)
+                rec: Optional[Dict[str, Any]] = None
+                prefix_len: Optional[int] = None
+                getter = getattr(reader, "get_with_prefix_len", None)
+                if callable(getter):
+                    try:
+                        res = getter(ip)
+                    except AttributeError, NotImplementedError:
+                        res = None
+                    if (
+                        isinstance(res, tuple)
+                        and len(res) == 2
+                        and (res[0] is None or isinstance(res[0], dict))
+                        and isinstance(res[1], int)
+                        and not isinstance(res[1], bool)
+                    ):
+                        rec = res[0] if isinstance(res[0], dict) else None
+                        prefix_len = res[1]
+                    else:
+                        raw = reader.get(ip)
+                        rec = raw if isinstance(raw, dict) else None
+                else:
+                    raw = reader.get(ip)
+                    rec = raw if isinstance(raw, dict) else None
+                records[key] = rec
+                prefix_lens[key] = prefix_len
+
+            # Combine City, Country (keeping Country iso_code authoritative), and ASN records.
+            combined_record: Dict[str, Any] = {}
+            if isinstance(records.get("city"), dict):
+                combined_record.update({k: v for k, v in records["city"].items() if v is not None})
+            if isinstance(records.get("country"), dict):
+                for key, value in records["country"].items():
+                    if key in ("country", "registered_country", "represented_country", "continent", "traits"):
+                        existing = combined_record.get(key)
+                        if isinstance(existing, dict) and isinstance(value, dict):
+                            merged = dict(existing)
+                            for sub_key, sub_val in value.items():
+                                if (
+                                    sub_key == "names"
+                                    and isinstance(merged.get("names"), dict)
+                                    and isinstance(sub_val, dict)
+                                ):
+                                    merged["names"] = {**merged["names"], **sub_val}
+                                elif sub_val is not None:
+                                    merged[sub_key] = sub_val
+                            combined_record[key] = merged
+                        elif value is not None:
+                            combined_record[key] = value
+                    elif key not in combined_record and value is not None:
+                        combined_record[key] = value
+            if isinstance(records.get("asn"), dict):
+                combined_record.update({k: v for k, v in records["asn"].items() if v is not None})
+
+            resolved_prefix_len = next(
+                (prefix_lens.get(key) for key in ("asn", "country", "city") if prefix_lens.get(key) is not None),
+                None,
+            )
+            if resolved_prefix_len is not None:
+                combined_record["_mmdb_prefix_len"] = resolved_prefix_len
+            offline_updated_at = get_maxmind_newest_mtime_iso()
+            if offline_updated_at:
+                combined_record["_offline_db_updated_at"] = offline_updated_at
+
+            return adapt_maxmind(combined_record, has_db=True, status_code=200, ip=ip)
+        except (OSError, ValueError, RuntimeError) as exc:
+            for path in db_paths.values():
+                evict_maxmind_reader(path)
+            safe_message = sanitize_error_message(str(exc))
+            logger.error("Error querying MaxMind local database: %s", safe_message)
+            return adapt_maxmind({"error": safe_message}, has_db=True, status_code=500)
+
+    return await asyncio.to_thread(_run)
+
+
+async def _run_offline_provider(
+    ip: str,
+    lookup_fn: Callable[[str], Dict[str, Any]],
+    adapt_fn: Callable[..., Dict[str, Any]],
+    *,
+    error_label: str,
+    extra_exceptions: Tuple[type[BaseException], ...] = (),
+    payload_builder: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
+    error_payload_builder: Optional[Callable[[str], Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Runs a synchronous local offline lookup off the event loop and adapts its response."""
+
+    def _run() -> Dict[str, Any]:
+        try:
+            lookup = lookup_fn(ip)
+        except (OSError, ValueError, RuntimeError, *extra_exceptions) as exc:
+            safe_message = sanitize_error_message(str(exc))
+            logger.error("Error querying %s: %s", error_label, safe_message)
+            err_payload = (
+                error_payload_builder(safe_message)
+                if error_payload_builder is not None
+                else {"status": "error", "error": safe_message}
+            )
+            return adapt_fn(err_payload, status_code=500, has_db=True)
+        if not lookup.get("has_db"):
+            return adapt_fn(None, has_db=False)
+        payload = payload_builder(ip, lookup) if payload_builder is not None else lookup
+        return adapt_fn(payload, status_code=200, has_db=True)
+
+    return await asyncio.to_thread(_run)
+
+
+def _build_stopforumspam_payload(ip: str, lookup: Dict[str, Any]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "success": 1,
+        "ip": {
+            "ip": ip,
+            "appears": 1 if lookup.get("appears") else 0,
+            "frequency": int(lookup.get("frequency") or 0),
+            "lastseen": lookup.get("last_seen"),
+            "blacklisted": bool(lookup.get("blacklisted")),
+            "toxicCidr": lookup.get("toxic_cidr"),
+            "sources": lookup.get("sources") or [],
+        },
+    }
+    if lookup.get("offline_db_updated_at"):
+        payload["offlineDbUpdatedAt"] = lookup["offline_db_updated_at"]
+    return payload
+
+
+async def query_stopforumspam(ip: str) -> Dict[str, Any]:
+    return await _run_offline_provider(
+        ip,
+        query_stopforumspam_offline,
+        adapt_stopforumspam,
+        error_label="StopForumSpam offline database",
+        extra_exceptions=(sqlite3.Error,),
+        payload_builder=_build_stopforumspam_payload,
+        error_payload_builder=lambda msg: {"success": 0, "error": msg},
+    )
+
+
+async def query_ipsum_drop(ip: str) -> Dict[str, Any]:
+    return await _run_offline_provider(
+        ip,
+        query_ipsum_drop_offline,
+        adapt_ipsum_drop,
+        error_label="IPsum and Spamhaus DROP offline index",
+    )
+
+
+async def query_openasn(ip: str) -> Dict[str, Any]:
+    return await _run_offline_provider(
+        ip,
+        query_openasn_offline,
+        adapt_openasn,
+        error_label="OpenASN offline database",
+    )
+
+
+async def query_oxylabs(ip: str) -> Dict[str, Any]:
+    return await _run_offline_provider(
+        ip,
+        query_oxylabs_offline,
+        adapt_oxylabs,
+        error_label="Oxylabs offline dataset",
     )

@@ -71,6 +71,7 @@ class ProviderMetadata:
     is_commercial_arbitration: bool = False
     is_dnsbl: bool = False
     is_offline: bool = False
+    bypass_redis_cache: bool = False
     credential_setting: Optional[str] = None
     credential_description: Optional[str] = None
     default_rpm_limit: int = 0
@@ -259,6 +260,7 @@ PROVIDER_REGISTRY: Tuple[ProviderMetadata, ...] = (
         supports_cooldown=False,
         active_in_light_mode=True,
         is_offline=True,
+        bypass_redis_cache=True,
         has_quota_env_vars=False,
     ),
     ProviderMetadata(
@@ -268,6 +270,7 @@ PROVIDER_REGISTRY: Tuple[ProviderMetadata, ...] = (
         supports_cooldown=False,
         active_in_light_mode=True,
         is_offline=True,
+        bypass_redis_cache=True,
         has_quota_env_vars=False,
     ),
     ProviderMetadata(
@@ -309,7 +312,9 @@ OFFLINE_PROVIDER_KEYS: FrozenSet[str] = frozenset(meta.key for meta in PROVIDER_
 OFFLINE_REHYDRATE_PROVIDERS: FrozenSet[str] = OFFLINE_PROVIDER_KEYS
 
 # Local mmap and in-memory lookups cost microseconds, so these providers bypass Redis and L1/L2 snapshots.
-NO_REDIS_CACHE_PROVIDER_KEYS: FrozenSet[str] = frozenset({"openasn", "oxylabs"})
+NO_REDIS_CACHE_PROVIDER_KEYS: FrozenSet[str] = frozenset(
+    meta.key for meta in PROVIDER_REGISTRY if meta.bypass_redis_cache
+)
 
 L1_ONLY_PROVIDERS: FrozenSet[str] = frozenset({"iphub", "spamhaus_zen", "spamcop"})
 

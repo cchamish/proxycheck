@@ -13,13 +13,13 @@ from django.core.management.base import BaseCommand, CommandError
 from django.utils.crypto import get_random_string
 from dotenv import set_key
 
-from detector.offline import collect_offline_databases_status
+from detector.offline.feeds import collect_offline_databases_status
 from detector.setup_diag.env_specs import (
     _LOCAL_HOSTS,
     _SECRET_KEY_CHARS,
-    DEFAULT_JOB_SPEC,
     DEFAULT_PRODUCTION_REDIRECT_URI,
     DEFAULT_TOOLFORGE_ALLOWED_HOSTS,
+    DEFAULT_TOOLFORGE_IMAGE,
     DEFAULT_TOOLFORGE_REDIS_URL,
     ENV_MODES,
     ENV_SPECS,
@@ -662,7 +662,7 @@ class Command(BaseCommand):
             )
             if mode == "bastion":
                 target_image = (
-                    f"tool-{tool_account}/tool-{tool_account}:latest" if tool_account else DEFAULT_JOB_SPEC.image
+                    f"tool-{tool_account}/tool-{tool_account}:latest" if tool_account else DEFAULT_TOOLFORGE_IMAGE
                 )
                 if missing_maxmind_dbs and not has_maxmind_creds:
                     self.stdout.write(

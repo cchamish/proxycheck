@@ -34,23 +34,13 @@ from ..core.ip_utils import (
     classify_non_public_ip,
     normalize_query_mode,
 )
-from ..offline import (
-    cidr_attribution,
-    lookup_bgp_tools_offline,
-    lookup_tor_onionoo_offline,
-)
-from ..provider_registry import (
-    NO_REDIS_CACHE_PROVIDER_KEYS,
-)
-from ..providers import (
+from ..offline import cidr_attribution
+from ..providers import dns as dns_providers
+from ..providers.common import (
     PROVIDER_SPECS,
-    adapt_tor_onionoo,
-    build_cooldown_provider_row,
-    build_deferred_provider_row,
     is_unconfigured_provider_row,
 )
-from ..providers import dns_local as dns_providers
-from ..providers.dns_local import reverse_ipv4_octets
+from ..providers.dns import reverse_ipv4_octets
 from ..rangeblock import service as rangeblock_service
 from .arbitration import (
     attach_request_diagnostics,
@@ -61,30 +51,31 @@ from .pipeline import (
     _BATCH_DETECT_CONCURRENCY,
     _DEFAULT_REFRESH_COOLDOWN_SECONDS,
     _DEFAULT_SWR_BACKOFF_SECONDS,
-    _LOCK_POLL_INTERVAL_SECONDS,
-    _LOCK_POLL_MAX_WAIT_SECONDS,
     _assemble_detection_payload,
-    _build_cache_or_cooldown_write,
-    _build_telemetry_entry,
     _ensure_offline_caches_warm,
     _evaluate_quota_candidates,
+    _extract_offline_bgp_prefix,
     _fetch_provider_cooldowns,
     _has_transient_upstream_failures,
-    _normalize_executed_row,
+    _persist_full_snapshot,
     _plan_provider_execution,
+    _poll_for_concurrent_snapshot,
     _read_provider_caches,
+    _record_global_cache_telemetry,
+    _rehydrate_layer_snapshot,
     _rehydrate_snapshot_payload,
-    _resolve_cache_layer_telemetry_event,
+    _resolve_offline_tor_row,
     _resolve_ptr_outcome,
-    _safe_l2_aget_snapshot,
     _safe_l2_amerge_snapshot,
+    _settle_provider_rows,
     _stamp_offline_signatures,
     _try_read_l1_snapshot,
+    _try_read_snapshot_with_layer,
 )
 
 logger = logging.getLogger("detector.views")
 
-_ip_detect_inflight: Dict[Tuple[str, str], Tuple[asyncio.Task[Dict[str, Any]], asyncio.AbstractEventLoop]] = {}
+_ip_detect_inflight: Dict[Tuple[str, str], asyncio.Task[Dict[str, Any]]] = {}
 _ip_detect_inflight_lock = threading.Lock()
 
 
@@ -108,17 +99,11 @@ async def _execute_detection_with_cache(
 
     active_redis = get_redis_client()
     executed_provider_results: Dict[str, Any] = {}
-    if (
-        normalized_mode == "light"
-        and "tor_onionoo" not in cached_providers
-        and "tor_onionoo" not in deferred_provider_keys
-    ):
-        offline_tor = lookup_tor_onionoo_offline(ip)
-        if isinstance(offline_tor, dict):
-            executed_provider_results["tor_onionoo"] = adapt_tor_onionoo(offline_tor, status_code=200, ip=ip)
-        else:
-            deferred_provider_keys = deferred_provider_keys | {"tor_onionoo"}
-        missed_cooldown_keys = [k for k in missed_cooldown_keys if k != "tor_onionoo"]
+    offline_tor_row, deferred_provider_keys, missed_cooldown_keys = _resolve_offline_tor_row(
+        ip, normalized_mode, cached_providers, deferred_provider_keys, missed_cooldown_keys
+    )
+    if offline_tor_row is not None:
+        executed_provider_results["tor_onionoo"] = offline_tor_row
 
     cooldown_entries = await _fetch_provider_cooldowns(active_redis, missed_cooldown_keys)
     candidate_specs = [
@@ -134,7 +119,8 @@ async def _execute_detection_with_cache(
     )
     specs_to_execute = [spec for spec in candidate_specs if spec.key not in quota_blocked_entries]
     needs_ptr = cached_ptr is None and normalized_mode != "light"
-    needs_cymru_bgp = needs_ptr and lookup_bgp_tools_offline(ip) is None
+    cymru_bgp_prefix = _extract_offline_bgp_prefix(ip)
+    needs_cymru_bgp = needs_ptr and cymru_bgp_prefix is None
     needs_http_client = any(spec.uses_http_client and spec.key in cache_expected_keys for spec in specs_to_execute)
 
     upstream_events: Dict[str, Dict[str, Any]] = {}
@@ -142,7 +128,6 @@ async def _execute_detection_with_cache(
     rdns_state: Dict[str, str] = {"status": "ok"}
     rdns_token = rdns_context_state.set(rdns_state)
     ptr_raw: Any = None
-    cymru_bgp_prefix: Optional[str] = None
     try:
         client = await http_client.get_shared_http_client() if needs_http_client else None
         coroutines: List[Any] = [spec.invoke(client, ip) for spec in specs_to_execute]
@@ -175,92 +160,56 @@ async def _execute_detection_with_cache(
 
     now_dt = datetime.now(timezone.utc)
     now_iso = now_dt.isoformat()
-    clean_results: List[Dict[str, Any]] = []
-    redis_set_entries: List[Tuple[str, str, int]] = []
-    telemetry_entries: List[Dict[str, Any]] = []
-    cached_at_timestamps: List[str] = []
     default_cooldown, _, _ = get_cooldown_bounds()
-    hit_count = miss_count = cooldown_count = 0
-
-    for spec in PROVIDER_SPECS:
-        provider_key = spec.key
-        provider_name = spec.label
-        if provider_key in cached_providers:
-            row, cached_at = cached_providers[provider_key]
-            row_copy = {**row, "isCached": True}
-            if cached_at:
-                row_copy["cachedAt"] = cached_at
-            clean_results.append(row_copy)
-            if not is_unconfigured_provider_row(row_copy):
-                hit_count += 1
-                if cached_at:
-                    cached_at_timestamps.append(cached_at)
-                if active_redis is not None:
-                    telemetry_entries.append({"provider_key": provider_key, "outcome": "cache_hit"})
-            continue
-
-        if provider_key in deferred_provider_keys:
-            clean_results.append(build_deferred_provider_row(provider_name))
-            continue
-
-        if provider_key in cooldown_entries or provider_key in quota_blocked_entries:
-            cd_info = cooldown_entries.get(provider_key) or quota_blocked_entries[provider_key]
-            clean_results.append(build_cooldown_provider_row(provider_name, cd_info))
-            cooldown_count += 1
-            continue
-
-        raw_res = executed_provider_results.get(provider_key)
-        row, miss_triggered_exception = _normalize_executed_row(provider_name, raw_res)
-        clean_results.append(row)
-        if not is_unconfigured_provider_row(row) and provider_key not in NO_REDIS_CACHE_PROVIDER_KEYS:
-            miss_count += 1
-
-        if active_redis is None:
-            continue
-        event = upstream_events.get(provider_key)
-        tel_entry = _build_telemetry_entry(
-            provider_key, row, event, miss_triggered_exception, raw_res, quota_consumed_keys
-        )
-        if tel_entry is not None:
-            telemetry_entries.append(tel_entry)
-        write_entry = _build_cache_or_cooldown_write(
-            spec, ip, row, event, miss_triggered_exception, now_dt, now_iso, default_cooldown
-        )
-        if write_entry is not None:
-            redis_set_entries.append(write_entry)
+    settled = _settle_provider_rows(
+        ip,
+        cached_providers=cached_providers,
+        deferred_provider_keys=deferred_provider_keys,
+        cooldown_entries=cooldown_entries,
+        quota_blocked_entries=quota_blocked_entries,
+        executed_results=executed_provider_results,
+        upstream_events=upstream_events,
+        quota_consumed_keys=quota_consumed_keys,
+        active_redis=active_redis,
+        now_dt=now_dt,
+        now_iso=now_iso,
+        default_cooldown=default_cooldown,
+        include_missing_executed=True,
+    )
 
     if cached_ptr is not None or needs_ptr:
         ptr_hostname, ptr_hit, ptr_miss, ptr_cached_at, ptr_write = _resolve_ptr_outcome(
             ip, cached_ptr, ptr_raw, rdns_state, active_redis, now_iso
         )
-        hit_count += ptr_hit
-        miss_count += ptr_miss
+        settled.hit_count += ptr_hit
+        settled.miss_count += ptr_miss
         if ptr_cached_at:
-            cached_at_timestamps.append(ptr_cached_at)
+            settled.cached_at_timestamps.append(ptr_cached_at)
         if ptr_write is not None:
-            redis_set_entries.append(ptr_write)
+            settled.redis_set_entries.append(ptr_write)
     else:
         ptr_hostname = None
 
     redis_write_ops = []
-    if redis_set_entries:
-        redis_write_ops.append(safe_redis_set_many(redis_set_entries))
-    if active_redis is not None and telemetry_entries:
-        redis_write_ops.append(quota_telemetry.record_provider_outcomes_batch(telemetry_entries, now_dt=now_dt))
+    if settled.redis_set_entries:
+        redis_write_ops.append(safe_redis_set_many(settled.redis_set_entries))
+    if active_redis is not None and settled.telemetry_entries:
+        redis_write_ops.append(quota_telemetry.record_provider_outcomes_batch(settled.telemetry_entries, now_dt=now_dt))
     if redis_write_ops:
         await asyncio.gather(*redis_write_ops)
 
     await _ensure_offline_caches_warm()
 
-    all_cached_l1 = miss_count == 0 and cooldown_count == 0 and hit_count > 0
+    clean_results = settled.ordered_rows()
+    all_cached_l1 = settled.miss_count == 0 and settled.cooldown_count == 0 and settled.hit_count > 0
     assembled = _assemble_detection_payload(
         ip,
         clean_results,
         ptr_hostname,
-        hit_count=hit_count,
-        miss_count=miss_count,
-        cooldown_count=cooldown_count,
-        cached_at_timestamps=cached_at_timestamps,
+        hit_count=settled.hit_count,
+        miss_count=settled.miss_count,
+        cooldown_count=settled.cooldown_count,
+        cached_at_timestamps=settled.cached_at_timestamps,
         query_mode=normalized_mode,
         is_partial_mode=bool(deferred_provider_keys),
         bgp_prefix=cymru_bgp_prefix,
@@ -270,26 +219,12 @@ async def _execute_detection_with_cache(
 
     has_transient_failure = _has_transient_upstream_failures(
         clean_results,
-        cooldown_count=cooldown_count,
+        cooldown_count=settled.cooldown_count,
         cached_ptr=cached_ptr,
         rdns_state=rdns_state,
     )
     if persist_snapshots and not all_cached_l1 and not deferred_provider_keys and not has_transient_failure:
-        snapshot_for_storage = {
-            **assembled,
-            "fetchedAt": now_iso,
-            "results": _stamp_offline_signatures(clean_results),
-            "_ptrResolved": True,
-        }
-        await asyncio.gather(
-            set_cached_ip_snapshot(ip, snapshot_for_storage, mode="full"),
-            _safe_l2_amerge_snapshot(
-                ip,
-                {**assembled, "fetchedAt": now_iso, "results": clean_results},
-                query_mode="full",
-                now_dt=now_dt,
-            ),
-        )
+        await _persist_full_snapshot(ip, assembled, clean_results, now_dt=now_dt, now_iso=now_iso)
     elif not persist_snapshots:
         assembled["_rawCleanResults"] = clean_results
         assembled["_hasTransientFailure"] = has_transient_failure
@@ -357,46 +292,6 @@ async def _await_inflight_task(
     return await asyncio.shield(asyncio.wrap_future(bridge_future))
 
 
-async def _poll_for_concurrent_snapshot(
-    ip: str,
-    normalized_mode: str,
-) -> Optional[Dict[str, Any]]:
-    max_attempts = max(1, int(_LOCK_POLL_MAX_WAIT_SECONDS / _LOCK_POLL_INTERVAL_SECONDS))
-    for _ in range(max_attempts):
-        await asyncio.sleep(_LOCK_POLL_INTERVAL_SECONDS)
-        l1_snap = await _try_read_l1_snapshot(ip, normalized_mode)
-        if l1_snap is not None:
-            return await _rehydrate_snapshot_payload(
-                ip,
-                l1_snap,
-                layer="L1",
-                normalized_mode=normalized_mode,
-                force_rehydrate_offline=False,
-            )
-        if not await is_ip_updating_locked(ip):
-            l1_after = await _try_read_l1_snapshot(ip, normalized_mode)
-            if l1_after is not None:
-                return await _rehydrate_snapshot_payload(
-                    ip,
-                    l1_after,
-                    layer="L1",
-                    normalized_mode=normalized_mode,
-                    force_rehydrate_offline=False,
-                )
-            l2_after = await _safe_l2_aget_snapshot(ip, mode=normalized_mode)
-            if l2_after is not None:
-                return await _rehydrate_snapshot_payload(
-                    ip,
-                    l2_after,
-                    layer="L2",
-                    normalized_mode=normalized_mode,
-                    force_rehydrate_offline=True,
-                    backfill_l1=True,
-                )
-            break
-    return None
-
-
 async def _execute_l1_l2_or_upstream(
     target_ip: str,
     target_mode: str,
@@ -404,26 +299,9 @@ async def _execute_l1_l2_or_upstream(
     skip_prefetched_snapshots: bool = False,
 ) -> Dict[str, Any]:
     if not skip_prefetched_snapshots:
-        l1_snap = await _try_read_l1_snapshot(target_ip, target_mode)
-        if l1_snap is not None:
-            return await _rehydrate_snapshot_payload(
-                target_ip,
-                l1_snap,
-                layer="L1",
-                normalized_mode=target_mode,
-                force_rehydrate_offline=False,
-            )
-
-        l2_snap = await _safe_l2_aget_snapshot(target_ip, mode=target_mode)
-        if l2_snap is not None:
-            return await _rehydrate_snapshot_payload(
-                target_ip,
-                l2_snap,
-                layer="L2",
-                normalized_mode=target_mode,
-                force_rehydrate_offline=True,
-                backfill_l1=True,
-            )
+        snapshot, layer = await _try_read_snapshot_with_layer(target_ip, target_mode)
+        if snapshot is not None:
+            return await _rehydrate_layer_snapshot(target_ip, snapshot, layer=layer, normalized_mode=target_mode)
 
     cached_providers, cached_ptr = await _read_provider_caches(target_ip)
     all_cached = False
@@ -541,14 +419,7 @@ async def detect_single_canonical_ip(
     rb_summary = await rb_task if rb_task is not None else None
 
     base_payload = shared_payload
-    cache_meta = base_payload.get("cacheMeta") or {}
-    cache_status = cache_meta.get("status")
-    if isinstance(cache_status, str) and cache_status in ("hit", "stale", "partial", "miss"):
-        await quota_telemetry.record_global_request_telemetry(
-            cache_status,
-            auth_mode,
-            cache_layer_event=_resolve_cache_layer_telemetry_event(cache_meta),
-        )
+    await _record_global_cache_telemetry(base_payload.get("cacheMeta"), auth_mode)
 
     response_payload = strip_raw_json_from_payload(base_payload) if compact else dict(base_payload)
     if rb_summary is not None:
@@ -597,30 +468,17 @@ async def _try_serve_existing_snapshot_for_refresh(
     *,
     refresh_in_progress: bool,
 ) -> Optional[Dict[str, Any]]:
-    l1_snap = await _try_read_l1_snapshot(ip, normalized_mode)
-    if l1_snap is not None:
-        return await _rehydrate_snapshot_payload(
-            ip,
-            l1_snap,
-            layer="L1",
-            normalized_mode=normalized_mode,
-            force_rehydrate_offline=False,
-            force_should_auto_refresh=False,
-            force_refresh_in_progress=refresh_in_progress,
-        )
-    l2_snap = await _safe_l2_aget_snapshot(ip, mode=normalized_mode)
-    if l2_snap is not None:
-        return await _rehydrate_snapshot_payload(
-            ip,
-            l2_snap,
-            layer="L2",
-            normalized_mode=normalized_mode,
-            force_rehydrate_offline=True,
-            force_should_auto_refresh=False,
-            force_refresh_in_progress=refresh_in_progress,
-            backfill_l1=True,
-        )
-    return None
+    snapshot, layer = await _try_read_snapshot_with_layer(ip, normalized_mode)
+    if snapshot is None:
+        return None
+    return await _rehydrate_layer_snapshot(
+        ip,
+        snapshot,
+        layer=layer,
+        normalized_mode=normalized_mode,
+        force_should_auto_refresh=False,
+        force_refresh_in_progress=refresh_in_progress,
+    )
 
 
 async def _finalize_refresh_payload(
@@ -679,12 +537,7 @@ async def refresh_single_canonical_ip(
             refresh_in_progress=False,
         )
         if cooldown_cached is not None:
-            cache_meta = cooldown_cached.get("cacheMeta") or {}
-            await quota_telemetry.record_global_request_telemetry(
-                str(cache_meta.get("status") or "hit"),
-                auth_mode,
-                cache_layer_event=_resolve_cache_layer_telemetry_event(cache_meta),
-            )
+            await _record_global_cache_telemetry(cooldown_cached.get("cacheMeta"), auth_mode)
             return await _finalize_refresh_payload(
                 cooldown_cached, ip=ip, wiki=wiki, compact=compact, start_time=start_time
             )

@@ -23,7 +23,15 @@ from django.core.management.base import CommandError
 
 from ..core.sanitization import sanitize_error_message
 from ..provider_registry import USER_AGENT_HEADER
-from . import (
+from .cidr_attribution import clear_offline_intelligence_caches
+from .feeds import (
+    classify_rezmoss_provider,
+    clear_offline_feed_caches,
+)
+from .mmdb import clear_maxmind_readers
+from .prefix_index import compile_binary_prefix_index, parse_cidr_to_int_prefix
+from .sfs import build_stopforumspam_sqlite_index
+from .store import (
     BGP_TAGS_JSON_FILENAME,
     BGP_TOOLS_BIN_FILENAME,
     HTTP_FEED_METADATA_FILENAME,
@@ -42,16 +50,10 @@ from . import (
     TOR_ONIONOO_SUMMARY_FILENAME,
     PrefixCidrIndex,
     atomic_temp_path,
-    build_stopforumspam_sqlite_index,
-    classify_rezmoss_provider,
-    clear_maxmind_readers,
-    clear_stopforumspam_caches,
     replace_temp_file_atomically,
     resolve_configured_data_dir,
     resolve_writable_data_dir,
 )
-from .cidr_attribution import clear_offline_intelligence_caches
-from .prefix_index import compile_binary_prefix_index, parse_cidr_to_int_prefix
 
 try:
     import maxminddb
@@ -554,7 +556,7 @@ class OfflineDbUpdater:
                     listed_90_target if listed_90_target.is_file() else None,
                     listed_1_target if listed_1_target.is_file() else None,
                 )
-                clear_stopforumspam_caches()
+                clear_offline_feed_caches()
                 self.stdout.write(
                     self.style.SUCCESS(
                         f"Rebuilt StopForumSpam SQLite index ({sqlite_target.name}, {row_count} entries)."

@@ -17,7 +17,7 @@ from django.db import Error as DjangoDbError
 from django.db import close_old_connections, connections
 
 from ..models import IpIntelligenceCache
-from ..offline import collect_offline_databases_status
+from ..offline.feeds import collect_offline_databases_status
 from ..provider_registry import PROVIDER_REGISTRY, REDIS_TRANSPORT_ERRORS
 from .quota_telemetry import (
     _decode_redis_str,
@@ -139,15 +139,9 @@ async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict
 
     offline_databases = await asyncio.to_thread(collect_offline_databases_status, now_dt=current_dt)
     l2_estimated_rows = await sync_to_async(_estimate_l2_table_rows_sync, thread_sensitive=True)()
-    has_maxmind_db = any(
-        entry.get("key", "").startswith("maxmind_") and entry.get("exists") for entry in offline_databases
-    )
-    has_sfs_db = any(
-        entry.get("key", "").startswith("stopforumspam_") and entry.get("exists") for entry in offline_databases
-    )
-    has_ipsum_db = any(entry.get("key") == "ipsum_drop" and entry.get("exists") for entry in offline_databases)
-    has_openasn_db = any(entry.get("key") == "openasn" and entry.get("exists") for entry in offline_databases)
-    has_oxylabs_db = any(entry.get("key") == "oxylabs" and entry.get("exists") for entry in offline_databases)
+    available_offline_providers = {
+        entry["providerKey"] for entry in offline_databases if entry.get("providerKey") and entry.get("exists")
+    }
 
     providers_out: List[Dict[str, Any]] = []
     for meta in PROVIDER_REGISTRY:
@@ -157,15 +151,9 @@ async def build_dashboard_snapshot(*, now_dt: Optional[datetime] = None) -> Dict
             meta.key, (0, 0, 0, None, {})
         )
 
-        if meta.key == "maxmind" and not has_maxmind_db:
-            status_key, status_label = "db_missing", "Database Missing"
-        elif (
-            (meta.key == "stopforumspam" and not has_sfs_db)
-            or (meta.key == "ipsum_drop" and not has_ipsum_db)
-            or (meta.key == "openasn" and not has_openasn_db)
-            or (meta.key == "oxylabs" and not has_oxylabs_db)
-        ):
-            status_key, status_label = "db_missing", "Offline DB Missing"
+        if meta.is_offline and meta.key not in available_offline_providers:
+            status_key = "db_missing"
+            status_label = "Database Missing" if meta.key == "maxmind" else "Offline DB Missing"
         elif not configured:
             status_key, status_label = "no_api_key", "No API Key"
         elif cooldown_ttl > 0:

@@ -12,6 +12,7 @@ from detector import views
 from detector.cache import redis_backend as cache_backends
 from detector.detection import service as detection_service
 from detector.providers import http as providers
+from detector.providers.common import is_provider_result_cacheable
 
 from .helpers import MAXMIND_STUB, _BatchingFakeRedis, _mock_response, patch_non_dnsbl_providers
 
@@ -54,7 +55,7 @@ class CacheAndOrchestrationTests(TestCase):
         calls = {"proxycheck": 0}
 
         def _make_provider(name):
-            async def _impl(client, ip):
+            async def _impl(*_args):
                 if name == "Proxycheck":
                     calls["proxycheck"] += 1
                     await asyncio.sleep(0.02)
@@ -82,7 +83,7 @@ class CacheAndOrchestrationTests(TestCase):
 
         with (
             patch("detector.cache.redis_backend.redis_client", fake_redis),
-            patch("detector.providers.dns_local.query_rdns_ptr", AsyncMock(return_value="dns.google")),
+            patch("detector.providers.dns.query_rdns_ptr", AsyncMock(return_value="dns.google")),
             patch("detector.core.http_client.get_shared_http_client", AsyncMock(return_value=mock_client)),
             patch_non_dnsbl_providers(
                 _make_provider, overrides={"maxmind": AsyncMock(return_value=dict(MAXMIND_STUB))}
@@ -109,7 +110,7 @@ class CacheAndOrchestrationTests(TestCase):
         with (
             override_settings(PROXYCHECK_API_KEY="test-proxycheck-key"),
             patch("detector.cache.redis_backend.redis_client", fake_redis),
-            patch("detector.providers.dns_local.query_rdns_ptr", AsyncMock(return_value=None)),
+            patch("detector.providers.dns.query_rdns_ptr", AsyncMock(return_value=None)),
             patch("detector.core.http_client.get_shared_http_client", AsyncMock(return_value=mock_client)),
             patch_non_dnsbl_providers(
                 lambda name: AsyncMock(return_value=dict(MAXMIND_STUB, provider=name)),
@@ -122,7 +123,7 @@ class CacheAndOrchestrationTests(TestCase):
             payload_429 = asyncio.run(detection_service.detect_single_canonical_ip("8.8.8.8", "session", 0.0))
             row_429 = next(r for r in payload_429["results"] if r["provider"] == "Proxycheck")
             self.assertEqual(row_429["statusCode"], 429)
-            self.assertFalse(providers.is_provider_result_cacheable(row_429))
+            self.assertFalse(is_provider_result_cacheable(row_429))
             cd_key = cache_backends.provider_cooldown_key("proxycheck")
             self.assertIn(cd_key, fake_redis.strings)
             self.assertEqual(fake_redis.ttls.get(cd_key), 90)
@@ -132,6 +133,6 @@ class CacheAndOrchestrationTests(TestCase):
             payload_timeout = asyncio.run(detection_service.detect_single_canonical_ip("8.8.4.4", "session", 0.0))
             row_timeout = next(r for r in payload_timeout["results"] if r["provider"] == "Proxycheck")
             self.assertEqual(row_timeout["statusCode"], 502)
-            self.assertFalse(providers.is_provider_result_cacheable(row_timeout))
+            self.assertFalse(is_provider_result_cacheable(row_timeout))
             self.assertIn(cd_key, fake_redis.strings)
             self.assertNotIn(cache_backends.provider_cache_key("proxycheck", "8.8.4.4"), fake_redis.strings)

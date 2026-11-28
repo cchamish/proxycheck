@@ -11,7 +11,8 @@ from django.test import Client, TestCase, override_settings
 from detector import views
 from detector.auth.oauth import MetaWikiRightsFetchError
 from detector.cache import redis_backend as cache_backends
-from detector.providers import adapt_dshield, adapt_stopforumspam, adapt_tor_onionoo
+from detector.providers.adapters_http import adapt_dshield, adapt_tor_onionoo
+from detector.providers.local import adapt_stopforumspam
 
 from .helpers import FakeAsyncRedis, _login_authorised, _mock_response, start_non_dnsbl_provider_stubs
 

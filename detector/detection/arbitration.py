@@ -132,7 +132,9 @@ def build_non_public_response_payload(
         "sharedPrivacyEgress": None,
         "confirmedResidentialProxy": False,
         "confirmedResidentialProxyProvider": None,
+        "highlySuspectedResidentialProxy": False,
         "suspectedResidentialProxy": False,
+        "openProxyPorts": [],
         "fetchedAt": None,
         "results": [],
         "isCached": False,
@@ -378,10 +380,9 @@ def _collect_arbitration_signals(rows: List[Dict[str, Any]]) -> _ArbitrationSign
                 is_affirmative_osint = True
             elif bool(row.get("isHosting")):
                 sig.has_hosting = True
-        elif provider == "Oxylabs":
-            if bool(row.get("isListed")):
-                sig.confirmed_residential_proxy_provider = str(row.get("residentialProxyProvider") or "Oxylabs")
-                is_affirmative_osint = True
+        elif bool(row.get("isListed")) and row.get("residentialProxyProvider"):
+            sig.confirmed_residential_proxy_provider = str(row["residentialProxyProvider"])
+            is_affirmative_osint = True
         elif provider == "Shodan InternetDB":
             raw_proxy_ports = row.get("openProxyPorts")
             if isinstance(raw_proxy_ports, list) and len(raw_proxy_ports) > 0:

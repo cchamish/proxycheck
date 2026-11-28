@@ -8,24 +8,28 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
-import math
 import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
-from . import (
-    MOBILE_BGP_TAG_TOKENS,
-    FileStatCache,
-    are_stopforumspam_caches_warm,
-    clear_stopforumspam_caches,
-    get_file_stat_signature,
-    get_setting,
+from .feeds import (
+    clear_offline_feed_caches,
     is_mobile_asn_offline,
     lookup_bgp_tools_offline,
     lookup_privacy_relay_offline,
     lookup_shared_cidr_offline,
-    query_openasn_offline,
-    resolve_hosting_rules_path,
+)
+from .mmdb import query_openasn_offline
+from .sfs import (
+    are_stopforumspam_caches_warm,
     warm_stopforumspam_caches,
+)
+from .store import (
+    MOBILE_BGP_TAG_TOKENS,
+    FileStatCache,
+    _parse_asn_int,
+    get_file_stat_signature,
+    get_setting,
+    resolve_hosting_rules_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -314,24 +318,7 @@ def classify_rdns_hostname(hostname: Optional[str]) -> Dict[str, Any]:
     }
 
 
-def _normalize_asn_number(asn_val: Any) -> Optional[int]:
-    """Parses a positive autonomous system number from integers or AS-prefixed strings."""
-    if isinstance(asn_val, bool) or asn_val is None:
-        return None
-    if isinstance(asn_val, int):
-        return asn_val if asn_val > 0 else None
-    if isinstance(asn_val, float):
-        if math.isfinite(asn_val) and asn_val > 0 and asn_val.is_integer():
-            return int(asn_val)
-        return None
-    if isinstance(asn_val, str):
-        cleaned = asn_val.strip().upper()
-        if cleaned.startswith("AS"):
-            cleaned = cleaned[2:].strip()
-        if cleaned.isdigit():
-            parsed = int(cleaned)
-            return parsed if parsed > 0 else None
-    return None
+_normalize_asn_number = _parse_asn_int
 
 
 _hosting_rules_cache: FileStatCache[
@@ -472,9 +459,9 @@ def match_hosting_asn_or_org(asn: Any, org_name: Optional[str]) -> Optional[Dict
 
 
 def clear_offline_intelligence_caches() -> None:
-    """Clears in-memory hosting ASN rule, stat throttle, mmap, and StopForumSpam caches."""
+    """Clears in-memory hosting ASN rule, stat throttle, mmap, and offline feed caches."""
     _hosting_rules_cache.clear()
-    clear_stopforumspam_caches()
+    clear_offline_feed_caches()
 
 
 def are_offline_intelligence_caches_warm() -> bool:

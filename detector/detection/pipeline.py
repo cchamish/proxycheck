@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Set, Tuple
 
 import httpx
 
-from .. import offline as offline_dbs
 from ..cache import l2_store as l2_cache
 from ..cache import quota_telemetry
 from ..cache.quota_telemetry import is_provider_configured
@@ -32,15 +32,15 @@ from ..cache.redis_backend import (
 )
 from ..core import sanitization
 from ..core.ip_utils import normalize_query_mode, parse_compact_flag
-from ..offline import (
-    cidr_attribution,
-    get_maxmind_newest_mtime_iso,
-    get_openasn_mtime_iso,
-    get_oxylabs_mtime_iso,
-    get_positive_int_setting,
+from ..offline import cidr_attribution
+from ..offline import feeds as offline_feeds
+from ..offline import mmdb as offline_mmdb
+from ..offline.mmdb import get_maxmind_newest_mtime_iso
+from ..offline.sfs import (
     get_stopforumspam_db_version,
     has_any_local_stopforumspam_db,
 )
+from ..offline.store import get_positive_int_setting
 from ..provider_registry import (
     DNSBL_PROVIDER_KEYS,
     LIGHT_MODE_ACTIVE_PROVIDER_KEYS,
@@ -48,9 +48,12 @@ from ..provider_registry import (
     OFFLINE_PROVIDER_KEYS,
     OFFLINE_REHYDRATE_PROVIDERS,
 )
-from ..providers import (
+from ..providers.adapters_http import adapt_tor_onionoo
+from ..providers.common import (
     PROVIDER_SPECS,
     ProviderSpec,
+    build_cooldown_provider_row,
+    build_deferred_provider_row,
     build_unhandled_provider_error_row,
     is_provider_result_cacheable,
     is_unconfigured_provider_row,
@@ -138,15 +141,11 @@ def _compute_age_and_staleness(
 
 def _current_offline_provider_signature(provider_key: str) -> str:
     if provider_key == "maxmind":
-        return f"{get_maxmind_newest_mtime_iso() or 'none'}|{int(offline_dbs.has_local_maxmind_city_db())}"
+        return f"{get_maxmind_newest_mtime_iso() or 'none'}|{int(offline_mmdb.has_local_maxmind_city_db())}"
     if provider_key == "stopforumspam":
         return f"v:{get_stopforumspam_db_version()}"
     if provider_key == "ipsum_drop":
-        return offline_dbs._ipsum_drop_index.get_reader_and_mtime()[1] or "none"
-    if provider_key == "openasn":
-        return get_openasn_mtime_iso() or "none"
-    if provider_key == "oxylabs":
-        return get_oxylabs_mtime_iso() or "none"
+        return offline_feeds._ipsum_drop_index.get_reader_and_mtime()[1] or "none"
     return "none"
 
 
@@ -230,9 +229,9 @@ def _plan_provider_execution(
             key not in NO_REDIS_CACHE_PROVIDER_KEYS
             and (is_ipv4 or (key not in DNSBL_PROVIDER_KEYS and key not in {"shodan_internetdb", "iphunter"}))
             and is_provider_configured(key)
-            and not (key == "maxmind" and not offline_dbs.has_any_local_maxmind_db())
+            and not (key == "maxmind" and not offline_mmdb.has_any_local_maxmind_db())
             and not (key == "stopforumspam" and not has_any_local_stopforumspam_db())
-            and not (key == "ipsum_drop" and offline_dbs._ipsum_drop_index.get_reader_and_mtime()[0] is None)
+            and not (key == "ipsum_drop" and offline_feeds._ipsum_drop_index.get_reader_and_mtime()[0] is None)
         )
         if is_expected:
             expected.add(key)
@@ -454,7 +453,7 @@ def _build_cache_or_cooldown_write(
     if is_provider_result_cacheable(row):
         entry_payload: Dict[str, Any] = {"row": row, "cachedAt": now_iso, "sanitized": True}
         if spec.key == "maxmind":
-            entry_payload["cityDbLoaded"] = offline_dbs.has_local_maxmind_city_db()
+            entry_payload["cityDbLoaded"] = offline_mmdb.has_local_maxmind_city_db()
             mm_updated = get_maxmind_newest_mtime_iso()
             if mm_updated:
                 entry_payload["dbUpdatedAt"] = mm_updated
@@ -637,10 +636,13 @@ async def _rehydrate_snapshot_payload(
         rehydrated_results = await asyncio.gather(*(spec_by_key[k].invoke(None, ip) for k in to_rehydrate))
         for pkey, fresh_row in zip(to_rehydrate, rehydrated_results, strict=True):
             if isinstance(fresh_row, dict):
-                rows_by_key[pkey] = {
-                    **fresh_row,
-                    "_rehydrate_sig": _current_offline_provider_signature(pkey),
-                }
+                if pkey in NO_REDIS_CACHE_PROVIDER_KEYS:
+                    rows_by_key[pkey] = dict(fresh_row)
+                else:
+                    rows_by_key[pkey] = {
+                        **fresh_row,
+                        "_rehydrate_sig": _current_offline_provider_signature(pkey),
+                    }
 
     merged_rows = [
         {**rows_by_key[spec.key], "isCached": spec.key not in NO_REDIS_CACHE_PROVIDER_KEYS}
@@ -733,3 +735,243 @@ def _resolve_cache_layer_telemetry_event(cache_meta: Dict[str, Any]) -> Optional
     if layer == "upstream":
         return "upstream_miss"
     return None
+
+
+def _extract_offline_bgp_prefix(ip: str) -> Optional[str]:
+    """Extracts the cleaned BGP origin prefix string from the local offline bgp.tools index."""
+    offline_bgp = offline_feeds.lookup_bgp_tools_offline(ip)
+    raw_prefix = offline_bgp.get("bgpPrefix") if isinstance(offline_bgp, dict) else None
+    return raw_prefix.strip() if isinstance(raw_prefix, str) and raw_prefix.strip() else None
+
+
+def _resolve_offline_tor_row(
+    ip: str,
+    normalized_mode: str,
+    cached_providers: Mapping[str, Tuple[Dict[str, Any], Optional[str]]],
+    deferred_provider_keys: FrozenSet[str],
+    missed_cooldown_keys: List[str],
+    *,
+    include_full_mode: bool = False,
+) -> Tuple[Optional[Dict[str, Any]], FrozenSet[str], List[str]]:
+    """Checks the offline Tor Onionoo mirror and defers online fallback in light mode on miss."""
+    if "tor_onionoo" in cached_providers or "tor_onionoo" in deferred_provider_keys:
+        return None, deferred_provider_keys, missed_cooldown_keys
+    if not include_full_mode and normalized_mode != "light":
+        return None, deferred_provider_keys, missed_cooldown_keys
+
+    offline_tor = offline_feeds.lookup_tor_onionoo_offline(ip)
+    if isinstance(offline_tor, dict):
+        updated_cooldowns = [k for k in missed_cooldown_keys if k != "tor_onionoo"]
+        return adapt_tor_onionoo(offline_tor, status_code=200, ip=ip), deferred_provider_keys, updated_cooldowns
+    if normalized_mode == "light":
+        updated_cooldowns = [k for k in missed_cooldown_keys if k != "tor_onionoo"]
+        return None, deferred_provider_keys | {"tor_onionoo"}, updated_cooldowns
+    return None, deferred_provider_keys, missed_cooldown_keys
+
+
+@dataclass
+class SettledProviderState:
+    """Mutable accumulator shared by single-shot and SSE provider settlement stages."""
+
+    rows_by_key: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    cached_at_timestamps: List[str] = field(default_factory=list)
+    redis_set_entries: List[Tuple[str, str, int]] = field(default_factory=list)
+    telemetry_entries: List[Dict[str, Any]] = field(default_factory=list)
+    hit_count: int = 0
+    miss_count: int = 0
+    cooldown_count: int = 0
+
+    def ordered_rows(self) -> List[Dict[str, Any]]:
+        return [self.rows_by_key[spec.key] for spec in PROVIDER_SPECS if spec.key in self.rows_by_key]
+
+
+def _settle_executed_provider_row(
+    state: SettledProviderState,
+    spec: ProviderSpec,
+    ip: str,
+    raw_res: Any,
+    *,
+    event: Optional[Dict[str, Any]],
+    quota_consumed_keys: Set[str],
+    active_redis: Any,
+    now_dt: datetime,
+    now_iso: str,
+    default_cooldown: int,
+) -> Tuple[Dict[str, Any], Optional[Tuple[str, str, int]], Optional[Dict[str, Any]]]:
+    """Normalises one executed provider result and records miss count, cache write, and telemetry."""
+    row, miss_exc = _normalize_executed_row(spec.label, raw_res)
+    state.rows_by_key[spec.key] = row
+    if not is_unconfigured_provider_row(row) and spec.key not in NO_REDIS_CACHE_PROVIDER_KEYS:
+        state.miss_count += 1
+
+    write_entry: Optional[Tuple[str, str, int]] = None
+    tel_entry: Optional[Dict[str, Any]] = None
+    if active_redis is not None:
+        tel_entry = _build_telemetry_entry(spec.key, row, event, miss_exc, raw_res, quota_consumed_keys)
+        if tel_entry is not None:
+            state.telemetry_entries.append(tel_entry)
+        write_entry = _build_cache_or_cooldown_write(spec, ip, row, event, miss_exc, now_dt, now_iso, default_cooldown)
+        if write_entry is not None:
+            state.redis_set_entries.append(write_entry)
+    return row, write_entry, tel_entry
+
+
+def _settle_provider_rows(
+    ip: str,
+    *,
+    cached_providers: Mapping[str, Tuple[Dict[str, Any], Optional[str]]],
+    deferred_provider_keys: FrozenSet[str],
+    cooldown_entries: Mapping[str, Dict[str, Any]],
+    quota_blocked_entries: Mapping[str, Dict[str, Any]],
+    executed_results: Mapping[str, Any],
+    upstream_events: Mapping[str, Dict[str, Any]],
+    quota_consumed_keys: Set[str],
+    active_redis: Any,
+    now_dt: datetime,
+    now_iso: str,
+    default_cooldown: int,
+    include_missing_executed: bool,
+) -> SettledProviderState:
+    """Materialises cached, deferred, cooldown, and completed provider rows in canonical order."""
+    state = SettledProviderState()
+    for spec in PROVIDER_SPECS:
+        key = spec.key
+        if key in cached_providers:
+            row, cached_at = cached_providers[key]
+            row_copy = {**row, "isCached": True}
+            if cached_at:
+                row_copy["cachedAt"] = cached_at
+            state.rows_by_key[key] = row_copy
+            if not is_unconfigured_provider_row(row_copy):
+                state.hit_count += 1
+                if cached_at:
+                    state.cached_at_timestamps.append(cached_at)
+                if active_redis is not None:
+                    state.telemetry_entries.append({"provider_key": key, "outcome": "cache_hit"})
+            continue
+
+        if key in deferred_provider_keys:
+            state.rows_by_key[key] = build_deferred_provider_row(spec.label)
+            continue
+
+        if key in cooldown_entries or key in quota_blocked_entries:
+            cd_info = cooldown_entries.get(key) or quota_blocked_entries[key]
+            state.rows_by_key[key] = build_cooldown_provider_row(spec.label, cd_info)
+            state.cooldown_count += 1
+            continue
+
+        if include_missing_executed or key in executed_results:
+            _settle_executed_provider_row(
+                state,
+                spec,
+                ip,
+                executed_results.get(key),
+                event=upstream_events.get(key),
+                quota_consumed_keys=quota_consumed_keys,
+                active_redis=active_redis,
+                now_dt=now_dt,
+                now_iso=now_iso,
+                default_cooldown=default_cooldown,
+            )
+    return state
+
+
+async def _persist_full_snapshot(
+    ip: str,
+    assembled: Dict[str, Any],
+    clean_results: List[Dict[str, Any]],
+    *,
+    now_dt: datetime,
+    now_iso: str,
+) -> None:
+    """Writes a completed full-mode snapshot to both L1 Redis and L2 ToolsDB."""
+    snapshot_for_storage = {
+        **assembled,
+        "fetchedAt": now_iso,
+        "results": _stamp_offline_signatures(clean_results),
+        "_ptrResolved": True,
+    }
+    await asyncio.gather(
+        set_cached_ip_snapshot(ip, snapshot_for_storage, mode="full"),
+        _safe_l2_amerge_snapshot(
+            ip,
+            {**assembled, "fetchedAt": now_iso, "results": clean_results},
+            query_mode="full",
+            now_dt=now_dt,
+        ),
+    )
+
+
+async def _try_read_snapshot_with_layer(ip: str, normalized_mode: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Reads an L1 Redis snapshot first, falling back to L2 ToolsDB on miss."""
+    l1_snap = await _try_read_l1_snapshot(ip, normalized_mode)
+    if l1_snap is not None:
+        return l1_snap, "L1"
+    l2_snap = await _safe_l2_aget_snapshot(ip, mode=normalized_mode)
+    if l2_snap is not None:
+        return l2_snap, "L2"
+    return None, ""
+
+
+async def _rehydrate_layer_snapshot(
+    ip: str,
+    snapshot: Dict[str, Any],
+    *,
+    layer: str,
+    normalized_mode: str,
+    allow_auto_refresh: bool = True,
+    force_should_auto_refresh: Optional[bool] = None,
+    force_refresh_in_progress: bool = False,
+) -> Dict[str, Any]:
+    """Rehydrates an L1 or L2 snapshot with standard offline rehydration and L1 backfill flags."""
+    is_l2 = layer == "L2"
+    return await _rehydrate_snapshot_payload(
+        ip,
+        snapshot,
+        layer=layer,
+        normalized_mode=normalized_mode,
+        force_rehydrate_offline=is_l2,
+        allow_auto_refresh=allow_auto_refresh,
+        force_should_auto_refresh=force_should_auto_refresh,
+        force_refresh_in_progress=force_refresh_in_progress,
+        backfill_l1=is_l2,
+    )
+
+
+async def _poll_for_concurrent_snapshot(
+    ip: str,
+    normalized_mode: str,
+) -> Optional[Dict[str, Any]]:
+    """Waits for a concurrent lock holder to populate L1 or L2 before falling back to upstream queries."""
+    max_attempts = max(1, int(_LOCK_POLL_MAX_WAIT_SECONDS / _LOCK_POLL_INTERVAL_SECONDS))
+    for _ in range(max_attempts):
+        await asyncio.sleep(_LOCK_POLL_INTERVAL_SECONDS)
+        l1_snap = await _try_read_l1_snapshot(ip, normalized_mode)
+        if l1_snap is not None:
+            return await _rehydrate_layer_snapshot(ip, l1_snap, layer="L1", normalized_mode=normalized_mode)
+        if not await is_ip_updating_locked(ip):
+            after_snap, after_layer = await _try_read_snapshot_with_layer(ip, normalized_mode)
+            if after_snap is not None:
+                return await _rehydrate_layer_snapshot(
+                    ip, after_snap, layer=after_layer, normalized_mode=normalized_mode
+                )
+            break
+    return None
+
+
+async def _record_global_cache_telemetry(
+    cache_meta: Optional[Mapping[str, Any]],
+    auth_mode: str,
+    *,
+    now_dt: Optional[datetime] = None,
+) -> None:
+    """Records global request cache status telemetry when cacheMeta carries a recognised status."""
+    meta = dict(cache_meta) if isinstance(cache_meta, Mapping) else {}
+    cache_status = meta.get("status")
+    if isinstance(cache_status, str) and cache_status in ("hit", "stale", "partial", "miss"):
+        await quota_telemetry.record_global_request_telemetry(
+            cache_status,
+            auth_mode,
+            cache_layer_event=_resolve_cache_layer_telemetry_event(meta),
+            now_dt=now_dt,
+        )

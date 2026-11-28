@@ -5,29 +5,7 @@ export const REQUIRED_USER_RIGHTS = [
   'checkuser-temporary-account-no-preference',
 ] as const;
 
-export const PROVIDER_NAMES = [
-  'Cloudflare Radar',
-  'AbuseIPDB',
-  'IPData',
-  'IPRegistry',
-  'IP2Location',
-  'GetIPIntel',
-  'Proxycheck',
-  'IPHub',
-  'IPHunter',
-  'MaxMind',
-  'Spamhaus ZEN',
-  'SpamCop',
-  'Tor Onionoo',
-  'StopForumSpam',
-  'DShield',
-  'IPsum / DROP',
-  'OpenASN',
-  'Oxylabs',
-  'Shodan InternetDB',
-] as const;
-
-export type ProviderName = (typeof PROVIDER_NAMES)[number];
+export type ProviderName = string;
 export type ChipStatus = 'notice' | 'warning' | 'error' | 'success';
 export type AppTab = 'detector' | 'rb';
 export type PtrCategory =

@@ -5,9 +5,12 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import threading
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Tuple
 
 from proxycheck.settings import (
     MAXMIND_ASN_DB_FILENAME,
@@ -20,21 +23,11 @@ from .sfs import clear_sfs_caches, resolve_stopforumspam_paths
 from .store import (
     BGP_TAGS_JSON_FILENAME,
     BGP_TOOLS_BIN_FILENAME,
-    DEFAULT_STALE_DAILY_FEED_SECONDS,
-    DEFAULT_STALE_MAXMIND_SECONDS,
-    DEFAULT_STALE_OPENASN_SECONDS,
-    DEFAULT_STALE_OXYLABS_SECONDS,
-    DEFAULT_STALE_RULES_SECONDS,
-    DEFAULT_STALE_SFS_1_SECONDS,
-    DEFAULT_STALE_SFS_90_SECONDS,
-    DEFAULT_STALE_SFS_TOXIC_SECONDS,
-    DEFAULT_STALE_SHARED_CIDRS_SECONDS,
-    DEFAULT_STALE_TOR_ONIONOO_SECONDS,
+    HOSTING_RULES_FILENAME,
     IPSUM_DROP_BIN_FILENAME,
     MOBILE_ASNS_JSON_FILENAME,
     MOBILE_BGP_TAG_TOKENS,
     OPENASN_MMDB_FILENAME,
-    OXYLABS_DIR_NAME,
     PRIVACY_RELAYS_BIN_FILENAME,
     REZMOSS_EXCLUDED_PROVIDERS,
     REZMOSS_PROVIDER_CATALOG,
@@ -46,13 +39,242 @@ from .store import (
     TOR_ONIONOO_SUMMARY_FILENAME,
     FileStatCache,
     _BinaryIndexCache,
+    _effective_base_dir,
+    _effective_stat_throttle_seconds,
+    _lookup_config_value,
     _parse_asn_int,
     clear_stat_throttle_cache,
     get_file_stat_signature,
     get_positive_int_setting,
+    resolve_feed_data_dir,
     resolve_feed_data_path,
     resolve_hosting_rules_path,
-    resolve_oxylabs_data_dir,
+)
+
+OXYLABS_DIR_NAME = "oxylabs"
+
+DEFAULT_STALE_MAXMIND_SECONDS = 14 * 86400
+DEFAULT_STALE_SFS_TOXIC_SECONDS = 7 * 86400
+DEFAULT_STALE_SFS_90_SECONDS = 2 * 86400
+DEFAULT_STALE_SFS_1_SECONDS = 6 * 3600
+DEFAULT_STALE_SHARED_CIDRS_SECONDS = 7 * 86400
+DEFAULT_STALE_OPENASN_SECONDS = 14 * 86400
+DEFAULT_STALE_OXYLABS_SECONDS = 7 * 86400
+DEFAULT_STALE_TOR_ONIONOO_SECONDS = 6 * 3600
+DEFAULT_STALE_DAILY_FEED_SECONDS = 7 * 86400
+DEFAULT_STALE_RULES_SECONDS = 90 * 86400
+
+
+@dataclass(frozen=True, slots=True)
+class OfflineDatasetSpec:
+    """Declarative metadata for one offline database, path override, and staleness rule."""
+
+    key: str
+    source: str
+    name: str
+    filename: str
+    stale_setting: str
+    default_stale_seconds: int
+    stale_description: str
+    provider_key: Optional[str] = None
+    override_setting: Optional[str] = None
+    override_description: Optional[str] = None
+    optional: bool = True
+    missing_label: Optional[str] = None
+    glob_pattern: Optional[str] = None
+
+
+OFFLINE_DATASET_SPECS: Tuple[OfflineDatasetSpec, ...] = (
+    OfflineDatasetSpec(
+        key="maxmind_country",
+        source="MaxMind",
+        name="MaxMind GeoLite2 Country",
+        filename=MAXMIND_COUNTRY_DB_FILENAME,
+        stale_setting="OFFLINE_DB_MAXMIND_STALE_SECONDS",
+        default_stale_seconds=DEFAULT_STALE_MAXMIND_SECONDS,
+        stale_description="MaxMind MMDB staleness warning threshold",
+        provider_key="maxmind",
+        optional=False,
+    ),
+    OfflineDatasetSpec(
+        key="maxmind_city",
+        source="MaxMind",
+        name="MaxMind GeoLite2 City",
+        filename=MAXMIND_CITY_DB_FILENAME,
+        stale_setting="OFFLINE_DB_MAXMIND_STALE_SECONDS",
+        default_stale_seconds=DEFAULT_STALE_MAXMIND_SECONDS,
+        stale_description="MaxMind MMDB staleness warning threshold",
+        provider_key="maxmind",
+        optional=False,
+    ),
+    OfflineDatasetSpec(
+        key="maxmind_asn",
+        source="MaxMind",
+        name="MaxMind GeoLite2 ASN",
+        filename=MAXMIND_ASN_DB_FILENAME,
+        stale_setting="OFFLINE_DB_MAXMIND_STALE_SECONDS",
+        default_stale_seconds=DEFAULT_STALE_MAXMIND_SECONDS,
+        stale_description="MaxMind MMDB staleness warning threshold",
+        provider_key="maxmind",
+        optional=False,
+    ),
+    OfflineDatasetSpec(
+        key="stopforumspam_toxic_cidr",
+        source="StopForumSpam",
+        name="StopForumSpam Toxic CIDRs",
+        filename=SFS_TOXIC_CIDR_FILENAME,
+        stale_setting="OFFLINE_DB_SFS_TOXIC_STALE_SECONDS",
+        default_stale_seconds=DEFAULT_STALE_SFS_TOXIC_SECONDS,
+        stale_description="StopForumSpam toxic_ip_cidr.txt staleness threshold",
+        provider_key="stopforumspam",
+        override_setting="STOPFORUMSPAM_TOXIC_CIDR_PATH",
+        override_description="Override file or directory path for toxic_ip_cidr.txt",
+        optional=False,
+    ),
+    OfflineDatasetSpec(
+        key="stopforumspam_listed_90",
+        source="StopForumSpam",
+        name="StopForumSpam Listed IPs (90d)",
+        filename=SFS_LISTED_90_ZIP_NAME,
+        stale_setting="OFFLINE_DB_SFS_90_STALE_SECONDS",
+        default_stale_seconds=DEFAULT_STALE_SFS_90_SECONDS,
+        stale_description="StopForumSpam 90-day dump staleness threshold",
+        provider_key="stopforumspam",
+        override_setting="STOPFORUMSPAM_LISTED_90_PATH",
+        override_description="Override path for StopForumSpam 90-day listed IP archive",
+        optional=False,
+    ),
+    OfflineDatasetSpec(
+        key="stopforumspam_listed_1",
+        source="StopForumSpam",
+        name="StopForumSpam Listed IPs (1d)",
+        filename=SFS_LISTED_1_ZIP_NAME,
+        stale_setting="OFFLINE_DB_SFS_1_STALE_SECONDS",
+        default_stale_seconds=DEFAULT_STALE_SFS_1_SECONDS,
+        stale_description="StopForumSpam 1-day dump staleness threshold",
+        provider_key="stopforumspam",
+        override_setting="STOPFORUMSPAM_LISTED_1_PATH",
+        override_description="Override path for StopForumSpam 1-day listed IP archive",
+        optional=True,
+    ),
+    OfflineDatasetSpec(
+        key="stopforumspam_index",
+        source="StopForumSpam",
+        name="StopForumSpam Local SQLite Index",
+        filename=SFS_SQLITE_FILENAME,
+        stale_setting="OFFLINE_DB_SFS_90_STALE_SECONDS",
+        default_stale_seconds=DEFAULT_STALE_SFS_90_SECONDS,
+        stale_description="StopForumSpam 90-day dump staleness threshold",
+        provider_key="stopforumspam",
+        override_setting="STOPFORUMSPAM_SQLITE_PATH",
+        override_description="Override path for stopforumspam.sqlite3 index",
+        optional=True,
+    ),
+    OfflineDatasetSpec(
+        key="hosting_asn_rules",
+        source="Hosting Rules",
+        name="Hosting ASN Rules",
+        filename=HOSTING_RULES_FILENAME,
+        stale_setting="OFFLINE_DB_RULES_STALE_SECONDS",
+        default_stale_seconds=DEFAULT_STALE_RULES_SECONDS,
+        stale_description="Hosting ASN rules staleness threshold",
+        override_setting="HOSTING_ASN_RULES_PATH",
+        override_description="Override path for hosting_asn_rules.json",
+        optional=True,
+        missing_label="Built-in (Optional)",
+    ),
+    OfflineDatasetSpec(
+        key="shared_cidrs",
+        source="Shared CIDRs",
+        name="Rezmoss Shared Egress CIDRs",
+        filename=SHARED_CIDRS_BIN_FILENAME,
+        stale_setting="OFFLINE_DB_SHARED_CIDRS_STALE_SECONDS",
+        default_stale_seconds=DEFAULT_STALE_SHARED_CIDRS_SECONDS,
+        stale_description="Rezmoss shared egress CIDRs staleness threshold",
+        override_setting="SHARED_CIDRS_BIN_PATH",
+        override_description="Override path for shared_cidrs.bin",
+    ),
+    OfflineDatasetSpec(
+        key="privacy_relays",
+        source="Privacy Relays",
+        name="Apple Private Relay and Cloudflare WARP",
+        filename=PRIVACY_RELAYS_BIN_FILENAME,
+        stale_setting="OFFLINE_DB_DAILY_FEED_STALE_SECONDS",
+        default_stale_seconds=DEFAULT_STALE_DAILY_FEED_SECONDS,
+        stale_description="Daily offline threat and relay feed staleness threshold",
+        override_setting="PRIVACY_RELAYS_BIN_PATH",
+        override_description="Override path for privacy_relays.bin",
+    ),
+    OfflineDatasetSpec(
+        key="ipsum_drop",
+        source="IPsum and DROP",
+        name="IPsum and Spamhaus DROP Index",
+        filename=IPSUM_DROP_BIN_FILENAME,
+        stale_setting="OFFLINE_DB_DAILY_FEED_STALE_SECONDS",
+        default_stale_seconds=DEFAULT_STALE_DAILY_FEED_SECONDS,
+        stale_description="Daily offline threat and relay feed staleness threshold",
+        provider_key="ipsum_drop",
+        override_setting="IPSUM_DROP_BIN_PATH",
+        override_description="Override path for ipsum_drop.bin",
+    ),
+    OfflineDatasetSpec(
+        key="tor_onionoo",
+        source="Tor Onionoo",
+        name="Tor Onionoo Summary Mirror",
+        filename=TOR_ONIONOO_SUMMARY_FILENAME,
+        stale_setting="OFFLINE_DB_TOR_ONIONOO_STALE_SECONDS",
+        default_stale_seconds=DEFAULT_STALE_TOR_ONIONOO_SECONDS,
+        stale_description="Tor Onionoo local mirror staleness threshold",
+        override_setting="TOR_ONIONOO_SUMMARY_PATH",
+        override_description="Override path for tor_onionoo_summary.json",
+    ),
+    OfflineDatasetSpec(
+        key="bgp_tools",
+        source="BGP Tools",
+        name="BGP Routing Table Prefix Index",
+        filename=BGP_TOOLS_BIN_FILENAME,
+        stale_setting="OFFLINE_DB_DAILY_FEED_STALE_SECONDS",
+        default_stale_seconds=DEFAULT_STALE_DAILY_FEED_SECONDS,
+        stale_description="Daily offline threat and relay feed staleness threshold",
+        override_setting="BGP_TOOLS_BIN_PATH",
+        override_description="Override path for bgp_tools.bin",
+    ),
+    OfflineDatasetSpec(
+        key="openasn",
+        source="OpenASN",
+        name="OpenASN IP/ASN Classification",
+        filename=OPENASN_MMDB_FILENAME,
+        stale_setting="OFFLINE_DB_OPENASN_STALE_SECONDS",
+        default_stale_seconds=DEFAULT_STALE_OPENASN_SECONDS,
+        stale_description="OpenASN MMDB staleness threshold",
+        provider_key="openasn",
+        override_setting="OPENASN_MMDB_PATH",
+        override_description="Override path for openasn.mmdb",
+    ),
+    OfflineDatasetSpec(
+        key="mobile_carriers",
+        source="Mobile Carriers",
+        name="Mobile Carrier ASNs",
+        filename=MOBILE_ASNS_JSON_FILENAME,
+        stale_setting="OFFLINE_DB_DAILY_FEED_STALE_SECONDS",
+        default_stale_seconds=DEFAULT_STALE_DAILY_FEED_SECONDS,
+        stale_description="Daily offline threat and relay feed staleness threshold",
+        override_setting="MOBILE_ASNS_JSON_PATH",
+        override_description="Override path for mobile_asns.json",
+    ),
+    OfflineDatasetSpec(
+        key="oxylabs",
+        source="Oxylabs",
+        name="Oxylabs Residential Proxy Datasets",
+        filename=OXYLABS_DIR_NAME,
+        stale_setting="OFFLINE_DB_OXYLABS_STALE_SECONDS",
+        default_stale_seconds=DEFAULT_STALE_OXYLABS_SECONDS,
+        stale_description="Oxylabs JSONL datasets staleness threshold",
+        provider_key="oxylabs",
+        override_setting="OXYLABS_DATA_DIR",
+        override_description="Override directory path for Oxylabs JSONL datasets",
+        glob_pattern="*.jsonl",
+    ),
 )
 
 logger = logging.getLogger(__name__)
@@ -67,7 +289,12 @@ _bgp_tags_cache: FileStatCache[Tuple[str, int, int], Tuple[Dict[int, Tuple[str, 
     FileStatCache()
 )
 _mobile_asns_cache: FileStatCache[Tuple[str, int, int], FrozenSet[int]] = FileStatCache()
-_oxylabs_cache: FileStatCache[Tuple[Tuple[str, int, int], ...], Dict[str, Dict[str, Any]]] = FileStatCache()
+_OxylabsRecord = Tuple[Optional[int], Optional[str], Optional[str], str]
+_oxylabs_cache: FileStatCache[Tuple[Tuple[str, int, int], ...], Dict[str, _OxylabsRecord]] = FileStatCache()
+_oxylabs_scan_lock = threading.Lock()
+_oxylabs_scan_cache: Optional[Tuple[Tuple[str, str, str], float, Optional[Path], Tuple[Tuple[Path, int, int], ...]]] = (
+    None
+)
 
 
 def classify_rezmoss_provider(slug: str) -> Optional[Tuple[str, str]]:
@@ -390,22 +617,51 @@ def _scan_oxylabs_files(
     base_dir: Optional[Path] = None,
     bypass_throttle: bool = False,
 ) -> Tuple[Optional[Path], Tuple[Tuple[Path, int, int], ...]]:
-    data_dir = resolve_oxylabs_data_dir(env_overrides=env_overrides, base_dir=base_dir)
+    global _oxylabs_scan_cache
+
+    use_throttle = env_overrides is None and base_dir is None and not bypass_throttle
+    throttle_s = _effective_stat_throttle_seconds() if use_throttle else 0.0
+    config_key: Optional[Tuple[str, str, str]] = None
+    now_mono = 0.0
+    if throttle_s > 0.0:
+        config_key = (
+            _lookup_config_value("OXYLABS_DATA_DIR"),
+            _lookup_config_value("TOOL_DATA_DIR"),
+            str(_effective_base_dir(None)),
+        )
+        now_mono = time.monotonic()
+        with _oxylabs_scan_lock:
+            cached = _oxylabs_scan_cache
+            if cached is not None and cached[0] == config_key and 0.0 <= (now_mono - cached[1]) < throttle_s:
+                return cached[2], cached[3]
+
+    data_dir = resolve_feed_data_dir(
+        OXYLABS_DIR_NAME,
+        override_setting="OXYLABS_DATA_DIR",
+        env_overrides=env_overrides,
+        base_dir=base_dir,
+    )
     if data_dir is None:
-        return None, ()
-    try:
-        candidates = sorted(data_dir.glob("*.jsonl"), key=lambda path: path.name)
-    except OSError:
-        return data_dir, ()
-    matched: List[Tuple[Path, int, int]] = []
-    for file_path in candidates:
-        sig = get_file_stat_signature(file_path, bypass_throttle=bypass_throttle)
-        if sig is not None:
-            matched.append((file_path, sig[0], sig[1]))
-    return data_dir, tuple(matched)
+        result: Tuple[Optional[Path], Tuple[Tuple[Path, int, int], ...]] = (None, ())
+    else:
+        try:
+            candidates = sorted(data_dir.glob("*.jsonl"), key=lambda path: path.name)
+        except OSError:
+            return data_dir, ()
+        matched: List[Tuple[Path, int, int]] = []
+        for file_path in candidates:
+            sig = get_file_stat_signature(file_path, bypass_throttle=bypass_throttle)
+            if sig is not None:
+                matched.append((file_path, sig[0], sig[1]))
+        result = (data_dir, tuple(matched))
+
+    if config_key is not None:
+        with _oxylabs_scan_lock:
+            _oxylabs_scan_cache = (config_key, now_mono, result[0], result[1])
+    return result
 
 
-def _parse_oxylabs_line(raw_line: str, source_file: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+def _parse_oxylabs_line(raw_line: str, source_file: str) -> Optional[Tuple[str, _OxylabsRecord]]:
     cleaned_line = raw_line.strip()
     if not cleaned_line:
         return None
@@ -429,17 +685,11 @@ def _parse_oxylabs_line(raw_line: str, source_file: str) -> Optional[Tuple[str, 
     org_name = raw_org.strip() if isinstance(raw_org, str) and raw_org.strip() else None
     raw_updated = obj.get("updated_at")
     updated_at = raw_updated.strip() if isinstance(raw_updated, str) and raw_updated.strip() else None
-    return canonical_ip, {
-        "ip": canonical_ip,
-        "asn": _parse_asn_int(obj.get("asn")),
-        "orgName": org_name,
-        "updatedAt": updated_at,
-        "sourceFile": source_file,
-    }
+    return canonical_ip, (_parse_asn_int(obj.get("asn")), org_name, updated_at, source_file)
 
 
-def _load_oxylabs_index(files: Tuple[Tuple[Path, int, int], ...]) -> Dict[str, Dict[str, Any]]:
-    index: Dict[str, Dict[str, Any]] = {}
+def _load_oxylabs_index(files: Tuple[Tuple[Path, int, int], ...]) -> Dict[str, _OxylabsRecord]:
+    index: Dict[str, _OxylabsRecord] = {}
     for file_path, _mtime_ns, _size in files:
         try:
             with file_path.open("r", encoding="utf-8") as handle:
@@ -449,22 +699,11 @@ def _load_oxylabs_index(files: Tuple[Tuple[Path, int, int], ...]) -> Dict[str, D
                         continue
                     canonical_ip, entry = parsed
                     existing = index.get(canonical_ip)
-                    if existing is None or (
-                        entry["updatedAt"] and (not existing["updatedAt"] or entry["updatedAt"] > existing["updatedAt"])
-                    ):
+                    if existing is None or (entry[2] and (not existing[2] or entry[2] > existing[2])):
                         index[canonical_ip] = entry
         except OSError as exc:
             logger.warning("Failed to read Oxylabs JSONL file %s: %s", file_path, exc)
     return index
-
-
-def get_oxylabs_mtime_iso() -> Optional[str]:
-    """Returns the newest modification time across Oxylabs JSONL datasets as an ISO timestamp, or None when absent."""
-    _data_dir, files = _scan_oxylabs_files()
-    if not files:
-        return None
-    newest_ns = max(mtime_ns for _, mtime_ns, _ in files)
-    return datetime.fromtimestamp(newest_ns / 1_000_000_000.0, tz=timezone.utc).isoformat()
 
 
 def _empty_oxylabs_result(*, has_db: bool, updated_at: Optional[str]) -> Dict[str, Any]:
@@ -511,54 +750,60 @@ def query_oxylabs_offline(ip: str) -> Dict[str, Any]:
     return {
         "has_db": True,
         "isListed": True,
-        "asn": hit["asn"],
-        "orgName": hit["orgName"],
-        "updatedAt": hit["updatedAt"],
-        "sourceFile": hit["sourceFile"],
+        "asn": hit[0],
+        "orgName": hit[1],
+        "updatedAt": hit[2],
+        "sourceFile": hit[3],
         "offlineDbUpdatedAt": updated_iso,
     }
 
 
-def _build_oxylabs_status_entry(
+def _build_status_entry(
+    spec: OfflineDatasetSpec,
     *,
-    now_ts: float,
+    filename: str,
+    exists: bool,
+    size_bytes: Optional[int],
+    mtime_ns: Optional[int],
     stale_after_seconds: int,
-    env_overrides: Optional[Mapping[str, str]] = None,
-    base_dir: Optional[Path] = None,
-    include_resolved_path: bool = False,
+    now_ts: float,
+    resolved_path: Optional[Path],
+    include_resolved_path: bool,
 ) -> Dict[str, Any]:
-    oxylabs_dir, oxylabs_files = _scan_oxylabs_files(
-        env_overrides=env_overrides, base_dir=base_dir, bypass_throttle=True
-    )
-    if not oxylabs_files:
+    if not exists or mtime_ns is None:
+        resolved_missing_label = (
+            spec.missing_label
+            if spec.missing_label is not None
+            else ("Optional (Not Configured)" if spec.optional else "Missing")
+        )
         entry: Dict[str, Any] = {
-            "key": "oxylabs",
-            "source": "Oxylabs",
-            "name": "Oxylabs Residential Proxy Datasets",
-            "filename": f"{OXYLABS_DIR_NAME}/*.jsonl",
+            "key": spec.key,
+            "providerKey": spec.provider_key,
+            "source": spec.source,
+            "name": spec.name,
+            "filename": filename,
             "exists": False,
-            "optional": True,
+            "optional": spec.optional,
             "sizeBytes": None,
             "lastModifiedIso": None,
             "ageSeconds": None,
             "staleAfterSeconds": stale_after_seconds,
             "status": "missing",
-            "statusLabel": "Optional (Not Configured)",
+            "statusLabel": resolved_missing_label,
         }
     else:
-        newest_ns = max(mtime_ns for _, mtime_ns, _ in oxylabs_files)
-        total_bytes = sum(size for _, _, size in oxylabs_files)
-        mtime_ts = newest_ns / 1_000_000_000.0
+        mtime_ts = mtime_ns / 1_000_000_000.0
         age_seconds = max(0, int(now_ts - mtime_ts))
         is_stale = stale_after_seconds > 0 and age_seconds > stale_after_seconds
         entry = {
-            "key": "oxylabs",
-            "source": "Oxylabs",
-            "name": "Oxylabs Residential Proxy Datasets",
-            "filename": f"{OXYLABS_DIR_NAME}/*.jsonl ({len(oxylabs_files)} files)",
+            "key": spec.key,
+            "providerKey": spec.provider_key,
+            "source": spec.source,
+            "name": spec.name,
+            "filename": filename,
             "exists": True,
-            "optional": True,
-            "sizeBytes": int(total_bytes),
+            "optional": spec.optional,
+            "sizeBytes": int(size_bytes) if size_bytes is not None else 0,
             "lastModifiedIso": datetime.fromtimestamp(mtime_ts, tz=timezone.utc).isoformat(),
             "ageSeconds": age_seconds,
             "staleAfterSeconds": stale_after_seconds,
@@ -566,155 +811,34 @@ def _build_oxylabs_status_entry(
             "statusLabel": "Stale" if is_stale else "Healthy",
         }
     if include_resolved_path:
-        entry["resolvedPath"] = str(oxylabs_dir) if (oxylabs_dir is not None and entry["exists"]) else ""
+        entry["resolvedPath"] = str(resolved_path) if (resolved_path is not None and entry["exists"]) else ""
     return entry
 
 
-def build_offline_database_entries(
+def _scan_glob_dataset_files(
+    spec: OfflineDatasetSpec,
     *,
-    maxmind_paths: Dict[str, Optional[Path]],
-    sfs_paths: Dict[str, Optional[Path]],
-    hosting_rules_path: Optional[Path],
-    hosting_rules_name: str,
-    maxmind_stale: int,
-    sfs_toxic_stale: int,
-    sfs_90_stale: int,
-    sfs_1_stale: int,
-    rules_stale: int,
-    now_ts: float,
-    extra_feed_specs: Optional[Sequence[Tuple[str, str, str, Optional[Path], str, bool, int, Optional[str]]]] = None,
-    include_resolved_path: bool = False,
-) -> List[Dict[str, Any]]:
-    """Builds standardised status entries for all configured offline databases and rule files."""
-    specs: List[Tuple[str, str, str, Optional[Path], str, bool, int, Optional[str]]] = [
-        (
-            "maxmind_country",
-            "MaxMind",
-            "MaxMind GeoLite2 Country",
-            maxmind_paths.get("country"),
-            MAXMIND_COUNTRY_DB_FILENAME,
-            False,
-            maxmind_stale,
-            None,
-        ),
-        (
-            "maxmind_city",
-            "MaxMind",
-            "MaxMind GeoLite2 City",
-            maxmind_paths.get("city"),
-            MAXMIND_CITY_DB_FILENAME,
-            False,
-            maxmind_stale,
-            None,
-        ),
-        (
-            "maxmind_asn",
-            "MaxMind",
-            "MaxMind GeoLite2 ASN",
-            maxmind_paths.get("asn"),
-            MAXMIND_ASN_DB_FILENAME,
-            False,
-            maxmind_stale,
-            None,
-        ),
-        (
-            "stopforumspam_toxic_cidr",
-            "StopForumSpam",
-            "StopForumSpam Toxic CIDRs",
-            sfs_paths.get("toxic_cidr"),
-            SFS_TOXIC_CIDR_FILENAME,
-            False,
-            sfs_toxic_stale,
-            None,
-        ),
-        (
-            "stopforumspam_listed_90",
-            "StopForumSpam",
-            "StopForumSpam Listed IPs (90d)",
-            sfs_paths.get("listed_90"),
-            SFS_LISTED_90_ZIP_NAME,
-            False,
-            sfs_90_stale,
-            None,
-        ),
-        (
-            "stopforumspam_listed_1",
-            "StopForumSpam",
-            "StopForumSpam Listed IPs (1d)",
-            sfs_paths.get("listed_1"),
-            SFS_LISTED_1_ZIP_NAME,
-            True,
-            sfs_1_stale,
-            None,
-        ),
-        (
-            "stopforumspam_index",
-            "StopForumSpam",
-            "StopForumSpam Local SQLite Index",
-            sfs_paths.get("sqlite_index"),
-            SFS_SQLITE_FILENAME,
-            True,
-            sfs_90_stale,
-            None,
-        ),
-        (
-            "hosting_asn_rules",
-            "Hosting Rules",
-            "Hosting ASN Rules",
-            hosting_rules_path,
-            hosting_rules_name,
-            True,
-            rules_stale,
-            "Built-in (Optional)",
-        ),
-    ]
-    if extra_feed_specs:
-        specs.extend(extra_feed_specs)
-
-    entries: List[Dict[str, Any]] = []
-    for key, source, name, file_path, fallback_filename, optional, stale_after_seconds, missing_label in specs:
-        filename = file_path.name if file_path is not None else fallback_filename
-        sig = get_file_stat_signature(file_path, bypass_throttle=True) if file_path is not None else None
-        if sig is None:
-            resolved_missing_label = (
-                missing_label if missing_label is not None else ("Optional (Not Configured)" if optional else "Missing")
-            )
-            entry: Dict[str, Any] = {
-                "key": key,
-                "source": source,
-                "name": name,
-                "filename": filename,
-                "exists": False,
-                "optional": optional,
-                "sizeBytes": None,
-                "lastModifiedIso": None,
-                "ageSeconds": None,
-                "staleAfterSeconds": stale_after_seconds,
-                "status": "missing",
-                "statusLabel": resolved_missing_label,
-            }
-        else:
-            mtime_ts = sig[0] / 1_000_000_000.0
-            age_seconds = max(0, int(now_ts - mtime_ts))
-            is_stale = stale_after_seconds > 0 and age_seconds > stale_after_seconds
-            entry = {
-                "key": key,
-                "source": source,
-                "name": name,
-                "filename": filename,
-                "exists": True,
-                "optional": optional,
-                "sizeBytes": int(sig[1]),
-                "lastModifiedIso": datetime.fromtimestamp(mtime_ts, tz=timezone.utc).isoformat(),
-                "ageSeconds": age_seconds,
-                "staleAfterSeconds": stale_after_seconds,
-                "status": "stale" if is_stale else "healthy",
-                "statusLabel": "Stale" if is_stale else "Healthy",
-            }
-        if include_resolved_path:
-            entry["resolvedPath"] = str(file_path) if (file_path is not None and entry["exists"]) else ""
-        entries.append(entry)
-    return entries
+    env_overrides: Optional[Mapping[str, str]] = None,
+    base_dir: Optional[Path] = None,
+) -> Tuple[Optional[Path], Tuple[Tuple[Path, int, int], ...]]:
+    data_dir = resolve_feed_data_dir(
+        spec.filename,
+        override_setting=spec.override_setting or "",
+        env_overrides=env_overrides,
+        base_dir=base_dir,
+    )
+    if data_dir is None or not spec.glob_pattern:
+        return data_dir, ()
+    try:
+        candidates = sorted(data_dir.glob(spec.glob_pattern), key=lambda path: path.name)
+    except OSError:
+        return data_dir, ()
+    matched: List[Tuple[Path, int, int]] = []
+    for file_path in candidates:
+        sig = get_file_stat_signature(file_path, bypass_throttle=True)
+        if sig is not None:
+            matched.append((file_path, sig[0], sig[1]))
+    return data_dir, tuple(matched)
 
 
 def collect_offline_databases_status(
@@ -724,190 +848,98 @@ def collect_offline_databases_status(
     base_dir: Optional[Path] = None,
     include_resolved_path: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Inventories all local offline databases and rules using file mtime metadata."""
+    """Inventories all local offline databases and rules from OFFLINE_DATASET_SPECS using file mtime metadata."""
     current_dt = now_dt or datetime.now(timezone.utc)
     now_ts = current_dt.timestamp()
-
-    maxmind_stale = get_positive_int_setting(
-        "OFFLINE_DB_MAXMIND_STALE_SECONDS", DEFAULT_STALE_MAXMIND_SECONDS, env_overrides=env_overrides
-    )
-    sfs_toxic_stale = get_positive_int_setting(
-        "OFFLINE_DB_SFS_TOXIC_STALE_SECONDS", DEFAULT_STALE_SFS_TOXIC_SECONDS, env_overrides=env_overrides
-    )
-    sfs_90_stale = get_positive_int_setting(
-        "OFFLINE_DB_SFS_90_STALE_SECONDS", DEFAULT_STALE_SFS_90_SECONDS, env_overrides=env_overrides
-    )
-    sfs_1_stale = get_positive_int_setting(
-        "OFFLINE_DB_SFS_1_STALE_SECONDS", DEFAULT_STALE_SFS_1_SECONDS, env_overrides=env_overrides
-    )
-    shared_cidrs_stale = get_positive_int_setting(
-        "OFFLINE_DB_SHARED_CIDRS_STALE_SECONDS", DEFAULT_STALE_SHARED_CIDRS_SECONDS, env_overrides=env_overrides
-    )
-    openasn_stale = get_positive_int_setting(
-        "OFFLINE_DB_OPENASN_STALE_SECONDS", DEFAULT_STALE_OPENASN_SECONDS, env_overrides=env_overrides
-    )
-    oxylabs_stale = get_positive_int_setting(
-        "OFFLINE_DB_OXYLABS_STALE_SECONDS", DEFAULT_STALE_OXYLABS_SECONDS, env_overrides=env_overrides
-    )
-    rules_stale = get_positive_int_setting(
-        "OFFLINE_DB_RULES_STALE_SECONDS", DEFAULT_STALE_RULES_SECONDS, env_overrides=env_overrides
-    )
-    tor_stale = get_positive_int_setting(
-        "OFFLINE_DB_TOR_ONIONOO_STALE_SECONDS", DEFAULT_STALE_TOR_ONIONOO_SECONDS, env_overrides=env_overrides
-    )
-    daily_feed_stale = get_positive_int_setting(
-        "OFFLINE_DB_DAILY_FEED_STALE_SECONDS", DEFAULT_STALE_DAILY_FEED_SECONDS, env_overrides=env_overrides
-    )
 
     maxmind_paths = resolve_maxmind_paths(env_overrides=env_overrides, base_dir=base_dir)
     sfs_paths = resolve_stopforumspam_paths(env_overrides=env_overrides, base_dir=base_dir, bypass_throttle=True)
     hosting_rules_path, hosting_rules_name = resolve_hosting_rules_path(
         env_overrides=env_overrides, base_dir=base_dir, bypass_throttle=True
     )
+    resolved_special_paths: Dict[str, Tuple[Optional[Path], Optional[str]]] = {
+        "maxmind_country": (maxmind_paths.get("country"), None),
+        "maxmind_city": (maxmind_paths.get("city"), None),
+        "maxmind_asn": (maxmind_paths.get("asn"), None),
+        "stopforumspam_toxic_cidr": (sfs_paths.get("toxic_cidr"), None),
+        "stopforumspam_listed_90": (sfs_paths.get("listed_90"), None),
+        "stopforumspam_listed_1": (sfs_paths.get("listed_1"), None),
+        "stopforumspam_index": (sfs_paths.get("sqlite_index"), None),
+        "hosting_asn_rules": (hosting_rules_path, hosting_rules_name),
+    }
 
-    extra_specs = (
-        (
-            "shared_cidrs",
-            "Shared CIDRs",
-            "Rezmoss Shared Egress CIDRs",
-            resolve_feed_data_path(
-                SHARED_CIDRS_BIN_FILENAME,
-                override_setting="SHARED_CIDRS_BIN_PATH",
-                env_overrides=env_overrides,
-                base_dir=base_dir,
-                bypass_throttle=True,
-            ),
-            SHARED_CIDRS_BIN_FILENAME,
-            True,
-            shared_cidrs_stale,
-            None,
-        ),
-        (
-            "privacy_relays",
-            "Privacy Relays",
-            "Apple Private Relay and Cloudflare WARP",
-            resolve_feed_data_path(
-                PRIVACY_RELAYS_BIN_FILENAME,
-                override_setting="PRIVACY_RELAYS_BIN_PATH",
-                env_overrides=env_overrides,
-                base_dir=base_dir,
-                bypass_throttle=True,
-            ),
-            PRIVACY_RELAYS_BIN_FILENAME,
-            True,
-            daily_feed_stale,
-            None,
-        ),
-        (
-            "ipsum_drop",
-            "IPsum and DROP",
-            "IPsum and Spamhaus DROP Index",
-            resolve_feed_data_path(
-                IPSUM_DROP_BIN_FILENAME,
-                override_setting="IPSUM_DROP_BIN_PATH",
-                env_overrides=env_overrides,
-                base_dir=base_dir,
-                bypass_throttle=True,
-            ),
-            IPSUM_DROP_BIN_FILENAME,
-            True,
-            daily_feed_stale,
-            None,
-        ),
-        (
-            "tor_onionoo",
-            "Tor Onionoo",
-            "Tor Onionoo Summary Mirror",
-            resolve_feed_data_path(
-                TOR_ONIONOO_SUMMARY_FILENAME,
-                override_setting="TOR_ONIONOO_SUMMARY_PATH",
-                env_overrides=env_overrides,
-                base_dir=base_dir,
-                bypass_throttle=True,
-            ),
-            TOR_ONIONOO_SUMMARY_FILENAME,
-            True,
-            tor_stale,
-            None,
-        ),
-        (
-            "bgp_tools",
-            "BGP Tools",
-            "BGP Routing Table Prefix Index",
-            resolve_feed_data_path(
-                BGP_TOOLS_BIN_FILENAME,
-                override_setting="BGP_TOOLS_BIN_PATH",
-                env_overrides=env_overrides,
-                base_dir=base_dir,
-                bypass_throttle=True,
-            ),
-            BGP_TOOLS_BIN_FILENAME,
-            True,
-            daily_feed_stale,
-            None,
-        ),
-        (
-            "openasn",
-            "OpenASN",
-            "OpenASN IP/ASN Classification",
-            resolve_feed_data_path(
-                OPENASN_MMDB_FILENAME,
-                override_setting="OPENASN_MMDB_PATH",
-                env_overrides=env_overrides,
-                base_dir=base_dir,
-                bypass_throttle=True,
-            ),
-            OPENASN_MMDB_FILENAME,
-            True,
-            openasn_stale,
-            None,
-        ),
-        (
-            "mobile_carriers",
-            "Mobile Carriers",
-            "Mobile Carrier ASNs",
-            resolve_feed_data_path(
-                MOBILE_ASNS_JSON_FILENAME,
-                override_setting="MOBILE_ASNS_JSON_PATH",
-                env_overrides=env_overrides,
-                base_dir=base_dir,
-                bypass_throttle=True,
-            ),
-            MOBILE_ASNS_JSON_FILENAME,
-            True,
-            daily_feed_stale,
-            None,
-        ),
-    )
-
-    entries = build_offline_database_entries(
-        maxmind_paths=maxmind_paths,
-        sfs_paths=sfs_paths,
-        hosting_rules_path=hosting_rules_path,
-        hosting_rules_name=hosting_rules_name,
-        maxmind_stale=maxmind_stale,
-        sfs_toxic_stale=sfs_toxic_stale,
-        sfs_90_stale=sfs_90_stale,
-        sfs_1_stale=sfs_1_stale,
-        rules_stale=rules_stale,
-        extra_feed_specs=extra_specs,
-        now_ts=now_ts,
-        include_resolved_path=include_resolved_path,
-    )
-    entries.append(
-        _build_oxylabs_status_entry(
-            now_ts=now_ts,
-            stale_after_seconds=oxylabs_stale,
-            env_overrides=env_overrides,
-            base_dir=base_dir,
-            include_resolved_path=include_resolved_path,
+    entries: List[Dict[str, Any]] = []
+    for spec in OFFLINE_DATASET_SPECS:
+        stale_after = get_positive_int_setting(
+            spec.stale_setting, spec.default_stale_seconds, env_overrides=env_overrides
         )
-    )
+        if spec.glob_pattern:
+            dataset_dir, matched_files = _scan_glob_dataset_files(spec, env_overrides=env_overrides, base_dir=base_dir)
+            if not matched_files:
+                entries.append(
+                    _build_status_entry(
+                        spec,
+                        filename=f"{spec.filename}/{spec.glob_pattern}",
+                        exists=False,
+                        size_bytes=None,
+                        mtime_ns=None,
+                        stale_after_seconds=stale_after,
+                        now_ts=now_ts,
+                        resolved_path=dataset_dir,
+                        include_resolved_path=include_resolved_path,
+                    )
+                )
+            else:
+                entries.append(
+                    _build_status_entry(
+                        spec,
+                        filename=f"{spec.filename}/{spec.glob_pattern} ({len(matched_files)} files)",
+                        exists=True,
+                        size_bytes=sum(size for _, _, size in matched_files),
+                        mtime_ns=max(mtime_ns for _, mtime_ns, _ in matched_files),
+                        stale_after_seconds=stale_after,
+                        now_ts=now_ts,
+                        resolved_path=dataset_dir,
+                        include_resolved_path=include_resolved_path,
+                    )
+                )
+            continue
+
+        if spec.key in resolved_special_paths:
+            file_path, custom_fallback = resolved_special_paths[spec.key]
+            fallback_filename = custom_fallback or spec.filename
+        else:
+            file_path = resolve_feed_data_path(
+                spec.filename,
+                override_setting=spec.override_setting or "",
+                env_overrides=env_overrides,
+                base_dir=base_dir,
+                bypass_throttle=True,
+            )
+            fallback_filename = spec.filename
+
+        filename = file_path.name if file_path is not None else fallback_filename
+        sig = get_file_stat_signature(file_path, bypass_throttle=True) if file_path is not None else None
+        entries.append(
+            _build_status_entry(
+                spec,
+                filename=filename,
+                exists=sig is not None,
+                size_bytes=sig[1] if sig is not None else None,
+                mtime_ns=sig[0] if sig is not None else None,
+                stale_after_seconds=stale_after,
+                now_ts=now_ts,
+                resolved_path=file_path,
+                include_resolved_path=include_resolved_path,
+            )
+        )
     return entries
 
 
-def clear_stopforumspam_caches() -> None:
+def clear_offline_feed_caches() -> None:
     """Clears StopForumSpam and offline feed caches, closes handles, and resets stat throttling."""
+    global _oxylabs_scan_cache
+
     clear_sfs_caches()
     _shared_cidrs_index.clear()
     _privacy_relays_index.clear()
@@ -917,4 +949,6 @@ def clear_stopforumspam_caches() -> None:
     _bgp_tags_cache.clear()
     _mobile_asns_cache.clear()
     _oxylabs_cache.clear()
+    with _oxylabs_scan_lock:
+        _oxylabs_scan_cache = None
     clear_stat_throttle_cache()

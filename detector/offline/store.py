@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import ipaddress
 import logging
+import math
 import os
 import socket
 import stat
@@ -62,7 +63,6 @@ TOR_ONIONOO_SUMMARY_FILENAME = "tor_onionoo_summary.json"
 BGP_TOOLS_BIN_FILENAME = "bgp_tools.bin"
 BGP_TAGS_JSON_FILENAME = "bgp_tags.json"
 OPENASN_MMDB_FILENAME = "openasn.mmdb"
-OXYLABS_DIR_NAME = "oxylabs"
 MOBILE_ASNS_JSON_FILENAME = "mobile_asns.json"
 HTTP_FEED_METADATA_FILENAME = "http_feed_metadata.json"
 
@@ -156,16 +156,6 @@ _SOURCE_MASK_90 = 1
 _SOURCE_MASK_1 = 2
 
 OFFLINE_STAT_THROTTLE_SECONDS = 30.0
-DEFAULT_STALE_MAXMIND_SECONDS = 14 * 86400
-DEFAULT_STALE_SFS_TOXIC_SECONDS = 7 * 86400
-DEFAULT_STALE_SFS_90_SECONDS = 2 * 86400
-DEFAULT_STALE_SFS_1_SECONDS = 6 * 3600
-DEFAULT_STALE_SHARED_CIDRS_SECONDS = 7 * 86400
-DEFAULT_STALE_OPENASN_SECONDS = 14 * 86400
-DEFAULT_STALE_OXYLABS_SECONDS = 7 * 86400
-DEFAULT_STALE_TOR_ONIONOO_SECONDS = 6 * 3600
-DEFAULT_STALE_DAILY_FEED_SECONDS = 7 * 86400
-DEFAULT_STALE_RULES_SECONDS = 90 * 86400
 
 _K = TypeVar("_K")
 _V = TypeVar("_V")
@@ -406,7 +396,7 @@ def get_positive_int_setting(
     *,
     env_overrides: Optional[Mapping[str, str]] = None,
 ) -> int:
-    """Resolves a positive integer setting from an explicit mapping or Django settings."""
+    """Resolves a positive integer setting from an explicit mapping, Django settings, or environment."""
     if env_overrides is not None:
         raw_text = str(env_overrides.get(name, "") or "").strip()
         if not raw_text:
@@ -416,7 +406,16 @@ def get_positive_int_setting(
         except ValueError:
             return default
         return parsed if parsed > 0 else default
-    raw = get_setting(name, default)
+    raw = get_setting(name, None)
+    if raw is None:
+        raw_env = os.environ.get(name, "").strip()
+        if not raw_env:
+            return default
+        try:
+            parsed = int(raw_env)
+        except ValueError:
+            return default
+        return parsed if parsed > 0 else default
     if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
         return default
     return raw
@@ -483,25 +482,28 @@ def resolve_feed_data_path(
     return None
 
 
-def resolve_oxylabs_data_dir(
+def resolve_feed_data_dir(
+    dir_name: str,
     *,
+    override_setting: str = "",
     env_overrides: Optional[Mapping[str, str]] = None,
     base_dir: Optional[Path] = None,
 ) -> Optional[Path]:
-    """Resolves the Oxylabs JSONL directory across OXYLABS_DATA_DIR, TOOL_DATA_DIR, and standard directories."""
-    raw_override = expand_configured_path(_lookup_config_value("OXYLABS_DATA_DIR", env_overrides=env_overrides))
-    if raw_override:
-        explicit = Path(raw_override)
-        return explicit if explicit.is_dir() else None
+    """Resolves an offline dataset subdirectory across an override setting, TOOL_DATA_DIR, and standard directories."""
+    if override_setting:
+        raw_override = expand_configured_path(_lookup_config_value(override_setting, env_overrides=env_overrides))
+        if raw_override:
+            explicit = Path(raw_override)
+            return explicit if explicit.is_dir() else None
 
     configured_dir = resolve_configured_data_dir(env_overrides=env_overrides)
     if configured_dir:
-        candidate = Path(expand_configured_path(configured_dir)) / OXYLABS_DIR_NAME
+        candidate = Path(expand_configured_path(configured_dir)) / dir_name
         return candidate if candidate.is_dir() else None
 
     resolved_base = _effective_base_dir(base_dir)
     for directory in _effective_standard_dirs(env_overrides=env_overrides, base_dir=resolved_base):
-        candidate = directory / OXYLABS_DIR_NAME
+        candidate = directory / dir_name
         if candidate.is_dir():
             return candidate
     return None
@@ -693,10 +695,15 @@ def atomic_temp_path(target_path: Path, *, prefix: Optional[str] = None, mode: i
 
 
 def _parse_asn_int(raw_asn: Any) -> Optional[int]:
+    """Parses a positive autonomous system number from integers, whole floats, or AS-prefixed strings."""
     if isinstance(raw_asn, bool) or raw_asn is None:
         return None
     if isinstance(raw_asn, int):
         return raw_asn if raw_asn > 0 else None
+    if isinstance(raw_asn, float):
+        if math.isfinite(raw_asn) and raw_asn > 0 and raw_asn.is_integer():
+            return int(raw_asn)
+        return None
     if isinstance(raw_asn, str):
         cleaned = raw_asn.strip().upper()
         if cleaned.startswith("AS"):

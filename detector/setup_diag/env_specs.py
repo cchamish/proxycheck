@@ -10,16 +10,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from django.db import Error as DjangoDbError
 
-from ..offline import (
-    DEFAULT_STALE_MAXMIND_SECONDS,
-    DEFAULT_STALE_OPENASN_SECONDS,
-    DEFAULT_STALE_OXYLABS_SECONDS,
-    DEFAULT_STALE_RULES_SECONDS,
-    DEFAULT_STALE_SFS_1_SECONDS,
-    DEFAULT_STALE_SFS_90_SECONDS,
-    DEFAULT_STALE_SFS_TOXIC_SECONDS,
-    DEFAULT_STALE_SHARED_CIDRS_SECONDS,
-)
+from ..offline.feeds import OFFLINE_DATASET_SPECS
 from ..provider_registry import PROVIDER_REGISTRY
 
 try:
@@ -56,27 +47,7 @@ _MYSQL_PROBE_ERRORS: Tuple[type[BaseException], ...] = (
     if _PyMySqlError is not None
     else (ImportError, OSError, RuntimeError, ValueError, DjangoDbError)
 )
-_OFFLINE_SOURCE_ALIASES = {
-    "stopforumspam": "stopforumspam",
-    "sfs": "stopforumspam",
-    "maxmind": "maxmind",
-    "shared_cidrs": "shared_cidrs",
-    "shared-cidrs": "shared_cidrs",
-    "rezmoss": "shared_cidrs",
-    "privacy_relays": "privacy_relays",
-    "privacy-relays": "privacy_relays",
-    "ipsum_drop": "ipsum_drop",
-    "ipsum-drop": "ipsum_drop",
-    "tor_onionoo": "tor_onionoo",
-    "tor-onionoo": "tor_onionoo",
-    "bgp_tools": "bgp_tools",
-    "bgp-tools": "bgp_tools",
-    "openasn": "openasn",
-    "open-asn": "openasn",
-    "mobile_carriers": "mobile_carriers",
-    "mobile-carriers": "mobile_carriers",
-}
-_ALL_OFFLINE_SOURCES = frozenset(_OFFLINE_SOURCE_ALIASES.values())
+DEFAULT_TOOLFORGE_IMAGE = "tool-proxycheck/tool-proxycheck:latest"
 
 
 @dataclass(frozen=True)
@@ -287,14 +258,6 @@ def _build_env_specs() -> Tuple[EnvVarSpec, ...]:
             "Restrict access exclusively to usernames listed in ALLOWED_WIKI_USERS",
             False,
         ),
-        ("STOPFORUMSPAM_TOXIC_CIDR_PATH", "(auto)", "Override file or directory path for toxic_ip_cidr.txt", False),
-        ("STOPFORUMSPAM_LISTED_90_PATH", "(auto)", "Override path for StopForumSpam 90-day listed IP archive", False),
-        ("STOPFORUMSPAM_LISTED_1_PATH", "(auto)", "Override path for StopForumSpam 1-day listed IP archive", False),
-        ("STOPFORUMSPAM_SQLITE_PATH", "(auto)", "Override path for stopforumspam.sqlite3 index", False),
-        ("OPENASN_MMDB_PATH", "(auto)", "Override path for openasn.mmdb", False),
-        ("OXYLABS_DATA_DIR", "(auto)", "Override directory path for Oxylabs JSONL datasets", False),
-        ("SHARED_CIDRS_BIN_PATH", "(auto)", "Override path for shared_cidrs.bin", False),
-        ("HOSTING_ASN_RULES_PATH", "(auto)", "Override path for hosting_asn_rules.json", False),
         ("HOSTING_ASNS", "(built-in)", "Extra comma-separated hosting ASNs", False),
         ("HOSTING_ORG_KEYWORDS", "(built-in)", "Extra comma-separated hosting organisation keywords", False),
         ("VITE_GITHUB_REPO", "(unset)", "Build-time GitHub repository slug shown in the UI footer", False),
@@ -318,6 +281,21 @@ def _build_env_specs() -> Tuple[EnvVarSpec, ...]:
         for name, default_display, description, sensitive in runtime_defs
     )
 
+    seen_override_settings: set[str] = set()
+    for dataset in OFFLINE_DATASET_SPECS:
+        if dataset.override_setting and dataset.override_setting not in seen_override_settings:
+            seen_override_settings.add(dataset.override_setting)
+            specs.append(
+                EnvVarSpec(
+                    name=dataset.override_setting,
+                    tier="optional",
+                    category="Runtime, Paths & Build Metadata",
+                    sensitive=False,
+                    default_display="(auto)",
+                    description=dataset.override_description or f"Override path for {dataset.filename}",
+                )
+            )
+
     tuning_defs = (
         ("PROVIDER_STATIC_CACHE_TTL_SECONDS", "86400", "Cache TTL for static commercial intelligence providers"),
         ("PROVIDER_DYNAMIC_CACHE_TTL_SECONDS", "7200", "Cache TTL for dynamic threat feeds"),
@@ -326,42 +304,6 @@ def _build_env_specs() -> Tuple[EnvVarSpec, ...]:
         ("PROVIDER_COOLDOWN_MAX_SECONDS", "300", "Maximum clamped Retry-After cooldown duration"),
         ("DNS_QUERY_TIMEOUT_SECONDS", "2.0", "Per-attempt DNS resolver timeout"),
         ("DNS_QUERY_LIFETIME_SECONDS", "2.0", "Total DNS resolver query lifetime"),
-        (
-            "OFFLINE_DB_MAXMIND_STALE_SECONDS",
-            str(DEFAULT_STALE_MAXMIND_SECONDS),
-            "MaxMind MMDB staleness warning threshold",
-        ),
-        (
-            "OFFLINE_DB_SFS_TOXIC_STALE_SECONDS",
-            str(DEFAULT_STALE_SFS_TOXIC_SECONDS),
-            "StopForumSpam toxic_ip_cidr.txt staleness threshold",
-        ),
-        (
-            "OFFLINE_DB_SFS_90_STALE_SECONDS",
-            str(DEFAULT_STALE_SFS_90_SECONDS),
-            "StopForumSpam 90-day dump staleness threshold",
-        ),
-        (
-            "OFFLINE_DB_SFS_1_STALE_SECONDS",
-            str(DEFAULT_STALE_SFS_1_SECONDS),
-            "StopForumSpam 1-day dump staleness threshold",
-        ),
-        (
-            "OFFLINE_DB_OPENASN_STALE_SECONDS",
-            str(DEFAULT_STALE_OPENASN_SECONDS),
-            "OpenASN MMDB staleness threshold",
-        ),
-        (
-            "OFFLINE_DB_OXYLABS_STALE_SECONDS",
-            str(DEFAULT_STALE_OXYLABS_SECONDS),
-            "Oxylabs JSONL datasets staleness threshold",
-        ),
-        (
-            "OFFLINE_DB_SHARED_CIDRS_STALE_SECONDS",
-            str(DEFAULT_STALE_SHARED_CIDRS_SECONDS),
-            "Rezmoss shared egress CIDRs staleness threshold",
-        ),
-        ("OFFLINE_DB_RULES_STALE_SECONDS", str(DEFAULT_STALE_RULES_SECONDS), "Hosting ASN rules staleness threshold"),
     )
     specs.extend(
         EnvVarSpec(
@@ -373,6 +315,20 @@ def _build_env_specs() -> Tuple[EnvVarSpec, ...]:
         )
         for name, default_display, description in tuning_defs
     )
+
+    seen_stale_settings: set[str] = set()
+    for dataset in OFFLINE_DATASET_SPECS:
+        if dataset.stale_setting not in seen_stale_settings:
+            seen_stale_settings.add(dataset.stale_setting)
+            specs.append(
+                EnvVarSpec(
+                    name=dataset.stale_setting,
+                    tier="tuning",
+                    category="Tuning & Quota Limits",
+                    default_display=str(dataset.default_stale_seconds),
+                    description=dataset.stale_description,
+                )
+            )
 
     for meta in PROVIDER_REGISTRY:
         if not meta.has_quota_env_vars:
@@ -400,38 +356,6 @@ def _build_env_specs() -> Tuple[EnvVarSpec, ...]:
 
 ENV_SPECS: Tuple[EnvVarSpec, ...] = _build_env_specs()
 ENV_SPEC_BY_NAME: Dict[str, EnvVarSpec] = {spec.name: spec for spec in ENV_SPECS}
-
-DEFAULT_JOB_SPECS: Tuple[JobSpec, ...] = (
-    JobSpec(
-        name="update-sfs-db",
-        command="python manage.py update_offline_dbs --sources stopforumspam",
-        image="tool-proxycheck/tool-proxycheck:latest",
-        schedule="@hourly",
-        mount="all",
-    ),
-    JobSpec(
-        name="update-maxmind-db",
-        command="python manage.py update_offline_dbs --sources maxmind",
-        image="tool-proxycheck/tool-proxycheck:latest",
-        schedule="@daily",
-        mount="all",
-    ),
-    JobSpec(
-        name="update-shared-cidrs-db",
-        command="python manage.py update_offline_dbs --sources shared_cidrs",
-        image="tool-proxycheck/tool-proxycheck:latest",
-        schedule="@daily",
-        mount="all",
-    ),
-    JobSpec(
-        name="update-openasn-db",
-        command="python manage.py update_offline_dbs --sources openasn",
-        image="tool-proxycheck/tool-proxycheck:latest",
-        schedule="@daily",
-        mount="all",
-    ),
-)
-DEFAULT_JOB_SPEC = DEFAULT_JOB_SPECS[0]
 
 
 def mask_secret(value: str) -> str:

@@ -12,7 +12,7 @@ from detector.cache import redis_backend as cache_backends
 from detector.models import RangeblockAggregate
 from detector.rangeblock import service as rangeblock_service
 
-from .helpers import _login_authorised, start_non_dnsbl_provider_stubs
+from .helpers import TEST_UPSTREAM_SECRETS, _login_authorised, start_non_dnsbl_provider_stubs
 
 
 async def _add_agg(wiki: str, count: int, *, active: bool = False) -> None:
@@ -153,3 +153,75 @@ class RangeblockAndSseTests(TestCase):
         self.assertIn("rangeblock", events[0][1])
         self.assertIn("provider", [name for name, _ in events[1:-1]])
         self.assertEqual(events[-1][0], "done")
+
+    async def test_detect_stream_light_mode_defers_tor_and_skips_dns_lookups(self):
+        """Light-mode SSE defers Tor Onionoo when offline misses, skips live PTR/BGP, and extracts bgpPrefix string."""
+        _login_authorised(self)
+        mocks = start_non_dnsbl_provider_stubs(self)
+        ptr_spy = AsyncMock(return_value="dns.google")
+        bgp_spy = AsyncMock(return_value={"bgpPrefix": "8.8.8.0/24", "asn": 15169})
+        client = AsyncClient()
+        client.cookies.load(self.client.cookies.output(header=""))
+        with (
+            override_settings(**TEST_UPSTREAM_SECRETS),
+            patch("detector.cache.redis_backend.redis_client", None),
+            patch("detector.rangeblock.service.discover_wiki_replica_credentials", return_value=None),
+            patch("detector.offline.feeds.lookup_tor_onionoo_offline", return_value=None),
+            patch(
+                "detector.offline.feeds.lookup_bgp_tools_offline",
+                return_value={"bgpPrefix": "8.8.8.0/24", "asn": 15169, "tags": []},
+            ),
+            patch("detector.providers.dns.query_rdns_ptr", ptr_spy),
+            patch("detector.providers.dns.query_cymru_bgp_prefix", bgp_spy),
+        ):
+            resp = await client.get("/api/v1/detect/stream?ip=8.8.8.8&mode=light")
+            self.assertEqual(resp.status_code, 200)
+            chunks = [c.decode("utf-8") if isinstance(c, bytes) else str(c) async for c in resp.streaming_content]
+
+        events = [
+            (lines[0].removeprefix("event:").strip(), json.loads(lines[1].removeprefix("data:").strip()))
+            for block in "".join(chunks).split("\n\n")
+            if (lines := [ln for ln in block.splitlines() if ln.startswith(("event:", "data:"))]) and len(lines) == 2
+        ]
+        self.assertEqual(events[0][0], "snapshot")
+        self.assertEqual(events[0][1]["pendingProviders"], [])
+        self.assertEqual(events[0][1]["bgpPrefix"], "8.8.8.0/24")
+        self.assertEqual(events[-1][0], "done")
+        mocks["tor_onionoo"].assert_not_awaited()
+        mocks["proxycheck"].assert_not_awaited()
+        ptr_spy.assert_not_awaited()
+        bgp_spy.assert_not_awaited()
+
+    async def test_detect_stream_coalesces_on_concurrent_updating_lock(self):
+        """Polls for a concurrent worker snapshot when the Redis updating lock is held instead of fanning out."""
+        _login_authorised(self)
+        mocks = start_non_dnsbl_provider_stubs(self)
+        polled_payload = {
+            "ip": "8.8.8.8",
+            "isCached": True,
+            "fetchedAt": "2026-11-28T00:00:00+00:00",
+            "results": [],
+            "cacheMeta": {"status": "hit", "layer": "L1", "isStale": False, "shouldAutoRefresh": False},
+        }
+        client = AsyncClient()
+        client.cookies.load(self.client.cookies.output(header=""))
+        with (
+            patch("detector.cache.redis_backend.redis_client", None),
+            patch("detector.rangeblock.service.discover_wiki_replica_credentials", return_value=None),
+            patch("detector.detection.stream.acquire_ip_updating_lock", AsyncMock(return_value=None)),
+            patch("detector.detection.stream.is_ip_updating_locked", AsyncMock(return_value=True)),
+            patch("detector.detection.stream._poll_for_concurrent_snapshot", AsyncMock(return_value=polled_payload)),
+        ):
+            resp = await client.get("/api/v1/detect/stream?ip=8.8.8.8")
+            self.assertEqual(resp.status_code, 200)
+            chunks = [c.decode("utf-8") if isinstance(c, bytes) else str(c) async for c in resp.streaming_content]
+
+        events = [
+            (lines[0].removeprefix("event:").strip(), json.loads(lines[1].removeprefix("data:").strip()))
+            for block in "".join(chunks).split("\n\n")
+            if (lines := [ln for ln in block.splitlines() if ln.startswith(("event:", "data:"))]) and len(lines) == 2
+        ]
+        self.assertEqual([name for name, _ in events], ["snapshot", "done"])
+        self.assertEqual(events[0][1]["pendingProviders"], [])
+        self.assertTrue(events[0][1]["isCached"])
+        mocks["proxycheck"].assert_not_awaited()

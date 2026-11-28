@@ -22,17 +22,15 @@ from proxycheck.settings import (
 )
 
 from ..core.sanitization import sanitize_error_message
+from ..offline.updaters import _ALL_CANONICAL_SOURCES, _SOURCE_ALIASES
 from .env_specs import (
-    _ALL_OFFLINE_SOURCES,
     _ENV_NAME_RE,
     _FAILED_JOB_STATUS_TOKENS,
     _GRANT_STMT_RE,
     _MYSQL_PROBE_ERRORS,
-    _OFFLINE_SOURCE_ALIASES,
     _SEPARATOR_LINE_RE,
     _WIKI_REPLICA_READONLY_PRIVS,
-    DEFAULT_JOB_SPEC,
-    DEFAULT_JOB_SPECS,
+    DEFAULT_TOOLFORGE_IMAGE,
     ENV_MODES,
     ENV_SPEC_BY_NAME,
     ENV_SPECS,
@@ -398,8 +396,8 @@ def _extract_update_offline_sources(command: str) -> set[str]:
         idx += 1
 
     if not source_tokens or "all" in source_tokens:
-        return set(_ALL_OFFLINE_SOURCES)
-    return {_OFFLINE_SOURCE_ALIASES[tok] for tok in source_tokens if tok in _OFFLINE_SOURCE_ALIASES}
+        return set(_ALL_CANONICAL_SOURCES)
+    return {_SOURCE_ALIASES[tok] for tok in source_tokens if tok in _SOURCE_ALIASES}
 
 
 def _schedule_matches_expected(expected_schedule: str, actual_job_type: str) -> bool:
@@ -585,16 +583,16 @@ def _check_bastion_jobs(
         expected_jobs = [
             JobSpec(
                 name=item["name"].strip(),
-                command=item.get("command", DEFAULT_JOB_SPEC.command).strip(),
-                image=item.get("image", DEFAULT_JOB_SPEC.image).strip(),
-                schedule=item.get("schedule", DEFAULT_JOB_SPEC.schedule).strip(),
-                mount=item.get("mount", DEFAULT_JOB_SPEC.mount).strip(),
+                command=item.get("command", "").strip(),
+                image=item.get("image", DEFAULT_TOOLFORGE_IMAGE).strip(),
+                schedule=item.get("schedule", "").strip(),
+                mount=item.get("mount", "all").strip(),
             )
             for item in raw_items
             if item.get("name", "").strip()
         ]
     if not expected_jobs:
-        expected_jobs = list(DEFAULT_JOB_SPECS)
+        return [], f"No scheduled jobs found in {jobs_path}"
 
     used_long_output = True
     rc, stdout, stderr = _run_toolforge_command(toolforge_bin, ("jobs", "list", "--output", "long"))

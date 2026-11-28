@@ -1,24 +1,22 @@
-"""Upstream HTTP IP intelligence provider queries and shared provider specification registry."""
+"""Upstream HTTP IP intelligence provider queries."""
 
 import asyncio
 import logging
 import os
 import re
-import sys
 import time
-from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
 
 import httpx
 from django.conf import settings
 
-from .. import offline as offline_dbs
 from ..cache.quota_telemetry import extract_upstream_rate_limit
 from ..cache.redis_backend import get_cooldown_bounds
 from ..core.context import provider_upstream_events, record_upstream_event
-from ..core.sanitization import sanitize_error_message, sanitize_payload
-from ..provider_registry import PROVIDER_REGISTRY, USER_AGENT_HEADER
-from . import dns_local as dns_providers
+from ..core.sanitization import sanitize_error_message
+from ..offline import feeds as offline_feeds
+from ..provider_registry import USER_AGENT_HEADER
+from . import dns as dns_providers
 from .adapters_http import (
     adapt_abuseipdb,
     adapt_cloudflare_radar,
@@ -324,7 +322,7 @@ async def query_iphunter(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
 
 
 async def query_tor_onionoo(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
-    offline_payload = offline_dbs.lookup_tor_onionoo_offline(ip)
+    offline_payload = offline_feeds.lookup_tor_onionoo_offline(ip)
     if isinstance(offline_payload, dict):
         return adapt_tor_onionoo(offline_payload, status_code=200, ip=ip)
 
@@ -385,125 +383,3 @@ async def query_dshield(client: httpx.AsyncClient, ip: str) -> Dict[str, Any]:
         if owned_events_token is not None:
             provider_upstream_events.reset(owned_events_token)
     return adapt_dshield(payload, status_code=status_code)
-
-
-def is_unconfigured_provider_row(row: Dict[str, Any]) -> bool:
-    return (
-        isinstance(row, dict)
-        and row.get("status") in ("No API Key", "Database Missing", "Offline DB Missing", "Skipped (IPv6)")
-        and row.get("statusCode") is None
-    )
-
-
-def is_provider_result_cacheable(row: Any) -> bool:
-    return isinstance(row, dict) and row.get("statusCode") == 200 and row.get("status") == "200 OK"
-
-
-def build_cooldown_provider_row(provider_name: str, cooldown_info: Dict[str, Any]) -> Dict[str, Any]:
-    raw_status = cooldown_info.get("statusCode")
-    status_code = raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool) else 503
-    reason = str(cooldown_info.get("reason") or "Upstream rate limited or degraded")
-    custom_label = cooldown_info.get("statusLabel")
-    is_quota_guard = bool(cooldown_info.get("isQuotaGuard") or cooldown_info.get("isQuotaGuarded"))
-    if isinstance(custom_label, str) and custom_label.strip():
-        status_label = custom_label.strip()
-    else:
-        status_label = "429 Cooldown (Rate Limited)" if status_code == 429 else f"{status_code} Cooldown (Circuit Open)"
-
-    flag_label = "Local Quota Guard" if is_quota_guard else "Provider Cooldown"
-    raw_payload: Dict[str, Any] = {
-        "status": "quota_guarded" if is_quota_guard else "cooldown",
-        "message": reason,
-        "retryAfterSeconds": cooldown_info.get("cooldownSeconds"),
-        "cooldownUntil": cooldown_info.get("until"),
-    }
-    if is_quota_guard:
-        raw_payload["window"] = cooldown_info.get("window")
-        raw_payload["used"] = cooldown_info.get("used")
-        raw_payload["limit"] = cooldown_info.get("limit")
-
-    row: Dict[str, Any] = {
-        "provider": provider_name,
-        "status": status_label,
-        "statusCode": status_code,
-        "asn": "-",
-        "isp": "-",
-        "organisation": "-",
-        "location": "-",
-        "usageType": "-",
-        "securityFlags": [{"label": flag_label, "isHighRisk": False}],
-        "isCooldown": True,
-        "rawJson": sanitize_payload(raw_payload),
-    }
-    if is_quota_guard:
-        row["isQuotaGuarded"] = True
-        row["isQuotaGuard"] = True
-    return row
-
-
-def build_unhandled_provider_error_row(provider_name: str, safe_message: str) -> Dict[str, Any]:
-    return {
-        "provider": provider_name,
-        "status": "500 Internal Error",
-        "statusCode": 500,
-        "asn": "-",
-        "isp": "-",
-        "organisation": "-",
-        "location": "-",
-        "usageType": "-",
-        "securityFlags": [{"label": "No Flags", "isHighRisk": False}],
-        "rawJson": {"status": "error", "message": safe_message},
-    }
-
-
-def build_deferred_provider_row(provider_name: str) -> Dict[str, Any]:
-    """Builds a placeholder row when an uncached commercial source is skipped in light mode."""
-    return {
-        "provider": provider_name,
-        "status": "Deferred (Light Mode)",
-        "statusCode": None,
-        "asn": "-",
-        "isp": "-",
-        "organisation": "-",
-        "location": "-",
-        "usageType": "-",
-        "securityFlags": [{"label": "Deferred (Light Mode)", "isHighRisk": False}],
-        "isDeferred": True,
-        "rawJson": {"status": "deferred", "mode": "light"},
-    }
-
-
-@dataclass(frozen=True)
-class ProviderSpec:
-    """Declarative execution specification resolving provider query callables dynamically at dispatch time."""
-
-    key: str
-    label: str
-    uses_http_client: bool
-    supports_cooldown: bool
-    target_module: Any
-    func_name: str
-    passes_client: bool = True
-
-    async def invoke(self, client: Optional[httpx.AsyncClient], ip: str) -> Dict[str, Any]:
-        query_fn = getattr(self.target_module, self.func_name)
-        if self.passes_client:
-            return await query_fn(client, ip)
-        return await query_fn(ip)
-
-
-_CURRENT_MODULE = sys.modules[__name__]
-_IP_ONLY_DNS_PROVIDER_KEYS = frozenset({"maxmind", "spamhaus_zen", "spamcop"})
-
-PROVIDER_SPECS: Tuple[ProviderSpec, ...] = tuple(
-    ProviderSpec(
-        key=meta.key,
-        label=meta.label,
-        uses_http_client=not (meta.is_offline or meta.is_dnsbl),
-        supports_cooldown=not meta.is_offline,
-        target_module=dns_providers if (meta.is_offline or meta.is_dnsbl) else _CURRENT_MODULE,
-        func_name=f"query_{meta.key}",
-        passes_client=meta.key not in _IP_ONLY_DNS_PROVIDER_KEYS,
-    )
-    for meta in PROVIDER_REGISTRY
-)

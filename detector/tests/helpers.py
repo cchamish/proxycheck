@@ -1,29 +1,13 @@
 """Shared test doubles and provider mock helpers for the detector P0 test suite."""
 
 import contextlib
+import inspect
 from typing import Any, Callable, Dict, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from detector.provider_registry import PROVIDER_REGISTRY
-from detector.providers import (
-    adapt_abuseipdb,
-    adapt_cloudflare_radar,
-    adapt_dshield,
-    adapt_getipintel,
-    adapt_ip2location,
-    adapt_ipdata,
-    adapt_iphub,
-    adapt_iphunter,
-    adapt_ipregistry,
-    adapt_ipsum_drop,
-    adapt_maxmind,
-    adapt_openasn,
-    adapt_oxylabs,
-    adapt_proxycheck,
-    adapt_shodan_internetdb,
-    adapt_stopforumspam,
-    adapt_tor_onionoo,
-)
+from detector.providers import adapters_http, dns, local
+from detector.providers.common import PROVIDER_SPECS
 
 TEST_UPSTREAM_SECRETS = {
     "CLOUDFLARE_RADAR_TOKEN": "cf-radar-token-7a1c",
@@ -50,25 +34,36 @@ MAXMIND_STUB = {
     "rawJson": {"status": "error", "message": "Local MMDB files not found"},
 }
 
-ALL_ADAPTERS = (
-    ("Cloudflare Radar", lambda raw, code: adapt_cloudflare_radar(raw, True, code)),
-    ("AbuseIPDB", lambda raw, code: adapt_abuseipdb(raw, True, code)),
-    ("IPData", lambda raw, code: adapt_ipdata(raw, True, code)),
-    ("IPRegistry", lambda raw, code: adapt_ipregistry(raw, True, code)),
-    ("IP2Location", lambda raw, code: adapt_ip2location(raw, True, code)),
-    ("MaxMind", lambda raw, code: adapt_maxmind(raw, True, code)),
-    ("GetIPIntel", lambda raw, code: adapt_getipintel(raw, True, code)),
-    ("Proxycheck", lambda raw, code: adapt_proxycheck(raw, True, code, "8.8.8.8")),
-    ("IPHub", lambda raw, code: adapt_iphub(raw, True, code)),
-    ("IPHunter", lambda raw, code: adapt_iphunter(raw, True, code)),
-    ("Tor Onionoo", lambda raw, code: adapt_tor_onionoo(raw, code, "8.8.8.8")),
-    ("StopForumSpam", lambda raw, code: adapt_stopforumspam(raw, code)),
-    ("DShield", lambda raw, code: adapt_dshield(raw, code)),
-    ("IPsum / DROP", lambda raw, code: adapt_ipsum_drop(raw, code)),
-    ("OpenASN", lambda raw, code: adapt_openasn(raw, code)),
-    ("Oxylabs", lambda raw, code: adapt_oxylabs(raw, code)),
-    ("Shodan InternetDB", lambda raw, code: adapt_shodan_internetdb(raw, code)),
-)
+
+def _build_adapter_invoker(adapter_fn: Callable[..., Dict[str, Any]]) -> Callable[[Any, int], Dict[str, Any]]:
+    params = inspect.signature(adapter_fn).parameters
+    flag_param = next((p for p in ("has_api_key", "has_contact_email", "has_db") if p in params), None)
+    takes_ip = "ip" in params
+
+    def _invoke(raw: Any, code: int) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {"status_code": code}
+        if flag_param is not None:
+            kwargs[flag_param] = True
+        if takes_ip:
+            kwargs["ip"] = "8.8.8.8"
+        return adapter_fn(raw, **kwargs)
+
+    return _invoke
+
+
+def _discover_all_adapters() -> Tuple[Tuple[str, Callable[[Any, int], Dict[str, Any]]], ...]:
+    discovered = []
+    for meta in PROVIDER_REGISTRY:
+        fn_name = f"adapt_{meta.key}"
+        adapter_fn = (
+            getattr(local, fn_name, None) or getattr(dns, fn_name, None) or getattr(adapters_http, fn_name, None)
+        )
+        if callable(adapter_fn):
+            discovered.append((meta.label, _build_adapter_invoker(adapter_fn)))
+    return tuple(discovered)
+
+
+ALL_ADAPTERS: Tuple[Tuple[str, Callable[[Any, int], Dict[str, Any]]], ...] = _discover_all_adapters()
 
 
 def _mock_response(status_code=200, json_value=None, json_error=None, text=""):
@@ -235,17 +230,8 @@ class _BatchingFakeRedis(FakeAsyncRedis):
         return super().pipeline(transaction=transaction)
 
 
-_DNS_PROVIDER_KEYS = frozenset(
-    {"maxmind", "spamhaus_zen", "spamcop", "stopforumspam", "ipsum_drop", "openasn", "oxylabs"}
-)
-
 CANONICAL_PROVIDER_PATCH_TARGETS: Dict[str, str] = {
-    meta.key: (
-        f"detector.providers.dns_local.query_{meta.key}"
-        if meta.key in _DNS_PROVIDER_KEYS
-        else f"detector.providers.http.query_{meta.key}"
-    )
-    for meta in PROVIDER_REGISTRY
+    spec.key: f"{spec.target_module_name}.{spec.func_name}" for spec in PROVIDER_SPECS
 }
 
 NON_DNSBL_PROVIDER_PATCH_SPECS: Tuple[Tuple[str, str, str], ...] = tuple(

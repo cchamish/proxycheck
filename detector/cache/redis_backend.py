@@ -20,12 +20,12 @@ from django.conf import settings
 from django.core.signals import setting_changed
 
 from ..core import sanitization
-from ..offline import (
+from ..offline.mmdb import (
     get_maxmind_newest_mtime_iso,
-    get_positive_int_setting,
-    get_stopforumspam_db_version,
     has_local_maxmind_city_db,
 )
+from ..offline.sfs import get_stopforumspam_db_version
+from ..offline.store import get_positive_int_setting
 from ..provider_registry import (
     REDIS_TRANSPORT_ERRORS,
     build_redis_namespace,

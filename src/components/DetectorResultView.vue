@@ -353,7 +353,6 @@ import {
   type TableColumn,
 } from '@wikimedia/codex';
 import {
-  PROVIDER_NAMES,
   canonicalizeIpAddress,
   formatCompactDuration,
   formatExactUtcTimestamp,
@@ -637,38 +636,33 @@ const verificationLinks = computed(() => {
 });
 
 const comparisonRows = computed<ProviderRawResult[]>(() => {
-  const resolvedByName = new Map<string, ProviderRawResult>();
-  for (const row of props.detectionData.results ?? []) {
-    if (row.provider !== 'GetIPIntel' && row.provider !== 'Tor Onionoo') {
-      resolvedByName.set(row.provider, row);
-    }
-  }
-  const pendingSet = new Set(
-    (props.detectionData.pendingProviders ?? []).filter(
-      (name) => name !== 'GetIPIntel' && name !== 'Tor Onionoo'
-    )
-  );
   const ordered: ProviderRawResult[] = [];
-  for (const providerName of PROVIDER_NAMES) {
-    if (providerName === 'GetIPIntel' || providerName === 'Tor Onionoo') continue;
-    const existing = resolvedByName.get(providerName);
-    if (existing) {
-      ordered.push(existing);
-    } else if (pendingSet.has(providerName)) {
-      ordered.push({
-        provider: providerName,
-        status: 'Querying...',
-        statusCode: null,
-        asn: '-',
-        isp: '-',
-        organisation: '-',
-        location: '-',
-        usageType: '-',
-        securityFlags: [],
-        isPending: true,
-        rawJson: {},
-      });
+  const seenProviders = new Set<string>();
+  for (const row of props.detectionData.results ?? []) {
+    if (row.provider === 'GetIPIntel' || row.provider === 'Tor Onionoo' || seenProviders.has(row.provider)) {
+      continue;
     }
+    seenProviders.add(row.provider);
+    ordered.push(row);
+  }
+  for (const providerName of props.detectionData.pendingProviders ?? []) {
+    if (providerName === 'GetIPIntel' || providerName === 'Tor Onionoo' || seenProviders.has(providerName)) {
+      continue;
+    }
+    seenProviders.add(providerName);
+    ordered.push({
+      provider: providerName,
+      status: 'Querying...',
+      statusCode: null,
+      asn: '-',
+      isp: '-',
+      organisation: '-',
+      location: '-',
+      usageType: '-',
+      securityFlags: [],
+      isPending: true,
+      rawJson: {},
+    });
   }
   return ordered;
 });

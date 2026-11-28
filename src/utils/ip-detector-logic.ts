@@ -23,6 +23,7 @@ export const PROVIDER_NAMES = [
   'DShield',
   'IPsum / DROP',
   'OpenASN',
+  'Oxylabs',
   'Shodan InternetDB',
 ] as const;
 
@@ -114,6 +115,8 @@ export interface ProviderRawResult {
   isDeferred?: boolean;
   isSkippedIpv6?: boolean;
   isListed?: boolean;
+  residentialProxyProvider?: string | null;
+  sourceFile?: string | null;
   isPolicyRange?: boolean;
   isQueryRestricted?: boolean;
   listedCodes?: string[];
@@ -202,6 +205,8 @@ export interface DetectionResponse {
   predictionTier?: string;
   getipintel_chance: number | null;
   residentialProxy?: number | null;
+  confirmedResidentialProxy?: boolean;
+  confirmedResidentialProxyProvider?: string | null;
   highlySuspectedResidentialProxy?: boolean;
   arbitrationVerdict: string;
   arbitrationTier?: string;

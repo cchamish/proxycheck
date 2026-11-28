@@ -130,6 +130,8 @@ def build_non_public_response_payload(
         "cidrRationale": f"External lookups skipped for {reason.lower()}",
         "isMobileOrCgnat": category == "shared_cgnat",
         "sharedPrivacyEgress": None,
+        "confirmedResidentialProxy": False,
+        "confirmedResidentialProxyProvider": None,
         "suspectedResidentialProxy": False,
         "fetchedAt": None,
         "results": [],
@@ -220,6 +222,7 @@ class _ArbitrationSignals:
     has_recent_sfs_activity: bool = False
     has_recent_dshield_activity: bool = False
     has_high_abuseipdb: bool = False
+    confirmed_residential_proxy_provider: Optional[str] = None
 
 
 def _collect_arbitration_signals(rows: List[Dict[str, Any]]) -> _ArbitrationSignals:  # noqa: C901
@@ -375,6 +378,10 @@ def _collect_arbitration_signals(rows: List[Dict[str, Any]]) -> _ArbitrationSign
                 is_affirmative_osint = True
             elif bool(row.get("isHosting")):
                 sig.has_hosting = True
+        elif provider == "Oxylabs":
+            if bool(row.get("isListed")):
+                sig.confirmed_residential_proxy_provider = str(row.get("residentialProxyProvider") or "Oxylabs")
+                is_affirmative_osint = True
         elif provider == "Shodan InternetDB":
             raw_proxy_ports = row.get("openProxyPorts")
             if isinstance(raw_proxy_ports, list) and len(raw_proxy_ports) > 0:
@@ -442,6 +449,7 @@ def aggregate_intelligence_metrics(  # noqa: C901
     else:
         prediction_score, prediction_label, prediction_tier = chance, "Needs Human Review", "neutral"
 
+    confirmed_residential_proxy = sig.confirmed_residential_proxy_provider is not None
     highly_suspected_residential_proxy = sig.residential_proxy is not None and sig.residential_proxy >= 0.95
     rdns_info = classify_rdns_hostname(ptr_hostname)
     primary_asn = sig.asns[0] if sig.asns else "-"
@@ -457,6 +465,7 @@ def aggregate_intelligence_metrics(  # noqa: C901
         ptr_hostname=rdns_info["ptrHostname"],
         ptr_category=rdns_info["ptrCategory"],
         provider_rows=sig.comparison_results,
+        confirmed_residential_proxy_provider=sig.confirmed_residential_proxy_provider,
         highly_suspected_residential_proxy=highly_suspected_residential_proxy,
     )
     shared_privacy_egress = cidr_info["sharedPrivacyEgress"]
@@ -486,7 +495,13 @@ def aggregate_intelligence_metrics(  # noqa: C901
     rounded_votes = round(float(votes), 2)
     votes_str = str(int(rounded_votes)) if rounded_votes.is_integer() else f"{rounded_votes:.1f}"
 
-    if highly_suspected_residential_proxy:
+    if confirmed_residential_proxy:
+        verdict, tier, is_majority = (
+            f"Confirmed Residential Proxy: {sig.confirmed_residential_proxy_provider}",
+            "destructive",
+            True,
+        )
+    elif highly_suspected_residential_proxy:
         verdict, tier, is_majority = "Highly Suspected Residential Proxy", "destructive", True
     elif (
         shared_privacy_egress in ("icloud_private_relay", "cloudflare_warp")
@@ -538,6 +553,8 @@ def aggregate_intelligence_metrics(  # noqa: C901
         "predictionTier": prediction_tier,
         "getipintel_chance": sig.getipintel_chance,
         "residentialProxy": sig.residential_proxy,
+        "confirmedResidentialProxy": confirmed_residential_proxy,
+        "confirmedResidentialProxyProvider": sig.confirmed_residential_proxy_provider,
         "highlySuspectedResidentialProxy": highly_suspected_residential_proxy,
         "arbitrationVerdict": verdict,
         "arbitrationTier": tier,

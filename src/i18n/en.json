@@ -47,6 +47,7 @@
   "detector-broadcast-ip": "Broadcast IP?",
   "detector-suspected-residential": "Suspected Residential Proxy / Compromised Host",
   "detector-highly-suspected-residential": "Highly Suspected Residential Proxy",
+  "detector-confirmed-residential-cidr-warning": "Confirmed Residential Proxy: {provider} — restrict blocking to this single IP and proceed with discretion on CIDR.",
   "detector-open-proxy-port-title": "Open proxy port detected via Shodan InternetDB",
   "detector-open-proxy-port": "Open Proxy Port: {port}",
   "detector-shodan-tag": "Shodan: {tag}",

@@ -23,6 +23,7 @@ from .store import (
     DEFAULT_STALE_DAILY_FEED_SECONDS,
     DEFAULT_STALE_MAXMIND_SECONDS,
     DEFAULT_STALE_OPENASN_SECONDS,
+    DEFAULT_STALE_OXYLABS_SECONDS,
     DEFAULT_STALE_RULES_SECONDS,
     DEFAULT_STALE_SFS_1_SECONDS,
     DEFAULT_STALE_SFS_90_SECONDS,
@@ -33,6 +34,7 @@ from .store import (
     MOBILE_ASNS_JSON_FILENAME,
     MOBILE_BGP_TAG_TOKENS,
     OPENASN_MMDB_FILENAME,
+    OXYLABS_DIR_NAME,
     PRIVACY_RELAYS_BIN_FILENAME,
     REZMOSS_EXCLUDED_PROVIDERS,
     REZMOSS_PROVIDER_CATALOG,
@@ -50,6 +52,7 @@ from .store import (
     get_positive_int_setting,
     resolve_feed_data_path,
     resolve_hosting_rules_path,
+    resolve_oxylabs_data_dir,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,6 +67,7 @@ _bgp_tags_cache: FileStatCache[Tuple[str, int, int], Tuple[Dict[int, Tuple[str, 
     FileStatCache()
 )
 _mobile_asns_cache: FileStatCache[Tuple[str, int, int], FrozenSet[int]] = FileStatCache()
+_oxylabs_cache: FileStatCache[Tuple[Tuple[str, int, int], ...], Dict[str, Dict[str, Any]]] = FileStatCache()
 
 
 def classify_rezmoss_provider(slug: str) -> Optional[Tuple[str, str]]:
@@ -380,6 +384,192 @@ def is_mobile_asn_offline(asn: Optional[int]) -> bool:
     return asn_num in bgp_mobile_asns
 
 
+def _scan_oxylabs_files(
+    *,
+    env_overrides: Optional[Mapping[str, str]] = None,
+    base_dir: Optional[Path] = None,
+    bypass_throttle: bool = False,
+) -> Tuple[Optional[Path], Tuple[Tuple[Path, int, int], ...]]:
+    data_dir = resolve_oxylabs_data_dir(env_overrides=env_overrides, base_dir=base_dir)
+    if data_dir is None:
+        return None, ()
+    try:
+        candidates = sorted(data_dir.glob("*.jsonl"), key=lambda path: path.name)
+    except OSError:
+        return data_dir, ()
+    matched: List[Tuple[Path, int, int]] = []
+    for file_path in candidates:
+        sig = get_file_stat_signature(file_path, bypass_throttle=bypass_throttle)
+        if sig is not None:
+            matched.append((file_path, sig[0], sig[1]))
+    return data_dir, tuple(matched)
+
+
+def _parse_oxylabs_line(raw_line: str, source_file: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+    cleaned_line = raw_line.strip()
+    if not cleaned_line:
+        return None
+    try:
+        obj = json.loads(cleaned_line)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    raw_ip = obj.get("ip")
+    if not isinstance(raw_ip, str) or not raw_ip.strip():
+        return None
+    ip_text = raw_ip.strip()
+    if "%" in ip_text and ":" in ip_text:
+        ip_text = ip_text.split("%", 1)[0]
+    try:
+        canonical_ip = ipaddress.ip_address(ip_text).compressed
+    except ValueError:
+        return None
+    raw_org = obj.get("org_name")
+    org_name = raw_org.strip() if isinstance(raw_org, str) and raw_org.strip() else None
+    raw_updated = obj.get("updated_at")
+    updated_at = raw_updated.strip() if isinstance(raw_updated, str) and raw_updated.strip() else None
+    return canonical_ip, {
+        "ip": canonical_ip,
+        "asn": _parse_asn_int(obj.get("asn")),
+        "orgName": org_name,
+        "updatedAt": updated_at,
+        "sourceFile": source_file,
+    }
+
+
+def _load_oxylabs_index(files: Tuple[Tuple[Path, int, int], ...]) -> Dict[str, Dict[str, Any]]:
+    index: Dict[str, Dict[str, Any]] = {}
+    for file_path, _mtime_ns, _size in files:
+        try:
+            with file_path.open("r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    parsed = _parse_oxylabs_line(raw_line, file_path.name)
+                    if parsed is None:
+                        continue
+                    canonical_ip, entry = parsed
+                    existing = index.get(canonical_ip)
+                    if existing is None or (
+                        entry["updatedAt"] and (not existing["updatedAt"] or entry["updatedAt"] > existing["updatedAt"])
+                    ):
+                        index[canonical_ip] = entry
+        except OSError as exc:
+            logger.warning("Failed to read Oxylabs JSONL file %s: %s", file_path, exc)
+    return index
+
+
+def get_oxylabs_mtime_iso() -> Optional[str]:
+    """Returns the newest modification time across Oxylabs JSONL datasets as an ISO timestamp, or None when absent."""
+    _data_dir, files = _scan_oxylabs_files()
+    if not files:
+        return None
+    newest_ns = max(mtime_ns for _, mtime_ns, _ in files)
+    return datetime.fromtimestamp(newest_ns / 1_000_000_000.0, tz=timezone.utc).isoformat()
+
+
+def _empty_oxylabs_result(*, has_db: bool, updated_at: Optional[str]) -> Dict[str, Any]:
+    return {
+        "has_db": has_db,
+        "isListed": False,
+        "asn": None,
+        "orgName": None,
+        "updatedAt": None,
+        "sourceFile": None,
+        "offlineDbUpdatedAt": updated_at,
+    }
+
+
+def query_oxylabs_offline(ip: str) -> Dict[str, Any]:
+    """Queries in-memory Oxylabs JSONL datasets for IPv4, IPv6, and IPv4-mapped IPv6 addresses."""
+    _data_dir, files = _scan_oxylabs_files()
+    if not files:
+        return _empty_oxylabs_result(has_db=False, updated_at=None)
+
+    newest_ns = max(mtime_ns for _, mtime_ns, _ in files)
+    updated_iso = datetime.fromtimestamp(newest_ns / 1_000_000_000.0, tz=timezone.utc).isoformat()
+    cache_key = tuple((str(file_path), mtime_ns, size) for file_path, mtime_ns, size in files)
+    index = _oxylabs_cache.get_or_load(cache_key, lambda: _load_oxylabs_index(files))
+
+    if not isinstance(ip, str) or not ip.strip():
+        return _empty_oxylabs_result(has_db=True, updated_at=updated_iso)
+    cleaned = ip.strip()
+    if "%" in cleaned and ":" in cleaned:
+        cleaned = cleaned.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(cleaned)
+    except ValueError:
+        return _empty_oxylabs_result(has_db=True, updated_at=updated_iso)
+
+    hit = index.get(addr.compressed)
+    if hit is None:
+        mapped_v4 = getattr(addr, "ipv4_mapped", None)
+        if mapped_v4 is not None:
+            hit = index.get(mapped_v4.compressed)
+    if hit is None:
+        return _empty_oxylabs_result(has_db=True, updated_at=updated_iso)
+
+    return {
+        "has_db": True,
+        "isListed": True,
+        "asn": hit["asn"],
+        "orgName": hit["orgName"],
+        "updatedAt": hit["updatedAt"],
+        "sourceFile": hit["sourceFile"],
+        "offlineDbUpdatedAt": updated_iso,
+    }
+
+
+def _build_oxylabs_status_entry(
+    *,
+    now_ts: float,
+    stale_after_seconds: int,
+    env_overrides: Optional[Mapping[str, str]] = None,
+    base_dir: Optional[Path] = None,
+    include_resolved_path: bool = False,
+) -> Dict[str, Any]:
+    oxylabs_dir, oxylabs_files = _scan_oxylabs_files(
+        env_overrides=env_overrides, base_dir=base_dir, bypass_throttle=True
+    )
+    if not oxylabs_files:
+        entry: Dict[str, Any] = {
+            "key": "oxylabs",
+            "source": "Oxylabs",
+            "name": "Oxylabs Residential Proxy Datasets",
+            "filename": f"{OXYLABS_DIR_NAME}/*.jsonl",
+            "exists": False,
+            "optional": True,
+            "sizeBytes": None,
+            "lastModifiedIso": None,
+            "ageSeconds": None,
+            "staleAfterSeconds": stale_after_seconds,
+            "status": "missing",
+            "statusLabel": "Optional (Not Configured)",
+        }
+    else:
+        newest_ns = max(mtime_ns for _, mtime_ns, _ in oxylabs_files)
+        total_bytes = sum(size for _, _, size in oxylabs_files)
+        mtime_ts = newest_ns / 1_000_000_000.0
+        age_seconds = max(0, int(now_ts - mtime_ts))
+        is_stale = stale_after_seconds > 0 and age_seconds > stale_after_seconds
+        entry = {
+            "key": "oxylabs",
+            "source": "Oxylabs",
+            "name": "Oxylabs Residential Proxy Datasets",
+            "filename": f"{OXYLABS_DIR_NAME}/*.jsonl ({len(oxylabs_files)} files)",
+            "exists": True,
+            "optional": True,
+            "sizeBytes": int(total_bytes),
+            "lastModifiedIso": datetime.fromtimestamp(mtime_ts, tz=timezone.utc).isoformat(),
+            "ageSeconds": age_seconds,
+            "staleAfterSeconds": stale_after_seconds,
+            "status": "stale" if is_stale else "healthy",
+            "statusLabel": "Stale" if is_stale else "Healthy",
+        }
+    if include_resolved_path:
+        entry["resolvedPath"] = str(oxylabs_dir) if (oxylabs_dir is not None and entry["exists"]) else ""
+    return entry
+
+
 def build_offline_database_entries(
     *,
     maxmind_paths: Dict[str, Optional[Path]],
@@ -556,6 +746,9 @@ def collect_offline_databases_status(
     openasn_stale = get_positive_int_setting(
         "OFFLINE_DB_OPENASN_STALE_SECONDS", DEFAULT_STALE_OPENASN_SECONDS, env_overrides=env_overrides
     )
+    oxylabs_stale = get_positive_int_setting(
+        "OFFLINE_DB_OXYLABS_STALE_SECONDS", DEFAULT_STALE_OXYLABS_SECONDS, env_overrides=env_overrides
+    )
     rules_stale = get_positive_int_setting(
         "OFFLINE_DB_RULES_STALE_SECONDS", DEFAULT_STALE_RULES_SECONDS, env_overrides=env_overrides
     )
@@ -687,7 +880,7 @@ def collect_offline_databases_status(
         ),
     )
 
-    return build_offline_database_entries(
+    entries = build_offline_database_entries(
         maxmind_paths=maxmind_paths,
         sfs_paths=sfs_paths,
         hosting_rules_path=hosting_rules_path,
@@ -701,6 +894,16 @@ def collect_offline_databases_status(
         now_ts=now_ts,
         include_resolved_path=include_resolved_path,
     )
+    entries.append(
+        _build_oxylabs_status_entry(
+            now_ts=now_ts,
+            stale_after_seconds=oxylabs_stale,
+            env_overrides=env_overrides,
+            base_dir=base_dir,
+            include_resolved_path=include_resolved_path,
+        )
+    )
+    return entries
 
 
 def clear_stopforumspam_caches() -> None:
@@ -713,4 +916,5 @@ def clear_stopforumspam_caches() -> None:
     _tor_onionoo_cache.clear()
     _bgp_tags_cache.clear()
     _mobile_asns_cache.clear()
+    _oxylabs_cache.clear()
     clear_stat_throttle_cache()

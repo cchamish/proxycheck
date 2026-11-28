@@ -262,6 +262,15 @@ PROVIDER_REGISTRY: Tuple[ProviderMetadata, ...] = (
         has_quota_env_vars=False,
     ),
     ProviderMetadata(
+        key="oxylabs",
+        label="Oxylabs",
+        uses_http=False,
+        supports_cooldown=False,
+        active_in_light_mode=True,
+        is_offline=True,
+        has_quota_env_vars=False,
+    ),
+    ProviderMetadata(
         key="shodan_internetdb",
         label="Shodan InternetDB",
         uses_http=True,
@@ -299,8 +308,8 @@ OFFLINE_PROVIDER_KEYS: FrozenSet[str] = frozenset(meta.key for meta in PROVIDER_
 
 OFFLINE_REHYDRATE_PROVIDERS: FrozenSet[str] = OFFLINE_PROVIDER_KEYS
 
-# Local mmap lookups cost microseconds, so these providers never touch Redis or the L1/L2 snapshots.
-NO_REDIS_CACHE_PROVIDER_KEYS: FrozenSet[str] = frozenset({"openasn"})
+# Local mmap and in-memory lookups cost microseconds, so these providers bypass Redis and L1/L2 snapshots.
+NO_REDIS_CACHE_PROVIDER_KEYS: FrozenSet[str] = frozenset({"openasn", "oxylabs"})
 
 L1_ONLY_PROVIDERS: FrozenSet[str] = frozenset({"iphub", "spamhaus_zen", "spamcop"})
 

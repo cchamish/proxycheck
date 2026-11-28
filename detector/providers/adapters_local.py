@@ -582,3 +582,69 @@ def adapt_openasn(
         security_flags=flags or _default_no_flags(),
         extra=row_extra,
     )
+
+
+def adapt_oxylabs(
+    raw_data: Optional[Dict[str, Any]],
+    status_code: int = 200,
+    *,
+    has_db: bool = True,
+) -> Dict[str, Any]:
+    """Normalises offline Oxylabs residential proxy JSONL lookups."""
+    extra: Dict[str, Any] = {
+        "isListed": False,
+        "residentialProxyProvider": None,
+    }
+    if not has_db:
+        return _build_error_row(
+            "Oxylabs",
+            status="Offline DB Missing",
+            usage_type="Offline DB Missing",
+            raw_data={"status": "unconfigured", "message": "Oxylabs offline dataset not found"},
+            extra=extra,
+        )
+
+    raw_data, status_code = _guard_payload(raw_data, status_code)
+    if status_code != 200 or not raw_data or "error" in raw_data or raw_data.get("status") == "error":
+        if status_code == 200:
+            status_code = 502
+        return _build_error_row("Oxylabs", status_code, raw_data, extra=extra)
+
+    offline_updated = raw_data.get("offlineDbUpdatedAt")
+    offline_updated_text = (
+        offline_updated.strip() if isinstance(offline_updated, str) and offline_updated.strip() else None
+    )
+
+    if bool(raw_data.get("isListed")):
+        raw_org = raw_data.get("orgName")
+        isp_text = raw_org.strip() if isinstance(raw_org, str) and raw_org.strip() else "-"
+        raw_source = raw_data.get("sourceFile")
+        source_file = raw_source.strip() if isinstance(raw_source, str) and raw_source.strip() else None
+        row_extra: Dict[str, Any] = {
+            "isListed": True,
+            "residentialProxyProvider": "Oxylabs",
+            "lastSeen": _normalize_timestamp_or_text(raw_data.get("updatedAt")),
+            "sourceFile": source_file,
+        }
+        if offline_updated_text is not None:
+            row_extra["offlineDbUpdatedAt"] = offline_updated_text
+        return _build_ok_row(
+            "Oxylabs",
+            raw_data,
+            asn=_format_asn_str(raw_data.get("asn"), strict_numeric=True),
+            isp=isp_text,
+            usage_type="Confirmed Residential Proxy: Oxylabs",
+            security_flags=[{"label": "Confirmed Residential Proxy: Oxylabs", "isHighRisk": True}],
+            extra=row_extra,
+        )
+
+    row_extra = dict(extra)
+    if offline_updated_text is not None:
+        row_extra["offlineDbUpdatedAt"] = offline_updated_text
+    return _build_ok_row(
+        "Oxylabs",
+        raw_data,
+        usage_type="Clean (Not Listed)",
+        security_flags=_default_no_flags(),
+        extra=row_extra,
+    )

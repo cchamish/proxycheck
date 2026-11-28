@@ -34,6 +34,7 @@ from ..offline import (
     lookup_bgp_tools_offline,
     query_ipsum_drop_offline,
     query_openasn_offline,
+    query_oxylabs_offline,
     query_stopforumspam_offline,
     record_city_db_presence,
 )
@@ -41,6 +42,7 @@ from .adapters_local import (
     adapt_ipsum_drop,
     adapt_maxmind,
     adapt_openasn,
+    adapt_oxylabs,
     adapt_spamcop,
     adapt_spamhaus_zen,
     adapt_stopforumspam,
@@ -224,6 +226,23 @@ async def query_openasn(ip_or_client: Any, ip: Optional[str] = None) -> Dict[str
         if not lookup.get("has_db"):
             return adapt_openasn(None, has_db=False)
         return adapt_openasn(lookup, status_code=200, has_db=True)
+
+    return await asyncio.to_thread(_run)
+
+
+async def query_oxylabs(ip_or_client: Any, ip: Optional[str] = None) -> Dict[str, Any]:
+    target_ip = ip if isinstance(ip, str) and ip.strip() else str(ip_or_client)
+
+    def _run() -> Dict[str, Any]:
+        try:
+            lookup = query_oxylabs_offline(target_ip)
+        except (OSError, ValueError, RuntimeError) as exc:
+            safe_message = sanitize_error_message(str(exc))
+            logger.error("Error querying Oxylabs offline dataset: %s", safe_message)
+            return adapt_oxylabs({"status": "error", "error": safe_message}, status_code=500, has_db=True)
+        if not lookup.get("has_db"):
+            return adapt_oxylabs(None, has_db=False)
+        return adapt_oxylabs(lookup, status_code=200, has_db=True)
 
     return await asyncio.to_thread(_run)
 

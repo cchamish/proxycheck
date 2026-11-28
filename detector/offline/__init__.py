@@ -53,7 +53,6 @@ from .store import (
     MOBILE_ASNS_JSON_FILENAME,
     MOBILE_BGP_TAG_TOKENS,
     OPENASN_MMDB_FILENAME,
-    OXYLABS_DIR_NAME,
     PRIVACY_RELAYS_BIN_FILENAME,
     REZMOSS_EXCLUDED_PROVIDERS,
     SFS_LISTED_1_ZIP_NAME,
@@ -71,7 +70,6 @@ from .store import (
     replace_temp_file_atomically,
     resolve_configured_data_dir,
     resolve_hosting_rules_path,
-    resolve_oxylabs_data_dir,
     resolve_writable_data_dir,
 )
 
@@ -94,7 +92,6 @@ __all__ = [
     "MOBILE_ASNS_JSON_FILENAME",
     "MOBILE_BGP_TAG_TOKENS",
     "OPENASN_MMDB_FILENAME",
-    "OXYLABS_DIR_NAME",
     "PRIVACY_RELAYS_BIN_FILENAME",
     "REZMOSS_EXCLUDED_PROVIDERS",
     "SFS_LISTED_1_ZIP_NAME",
@@ -139,7 +136,6 @@ __all__ = [
     "resolve_configured_data_dir",
     "resolve_hosting_rules_path",
     "resolve_maxmind_db_paths",
-    "resolve_oxylabs_data_dir",
     "resolve_writable_data_dir",
     "warm_stopforumspam_caches",
 ]

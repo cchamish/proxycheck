@@ -1,23 +1,23 @@
 name: Deploy User Gadget to Meta-Wiki
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'scripts/user-gadget.js'
+  workflow_call:
+    inputs:
+      verified_sha:
+        description: Commit SHA verified by CI
+        required: true
+        type: string
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: deploy-gadget-meta
-  cancel-in-progress: false
-
 jobs:
   deploy:
     name: Minify and Deploy User Gadget
+    concurrency:
+      group: deploy-gadget-meta
+      cancel-in-progress: false
     runs-on: macos-latest
     timeout-minutes: 10
     if: ${{ github.repository == 'cchamish/proxycheck' }}
@@ -25,6 +25,9 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.verified_sha || github.sha }}
+          fetch-depth: 1
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
@@ -35,9 +38,6 @@ jobs:
 
       - name: Install npm dependencies
         run: npm ci
-
-      - name: Verify gadget deployment script
-        run: node --test scripts/deploy-gadget.test.mjs
 
       - name: Minify and deploy gadget to Meta-Wiki
         env:

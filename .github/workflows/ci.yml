@@ -21,10 +21,39 @@ jobs:
     name: Metadata and Syntax Checks
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      gadget_changed: ${{ steps.gadget-diff.outputs.changed }}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+
+      - name: Check for user gadget changes
+        id: gadget-diff
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [[ ! -f scripts/user-gadget.js ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ -z "$BEFORE_SHA" || "$BEFORE_SHA" == "0000000000000000000000000000000000000000" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            if ! git fetch --no-tags --depth=1 origin "$BEFORE_SHA"; then
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          if git diff --quiet "$BEFORE_SHA" "$HEAD_SHA" -- scripts/user-gadget.js; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v10.3.3
@@ -169,4 +198,17 @@ jobs:
       toolforge_tool: proxycheck
       environment_name: Toolforge
       environment_url: https://proxycheck.toolforge.org/
+      verified_sha: ${{ github.sha }}
+
+  deploy-gadget:
+    name: Deploy User Gadget to Meta-Wiki
+    needs: [lint-meta, backend, frontend, static-assets, deploy-prod]
+    if: >-
+      github.event_name == 'push'
+      && github.ref == 'refs/heads/main'
+      && github.repository == 'cchamish/proxycheck'
+      && needs.lint-meta.outputs.gadget_changed == 'true'
+    uses: ./.github/workflows/deploy-gadget.yml
+    secrets: inherit
+    with:
       verified_sha: ${{ github.sha }}
